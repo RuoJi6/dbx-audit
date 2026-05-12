@@ -25,6 +25,7 @@ const props = defineProps<{
   showConnectionDialog: boolean;
   showSettingsDialog: boolean;
   settingsInitialTab?: string;
+  appVersion?: string;
   showDangerDialog: boolean;
   dangerSql: string;
 }>();
@@ -102,6 +103,7 @@ watch(
   <EditorSettingsDialog
     :open="showSettingsDialog"
     :initial-tab="settingsInitialTab || 'editor'"
+    :app-version="appVersion"
     @update:open="emit('update:showSettingsDialog', $event)"
   />
   <DangerConfirmDialog

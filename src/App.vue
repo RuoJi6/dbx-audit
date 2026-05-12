@@ -701,6 +701,7 @@ onUnmounted(() => {
         <AppDialogs
           :show-connection-dialog="showConnectionDialog"
           :show-settings-dialog="showSettingsDialog"
+          :app-version="appVersion"
           :show-danger-dialog="showDangerDialog"
           :danger-sql="dangerSql"
           @update:show-connection-dialog="showConnectionDialog = $event"

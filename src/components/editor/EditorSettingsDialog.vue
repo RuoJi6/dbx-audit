@@ -34,6 +34,7 @@ const { toast } = useToast();
 const props = defineProps<{
   open: boolean;
   initialTab?: string;
+  appVersion?: string;
 }>();
 
 const emit = defineEmits<{
@@ -113,6 +114,7 @@ function setAppLayout(value: "separated" | "classic") {
 
 const activeSettingsTab = ref("editor");
 const isWeb = !isTauriRuntime();
+const displayedAppVersion = computed(() => (props.appVersion ? `v${props.appVersion}` : ""));
 
 function openExternalUrl(url: string) {
   if (isTauriRuntime()) {
@@ -933,7 +935,12 @@ watch(
                 <div class="text-lg font-semibold">DBX</div>
                 <p class="text-sm text-muted-foreground">{{ t("settings.aboutDescription") }}</p>
               </div>
-              <div class="rounded-md border bg-background px-2 py-1 text-xs text-muted-foreground">v0.5.0</div>
+              <div
+                v-if="displayedAppVersion"
+                class="rounded-md border bg-background px-2 py-1 text-xs text-muted-foreground"
+              >
+                {{ displayedAppVersion }}
+              </div>
             </div>
           </div>
 
