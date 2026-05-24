@@ -10,7 +10,6 @@ const mountedOpenDialogs = [
   "apps/desktop/src/components/sql-file/SqlFileExecutionDialog.vue",
   "apps/desktop/src/components/diagram/SchemaDiagramDialog.vue",
   "apps/desktop/src/components/import/TableImportDialog.vue",
-  "apps/desktop/src/components/structure/TableStructureEditorDialog.vue",
   "apps/desktop/src/components/lineage/FieldLineageDialog.vue",
   "apps/desktop/src/components/search/DatabaseSearchDialog.vue",
   "apps/desktop/src/components/export/DatabaseExportDialog.vue",

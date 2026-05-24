@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { strict as assert } from "node:assert";
 import test from "node:test";
 
-const source = readFileSync("apps/desktop/src/components/structure/TableStructureEditorDialog.vue", "utf8");
+const source = readFileSync("apps/desktop/src/components/structure/TableStructureEditor.vue", "utf8");
 const clickhouseSource = readFileSync("crates/dbx-core/src/db/clickhouse_driver.rs", "utf8");
 
 test("column comments can be expanded into a multiline editor", () => {
@@ -14,9 +14,9 @@ test("column comments can be expanded into a multiline editor", () => {
 
 test("structure editor keeps columns when optional metadata fails", () => {
   assert.match(source, /const nextColumns = await api\.getColumns/);
-  assert.match(source, /api\s*\n\s*\.listIndexes[\s\S]*\.catch\(\(\) => \[\]\)/);
-  assert.match(source, /api\s*\n\s*\.listForeignKeys[\s\S]*\.catch\(\(\) => \[\]\)/);
-  assert.match(source, /api\s*\n\s*\.listTriggers[\s\S]*\.catch\(\(\) => \[\]\)/);
+  assert.match(source, /api\.listIndexes[\s\S]*?\.catch\(\(\) => \[\]\)/);
+  assert.match(source, /api\.listForeignKeys[\s\S]*?\.catch\(\(\) => \[\]\)/);
+  assert.match(source, /api\.listTriggers[\s\S]*?\.catch\(\(\) => \[\]\)/);
 });
 
 test("ClickHouse column metadata preserves comments for structure editing", () => {
@@ -24,8 +24,12 @@ test("ClickHouse column metadata preserves comments for structure editing", () =
   assert.match(clickhouseSource, /comment:\s*row\.get\(5\)/);
 });
 
-test("structure editor loads immediately when mounted open", () => {
-  assert.match(source, /watch\(\s*open,[\s\S]*\{\s*immediate:\s*true\s*\},?\s*\)/);
+test("structure editor loads table metadata on mount", () => {
+  assert.match(source, /async function loadStructure/);
+  assert.match(source, /api\.getColumns/);
+  assert.match(source, /api\.listIndexes/);
+  assert.match(source, /api\.listForeignKeys/);
+  assert.match(source, /api\.listTriggers/);
 });
 
 test("structure editor gates controls through table structure capabilities", () => {
@@ -52,9 +56,9 @@ test("structure editor exposes column order controls", () => {
 });
 
 test("structure editor uses a dense wide layout for large tables", () => {
-  assert.match(source, /sm:max-w-\[1180px\]/);
-  assert.doesNotMatch(source, /1500px/);
   assert.match(source, /grid-cols-\[minmax\(0,1fr\)_300px\]/);
   assert.match(source, /data-structure-density="compact"/);
   assert.match(source, /class="h-6 min-w-28 text-\[11px\]"/);
+  assert.match(source, /w-36/);
+  assert.match(source, /w-24/);
 });

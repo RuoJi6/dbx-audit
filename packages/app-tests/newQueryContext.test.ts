@@ -47,6 +47,7 @@ test("new query target prefers the active data tab context", () => {
   assert.deepEqual(target, {
     connectionId: "conn-data",
     database: "analytics",
+    schema: undefined,
     shouldRefreshDefaultDatabase: false,
   });
 });
@@ -71,6 +72,7 @@ test("new query target uses the selected sidebar node when there is no active ta
   assert.deepEqual(target, {
     connectionId: "conn-tree",
     database: "reporting",
+    schema: "public",
     shouldRefreshDefaultDatabase: false,
   });
 });
@@ -93,6 +95,7 @@ test("new query target prefers the selected sidebar node after sidebar focus", (
   assert.deepEqual(target, {
     connectionId: "conn-tree",
     database: "reporting",
+    schema: undefined,
     shouldRefreshDefaultDatabase: false,
   });
 });
@@ -108,6 +111,7 @@ test("new query target refreshes default database for connection-only sidebar no
   assert.deepEqual(target, {
     connectionId: "conn-tree",
     database: "saved_default",
+    schema: undefined,
     shouldRefreshDefaultDatabase: true,
   });
 });

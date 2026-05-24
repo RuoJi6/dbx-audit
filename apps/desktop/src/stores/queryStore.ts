@@ -43,8 +43,16 @@ function loadSavedTabs(): { tabs: QueryTab[]; activeTabId: string | null } {
   }
 }
 
+function getI18nT() {
+  try {
+    return useI18n().t;
+  } catch {
+    return ((key: string, ..._args: unknown[]) => key) as ReturnType<typeof useI18n>["t"];
+  }
+}
+
 export const useQueryStore = defineStore("query", () => {
-  const { t } = useI18n();
+  const t = getI18nT();
   const restored = loadSavedTabs();
   const tabs = ref<QueryTab[]>(restored.tabs);
   const activeTabId = ref<string | null>(restored.activeTabId);

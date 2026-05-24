@@ -5,7 +5,7 @@ import test from "node:test";
 const apiSource = readFileSync("apps/desktop/src/lib/api.ts", "utf8");
 const tauriSource = readFileSync("apps/desktop/src/lib/tauri.ts", "utf8");
 const httpSource = readFileSync("apps/desktop/src/lib/http.ts", "utf8");
-const dialogSource = readFileSync("apps/desktop/src/components/structure/TableStructureEditorDialog.vue", "utf8");
+const dialogSource = readFileSync("apps/desktop/src/components/structure/TableStructureEditor.vue", "utf8");
 const tableStructureTypesSource = readFileSync("apps/desktop/src/lib/tableStructureEditorSql.ts", "utf8");
 const rustCoreLibSource = readFileSync("crates/dbx-core/src/lib.rs", "utf8");
 const rustTableStructureSqlSource = readFileSync("crates/dbx-core/src/table_structure_sql.rs", "utf8");
