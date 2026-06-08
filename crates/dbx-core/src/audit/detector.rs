@@ -11,7 +11,12 @@ const TOKEN_PATTERN: &str = r"(?i)\b(?:ak|sk|token|secret|bearer|api[_-]?key)[a-
 pub fn detect_field(table: &str, column: &str, level: AuditLevelFilter) -> Vec<AuditKind> {
     let haystack = format!("{} {}", table, column).to_ascii_lowercase();
     let mut kinds = Vec::new();
-    push_if(&mut kinds, AuditKind::Phone, level, any_contains(&haystack, &["phone", "mobile", "tel", "手机号", "手机"]));
+    push_if(
+        &mut kinds,
+        AuditKind::Phone,
+        level,
+        any_contains(&haystack, &["phone", "mobile", "tel", "手机号", "手机"]),
+    );
     push_if(&mut kinds, AuditKind::Email, level, any_contains(&haystack, &["email", "mail", "邮箱"]));
     push_if(
         &mut kinds,
@@ -19,12 +24,7 @@ pub fn detect_field(table: &str, column: &str, level: AuditLevelFilter) -> Vec<A
         level,
         any_contains(&haystack, &["idcard", "id_card", "identity", "身份证", "证件"]),
     );
-    push_if(
-        &mut kinds,
-        AuditKind::BankCard,
-        level,
-        any_contains(&haystack, &["bank", "card_no", "银行卡", "卡号"]),
-    );
+    push_if(&mut kinds, AuditKind::BankCard, level, any_contains(&haystack, &["bank", "card_no", "银行卡", "卡号"]));
     push_if(
         &mut kinds,
         AuditKind::PasswordSecret,

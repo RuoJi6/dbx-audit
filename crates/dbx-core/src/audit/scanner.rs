@@ -163,7 +163,8 @@ mod tests {
     fn builds_content_match_sql_for_core_databases() {
         assert!(build_content_match_sql(AuditSqlDialect::Postgres, Some("public"), "users", "email", "@", 3)
             .contains("::text ~"));
-        assert!(build_content_match_sql(AuditSqlDialect::Oracle, None, "USERS", "EMAIL", "@", 3)
-            .contains("regexp_like"));
+        assert!(
+            build_content_match_sql(AuditSqlDialect::Oracle, None, "USERS", "EMAIL", "@", 3).contains("regexp_like")
+        );
     }
 }

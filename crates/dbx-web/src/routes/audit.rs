@@ -180,9 +180,7 @@ pub async fn parse_fscan(Json(body): Json<ParseFscanRequest>) -> Result<Json<Par
     Ok(Json(parse_fscan_text(&input)))
 }
 
-pub async fn load_task_store(
-    State(state): State<Arc<WebState>>,
-) -> Result<Json<Option<serde_json::Value>>, AppError> {
+pub async fn load_task_store(State(state): State<Arc<WebState>>) -> Result<Json<Option<serde_json::Value>>, AppError> {
     Ok(Json(state.app.storage.load_audit_task_store().await.map_err(AppError)?))
 }
 

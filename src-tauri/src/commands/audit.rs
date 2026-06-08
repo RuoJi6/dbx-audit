@@ -8,12 +8,12 @@ use tauri::State;
 use uuid::Uuid;
 
 use crate::commands::connection::AppState;
+use dbx_core::audit::scanner::AuditSqlDialect;
 use dbx_core::audit::{
     audit_column_findings, audit_findings_to_xlsx, audit_job_to_json, build_sample_rows_sql, mask_sensitive_value,
     parse_fscan_text, AuditExportFormat, AuditExportResult, AuditFinding, AuditJobState, AuditJobStatus, AuditLogEntry,
     AuditSample, AuditScanRequest, ParsedFscanTargets,
 };
-use dbx_core::audit::scanner::AuditSqlDialect;
 use dbx_core::models::connection::DatabaseType;
 use dbx_core::query::QueryExecutionOptions;
 use serde_json::Value;
@@ -41,10 +41,7 @@ fn update_job(job_id: &str, update: impl FnOnce(&mut AuditJobState)) {
 }
 
 #[tauri::command]
-pub async fn audit_start_scan(
-    state: State<'_, Arc<AppState>>,
-    request: AuditScanRequest,
-) -> Result<String, String> {
+pub async fn audit_start_scan(state: State<'_, Arc<AppState>>, request: AuditScanRequest) -> Result<String, String> {
     if request.connection_id.trim().is_empty() {
         return Err("请选择连接".to_string());
     }
@@ -138,11 +135,7 @@ pub async fn audit_export_report(
         }
     }
 
-    Ok(AuditExportResult {
-        path: path_buf.to_string_lossy().to_string(),
-        format,
-        finding_count: job.findings.len(),
-    })
+    Ok(AuditExportResult { path: path_buf.to_string_lossy().to_string(), format, finding_count: job.findings.len() })
 }
 
 #[tauri::command]
@@ -192,18 +185,11 @@ pub async fn audit_load_task_store(state: State<'_, Arc<AppState>>) -> Result<Op
 }
 
 #[tauri::command]
-pub async fn audit_save_task_store(
-    state: State<'_, Arc<AppState>>,
-    store: serde_json::Value,
-) -> Result<(), String> {
+pub async fn audit_save_task_store(state: State<'_, Arc<AppState>>, store: serde_json::Value) -> Result<(), String> {
     state.storage.save_audit_task_store(&store).await
 }
 
-async fn run_field_name_scan(
-    state: Arc<AppState>,
-    request: AuditScanRequest,
-    job_id: &str,
-) -> Result<(), String> {
+async fn run_field_name_scan(state: Arc<AppState>, request: AuditScanRequest, job_id: &str) -> Result<(), String> {
     let schema = request.schema.clone().unwrap_or_default();
     let databases = audit_target_databases(&state, &request, job_id).await?;
     let total_databases = databases.len().max(1);
@@ -246,7 +232,16 @@ async fn run_field_name_scan(
             );
 
             if request.mode.includes_content() && !findings.is_empty() {
-                match attach_sample_rows(&state, &request, database, if schema.is_empty() { None } else { Some(schema.as_str()) }, table, &mut findings).await {
+                match attach_sample_rows(
+                    &state,
+                    &request,
+                    database,
+                    if schema.is_empty() { None } else { Some(schema.as_str()) },
+                    table,
+                    &mut findings,
+                )
+                .await
+                {
                     Ok(()) => {}
                     Err(err) => update_job(job_id, |job| {
                         job.logs.push(log_entry("warn", format!("样例采集失败：{database}.{table}，{err}")));
@@ -276,10 +271,8 @@ async fn attach_sample_rows(
     findings: &mut [AuditFinding],
 ) -> Result<(), String> {
     let dialect = audit_sql_dialect(state, &request.connection_id).await.ok_or("当前数据库暂不支持样例采集")?;
-    let columns = findings
-        .iter()
-        .map(|finding| finding.column.clone())
-        .fold(Vec::<String>::new(), |mut columns, column| {
+    let columns =
+        findings.iter().map(|finding| finding.column.clone()).fold(Vec::<String>::new(), |mut columns, column| {
             if !columns.contains(&column) {
                 columns.push(column);
             }
@@ -306,7 +299,8 @@ async fn attach_sample_rows(
     .await?;
 
     for finding in findings.iter_mut() {
-        let Some(column_index) = result.columns.iter().position(|column| column.eq_ignore_ascii_case(&finding.column)) else {
+        let Some(column_index) = result.columns.iter().position(|column| column.eq_ignore_ascii_case(&finding.column))
+        else {
             continue;
         };
         finding.samples = result

@@ -340,7 +340,8 @@ const en = {
   newTaskName: "New audit task",
   dataManager: "Data Manager",
   dataManagerTitle: "Audit Data Manager",
-  dataManagerHint: "Tasks, configuration, and scan results are saved in DBX's official dbx.db. Export or import JSON backups here.",
+  dataManagerHint:
+    "Tasks, configuration, and scan results are saved in DBX's official dbx.db. Export or import JSON backups here.",
   storageKey: "Storage key",
   backupData: "Backup data",
   exportBackup: "Export backup",
@@ -443,7 +444,8 @@ const en = {
   noTargets: "No batch targets",
   exportReport: "Export report",
   chooseOutput: "Choose output file",
-  chooseOutputUnavailable: "Web dev mode cannot choose local output paths. Use the desktop app or enter a path manually.",
+  chooseOutputUnavailable:
+    "Web dev mode cannot choose local output paths. Use the desktop app or enter a path manually.",
   fieldSearch: "phone / id_card / token",
   contentSearch: "phone / email / token value",
   riskHighShort: "High",
@@ -476,7 +478,8 @@ const en = {
   fieldCount: "{count} fields",
   fieldDetail: "Field detail",
   sampleValues: "Sample values",
-  noFieldSamplesHint: "This scan result did not return sample values. Masked samples will appear here after content scanning is connected.",
+  noFieldSamplesHint:
+    "This scan result did not return sample values. Masked samples will appear here after content scanning is connected.",
   rowHits: "{count} row hits",
   type: "Type",
   address: "Address",
@@ -489,9 +492,11 @@ const en = {
   databaseName: "Database",
   tableName: "Table",
   sampleRows: "Sample rows",
-  noSampleRowsHint: "This task only has field findings and did not return content sample rows. Real samples will appear here after backend content scanning is connected.",
+  noSampleRowsHint:
+    "This task only has field findings and did not return content sample rows. Real samples will appear here after backend content scanning is connected.",
   fieldEvidence: "Field evidence",
-  openFolderUnavailable: "Web dev mode cannot open local folders directly. Use the desktop app or open manually: {path}",
+  openFolderUnavailable:
+    "Web dev mode cannot open local folders directly. Use the desktop app or open manually: {path}",
   openedFolder: "Opened folder: {path}",
   status: {
     draft: "Draft",
@@ -546,7 +551,9 @@ const auditStoreLoaded = ref(false);
 let auditStoreSaveTimer: ReturnType<typeof setTimeout> | undefined;
 
 const selectedTask = computed(() => tasks.value.find((task) => task.id === selectedTaskId.value) || null);
-const selectedConnection = computed(() => props.connections.find((connection) => connection.id === draft.value.connectionId));
+const selectedConnection = computed(() =>
+  props.connections.find((connection) => connection.id === draft.value.connectionId),
+);
 const selectedConnections = computed(() =>
   props.connections.filter((connection) => activeConnectionIds(draft.value).includes(connection.id)),
 );
@@ -555,7 +562,15 @@ const filteredTasks = computed(() => {
   const query = searchQuery.value.trim().toLowerCase();
   if (!query) return tasks.value;
   return tasks.value.filter((task) => {
-    const haystack = [task.name, task.description, task.database, task.tables, task.kind, task.message, connectionLabel(task)]
+    const haystack = [
+      task.name,
+      task.description,
+      task.database,
+      task.tables,
+      task.kind,
+      task.message,
+      connectionLabel(task),
+    ]
       .join(" ")
       .toLowerCase();
     return haystack.includes(query);
@@ -604,7 +619,9 @@ const filteredSampleGroups = computed(() => {
     return (!valueQuery || text.includes(valueQuery)) && (!sensitiveQuery || text.includes(sensitiveQuery));
   });
 });
-const filteredSampleRowCount = computed(() => filteredSampleGroups.value.reduce((total, group) => total + group.rows.length, 0));
+const filteredSampleRowCount = computed(() =>
+  filteredSampleGroups.value.reduce((total, group) => total + group.rows.length, 0),
+);
 const filteredSampleSummary = computed(() =>
   ui.value.sampleSummary
     .replace("{groups}", String(filteredSampleGroups.value.length))
@@ -624,17 +641,9 @@ watch(
   { immediate: true },
 );
 
-watch(
-  tasks,
-  () => scheduleAuditTaskStoreSave(),
-  { deep: true },
-);
+watch(tasks, () => scheduleAuditTaskStoreSave(), { deep: true });
 
-watch(
-  draft,
-  () => scheduleAuditTaskStoreSave(),
-  { deep: true },
-);
+watch(draft, () => scheduleAuditTaskStoreSave(), { deep: true });
 
 watch(
   detailTabs,
@@ -691,7 +700,9 @@ function loadLegacyAuditTaskStore(): { tasks: AuditTask[]; draft?: Partial<Audit
 }
 
 function normalizeTasks(value: AuditTask[]) {
-  return value.map((task) => normalizeTask({ ...newTask(), ...task, targets: task.targets || [], errors: task.errors || [] }));
+  return value.map((task) =>
+    normalizeTask({ ...newTask(), ...task, targets: task.targets || [], errors: task.errors || [] }),
+  );
 }
 
 function scheduleAuditTaskStoreSave() {
@@ -729,7 +740,11 @@ function newTask(seed?: Partial<AuditTask>): AuditTask {
     progress: seed?.progress || 0,
     message: seed?.message || ui.value.notStarted,
     connectionId: fallbackConnectionId,
-    connectionIds: seed?.connectionIds?.length ? seed.connectionIds : fallbackConnectionId ? [fallbackConnectionId] : [],
+    connectionIds: seed?.connectionIds?.length
+      ? seed.connectionIds
+      : fallbackConnectionId
+        ? [fallbackConnectionId]
+        : [],
     database: seed?.database || "",
     schema: seed?.schema || "",
     tables: seed?.tables || "",
@@ -804,7 +819,10 @@ function saveDraft() {
     return;
   }
   error.value = "";
-  const saved = persistTask({ ...draft.value, status: draft.value.status === "running" ? "draft" : draft.value.status });
+  const saved = persistTask({
+    ...draft.value,
+    status: draft.value.status === "running" ? "draft" : draft.value.status,
+  });
   selectedTaskId.value = saved.id;
   view.value = "detail";
 }
@@ -883,7 +901,12 @@ async function importTaskBackup() {
     if (!Array.isArray(imported)) {
       throw new Error(ui.value.invalidBackup);
     }
-    tasks.value = imported.map((task) => ({ ...newTask(), ...task, targets: task.targets || [], errors: task.errors || [] }));
+    tasks.value = imported.map((task) => ({
+      ...newTask(),
+      ...task,
+      targets: task.targets || [],
+      errors: task.errors || [],
+    }));
     selectedTaskId.value = "";
     dataManagerMessage.value = ui.value.importedTasks.replace("{count}", String(tasks.value.length));
   } catch (err) {
@@ -943,7 +966,12 @@ function validateTask(task: AuditTask) {
   if (!task.name.trim()) return ui.value.nameRequired.replace("{name}", ui.value.name);
   if (activeConnectionIds(task).length === 0) return ui.value.connectionRequired;
   if (task.kind === "sql" && !task.sql.trim()) return ui.value.sqlRequired;
-  if (task.kind === "fscan" && activeConnectionIds(task).length === 0 && !task.fscanText.trim() && task.targets.length === 0) {
+  if (
+    task.kind === "fscan" &&
+    activeConnectionIds(task).length === 0 &&
+    !task.fscanText.trim() &&
+    task.targets.length === 0
+  ) {
     return ui.value.targetRequired;
   }
   if (task.limit < 1) return ui.value.limitRequired;
@@ -962,7 +990,12 @@ async function parseFscanForDraft() {
 }
 
 async function testCurrentConnection() {
-  const connections = draft.value.kind === "fscan" ? selectedConnections.value : selectedConnection.value ? [selectedConnection.value] : [];
+  const connections =
+    draft.value.kind === "fscan"
+      ? selectedConnections.value
+      : selectedConnection.value
+        ? [selectedConnection.value]
+        : [];
   if (connections.length === 0) {
     error.value = ui.value.connectionRequired;
     return;
@@ -972,9 +1005,10 @@ async function testCurrentConnection() {
     for (const connection of connections) {
       await api.testConnection(connection);
     }
-    draft.value.message = connections.length > 1
-      ? ui.value.testedConnections.replace("{count}", String(connections.length))
-      : ui.value.connectionTestPassed;
+    draft.value.message =
+      connections.length > 1
+        ? ui.value.testedConnections.replace("{count}", String(connections.length))
+        : ui.value.connectionTestPassed;
   } catch (err) {
     error.value = String(err);
   }
@@ -1104,7 +1138,11 @@ async function startConnectionBatchTask(task: AuditTask, connectionIds: string[]
     const connection = props.connections.find((item) => item.id === connectionId);
     const label = connection?.name || connectionId;
     try {
-      aggregate.logs.push({ time: new Date().toLocaleTimeString(), level: "info", message: ui.value.startScanConnection.replace("{name}", label) });
+      aggregate.logs.push({
+        time: new Date().toLocaleTimeString(),
+        level: "info",
+        message: ui.value.startScanConnection.replace("{name}", label),
+      });
       persistTask({
         ...task,
         job: { ...aggregate, progress: Math.round((index / connectionIds.length) * 100) },
@@ -1129,7 +1167,11 @@ async function startConnectionBatchTask(task: AuditTask, connectionIds: string[]
       aggregate.errors.push(...(job.errors || []).map((entry) => `${label}: ${entry}`));
     } catch (err) {
       aggregate.errors.push(`${label}: ${String(err)}`);
-      aggregate.logs.push({ time: new Date().toLocaleTimeString(), level: "error", message: `${label}: ${String(err)}` });
+      aggregate.logs.push({
+        time: new Date().toLocaleTimeString(),
+        level: "error",
+        message: `${label}: ${String(err)}`,
+      });
     }
   }
 
@@ -1153,7 +1195,7 @@ async function waitForAuditJob(jobId: string, taskId: string, label: string, ind
     const job = await api.auditGetJob(jobId);
     if (!job) throw new Error(ui.value.jobNotFound.replace("{id}", jobId));
     const baseProgress = (index / total) * 100;
-    const currentProgress = Math.min(99, Math.round(baseProgress + (job.progress / total)));
+    const currentProgress = Math.min(99, Math.round(baseProgress + job.progress / total));
     const task = tasks.value.find((item) => item.id === taskId);
     if (task) {
       persistTask({
@@ -1413,7 +1455,7 @@ function fieldHits(findings: AuditFinding[]): FieldHit[] {
     level: finding.level as "high" | "medium" | "low",
     count: Number(finding.count || finding.samples?.length || 1),
     samples: (finding.samples || []).map((sample) => sample.value),
-}));
+  }));
 }
 
 function buildSampleGroups(findings: AuditFinding[]) {
@@ -1549,7 +1591,12 @@ onUnmounted(() => {
             <h3 class="mt-1 text-xl font-semibold">{{ ui.overviewHeadline }}</h3>
           </div>
           <div class="flex gap-2">
-            <Button variant="outline" class="gap-1" :class="showDataManager ? 'border-primary text-primary' : ''" @click="toggleDataManager">
+            <Button
+              variant="outline"
+              class="gap-1"
+              :class="showDataManager ? 'border-primary text-primary' : ''"
+              @click="toggleDataManager"
+            >
               <Database class="h-4 w-4" />
               {{ ui.dataManager }}
             </Button>
@@ -1613,7 +1660,9 @@ onUnmounted(() => {
           <div class="mt-2 text-3xl font-semibold">{{ stats.failed }}</div>
         </div>
       </div>
-      <p v-if="dataManagerMessage && !showDataManager" class="mb-3 text-xs text-muted-foreground">{{ dataManagerMessage }}</p>
+      <p v-if="dataManagerMessage && !showDataManager" class="mb-3 text-xs text-muted-foreground">
+        {{ dataManagerMessage }}
+      </p>
 
       <div class="rounded-md border bg-background">
         <div class="flex flex-wrap items-center justify-between gap-3 border-b px-4 py-3">
@@ -1623,7 +1672,11 @@ onUnmounted(() => {
         <div v-if="filteredTasks.length === 0" class="p-10 text-center text-sm text-muted-foreground">
           {{ ui.noTasks }}
         </div>
-        <div v-for="task in filteredTasks" :key="task.id" class="grid gap-3 border-b p-4 lg:grid-cols-[1fr_160px_1.4fr_auto]">
+        <div
+          v-for="task in filteredTasks"
+          :key="task.id"
+          class="grid gap-3 border-b p-4 lg:grid-cols-[1fr_160px_1.4fr_auto]"
+        >
           <div>
             <button class="text-left text-base font-semibold hover:text-primary" @click="viewTask(task)">
               {{ task.name }}
@@ -1631,7 +1684,18 @@ onUnmounted(() => {
             <div class="mt-1 text-xs text-muted-foreground">{{ task.description || ui.noDescription }}</div>
           </div>
           <div>
-            <span class="rounded-full px-3 py-1 text-xs" :class="task.status === 'completed' ? 'bg-emerald-50 text-emerald-700' : task.status === 'running' ? 'bg-blue-50 text-blue-700' : task.status === 'failed' ? 'bg-red-50 text-red-700' : 'bg-muted text-muted-foreground'">
+            <span
+              class="rounded-full px-3 py-1 text-xs"
+              :class="
+                task.status === 'completed'
+                  ? 'bg-emerald-50 text-emerald-700'
+                  : task.status === 'running'
+                    ? 'bg-blue-50 text-blue-700'
+                    : task.status === 'failed'
+                      ? 'bg-red-50 text-red-700'
+                      : 'bg-muted text-muted-foreground'
+              "
+            >
               {{ ui.status[task.status] }}
             </span>
           </div>
@@ -1642,9 +1706,15 @@ onUnmounted(() => {
             </div>
             <div v-if="task.proxy">{{ ui.proxyPrefix }} {{ task.proxy }}</div>
             <div class="flex flex-wrap items-center gap-2">
-              <span class="rounded-full border px-2 py-0.5" :class="riskClass('high')">{{ ui.riskHighShort }} {{ taskTotals(task).high }}</span>
-              <span class="rounded-full border px-2 py-0.5" :class="riskClass('medium')">{{ ui.riskMediumShort }} {{ taskTotals(task).medium }}</span>
-              <span class="rounded-full border px-2 py-0.5" :class="riskClass('low')">{{ ui.riskLowShort }} {{ taskTotals(task).low }}</span>
+              <span class="rounded-full border px-2 py-0.5" :class="riskClass('high')"
+                >{{ ui.riskHighShort }} {{ taskTotals(task).high }}</span
+              >
+              <span class="rounded-full border px-2 py-0.5" :class="riskClass('medium')"
+                >{{ ui.riskMediumShort }} {{ taskTotals(task).medium }}</span
+              >
+              <span class="rounded-full border px-2 py-0.5" :class="riskClass('low')"
+                >{{ ui.riskLowShort }} {{ taskTotals(task).low }}</span
+              >
             </div>
             <div class="h-1.5 overflow-hidden rounded bg-muted">
               <div class="h-full bg-primary" :style="{ width: `${task.progress}%` }" />
@@ -1673,7 +1743,13 @@ onUnmounted(() => {
             {{ ui.newTask }}
           </div>
           <div class="mt-3 grid gap-2 sm:grid-cols-4">
-            <button v-for="step in wizardSteps" :key="step" class="rounded-md border px-3 py-2 text-left text-xs" :class="wizardStep === step ? 'border-primary bg-primary/5 text-primary' : 'text-muted-foreground'" @click="setWizardStep(step)">
+            <button
+              v-for="step in wizardSteps"
+              :key="step"
+              class="rounded-md border px-3 py-2 text-left text-xs"
+              :class="wizardStep === step ? 'border-primary bg-primary/5 text-primary' : 'text-muted-foreground'"
+              @click="setWizardStep(step)"
+            >
               {{ step }}. {{ [ui.taskInfo, ui.taskType, ui.target, ui.params][step - 1] }}
             </button>
           </div>
@@ -1692,10 +1768,24 @@ onUnmounted(() => {
           </div>
 
           <div v-else-if="wizardStep === 2" class="grid gap-3 md:grid-cols-3">
-            <button v-for="kind in taskKinds" :key="kind" class="rounded-md border p-4 text-left" :class="draft.kind === kind ? 'border-primary bg-primary/5' : ''" @click="setTaskKind(kind)">
-              <div class="font-semibold">{{ kind === 'single' ? ui.single : kind === 'fscan' ? ui.fscan : ui.sql }}</div>
+            <button
+              v-for="kind in taskKinds"
+              :key="kind"
+              class="rounded-md border p-4 text-left"
+              :class="draft.kind === kind ? 'border-primary bg-primary/5' : ''"
+              @click="setTaskKind(kind)"
+            >
+              <div class="font-semibold">
+                {{ kind === "single" ? ui.single : kind === "fscan" ? ui.fscan : ui.sql }}
+              </div>
               <div class="mt-2 text-xs text-muted-foreground">
-                {{ kind === 'single' ? ui.kindDescription.single : kind === 'fscan' ? ui.kindDescription.fscan : ui.kindDescription.sql }}
+                {{
+                  kind === "single"
+                    ? ui.kindDescription.single
+                    : kind === "fscan"
+                      ? ui.kindDescription.fscan
+                      : ui.kindDescription.sql
+                }}
               </div>
             </button>
           </div>
@@ -1720,18 +1810,26 @@ onUnmounted(() => {
                   <DatabaseIcon :db-type="connectionIconType(connection)" class="h-4 w-4 shrink-0" />
                   <span class="min-w-0">
                     <span class="block truncate font-medium">{{ connection.name }}</span>
-                    <span class="block truncate text-muted-foreground">{{ connection.db_type }} · {{ connection.host }}:{{ connection.port }}</span>
+                    <span class="block truncate text-muted-foreground"
+                      >{{ connection.db_type }} · {{ connection.host }}:{{ connection.port }}</span
+                    >
                   </span>
                 </button>
               </div>
-              <div class="text-xs text-muted-foreground">{{ ui.selectedConnectionHint.replace("{count}", String(activeConnectionIds(draft).length)) }}</div>
+              <div class="text-xs text-muted-foreground">
+                {{ ui.selectedConnectionHint.replace("{count}", String(activeConnectionIds(draft).length)) }}
+              </div>
             </div>
             <label v-else class="space-y-1 text-xs font-medium">
               {{ ui.connection }}
               <Select v-model="draft.connectionId">
                 <SelectTrigger class="h-9">
                   <div class="flex min-w-0 items-center gap-2">
-                    <DatabaseIcon v-if="draft.connectionId" :db-type="draftConnectionIcon()" class="h-3.5 w-3.5 shrink-0" />
+                    <DatabaseIcon
+                      v-if="draft.connectionId"
+                      :db-type="draftConnectionIcon()"
+                      class="h-3.5 w-3.5 shrink-0"
+                    />
                     <SelectValue />
                   </div>
                 </SelectTrigger>
@@ -1769,19 +1867,28 @@ onUnmounted(() => {
             </div>
             <label v-if="draft.kind === 'sql'" class="space-y-1 text-xs font-medium md:col-span-2">
               {{ ui.sqlText }}
-              <textarea v-model="draft.sql" class="h-32 w-full resize-none rounded-md border bg-background p-2 font-mono text-xs" placeholder="select * from users limit 100" />
+              <textarea
+                v-model="draft.sql"
+                class="h-32 w-full resize-none rounded-md border bg-background p-2 font-mono text-xs"
+                placeholder="select * from users limit 100"
+              />
             </label>
             <div v-if="draft.kind === 'fscan'" class="space-y-2 md:col-span-2">
               <label class="block space-y-1 text-xs font-medium">
                 {{ ui.fscanText }}
-                <textarea v-model="draft.fscanText" class="h-32 w-full resize-none rounded-md border bg-background p-2 font-mono text-xs" />
+                <textarea
+                  v-model="draft.fscanText"
+                  class="h-32 w-full resize-none rounded-md border bg-background p-2 font-mono text-xs"
+                />
               </label>
               <div class="flex items-center gap-2">
                 <Button variant="outline" size="sm" class="gap-1" @click="parseFscanForDraft">
                   <Search class="h-3.5 w-3.5" />
                   {{ ui.parse }}
                 </Button>
-                <span class="text-xs text-muted-foreground">{{ ui.parsed.replace("{count}", String(draft.targets.length)) }}</span>
+                <span class="text-xs text-muted-foreground">{{
+                  ui.parsed.replace("{count}", String(draft.targets.length))
+                }}</span>
               </div>
             </div>
           </div>
@@ -1850,9 +1957,15 @@ onUnmounted(() => {
                 </Button>
               </div>
             </label>
-            <label class="flex items-center gap-2 text-xs"><input v-model="draft.mask" type="checkbox" />{{ ui.mask }}</label>
-            <label class="flex items-center gap-2 text-xs"><input v-model="draft.includeSystem" type="checkbox" />{{ ui.includeSystem }}</label>
-            <label class="flex items-center gap-2 text-xs"><input v-model="draft.splitOutput" type="checkbox" />{{ ui.splitOutput }}</label>
+            <label class="flex items-center gap-2 text-xs"
+              ><input v-model="draft.mask" type="checkbox" />{{ ui.mask }}</label
+            >
+            <label class="flex items-center gap-2 text-xs"
+              ><input v-model="draft.includeSystem" type="checkbox" />{{ ui.includeSystem }}</label
+            >
+            <label class="flex items-center gap-2 text-xs"
+              ><input v-model="draft.splitOutput" type="checkbox" />{{ ui.splitOutput }}</label
+            >
           </div>
 
           <p v-if="error" class="text-xs text-destructive">{{ error }}</p>
@@ -1872,17 +1985,29 @@ onUnmounted(() => {
       <div class="mb-4 rounded-md border bg-background p-4">
         <div class="flex flex-wrap items-center justify-between gap-3">
           <div>
-            <div class="text-xs text-muted-foreground">{{ targetSummary(selectedTask) }} · {{ ui.status[selectedTask.status] }}</div>
+            <div class="text-xs text-muted-foreground">
+              {{ targetSummary(selectedTask) }} · {{ ui.status[selectedTask.status] }}
+            </div>
             <h3 class="text-lg font-semibold">{{ selectedTask.name }}</h3>
             <div class="text-xs text-muted-foreground">{{ selectedTask.description || ui.noDescription }}</div>
           </div>
           <div class="flex flex-wrap gap-2">
-            <Button variant="outline" size="sm" class="gap-1" @click="copyTask(selectedTask)"><Clipboard class="h-3.5 w-3.5" />{{ ui.copy }}</Button>
+            <Button variant="outline" size="sm" class="gap-1" @click="copyTask(selectedTask)"
+              ><Clipboard class="h-3.5 w-3.5" />{{ ui.copy }}</Button
+            >
             <Button variant="outline" size="sm" @click="configureTask(selectedTask)">{{ ui.config }}</Button>
-            <Button v-if="selectedTask.status !== 'running'" size="sm" class="gap-1" @click="startTask(selectedTask)"><Play class="h-3.5 w-3.5" />{{ ui.start }}</Button>
-            <Button v-else variant="outline" size="sm" class="gap-1" @click="stopTask(selectedTask)"><Square class="h-3.5 w-3.5" />{{ ui.stop }}</Button>
-            <Button variant="outline" size="sm" class="gap-1" @click="refreshTaskJob(selectedTask.id)"><RefreshCw class="h-3.5 w-3.5" />{{ ui.refresh }}</Button>
-            <Button variant="outline" size="sm" class="gap-1 text-destructive" @click="removeTask(selectedTask)"><Trash2 class="h-3.5 w-3.5" />{{ ui.delete }}</Button>
+            <Button v-if="selectedTask.status !== 'running'" size="sm" class="gap-1" @click="startTask(selectedTask)"
+              ><Play class="h-3.5 w-3.5" />{{ ui.start }}</Button
+            >
+            <Button v-else variant="outline" size="sm" class="gap-1" @click="stopTask(selectedTask)"
+              ><Square class="h-3.5 w-3.5" />{{ ui.stop }}</Button
+            >
+            <Button variant="outline" size="sm" class="gap-1" @click="refreshTaskJob(selectedTask.id)"
+              ><RefreshCw class="h-3.5 w-3.5" />{{ ui.refresh }}</Button
+            >
+            <Button variant="outline" size="sm" class="gap-1 text-destructive" @click="removeTask(selectedTask)"
+              ><Trash2 class="h-3.5 w-3.5" />{{ ui.delete }}</Button
+            >
           </div>
         </div>
       </div>
@@ -1890,15 +2015,33 @@ onUnmounted(() => {
       <div class="mb-4 grid gap-4 lg:grid-cols-[1fr_340px]">
         <div class="rounded-md border bg-background p-4">
           <div class="grid gap-4 md:grid-cols-4">
-            <div><div class="text-xs text-muted-foreground">{{ ui.hitTables }}</div><div class="mt-1 text-3xl font-semibold">{{ detailTables.length }}</div></div>
-            <div><div class="text-xs text-muted-foreground">{{ ui.sensitiveFields }}</div><div class="mt-1 text-3xl font-semibold">{{ detailFields.length }}</div></div>
-            <div><div class="text-xs text-muted-foreground">{{ ui.highRiskHits }}</div><div class="mt-1 text-3xl font-semibold">{{ detailTotals.high }}</div></div>
-            <div><div class="text-xs text-muted-foreground">{{ ui.currentProgress }}</div><div class="mt-1 text-3xl font-semibold">{{ selectedTask.progress }}%</div></div>
+            <div>
+              <div class="text-xs text-muted-foreground">{{ ui.hitTables }}</div>
+              <div class="mt-1 text-3xl font-semibold">{{ detailTables.length }}</div>
+            </div>
+            <div>
+              <div class="text-xs text-muted-foreground">{{ ui.sensitiveFields }}</div>
+              <div class="mt-1 text-3xl font-semibold">{{ detailFields.length }}</div>
+            </div>
+            <div>
+              <div class="text-xs text-muted-foreground">{{ ui.highRiskHits }}</div>
+              <div class="mt-1 text-3xl font-semibold">{{ detailTotals.high }}</div>
+            </div>
+            <div>
+              <div class="text-xs text-muted-foreground">{{ ui.currentProgress }}</div>
+              <div class="mt-1 text-3xl font-semibold">{{ selectedTask.progress }}%</div>
+            </div>
           </div>
           <div class="mt-4 flex flex-wrap gap-2">
-            <span class="rounded-full border px-2 py-0.5 text-xs" :class="riskClass('high')">{{ ui.riskHigh }} {{ detailTotals.high }}</span>
-            <span class="rounded-full border px-2 py-0.5 text-xs" :class="riskClass('medium')">{{ ui.riskMedium }} {{ detailTotals.medium }}</span>
-            <span class="rounded-full border px-2 py-0.5 text-xs" :class="riskClass('low')">{{ ui.riskLow }} {{ detailTotals.low }}</span>
+            <span class="rounded-full border px-2 py-0.5 text-xs" :class="riskClass('high')"
+              >{{ ui.riskHigh }} {{ detailTotals.high }}</span
+            >
+            <span class="rounded-full border px-2 py-0.5 text-xs" :class="riskClass('medium')"
+              >{{ ui.riskMedium }} {{ detailTotals.medium }}</span
+            >
+            <span class="rounded-full border px-2 py-0.5 text-xs" :class="riskClass('low')"
+              >{{ ui.riskLow }} {{ detailTotals.low }}</span
+            >
           </div>
           <div class="mt-4 h-2 overflow-hidden rounded bg-muted">
             <div class="h-full bg-primary" :style="{ width: `${selectedTask.progress}%` }" />
@@ -1915,25 +2058,79 @@ onUnmounted(() => {
         <div class="rounded-md border bg-background p-4">
           <div class="font-semibold">{{ ui.taskInfo }}</div>
           <div class="mt-4 grid grid-cols-2 gap-3 text-xs">
-            <div><div class="text-muted-foreground">{{ ui.createdAt }}</div><div class="font-medium">{{ formatTime(selectedTask.createdAt) }}</div></div>
-            <div><div class="text-muted-foreground">{{ ui.updatedAt }}</div><div class="font-medium">{{ formatTime(selectedTask.updatedAt) }}</div></div>
-            <div><div class="text-muted-foreground">{{ ui.mode }}</div><div class="font-medium">{{ ui.modeLabel[selectedTask.mode] }}</div></div>
-            <div><div class="text-muted-foreground">{{ ui.encoding }}</div><div class="font-medium">{{ selectedTask.textEncoding }}</div></div>
-            <div><div class="text-muted-foreground">{{ ui.proxy }}</div><div class="font-medium">{{ selectedTask.proxy || ui.direct }}</div></div>
-            <div><div class="text-muted-foreground">{{ ui.output }}</div><div class="truncate font-medium">{{ selectedTask.outputPath }}</div></div>
+            <div>
+              <div class="text-muted-foreground">{{ ui.createdAt }}</div>
+              <div class="font-medium">{{ formatTime(selectedTask.createdAt) }}</div>
+            </div>
+            <div>
+              <div class="text-muted-foreground">{{ ui.updatedAt }}</div>
+              <div class="font-medium">{{ formatTime(selectedTask.updatedAt) }}</div>
+            </div>
+            <div>
+              <div class="text-muted-foreground">{{ ui.mode }}</div>
+              <div class="font-medium">{{ ui.modeLabel[selectedTask.mode] }}</div>
+            </div>
+            <div>
+              <div class="text-muted-foreground">{{ ui.encoding }}</div>
+              <div class="font-medium">{{ selectedTask.textEncoding }}</div>
+            </div>
+            <div>
+              <div class="text-muted-foreground">{{ ui.proxy }}</div>
+              <div class="font-medium">{{ selectedTask.proxy || ui.direct }}</div>
+            </div>
+            <div>
+              <div class="text-muted-foreground">{{ ui.output }}</div>
+              <div class="truncate font-medium">{{ selectedTask.outputPath }}</div>
+            </div>
           </div>
           <div class="mt-4 flex flex-wrap gap-2">
-            <Button variant="outline" size="sm" class="gap-1" :disabled="!selectedTask.jobId" @click="exportReport(selectedTask, 'json')"><FileJson class="h-3.5 w-3.5" />{{ ui.json }}</Button>
-            <Button variant="outline" size="sm" class="gap-1" :disabled="!selectedTask.jobId" @click="exportReport(selectedTask, 'xlsx')"><FileSpreadsheet class="h-3.5 w-3.5" />{{ ui.xlsx }}</Button>
-            <Button variant="outline" size="sm" class="gap-1" @click="openOutputDirectory(selectedTask)"><FolderOpen class="h-3.5 w-3.5" />{{ ui.openFolder }}</Button>
+            <Button
+              variant="outline"
+              size="sm"
+              class="gap-1"
+              :disabled="!selectedTask.jobId"
+              @click="exportReport(selectedTask, 'json')"
+              ><FileJson class="h-3.5 w-3.5" />{{ ui.json }}</Button
+            >
+            <Button
+              variant="outline"
+              size="sm"
+              class="gap-1"
+              :disabled="!selectedTask.jobId"
+              @click="exportReport(selectedTask, 'xlsx')"
+              ><FileSpreadsheet class="h-3.5 w-3.5" />{{ ui.xlsx }}</Button
+            >
+            <Button variant="outline" size="sm" class="gap-1" @click="openOutputDirectory(selectedTask)"
+              ><FolderOpen class="h-3.5 w-3.5" />{{ ui.openFolder }}</Button
+            >
           </div>
         </div>
       </div>
 
       <div class="rounded-md border bg-background">
         <div class="flex flex-wrap gap-1 border-b px-3 pt-3">
-          <button v-for="tab in detailTabs" :key="tab" class="rounded-t-md px-4 py-2 text-sm" :class="activeTab === tab ? 'border border-b-background bg-background text-primary' : 'text-muted-foreground'" @click="activeTab = tab">
-            {{ tab === 'hits' ? ui.hits : tab === 'fields' ? ui.fields : tab === 'targets' ? ui.targets : tab === 'sql' ? ui.sqlResult : tab === 'samples' ? ui.samples : ui.logs }}
+          <button
+            v-for="tab in detailTabs"
+            :key="tab"
+            class="rounded-t-md px-4 py-2 text-sm"
+            :class="
+              activeTab === tab ? 'border border-b-background bg-background text-primary' : 'text-muted-foreground'
+            "
+            @click="activeTab = tab"
+          >
+            {{
+              tab === "hits"
+                ? ui.hits
+                : tab === "fields"
+                  ? ui.fields
+                  : tab === "targets"
+                    ? ui.targets
+                    : tab === "sql"
+                      ? ui.sqlResult
+                      : tab === "samples"
+                        ? ui.samples
+                        : ui.logs
+            }}
           </button>
         </div>
 
@@ -1952,7 +2149,14 @@ onUnmounted(() => {
           </div>
           <table class="w-full text-xs">
             <thead class="bg-muted/60 text-muted-foreground">
-              <tr><th class="px-3 py-2 text-left">{{ ui.connectionSource }}</th><th class="px-3 py-2 text-left">{{ ui.database }}</th><th class="px-3 py-2 text-left">{{ ui.table }}</th><th class="px-3 py-2 text-left">{{ ui.sensitiveFields }}</th><th class="px-3 py-2 text-left">{{ ui.rows }}</th><th class="px-3 py-2 text-left">{{ ui.risk }}</th></tr>
+              <tr>
+                <th class="px-3 py-2 text-left">{{ ui.connectionSource }}</th>
+                <th class="px-3 py-2 text-left">{{ ui.database }}</th>
+                <th class="px-3 py-2 text-left">{{ ui.table }}</th>
+                <th class="px-3 py-2 text-left">{{ ui.sensitiveFields }}</th>
+                <th class="px-3 py-2 text-left">{{ ui.rows }}</th>
+                <th class="px-3 py-2 text-left">{{ ui.risk }}</th>
+              </tr>
             </thead>
             <tbody>
               <tr v-for="hit in filteredTables" :key="hit.key" class="border-t">
@@ -1966,9 +2170,13 @@ onUnmounted(() => {
                 <td class="px-3 py-2 font-mono">{{ hit.table }}</td>
                 <td class="px-3 py-2">{{ hit.columns.join(", ") }}</td>
                 <td class="px-3 py-2">{{ hit.rowCount }}</td>
-                <td class="px-3 py-2"><span class="rounded-full border px-2 py-0.5" :class="riskClass(hit.risk)">{{ hit.risk }}</span></td>
+                <td class="px-3 py-2">
+                  <span class="rounded-full border px-2 py-0.5" :class="riskClass(hit.risk)">{{ hit.risk }}</span>
+                </td>
               </tr>
-              <tr v-if="filteredTables.length === 0"><td class="px-3 py-8 text-center text-muted-foreground" colspan="6">{{ ui.noFindings }}</td></tr>
+              <tr v-if="filteredTables.length === 0">
+                <td class="px-3 py-8 text-center text-muted-foreground" colspan="6">{{ ui.noFindings }}</td>
+              </tr>
             </tbody>
           </table>
         </div>
@@ -1984,7 +2192,9 @@ onUnmounted(() => {
                 <SelectItem value="low">{{ ui.riskLow }}</SelectItem>
               </SelectContent>
             </Select>
-            <span class="text-xs text-muted-foreground">{{ ui.fieldCount.replace('{count}', String(filteredFields.length)) }}</span>
+            <span class="text-xs text-muted-foreground">{{
+              ui.fieldCount.replace("{count}", String(filteredFields.length))
+            }}</span>
           </div>
           <div class="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
             <div
@@ -2004,8 +2214,11 @@ onUnmounted(() => {
               </div>
               <div class="mt-2 text-xs">{{ field.database }} / {{ field.table }}</div>
               <div class="mt-2 text-xs">{{ kindName(field.kind) }} · {{ ui.levelLabel[field.level] }}</div>
-              <div class="mt-2 text-xs font-semibold">{{ ui.rowHits.replace('{count}', String(field.count)) }}</div>
-              <div v-if="field.samples.length" class="mt-3 max-h-20 overflow-auto rounded bg-background/70 p-2 font-mono text-xs">
+              <div class="mt-2 text-xs font-semibold">{{ ui.rowHits.replace("{count}", String(field.count)) }}</div>
+              <div
+                v-if="field.samples.length"
+                class="mt-3 max-h-20 overflow-auto rounded bg-background/70 p-2 font-mono text-xs"
+              >
                 <div v-for="sample in field.samples" :key="sample">{{ sample }}</div>
               </div>
               <div
@@ -2025,15 +2238,33 @@ onUnmounted(() => {
                     <DatabaseIcon :db-type="field.dbType || ''" class="h-3.5 w-3.5 shrink-0" />
                     <span>{{ databaseScopeText(field) || "-" }}</span>
                   </div>
-                  <div><span class="text-muted-foreground">{{ ui.database }}：</span><span class="font-mono">{{ field.database }}</span></div>
-                  <div><span class="text-muted-foreground">{{ ui.table }}：</span><span class="font-mono">{{ field.table }}</span></div>
-                  <div><span class="text-muted-foreground">{{ ui.kind }}：</span>{{ kindName(field.kind) }}</div>
-                  <div><span class="text-muted-foreground">{{ ui.risk }}：</span><span class="rounded-full border px-2 py-0.5" :class="riskClass(field.level)">{{ ui.levelLabel[field.level] }}</span></div>
-                  <div><span class="text-muted-foreground">{{ ui.rows }}：</span><b>{{ field.count }}</b></div>
+                  <div>
+                    <span class="text-muted-foreground">{{ ui.database }}：</span
+                    ><span class="font-mono">{{ field.database }}</span>
+                  </div>
+                  <div>
+                    <span class="text-muted-foreground">{{ ui.table }}：</span
+                    ><span class="font-mono">{{ field.table }}</span>
+                  </div>
+                  <div>
+                    <span class="text-muted-foreground">{{ ui.kind }}：</span>{{ kindName(field.kind) }}
+                  </div>
+                  <div>
+                    <span class="text-muted-foreground">{{ ui.risk }}：</span
+                    ><span class="rounded-full border px-2 py-0.5" :class="riskClass(field.level)">{{
+                      ui.levelLabel[field.level]
+                    }}</span>
+                  </div>
+                  <div>
+                    <span class="text-muted-foreground">{{ ui.rows }}：</span><b>{{ field.count }}</b>
+                  </div>
                 </div>
                 <div class="mt-3">
                   <div class="text-xs text-muted-foreground">{{ ui.sampleValues }}</div>
-                  <div v-if="field.samples.length" class="mt-2 max-h-32 overflow-auto rounded-md border bg-muted/20 p-3 font-mono text-xs">
+                  <div
+                    v-if="field.samples.length"
+                    class="mt-2 max-h-32 overflow-auto rounded-md border bg-muted/20 p-3 font-mono text-xs"
+                  >
                     <div v-for="sample in field.samples" :key="sample">{{ sample }}</div>
                   </div>
                   <div v-else class="mt-2 rounded-md border bg-muted/20 p-3 text-xs text-muted-foreground">
@@ -2047,7 +2278,14 @@ onUnmounted(() => {
 
         <div v-else-if="activeTab === 'targets'" class="p-4">
           <table v-if="selectedTask.targets.length" class="w-full text-xs">
-            <thead class="bg-muted/60 text-muted-foreground"><tr><th class="px-3 py-2 text-left">{{ ui.type }}</th><th class="px-3 py-2 text-left">{{ ui.address }}</th><th class="px-3 py-2 text-left">{{ ui.usernameLabel }}</th><th class="px-3 py-2 text-left">{{ ui.source }}</th></tr></thead>
+            <thead class="bg-muted/60 text-muted-foreground">
+              <tr>
+                <th class="px-3 py-2 text-left">{{ ui.type }}</th>
+                <th class="px-3 py-2 text-left">{{ ui.address }}</th>
+                <th class="px-3 py-2 text-left">{{ ui.usernameLabel }}</th>
+                <th class="px-3 py-2 text-left">{{ ui.source }}</th>
+              </tr>
+            </thead>
             <tbody>
               <tr v-for="target in selectedTask.targets" :key="`${target.line}-${target.raw}`" class="border-t">
                 <td class="px-3 py-2">{{ target.dbType }}</td>
@@ -2061,7 +2299,11 @@ onUnmounted(() => {
         </div>
 
         <div v-else-if="activeTab === 'sql'" class="p-4">
-          <textarea class="h-44 w-full resize-none rounded-md border bg-muted/30 p-3 font-mono text-xs" readonly :value="selectedTask.sql || ui.sqlPlaceholder" />
+          <textarea
+            class="h-44 w-full resize-none rounded-md border bg-muted/30 p-3 font-mono text-xs"
+            readonly
+            :value="selectedTask.sql || ui.sqlPlaceholder"
+          />
         </div>
 
         <div v-else-if="activeTab === 'samples'" class="space-y-4 p-4">
@@ -2077,10 +2319,19 @@ onUnmounted(() => {
                 <span class="text-muted-foreground">{{ ui.connectionSource }}</span>
                 <b>{{ databaseScopeText(group) || "-" }}</b>
               </span>
-              <span><span class="text-muted-foreground">{{ ui.databaseName }}</span> <b>{{ group.database }}</b></span>
-              <span><span class="text-muted-foreground">{{ ui.tableName }}</span> <b>{{ group.table }}</b></span>
-              <span><span class="text-muted-foreground">{{ ui.fieldEvidence }}</span> <b>{{ group.fields.length }}</b></span>
-              <span v-if="group.rows.length"><span class="text-muted-foreground">{{ ui.sampleRows }}</span> <b>{{ group.rows.length }}</b></span>
+              <span
+                ><span class="text-muted-foreground">{{ ui.databaseName }}</span> <b>{{ group.database }}</b></span
+              >
+              <span
+                ><span class="text-muted-foreground">{{ ui.tableName }}</span> <b>{{ group.table }}</b></span
+              >
+              <span
+                ><span class="text-muted-foreground">{{ ui.fieldEvidence }}</span>
+                <b>{{ group.fields.length }}</b></span
+              >
+              <span v-if="group.rows.length"
+                ><span class="text-muted-foreground">{{ ui.sampleRows }}</span> <b>{{ group.rows.length }}</b></span
+              >
             </div>
             <div v-if="group.rows.length" class="max-w-full overflow-x-auto border-t">
               <table class="min-w-max table-fixed text-xs">
@@ -2093,7 +2344,9 @@ onUnmounted(() => {
                       :class="riskTextClass(field.level)"
                     >
                       <div class="whitespace-normal break-words">{{ field.column }}</div>
-                      <div class="whitespace-normal break-words font-sans text-[11px]">{{ ui.levelLabel[field.level] }} · {{ kindName(field.kind) }}</div>
+                      <div class="whitespace-normal break-words font-sans text-[11px]">
+                        {{ ui.levelLabel[field.level] }} · {{ kindName(field.kind) }}
+                      </div>
                     </th>
                   </tr>
                 </thead>
@@ -2113,14 +2366,22 @@ onUnmounted(() => {
             </div>
             <div v-else class="border-t p-4">
               <div class="flex flex-wrap gap-2">
-                <span v-for="field in group.fields" :key="field.key" class="rounded-full border px-2 py-1 font-mono text-xs" :class="riskClass(field.level)">
+                <span
+                  v-for="field in group.fields"
+                  :key="field.key"
+                  class="rounded-full border px-2 py-1 font-mono text-xs"
+                  :class="riskClass(field.level)"
+                >
                   {{ field.column }} · {{ ui.levelLabel[field.level] }} · {{ kindName(field.kind) }}
                 </span>
               </div>
               <div class="mt-3 text-xs text-muted-foreground">{{ ui.noSampleRowsHint }}</div>
             </div>
           </div>
-          <div v-if="filteredSampleGroups.length === 0" class="rounded-md border bg-muted/20 p-8 text-center text-sm text-muted-foreground">
+          <div
+            v-if="filteredSampleGroups.length === 0"
+            class="rounded-md border bg-muted/20 p-8 text-center text-sm text-muted-foreground"
+          >
             <div>{{ ui.noSamples }}</div>
             <div class="mt-2 text-xs">
               {{ ui.noSampleRowsHint }}
@@ -2135,7 +2396,12 @@ onUnmounted(() => {
           <div v-for="(entry, index) in selectedTask.errors" :key="`error-${index}`" class="text-destructive">
             error {{ entry }}
           </div>
-          <div v-if="!selectedTask.job?.logs?.length && !selectedTask.errors.length" class="font-sans text-sm text-muted-foreground">{{ ui.logs }}</div>
+          <div
+            v-if="!selectedTask.job?.logs?.length && !selectedTask.errors.length"
+            class="font-sans text-sm text-muted-foreground"
+          >
+            {{ ui.logs }}
+          </div>
         </div>
       </div>
 
