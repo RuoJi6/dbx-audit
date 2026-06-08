@@ -27,9 +27,23 @@ jobs:
           node-version: 22
       - uses: pnpm/action-setup@v6
       - run: cd docs && pnpm install --frozen-lockfile --ignore-workspace && pnpm build
+      - name: Check Cloudflare credentials
+        id: cloudflare
+        shell: bash
+        run: |
+          if [ -n "$CLOUDFLARE_ACCOUNT_ID" ] && [ -n "$CLOUDFLARE_API_TOKEN" ]; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Cloudflare credentials are not configured; skipping docs deployment."
+          fi
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || secrets.R2_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       - name: Deploy to Cloudflare Workers
+        if: steps.cloudflare.outputs.deploy == 'true'
         working-directory: docs
         run: pnpm dlx wrangler@4 deploy
         env:
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || secrets.R2_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
