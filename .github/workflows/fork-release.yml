@@ -104,12 +104,14 @@ jobs:
             cp "$file" "release-assets/${{ matrix.label }}-$(basename "$file")"
           done < <(
             find target src-tauri/target -type f \( \
-              -name '*.AppImage' -o \
-              -name '*.deb' -o \
-              -name '*.rpm' -o \
-              -name '*.dmg' -o \
-              -name '*.msi' -o \
-              -name '*.exe' \
+              -path '*/release/bundle/*' -a \( \
+                -name '*.AppImage' -o \
+                -name '*.deb' -o \
+                -name '*.rpm' -o \
+                -name '*.dmg' -o \
+                -name '*.msi' -o \
+                -name '*setup.exe' \
+              \) \
             \) 2>/dev/null
           )
           if [ -z "$(ls -A release-assets)" ]; then
