@@ -48,7 +48,6 @@ type AuditTask = {
   schema: string;
   tables: string;
   sql: string;
-  proxy: string;
   mode: AuditMode;
   level: AuditLevelFilter;
   limit: number;
@@ -210,7 +209,6 @@ const zh = {
   database: "数据库",
   schema: "Schema / 模式",
   tables: "表",
-  proxy: "代理",
   sqlText: "SQL 内容",
   mode: "扫描模式",
   level: "风险级别",
@@ -225,7 +223,6 @@ const zh = {
   fscanText: "fscan 内容",
   parse: "解析",
   parsed: "已解析 {count} 个目标",
-  testConnection: "测试连接",
   hits: "命中结果",
   fields: "高危字段",
   targets: "批量目标",
@@ -283,8 +280,6 @@ const zh = {
   dbxConnectionCount: "{count} 个 DBX 连接",
   importedTargetCount: "{count} 个导入目标",
   noConnection: "未选择连接",
-  proxyPrefix: "代理",
-  direct: "直连",
   kindDescription: {
     single: "复用 DBX 连接扫描一个库或指定表。",
     fscan: "从 DBX 连接、fscan 文本或手动列表加载多个目标。",
@@ -436,7 +431,6 @@ const en = {
   database: "Database",
   schema: "Schema",
   tables: "Tables",
-  proxy: "Proxy",
   sqlText: "SQL",
   mode: "Mode",
   level: "Risk level",
@@ -451,7 +445,6 @@ const en = {
   fscanText: "fscan text",
   parse: "Parse",
   parsed: "Parsed {count} targets",
-  testConnection: "Test connection",
   hits: "Hits",
   fields: "Risk fields",
   targets: "Batch targets",
@@ -504,8 +497,6 @@ const en = {
   dbxConnectionCount: "{count} DBX connections",
   importedTargetCount: "{count} imported targets",
   noConnection: "No connection selected",
-  proxyPrefix: "Proxy",
-  direct: "Direct",
   kindDescription: {
     single: "Scan one database or selected tables through a DBX connection.",
     fscan: "Load multiple targets from DBX connections, fscan text, or a manual list.",
@@ -690,10 +681,6 @@ const selectedTask = computed(() => tasks.value.find((task) => task.id === selec
 const selectedConnection = computed(() =>
   props.connections.find((connection) => connection.id === draft.value.connectionId),
 );
-const selectedConnections = computed(() =>
-  props.connections.filter((connection) => activeConnectionIds(draft.value).includes(connection.id)),
-);
-
 const filteredTasks = computed(() => {
   const query = searchQuery.value.trim().toLowerCase();
   if (!query) return tasks.value;
@@ -907,7 +894,6 @@ function newTask(seed?: Partial<AuditTask>): AuditTask {
     schema: seed?.schema || "",
     tables: seed?.tables || "",
     sql: seed?.sql || "",
-    proxy: seed?.proxy || "",
     mode: seed?.mode || "field-content",
     level: seed?.level || "all",
     limit: seed?.limit || 15,
@@ -1390,31 +1376,6 @@ async function parseFscanForDraft() {
     const parsed = await api.auditParseFscan(draft.value.fscanText);
     draft.value.targets = parsed.targets;
     draft.value.message = ui.value.parsed.replace("{count}", String(parsed.total));
-  } catch (err) {
-    error.value = String(err);
-  }
-}
-
-async function testCurrentConnection() {
-  const connections =
-    draft.value.kind === "fscan"
-      ? selectedConnections.value
-      : selectedConnection.value
-        ? [selectedConnection.value]
-        : [];
-  if (connections.length === 0) {
-    error.value = ui.value.connectionRequired;
-    return;
-  }
-  error.value = "";
-  try {
-    for (const connection of connections) {
-      await api.testConnection(connection);
-    }
-    draft.value.message =
-      connections.length > 1
-        ? ui.value.testedConnections.replace("{count}", String(connections.length))
-        : ui.value.connectionTestPassed;
   } catch (err) {
     error.value = String(err);
   }
@@ -2023,7 +1984,6 @@ function formatConnectionInfo(connection: ConnectionConfig, task: AuditTask) {
     database ? [ui.value.database, database] : undefined,
     task.schema.trim() ? [ui.value.scanSchema, task.schema.trim()] : undefined,
     task.tables.trim() ? [ui.value.scanTables, task.tables.trim()] : undefined,
-    task.proxy.trim() ? [ui.value.proxy, task.proxy.trim()] : undefined,
     connection.connection_string ? [ui.value.connectionString, connection.connection_string] : undefined,
     connection.redis_connection_mode ? [ui.value.redisMode, connection.redis_connection_mode] : undefined,
     connection.redis_sentinel_master ? [ui.value.sentinelMaster, connection.redis_sentinel_master] : undefined,
@@ -2233,7 +2193,6 @@ onUnmounted(() => {
               <DatabaseIcon :db-type="taskConnectionIcon(task)" class="h-3.5 w-3.5 shrink-0" />
               <span>{{ targetSummary(task) }}</span>
             </div>
-            <div v-if="task.proxy">{{ ui.proxyPrefix }} {{ task.proxy }}</div>
             <div class="flex flex-wrap items-center gap-2">
               <span class="rounded-full border px-2 py-0.5" :class="riskClass('high')"
                 >{{ ui.riskHighShort }} {{ taskTotals(task).high }}</span
@@ -2384,16 +2343,6 @@ onUnmounted(() => {
               {{ ui.tables }}
               <Input v-model="draft.tables" class="h-9" :placeholder="ui.tablesPlaceholderLong" />
             </label>
-            <label class="space-y-1 text-xs font-medium">
-              {{ ui.proxy }}
-              <Input v-model="draft.proxy" class="h-9" placeholder="direct / socks5://127.0.0.1:1080" />
-            </label>
-            <div class="flex items-end">
-              <Button variant="outline" class="gap-1" @click="testCurrentConnection">
-                <RefreshCw class="h-3.5 w-3.5" />
-                {{ ui.testConnection }}
-              </Button>
-            </div>
             <label v-if="draft.kind === 'sql'" class="space-y-1 text-xs font-medium md:col-span-2">
               {{ ui.sqlText }}
               <textarea
@@ -2602,10 +2551,6 @@ onUnmounted(() => {
             <div>
               <div class="text-muted-foreground">{{ ui.encoding }}</div>
               <div class="font-medium">{{ selectedTask.textEncoding }}</div>
-            </div>
-            <div>
-              <div class="text-muted-foreground">{{ ui.proxy }}</div>
-              <div class="font-medium">{{ selectedTask.proxy || ui.direct }}</div>
             </div>
             <div>
               <div class="text-muted-foreground">{{ ui.output }}</div>
