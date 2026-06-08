@@ -66,6 +66,7 @@ pub fn build_sample_rows_sql(
     let table_name = qualified_table_name(dialect, schema, table);
     match dialect {
         AuditSqlDialect::Mssql => format!("select top ({limit}) {select} from {table_name}"),
+        AuditSqlDialect::Oracle => format!("select {select} from {table_name} fetch first {limit} rows only"),
         _ => format!("select {select} from {table_name} limit {limit}"),
     }
 }
@@ -156,6 +157,10 @@ mod tests {
         assert_eq!(
             build_sample_rows_sql(AuditSqlDialect::Mssql, Some("dbo"), "Users", &["email".into()], 5),
             "select top (5) [email] from [dbo].[Users]"
+        );
+        assert_eq!(
+            build_sample_rows_sql(AuditSqlDialect::Oracle, Some("HR"), "USERS", &["EMAIL".into()], 5),
+            "select \"EMAIL\" from \"HR\".\"USERS\" fetch first 5 rows only"
         );
     }
 

@@ -323,7 +323,9 @@ async fn audit_sql_dialect(state: &AppState, connection_id: &str) -> Option<Audi
     let configs = state.configs.read().await;
     let db_type = &configs.get(connection_id)?.db_type;
     match db_type {
-        DatabaseType::Mysql | DatabaseType::Doris | DatabaseType::StarRocks => Some(AuditSqlDialect::Mysql),
+        DatabaseType::Mysql | DatabaseType::Doris | DatabaseType::StarRocks | DatabaseType::Goldendb => {
+            Some(AuditSqlDialect::Mysql)
+        }
         DatabaseType::Postgres
         | DatabaseType::OpenGauss
         | DatabaseType::Redshift
@@ -333,7 +335,9 @@ async fn audit_sql_dialect(state: &AppState, connection_id: &str) -> Option<Audi
         | DatabaseType::Gaussdb
         | DatabaseType::Kwdb => Some(AuditSqlDialect::Postgres),
         DatabaseType::SqlServer => Some(AuditSqlDialect::Mssql),
-        DatabaseType::Oracle | DatabaseType::Dameng | DatabaseType::OceanbaseOracle => Some(AuditSqlDialect::Oracle),
+        DatabaseType::Oracle | DatabaseType::Dameng | DatabaseType::OceanbaseOracle | DatabaseType::Yashandb => {
+            Some(AuditSqlDialect::Oracle)
+        }
         _ => None,
     }
 }
