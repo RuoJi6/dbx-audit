@@ -1,4 +1,6 @@
 <div align="center">
+  <h1>DBX Audit</h1>
+  <p><strong>A DBX fork focused on database sensitive field auditing.</strong></p>
   <p style="font-size: 18px; white-space: nowrap;"><strong>40+ databases in 15 MB. Desktop & Docker self-hosting, with built-in AI assistant.</strong></p>
 
   <p>

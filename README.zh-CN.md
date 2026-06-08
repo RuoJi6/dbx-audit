@@ -1,4 +1,6 @@
 <div align="center">
+  <h1>DBX Audit</h1>
+  <p><strong>基于 DBX 的数据库敏感字段审计增强分支。</strong></p>
   <p style="font-size: 18px; white-space: nowrap;"><strong>15 MB 驾驭 40+ 种数据库。桌面端 & Docker 自托管，内置 AI 助手。</strong></p>
 
   <p>

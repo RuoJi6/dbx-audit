@@ -42,13 +42,13 @@ jobs:
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release edit "$TAG" \
               --repo "$GITHUB_REPOSITORY" \
-              --title "DBX ${TAG}" \
-              --notes "Automated fork build for ${TAG}."
+              --title "DBX Audit ${TAG}" \
+              --notes "Automated DBX Audit fork build for ${TAG}."
           else
             gh release create "$TAG" \
               --repo "$GITHUB_REPOSITORY" \
-              --title "DBX ${TAG}" \
-              --notes "Automated fork build for ${TAG}."
+              --title "DBX Audit ${TAG}" \
+              --notes "Automated DBX Audit fork build for ${TAG}."
           fi
 
   build:
