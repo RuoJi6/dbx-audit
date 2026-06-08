@@ -1,3 +1,4 @@
+use dbx_core::audit::AuditJobState;
 use dbx_core::connection::AppState;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -20,6 +21,7 @@ pub struct WebState {
     pub login_rate_limit: Mutex<LoginRateLimit>,
     /// Table export temp files: export_id -> (file_path, format)
     pub export_files: RwLock<HashMap<String, (String, String)>>,
+    pub audit_jobs: RwLock<HashMap<String, AuditJobState>>,
 }
 
 impl WebState {

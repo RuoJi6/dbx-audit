@@ -16,6 +16,7 @@ import {
   Pencil,
   Package,
   Check,
+  ShieldCheck,
 } from "@lucide/vue";
 import CustomContextMenu, { type ContextMenuItem } from "@/components/ui/CustomContextMenu.vue";
 import LightDropdown from "@/components/ui/LightDropdown.vue";
@@ -35,12 +36,14 @@ import type { QueryTab } from "@/types/database";
 
 const props = defineProps<{
   showDriverStore?: boolean;
+  showAuditPanel?: boolean;
   agentDriverUpdateCount?: number;
 }>();
 
 const emit = defineEmits<{
   "toggle-driver-store": [];
   "close-driver-store": [];
+  "close-audit-panel": [];
 }>();
 
 const { t } = useI18n();
@@ -172,7 +175,7 @@ watch(
 
 function tabColorStyle(tab: QueryTab) {
   const color = connectionColor(tab.connectionId);
-  const isActive = tab.id === queryStore.activeTabId && !props.showDriverStore;
+  const isActive = tab.id === queryStore.activeTabId && !props.showDriverStore && !props.showAuditPanel;
   const isClassic = settingsStore.editorSettings.appLayout === "classic";
   if (!color) {
     if (isClassic) {
@@ -201,6 +204,7 @@ function tabColorStyle(tab: QueryTab) {
 function tabIconClass(tab: QueryTab) {
   if (tab.mode === "data" || tab.mode === "objects" || tab.mode === "structure")
     return "text-emerald-600 dark:text-emerald-400";
+  if (tab.mode === "audit") return "text-primary";
   return "text-blue-600 dark:text-blue-400";
 }
 
@@ -228,6 +232,7 @@ function tabMenuIcon(tab: QueryTab) {
   if (tab.mode === "etcd") return KeyRound;
   if (tab.mode === "objects") return TableProperties;
   if (tab.mode === "structure") return PencilRuler;
+  if (tab.mode === "audit") return ShieldCheck;
   return Code2;
 }
 
@@ -283,6 +288,7 @@ function activateTab(tabId: string) {
   tabScrollBehavior.value = "auto";
   queryStore.activeTabId = tabId;
   emit("close-driver-store");
+  emit("close-audit-panel");
 }
 </script>
 
@@ -332,20 +338,20 @@ function activateTab(tabId: string) {
                     ? [
                         compactTabTitle ? 'min-w-24' : 'min-w-38',
                         'h-full border-r border-border/80 dark:border-border/45',
-                        tab.id === queryStore.activeTabId && !showDriverStore
+                        tab.id === queryStore.activeTabId && !showDriverStore && !showAuditPanel
                           ? 'bg-background text-foreground font-medium'
                           : 'text-foreground/70 hover:text-foreground/90',
                       ]
                     : [
                         compactTabTitle ? 'min-w-24' : 'min-w-38',
                         'h-7 rounded-md border',
-                        tab.id === queryStore.activeTabId && !showDriverStore
+                        tab.id === queryStore.activeTabId && !showDriverStore && !showAuditPanel
                           ? 'text-foreground font-medium'
                           : 'border-border/60 text-foreground/70 hover:border-border hover:text-foreground/90',
                       ]
                 "
                 :style="[tabColorStyle(tab), tabDropStyle(tab.id)]"
-                :data-active-tab="tab.id === queryStore.activeTabId && !showDriverStore"
+                :data-active-tab="tab.id === queryStore.activeTabId && !showDriverStore && !showAuditPanel"
                 @click="handleTabClick(tab)"
                 @dblclick.stop="startRenameTab(tab)"
                 @mousedown.middle.prevent="queryStore.closeTab(tab.id)"
@@ -359,6 +365,7 @@ function activateTab(tabId: string) {
                   <KeyRound v-else-if="tab.mode === 'etcd'" class="h-3.5 w-3.5" />
                   <TableProperties v-else-if="tab.mode === 'objects'" class="h-3.5 w-3.5" />
                   <PencilRuler v-else-if="tab.mode === 'structure'" class="h-3.5 w-3.5" />
+                  <ShieldCheck v-else-if="tab.mode === 'audit'" class="h-3.5 w-3.5" />
                   <Code2 v-else class="h-3.5 w-3.5" />
                 </span>
                 <input

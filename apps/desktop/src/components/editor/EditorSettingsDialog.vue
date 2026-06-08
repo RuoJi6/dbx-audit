@@ -2156,6 +2156,8 @@ watch(
 
             <!-- AI Settings Tab -->
             <section v-else-if="activeSettingsTab === 'ai'" class="flex flex-col gap-5 py-2">
+              <p class="text-xs text-muted-foreground">{{ t("ai.settingsHint") }}</p>
+
               <div class="space-y-3">
                 <div class="grid grid-cols-3 items-center gap-3">
                   <Label class="text-right text-xs">{{ t("ai.provider") }}</Label>

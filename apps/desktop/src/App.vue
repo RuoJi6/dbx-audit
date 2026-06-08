@@ -103,8 +103,8 @@ const { setupFileDrop } = useFileDrop();
 const isDesktop = isTauriRuntime();
 const UPDATE_CHECK_INTERVAL_MS = 60 * 60 * 1000;
 let updateCheckTimer: ReturnType<typeof setInterval> | undefined;
-const needsAuth = ref(!isDesktop);
-const authenticated = ref(isDesktop);
+const needsAuth = ref(false);
+const authenticated = ref(true);
 const setupRequired = ref(false);
 
 const showConnectionDialog = ref(false);
@@ -449,14 +449,16 @@ async function confirmSaveSqlToLibrary() {
 }
 
 async function openSqlFile() {
+  closePrimaryWorkspacePanels();
   const tab = activeTab.value;
   if (!tab) return;
   try {
     if (isTauriRuntime()) {
       const { open } = await import("@tauri-apps/plugin-dialog");
+      const { readTextFile } = await import("@tauri-apps/plugin-fs");
       const path = await open({ filters: [{ name: "SQL", extensions: ["sql"] }], multiple: false });
       if (path) {
-        const content = await api.readExternalSqlFile(path as string);
+        const content = await readTextFile(path as string);
         queryStore.updateSql(tab.id, content);
       }
     } else {
@@ -483,6 +485,7 @@ async function openSqlFile() {
 
 async function openSqlFilePath(path: string) {
   if (!isTauriRuntime()) return;
+  closePrimaryWorkspacePanels();
   try {
     const content = await api.readExternalSqlFile(path);
     const connectionId =
@@ -519,6 +522,7 @@ function getDbTypeFromPath(path: string): "sqlite" | "duckdb" | null {
 
 async function openDbFilePath(path: string) {
   if (!isTauriRuntime()) return;
+  closePrimaryWorkspacePanels();
   try {
     const name = path.split("/").pop()?.split("\\").pop() || path;
     const dbType = getDbTypeFromPath(path);
@@ -577,6 +581,7 @@ async function openPendingDbFiles() {
 
 async function openConnectionDeepLink(url: string) {
   try {
+    closePrimaryWorkspacePanels();
     const draft = parseConnectionDeepLink(url);
     if (!draft) return;
     connectionStore.stopEditing();
@@ -606,6 +611,7 @@ function setConnectionDialogOpen(value: boolean) {
 }
 
 async function newQuery() {
+  closePrimaryWorkspacePanels();
   const target = resolveNewQueryTarget({
     activeTab: activeTab.value,
     selectedTreeNode: findTreeNodeById(connectionStore.treeNodes, connectionStore.selectedTreeNodeId),
@@ -630,6 +636,7 @@ async function newQuery() {
 }
 
 async function openConnectionQuery(connectionId: string) {
+  closePrimaryWorkspacePanels();
   const connection = connectionStore.getConfig(connectionId);
   if (!connection) return;
   connectionStore.activeConnectionId = connectionId;
@@ -644,6 +651,7 @@ async function openConnectionQuery(connectionId: string) {
 }
 
 async function onClickTable(tableName: string) {
+  closePrimaryWorkspacePanels();
   const tab = activeTab.value;
   if (!tab) return;
   const connectionId = tab.connectionId;
@@ -665,6 +673,7 @@ async function onClickTable(tableName: string) {
 }
 
 async function changeActiveConnection(connectionId: string) {
+  closePrimaryWorkspacePanels();
   const tab = activeTab.value;
   if (!tab) return;
   const connection = connectionStore.getConfig(connectionId);
@@ -843,7 +852,7 @@ function handleKeydown(e: KeyboardEvent) {
 function onLoginSuccess() {
   authenticated.value = true;
   setupRequired.value = false;
-  needsAuth.value = true;
+  needsAuth.value = false;
   window.history.replaceState(null, "", "/");
   initApp();
 }
@@ -889,6 +898,29 @@ function openDriverStoreFromEvent() {
   showDriverStore.value = true;
 }
 
+function closePrimaryWorkspacePanels() {
+  showDriverStore.value = false;
+}
+
+function openConnectionDialog() {
+  closePrimaryWorkspacePanels();
+  showConnectionDialog.value = true;
+}
+
+function toggleDriverStore() {
+  showDriverStore.value = !showDriverStore.value;
+}
+
+function toggleAuditPanel() {
+  showDriverStore.value = false;
+  queryStore.openAuditTab(activeTab.value?.connectionId || connectionStore.activeConnectionId || undefined);
+}
+
+function openToolDialog(open: () => void) {
+  closePrimaryWorkspacePanels();
+  open();
+}
+
 function runUpdateNotificationChecks() {
   if (!updateNotificationsEnabled.value) return;
   checkUpdates({ silent: true });
@@ -924,19 +956,11 @@ onMounted(async () => {
     document.addEventListener("contextmenu", handleContextMenu);
   }
   if (!isDesktop) {
-    try {
-      const res = await fetch("/api/auth/check");
-      const data = await res.json();
-      needsAuth.value = data.required;
-      authenticated.value = data.authenticated;
-      setupRequired.value = data.setup_required;
-    } catch {
-      /* server unreachable */
-    }
-    if (needsAuth.value && !authenticated.value) {
-      history.replaceState(null, "", "/login");
-    }
-    if (!setupRequired.value && (!needsAuth.value || authenticated.value)) initApp();
+    needsAuth.value = false;
+    authenticated.value = true;
+    setupRequired.value = false;
+    if (location.pathname === "/login") history.replaceState(null, "", "/");
+    initApp();
     api
       .getAppVersion()
       .then((v) => {
@@ -994,24 +1018,26 @@ onUnmounted(() => {
           :show-ai-panel="showAiPanel"
           :show-history="showHistory"
           :show-driver-store="showDriverStore"
+          :show-audit-panel="activeTab?.mode === 'audit'"
           :checking-updates="checkingUpdates"
           :has-update-available="toolbarHasUpdateAvailable"
           :agent-driver-update-count="toolbarAgentDriverUpdateCount"
           :has-connections="connectionStore.connections.length > 0"
           :has-sql-file-connections="hasSqlFileConnections"
-          @new-connection="showConnectionDialog = true"
+          @new-connection="openConnectionDialog"
           @new-query="newQuery"
           @set-theme-mode="setThemeMode"
           @toggle-ai="toggleAiPanel"
           @toggle-history="showHistory = !showHistory"
           @open-github="openGitHub"
-          @open-settings="showSettingsDialog = true"
-          @open-driver-store="showDriverStore = !showDriverStore"
+          @open-settings="openToolDialog(() => (showSettingsDialog = true))"
+          @open-driver-store="toggleDriverStore"
           @check-updates="checkUpdates()"
-          @open-transfer="dialogs.showTransferDialog.value = true"
-          @open-sql-file="dialogs.showSqlFileDialog.value = true"
-          @open-schema-diff="dialogs.showSchemaDiffDialog.value = true"
-          @open-data-compare="dialogs.showDataCompareDialog.value = true"
+          @open-transfer="openToolDialog(() => (dialogs.showTransferDialog.value = true))"
+          @open-sql-file="openToolDialog(() => (dialogs.showSqlFileDialog.value = true))"
+          @open-schema-diff="openToolDialog(() => (dialogs.showSchemaDiffDialog.value = true))"
+          @open-data-compare="openToolDialog(() => (dialogs.showDataCompareDialog.value = true))"
+          @toggle-audit="toggleAuditPanel"
         />
 
         <div
@@ -1026,8 +1052,8 @@ onUnmounted(() => {
             ref="appSidebarRef"
             :sidebar-width="sidebarWidth"
             :classic-layout="isClassicLayout"
-            @import="dialogs.onImportClick"
-            @export="dialogs.onExportClick"
+            @import="openToolDialog(dialogs.onImportClick)"
+            @export="openToolDialog(dialogs.onExportClick)"
             @start-resize="startSidebarResize"
             @collapse="setSidebarOpen(false)"
           />
@@ -1059,7 +1085,8 @@ onUnmounted(() => {
               <AppTabBar
                 :show-driver-store="showDriverStore"
                 :agent-driver-update-count="toolbarAgentDriverUpdateCount"
-                @toggle-driver-store="showDriverStore = true"
+                :show-audit-panel="false"
+                @toggle-driver-store="toggleDriverStore"
                 @close-driver-store="showDriverStore = false"
               />
               <DriverStorePage
@@ -1164,10 +1191,10 @@ onUnmounted(() => {
                 :app-version="appVersion"
                 :has-connections="connectionStore.connections.length > 0"
                 @open-connection-query="openConnectionQuery"
-                @new-connection="showConnectionDialog = true"
+                @new-connection="openConnectionDialog"
                 @new-query="newQuery"
                 @show-history="showHistory = true"
-                @import-config="dialogs.onImportClick"
+                @import-config="openToolDialog(dialogs.onImportClick)"
                 @open-github="openGitHub"
                 @open-mcp-guide="openMcpGuide"
               />

@@ -390,7 +390,7 @@ export interface QueryTab {
   executionId?: string;
   isExplaining?: boolean;
   explainExecutionId?: string;
-  mode: "data" | "query" | "redis" | "mongo" | "etcd" | "objects" | "structure" | "users";
+  mode: "data" | "query" | "redis" | "mongo" | "etcd" | "objects" | "structure" | "users" | "audit";
   structureTableName?: string;
   objectBrowser?: {
     schema?: string;

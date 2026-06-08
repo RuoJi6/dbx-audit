@@ -1601,3 +1601,27 @@ export async function loadSidebarLayout(): Promise<SidebarLayout | null> {
 export async function refreshConnections(): Promise<void> {
   // Web mode doesn't maintain persistent connection pools — no-op
 }
+
+export async function auditStartScan(request: import("./tauri").AuditScanRequest): Promise<string> {
+  return post("/api/audit/start", { request });
+}
+
+export async function auditCancelScan(jobId: string): Promise<boolean> {
+  return post("/api/audit/cancel", { jobId });
+}
+
+export async function auditGetJob(jobId: string): Promise<import("./tauri").AuditJobState | null> {
+  return get(`/api/audit/job/${encodeURIComponent(jobId)}`);
+}
+
+export async function auditExportReport(
+  jobId: string,
+  format: import("./tauri").AuditExportFormat,
+  path: string,
+): Promise<import("./tauri").AuditExportResult> {
+  return post("/api/audit/export", { jobId, format, path });
+}
+
+export async function auditParseFscan(textOrFile: string): Promise<import("./tauri").ParsedFscanTargets> {
+  return post("/api/audit/parse-fscan", { textOrFile });
+}

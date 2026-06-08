@@ -18,8 +18,6 @@ pub fn agent_connect_params(config: &ConnectionConfig, host: &str, port: u16, da
         postgres_like_agent_jdbc_connection_string(config, host, port, database)
     } else if config.db_type == DatabaseType::SapHana {
         sap_hana_jdbc_connection_string(config, host, port, database)
-    } else if config.db_type == DatabaseType::Trino {
-        trino_agent_jdbc_connection_string(config, host, port, database)
     } else {
         config.connection_string.as_deref().unwrap_or("").to_string()
     };
@@ -199,48 +197,6 @@ fn sap_hana_jdbc_connection_string(config: &ConnectionConfig, host: &str, port: 
     }
 }
 
-fn trino_agent_jdbc_connection_string(config: &ConnectionConfig, host: &str, port: u16, database: &str) -> String {
-    let base = config
-        .connection_string
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| value.get(..11).is_some_and(|prefix| prefix.eq_ignore_ascii_case("jdbc:trino:")))
-        .map(|connection_string| {
-            if host == config.host && port == config.port {
-                connection_string.to_string()
-            } else {
-                crate::models::connection::rewrite_jdbc_url_host(connection_string, host, port)
-            }
-        })
-        .unwrap_or_else(|| {
-            let database = database.trim();
-            if database.is_empty() {
-                format!("jdbc:trino://{host}:{port}")
-            } else {
-                format!("jdbc:trino://{host}:{port}/{database}")
-            }
-        });
-
-    let params = trino_agent_jdbc_params(config, &base);
-    if params.is_empty() {
-        base
-    } else {
-        append_agent_url_params(base, Some(&params))
-    }
-}
-
-fn trino_agent_jdbc_params(config: &ConnectionConfig, base: &str) -> String {
-    let user_params = normalize_agent_url_params(config.url_params.as_deref());
-    let mut params = Vec::new();
-    if !user_params.is_empty() {
-        params.push(user_params.to_string());
-    }
-    if config.ssl && !url_params_has_key(&user_params, "SSL") && !url_has_query_key(base, "SSL") {
-        params.push("SSL=true".to_string());
-    }
-    params.join("&")
-}
-
 fn normalize_etcd_endpoints(config: &ConnectionConfig, host: &str, port: u16) -> String {
     let endpoints = config.etcd_endpoints.trim();
     if !endpoints.is_empty() {
@@ -250,33 +206,8 @@ fn normalize_etcd_endpoints(config: &ConnectionConfig, host: &str, port: u16) ->
     format!("{scheme}://{host}:{port}")
 }
 
-fn normalize_agent_url_params(params: Option<&str>) -> &str {
-    params.unwrap_or("").trim().trim_start_matches(['?', '&'])
-}
-
-fn url_has_query_key(url: &str, key: &str) -> bool {
-    let Some((_, query)) = url.split_once('?') else {
-        return false;
-    };
-    let query = query.split('#').next().unwrap_or(query);
-    url_params_has_key(query, key)
-}
-
-fn url_params_has_key(params: &str, key: &str) -> bool {
-    params
-        .split(['&', ';'])
-        .filter_map(|part| {
-            let part = part.trim();
-            if part.is_empty() {
-                return None;
-            }
-            Some(part.split_once('=').map(|(param_key, _)| param_key).unwrap_or(part).trim())
-        })
-        .any(|param_key| param_key.eq_ignore_ascii_case(key))
-}
-
 fn append_agent_url_params(base: String, params: Option<&str>) -> String {
-    let params = normalize_agent_url_params(params);
+    let params = params.unwrap_or("").trim().trim_start_matches(['?', '&']);
     if params.is_empty() {
         return base;
     }
@@ -488,88 +419,5 @@ mod tests {
         let params = agent_connect_params(&cfg, "hana.example.com", 30013, "TENANT1");
 
         assert_eq!(params["connection_string"], "jdbc:sap://hana.example.com:30013/?databaseName=TENANT1&encrypt=true");
-    }
-
-    #[test]
-    fn trino_agent_url_uses_jdbc_scheme_without_ssl_by_default() {
-        let mut cfg = config(DatabaseType::Trino, Some("hive"));
-        cfg.host = "trino.example.com".to_string();
-        cfg.port = 8080;
-
-        let params = agent_connect_params(&cfg, "trino.example.com", 8080, "hive");
-
-        assert_eq!(params["connection_string"], "jdbc:trino://trino.example.com:8080/hive");
-        assert_eq!(params["ssl"], false);
-    }
-
-    #[test]
-    fn trino_agent_url_appends_ssl_when_enabled() {
-        let mut cfg = config(DatabaseType::Trino, Some("hive"));
-        cfg.ssl = true;
-
-        let params = agent_connect_params(&cfg, "trino.example.com", 8443, "hive");
-
-        assert_eq!(params["connection_string"], "jdbc:trino://trino.example.com:8443/hive?SSL=true");
-    }
-
-    #[test]
-    fn trino_agent_url_preserves_ssl_verification_and_avoids_duplicate_ssl() {
-        let mut cfg = config(DatabaseType::Trino, Some("hive"));
-        cfg.ssl = true;
-        cfg.url_params = Some("ssl=true&SSLVerification=NONE".to_string());
-
-        let params = agent_connect_params(&cfg, "trino.example.com", 8443, "hive");
-
-        assert_eq!(
-            params["connection_string"],
-            "jdbc:trino://trino.example.com:8443/hive?ssl=true&SSLVerification=NONE"
-        );
-    }
-
-    #[test]
-    fn trino_agent_url_preserves_tls_store_params() {
-        let mut cfg = config(DatabaseType::Trino, Some("hive"));
-        cfg.ssl = true;
-        cfg.url_params = Some(
-            "SSLTrustStorePath=C:\\certs\\trino.jks&SSLTrustStorePassword=secret&SSLKeyStorePath=C:\\certs\\client.jks"
-                .to_string(),
-        );
-
-        let params = agent_connect_params(&cfg, "trino.example.com", 8443, "hive");
-
-        assert_eq!(
-            params["connection_string"],
-            "jdbc:trino://trino.example.com:8443/hive?SSLTrustStorePath=C:\\certs\\trino.jks&SSLTrustStorePassword=secret&SSLKeyStorePath=C:\\certs\\client.jks&SSL=true"
-        );
-    }
-
-    #[test]
-    fn trino_agent_url_uses_forwarded_host_and_port_with_params() {
-        let mut cfg = config(DatabaseType::Trino, Some("hive"));
-        cfg.host = "trino.internal".to_string();
-        cfg.port = 8443;
-        cfg.ssl = true;
-        cfg.url_params = Some("SSLVerification=NONE".to_string());
-
-        let params = agent_connect_params(&cfg, "127.0.0.1", 15443, "hive");
-
-        assert_eq!(params["connection_string"], "jdbc:trino://127.0.0.1:15443/hive?SSLVerification=NONE&SSL=true");
-    }
-
-    #[test]
-    fn trino_agent_custom_jdbc_url_rewrites_forwarded_host_and_preserves_query_ssl() {
-        let mut cfg = config(DatabaseType::Trino, Some("hive"));
-        cfg.host = "trino.internal".to_string();
-        cfg.port = 8443;
-        cfg.ssl = true;
-        cfg.connection_string = Some("jdbc:trino://trino.internal:8443/hive?SSL=true&source=dbx".to_string());
-        cfg.url_params = Some("SSLVerification=NONE".to_string());
-
-        let params = agent_connect_params(&cfg, "127.0.0.1", 15443, "hive");
-
-        assert_eq!(
-            params["connection_string"],
-            "jdbc:trino://127.0.0.1:15443/hive?SSL=true&source=dbx&SSLVerification=NONE"
-        );
     }
 }

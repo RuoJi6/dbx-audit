@@ -29,7 +29,6 @@ import {
   getSqlFunctionSignatureHelp,
   getSqlCompletionContext,
   getSqlCompletionResultValidFor,
-  isSqlLikeCompletionStatement,
   shouldAutoOpenSqlCompletion,
   extractCteDefinitions,
 } from "@/lib/sqlCompletion";
@@ -740,13 +739,7 @@ async function refreshSemanticDiagnostics() {
     setSemanticDiagnostics([]);
     return;
   }
-  if (props.databaseType === "elasticsearch") {
-    setSemanticDiagnostics([]);
-    return;
-  }
-  if (
-    !shouldRunSqlSemanticDiagnostics(sql, currentView.state.selection.main.head, { databaseType: props.databaseType })
-  ) {
+  if (!shouldRunSqlSemanticDiagnostics(sql, currentView.state.selection.main.head)) {
     scheduleSemanticDiagnostics(1200);
     return;
   }
@@ -940,17 +933,15 @@ async function provideSqlCompletions(
   explicit: boolean,
 ) {
   if (!props.connectionId) return null;
-  const fullDoc = currentState.doc.toString();
   if (props.databaseType === "elasticsearch") {
-    if (!isSqlLikeCompletionStatement(fullDoc, position)) {
-      return provideElasticsearchCompletions(currentState, position, explicit);
-    }
+    return provideElasticsearchCompletions(currentState, position, explicit);
   }
   const hasDatabase = props.database != null;
 
   const epoch = ++completionEpoch;
 
   try {
+    const fullDoc = currentState.doc.toString();
     if (!explicit && !shouldAutoOpenSqlCompletion(fullDoc, position)) return null;
 
     const completionContext = getSqlCompletionContext(fullDoc, position);

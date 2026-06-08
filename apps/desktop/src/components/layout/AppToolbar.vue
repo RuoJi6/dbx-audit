@@ -15,6 +15,7 @@ import {
   FileCode,
   GitCompareArrows,
   TableProperties,
+  ShieldCheck,
   Settings,
   CloudDownload,
   Package,
@@ -35,6 +36,7 @@ const props = defineProps<{
   showAiPanel: boolean;
   showHistory: boolean;
   showDriverStore: boolean;
+  showAuditPanel: boolean;
   checkingUpdates: boolean;
   hasUpdateAvailable: boolean;
   agentDriverUpdateCount: number;
@@ -56,6 +58,7 @@ const emit = defineEmits<{
   "open-sql-file": [];
   "open-schema-diff": [];
   "open-data-compare": [];
+  "toggle-audit": [];
 }>();
 
 const { t } = useI18n();
@@ -152,6 +155,18 @@ function onToolbarDblClick(e: MouseEvent) {
     >
       <TableProperties class="h-3.5 w-3.5" />
       {{ t("dataCompare.title") }}
+    </Button>
+
+    <Button
+      variant="ghost"
+      size="sm"
+      class="h-8 px-2 text-xs gap-1"
+      :class="{ 'bg-accent': showAuditPanel }"
+      @click="emit('toggle-audit')"
+      :disabled="!hasConnections"
+    >
+      <ShieldCheck class="h-3.5 w-3.5" />
+      {{ t("audit.toolbar") }}
     </Button>
 
     <Button

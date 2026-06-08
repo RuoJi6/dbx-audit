@@ -1,12 +1,6 @@
 import type { SqlCompletionColumn, SqlCompletionTable } from "@/lib/sqlCompletion";
 import { getSqlCompletionContext } from "@/lib/sqlCompletion";
-import type {
-  DatabaseType,
-  SqlColumnReference,
-  SqlReferenceAnalysis,
-  SqlTableReference,
-  SqlTextSpan,
-} from "@/types/database";
+import type { SqlColumnReference, SqlReferenceAnalysis, SqlTableReference, SqlTextSpan } from "@/types/database";
 
 export interface SqlSemanticDiagnostic {
   span: SqlTextSpan;
@@ -99,12 +93,7 @@ export function areSqlSemanticDiagnosticsEqual(
   });
 }
 
-export function shouldRunSqlSemanticDiagnostics(
-  sql: string,
-  cursor: number,
-  options: { databaseType?: DatabaseType } = {},
-): boolean {
-  if (options.databaseType === "elasticsearch") return false;
+export function shouldRunSqlSemanticDiagnostics(sql: string, cursor: number): boolean {
   const context = getSqlCompletionContext(sql, cursor);
   if (context.suggestTables || context.exclusiveTableSuggestions || context.exclusiveColumnSuggestions) return false;
   if (context.qualifier) return false;

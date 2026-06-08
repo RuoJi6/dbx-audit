@@ -72,6 +72,9 @@ export function tabDisplayTitle(tab: QueryTab, t: Translate): string {
     if (compact) return t("tabs.users");
     return `${t("tabs.users")}@${connectionDisplayName(tab.connectionId)}`;
   }
+  if (tab.mode === "audit") {
+    return tab.title || t("audit.title");
+  }
   return tab.title;
 }
 
@@ -93,6 +96,9 @@ export function tabTooltipLines(tab: QueryTab, t: Translate): { label: string; v
   }
   if (tab.mode === "objects" && tab.objectBrowser?.schema) {
     lines.push({ label: t("tabs.tooltipSchema"), value: tab.objectBrowser.schema });
+  }
+  if (tab.mode === "audit") {
+    lines.unshift({ label: t("tabs.tooltipTitle"), value: tab.title || t("audit.title") });
   }
   return lines;
 }
@@ -149,5 +155,6 @@ export function tabModeLabel(tab: QueryTab, t: Translate): string {
   if (tab.mode === "etcd") return t("tabs.etcd");
   if (tab.mode === "objects") return t("tabs.objects");
   if (tab.mode === "users") return t("tabs.users");
+  if (tab.mode === "audit") return t("audit.title");
   return tab.mode;
 }

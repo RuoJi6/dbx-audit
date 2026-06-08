@@ -79,7 +79,6 @@ import ImagePreviewDialog from "@/components/grid/ImagePreviewDialog.vue";
 import TemporalCellEditor from "@/components/grid/TemporalCellEditor.vue";
 import type { QueryResult, ColumnInfo, DatabaseType, ForeignKeyInfo, IndexInfo, TriggerInfo } from "@/types/database";
 import * as api from "@/lib/api";
-import { coerceDataGridCellValue, dataGridCellDisplayText, dataGridCellEditorText } from "@/lib/dataGridCellCoercion";
 import { createColumnDrafts } from "@/lib/tableStructureEditorState";
 import type { BuildSingleColumnAlterSqlOptions } from "@/lib/tableStructureEditorSql";
 import { buildTableSelectSql, quoteTableIdentifier } from "@/lib/tableSelectSql";
@@ -247,11 +246,11 @@ const props = defineProps<{
   onExecuteSql?: (sql: string) => Promise<void>;
   fullExportResult?: () => Promise<QueryResult | undefined>;
   customSave?: (changes: {
-    dirtyRows: Map<number, Map<number, CellValue>>;
-    newRows: CellValue[][];
+    dirtyRows: Map<number, Map<number, string | number | boolean | null>>;
+    newRows: (string | number | boolean | null)[][];
     deletedRows: Set<number>;
     columns: string[];
-    rows: CellValue[][];
+    rows: (string | number | boolean | null)[][];
   }) => Promise<void>;
 }>();
 
@@ -1858,30 +1857,10 @@ const showTruncationWarning = computed(
   () => props.result.truncated === true && typeof props.pageLimit !== "number" && props.result.has_more !== true,
 );
 const isResultsContext = computed(() => props.context === "results");
-// affected_rows reported by the backend can be larger than the rows we
-// actually have in memory — e.g. ES auto-pages SELECT * on a big index and
-// reports the index's true match count. Surface that in the status bar so
-// the user sees the real total, but do NOT use it to unlock pagination:
-// we don't have those rows, so letting the user page into them would just
-// show blank screens.
-const inferredBackendTotalRowCount = computed(() => {
-  const affected = props.result.affected_rows;
-  if (typeof affected !== "number" || !Number.isFinite(affected)) return undefined;
-  if (affected <= props.result.rows.length) return undefined;
-  return affected;
-});
-const serverKnownTotalRowCount = computed(() => props.totalRowCount ?? manualTotalRowCount.value);
-const displayedTotalRowCount = computed(() => serverKnownTotalRowCount.value ?? inferredBackendTotalRowCount.value);
-// Only a server-confirmed total drives pagination — an inferred total means
-// rows exist that we never fetched, so navigation must stay inside rows.length.
+const displayedTotalRowCount = computed(() => props.totalRowCount ?? manualTotalRowCount.value);
 const hasKnownTotalRowCount = computed(
-  () => typeof serverKnownTotalRowCount.value === "number" && serverKnownTotalRowCount.value >= 0,
+  () => typeof displayedTotalRowCount.value === "number" && displayedTotalRowCount.value >= 0,
 );
-// When context=results and the caller hasn't configured server-side
-// pagination (no pageLimit), the backend handed us every row up-front and
-// rowCount IS the total. Without this hint, the "page is full → assume more"
-// fallback in canGoNextDataGridPage lets the user keep clicking next forever.
-const allRowsLoaded = computed(() => isResultsContext.value && props.pageLimit === undefined);
 const canGoNextPage = computed(() => {
   return canGoNextDataGridPage({
     hasMore: props.result.has_more,
@@ -1890,13 +1869,10 @@ const canGoNextPage = computed(() => {
     pageOffset: props.pageOffset,
     currentPage: currentPage.value,
     totalRowCount: hasKnownTotalRowCount.value ? displayedTotalRowCount.value : undefined,
-    allRowsLoaded: allRowsLoaded.value,
   });
 });
 const canJumpLastPage = computed(
-  () =>
-    canGoNextPage.value &&
-    (hasKnownTotalRowCount.value || allRowsLoaded.value || !!props.tableMeta || !!props.countSql),
+  () => canGoNextPage.value && (hasKnownTotalRowCount.value || !!props.tableMeta || !!props.countSql),
 );
 const totalRowCountBusy = computed(() => props.totalRowCountLoading === true || manualTotalRowCountLoading.value);
 const canCalculateTotalRowCount = computed(
@@ -2037,15 +2013,6 @@ async function lastPage() {
     currentPage.value = lastPageNum;
     resetGridVerticalScroll(true);
     emit("paginate", (lastPageNum - 1) * pageSize.value, pageSize.value, currentWhereInput(), currentOrderBy());
-    return;
-  }
-  if (allRowsLoaded.value) {
-    const total = props.result.rows.length;
-    if (total <= 0) return;
-    const lastPageNum = Math.ceil(total / pageSize.value);
-    if (lastPageNum <= currentPage.value) return;
-    currentPage.value = lastPageNum;
-    resetGridVerticalScroll(true);
     return;
   }
   if (!props.connectionId) return;
@@ -2194,6 +2161,7 @@ const {
   saveChanges,
   discardChanges,
   rowDataWithChanges,
+  coerceCellValue,
   canEditColumn,
   resetGridVerticalScroll,
   getResetScrollAfterResult,
@@ -2247,15 +2215,6 @@ function tableColumnForGridColumn(columnIndex: number): ColumnInfo | undefined {
   const columnName = props.sourceColumns?.[columnIndex] ?? props.result.columns[columnIndex];
   if (!columnName) return undefined;
   return props.tableMeta?.columns.find((column) => column.name.toLowerCase() === columnName.toLowerCase());
-}
-
-function coerceDetailCellValue(value: string, oldValue: CellValue | undefined, columnIndex: number): CellValue {
-  return coerceDataGridCellValue({
-    value,
-    oldValue,
-    databaseType: props.databaseType,
-    columnInfo: tableColumnForGridColumn(columnIndex),
-  }) as CellValue;
 }
 
 function temporalEditorKindForColumn(columnIndex: number): TemporalCellEditorKind | undefined {
@@ -2913,11 +2872,7 @@ watch(activeCellDetail, (detail) => {
     resetDetailEdit();
     return;
   }
-  detailEditValue.value = dataGridCellEditorText({
-    value: detail.value,
-    databaseType: props.databaseType,
-    columnInfo: tableColumnForGridColumn(detail.colIndex),
-  });
+  detailEditValue.value = cellDetailEditorText(detail.value, detail.type);
   syncEditorFromDetailEdit();
   isEditingDetail.value = true;
 });
@@ -2997,11 +2952,7 @@ function closeCellDetails() {
 function startDetailEdit() {
   const detail = activeCellDetail.value;
   if (!detail || !detail.isEditable) return;
-  detailEditValue.value = dataGridCellEditorText({
-    value: detail.value,
-    databaseType: props.databaseType,
-    columnInfo: tableColumnForGridColumn(detail.colIndex),
-  });
+  detailEditValue.value = cellDetailEditorText(detail.value, detail.type);
   isEditingDetail.value = true;
 }
 
@@ -3015,11 +2966,7 @@ function commitDetailEdit() {
 
   if (item.isNew && item.newIndex !== undefined) {
     const oldVal = newRows.value[item.newIndex]?.[detail.colIndex];
-    newRows.value[item.newIndex][detail.colIndex] = coerceDetailCellValue(
-      detailEditValue.value,
-      oldVal,
-      detail.colIndex,
-    );
+    newRows.value[item.newIndex][detail.colIndex] = coerceCellValue(detailEditValue.value, oldVal);
     return;
   }
 
@@ -3027,7 +2974,7 @@ function commitDetailEdit() {
   if (!canEditExistingRows.value) return;
 
   const oldVal = props.result.rows[item.sourceIndex]?.[detail.colIndex];
-  const newVal = coerceDetailCellValue(detailEditValue.value, oldVal, detail.colIndex);
+  const newVal = coerceCellValue(detailEditValue.value, oldVal);
   if (newVal !== oldVal) {
     if (!dirtyRows.value.has(item.sourceIndex)) dirtyRows.value.set(item.sourceIndex, new Map());
     dirtyRows.value.get(item.sourceIndex)!.set(detail.colIndex, newVal);
@@ -3056,11 +3003,7 @@ function syncEditorFromDetailEdit() {
 function cancelValueEditorEdit() {
   const detail = activeCellDetail.value;
   if (!detail || !detail.isEditable) return;
-  detailEditValue.value = dataGridCellEditorText({
-    value: detail.value,
-    databaseType: props.databaseType,
-    columnInfo: tableColumnForGridColumn(detail.colIndex),
-  });
+  detailEditValue.value = cellDetailEditorText(detail.value, detail.type);
   syncEditorFromDetailEdit();
   isEditingDetail.value = true;
 }
@@ -3092,11 +3035,7 @@ function restoreDetailOriginalValue() {
     dirtyRows.value = new Map(dirtyRows.value);
   }
 
-  detailEditValue.value = dataGridCellEditorText({
-    value: restoredValue,
-    databaseType: props.databaseType,
-    columnInfo: tableColumnForGridColumn(detail.colIndex),
-  });
+  detailEditValue.value = cellDetailEditorText(restoredValue, detail.type);
   syncEditorFromDetailEdit();
   isEditingDetail.value = activeCellDetailTab.value === "valueEditor";
   detailCell.value = { ...detailCell.value! };
@@ -3326,17 +3265,9 @@ function primitiveCellFormatKey(value: CellValue, columnIndex?: number): string 
 function formatCell(value: CellValue, columnIndex?: number): string {
   const formatter = columnIndex === undefined ? undefined : resolvedColumnFormatters.value[columnIndex];
   const columnName = columnIndex === undefined ? undefined : props.result.columns[columnIndex];
-  const columnInfo = columnIndex === undefined ? undefined : tableColumnForGridColumn(columnIndex);
-  const arrayDisplay = formatter
-    ? undefined
-    : dataGridCellDisplayText({ value, databaseType: props.databaseType, columnInfo });
-  if (arrayDisplay !== undefined) return arrayDisplay;
   const binaryDisplay = formatter
     ? null
-    : binaryCellDisplayText(
-        value,
-        columnInfo?.data_type ?? (columnName ? columnTypeMap.value.get(columnName) : undefined),
-      );
+    : binaryCellDisplayText(value, columnName ? columnTypeMap.value.get(columnName) : undefined);
   if (binaryDisplay) return binaryDisplay;
   const s = applyColumnFormatter(value, formatter);
   return s.length > CELL_DISPLAY_MAX_LENGTH ? s.slice(0, CELL_DISPLAY_MAX_LENGTH) : s;

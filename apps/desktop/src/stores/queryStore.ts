@@ -382,6 +382,29 @@ export const useQueryStore = defineStore("query", () => {
     return id;
   }
 
+  function openAuditTab(connectionId?: string) {
+    const connStore = useConnectionStore();
+    const resolvedConnectionId = connectionId || connStore.activeConnectionId || connStore.connections[0]?.id || "";
+    const conn = resolvedConnectionId ? connStore.getConfig(resolvedConnectionId) : undefined;
+    const titleBase = t("audit.title");
+    const existingCount = tabs.value.filter((tab) => tab.mode === "audit").length;
+    const id = uuid();
+    const tab: QueryTab = {
+      id,
+      title: existingCount === 0 ? titleBase : `${titleBase} ${existingCount + 1}`,
+      connectionId: resolvedConnectionId,
+      database: conn?.database || "",
+      sql: "",
+      isExecuting: false,
+      isCancelling: false,
+      isExplaining: false,
+      mode: "audit",
+    };
+    tabs.value.push(tab);
+    activeTabId.value = id;
+    return id;
+  }
+
   function openTableStructure(connectionId: string, database: string, schema?: string, tableName?: string) {
     const resolvedTableName = tableName || "";
     if (resolvedTableName) {
@@ -1270,20 +1293,6 @@ export const useQueryStore = defineStore("query", () => {
           current.resultTotalRowCount = undefined;
         }
         current.resultTotalRowCountLoading = current.mode === "query" && !!current.result && !!countSql;
-        // Server-side pagination without a countSql: the backend (currently
-        // the Elasticsearch driver) already reports the true match total via
-        // affected_rows. Use it directly so the result-grid can compute the
-        // page count without issuing a separate COUNT query.
-        if (
-          current.result &&
-          current.mode === "query" &&
-          typeof pageLimit === "number" &&
-          !countSql &&
-          typeof current.result.affected_rows === "number"
-        ) {
-          current.resultTotalRowCount = current.result.affected_rows;
-          current.resultTotalRowCountLoading = false;
-        }
         touchResult(current);
         if (current.mode === "query" && current.result) {
           countQueryTotalRowsInBackground({
@@ -1744,6 +1753,7 @@ export const useQueryStore = defineStore("query", () => {
     renameTab,
     openObjectBrowser,
     openUserAdmin,
+    openAuditTab,
     openTableStructure,
     linkSavedSql,
     openSavedSql,

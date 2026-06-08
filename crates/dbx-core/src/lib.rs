@@ -5,6 +5,7 @@ pub mod agent_manager;
 pub mod agent_runtime;
 pub mod agent_service;
 pub mod ai;
+pub mod audit;
 pub mod cloud_sync;
 pub mod connection;
 pub mod connection_secrets;

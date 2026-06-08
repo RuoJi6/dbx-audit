@@ -184,6 +184,11 @@ export const webdavSyncDownload = forward("webdavSyncDownload");
 export const saveAiConversation = forward("saveAiConversation");
 export const loadAiConversations = forward("loadAiConversations");
 export const deleteAiConversation = forward("deleteAiConversation");
+export const auditStartScan = forward("auditStartScan");
+export const auditCancelScan = forward("auditCancelScan");
+export const auditGetJob = forward("auditGetJob");
+export const auditExportReport = forward("auditExportReport");
+export const auditParseFscan = forward("auditParseFscan");
 
 // System
 export const listSystemFonts = forward("listSystemFonts");
