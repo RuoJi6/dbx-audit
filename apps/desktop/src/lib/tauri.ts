@@ -163,6 +163,7 @@ export interface AuditScanRequest {
   level: AuditLevelFilter;
   limit: number;
   mask: boolean;
+  includeSystem: boolean;
   workers: number;
   timeoutSecs: number;
 }
@@ -1976,6 +1977,14 @@ export async function auditExportReport(
   path: string,
 ): Promise<AuditExportResult> {
   return invoke("audit_export_report", { jobId, format, path });
+}
+
+export async function auditExportReportSnapshot(
+  job: AuditJobState,
+  format: AuditExportFormat,
+  path: string,
+): Promise<AuditExportResult> {
+  return invoke("audit_export_report_snapshot", { job, format, path });
 }
 
 export async function auditOpenOutputDirectory(path: string): Promise<void> {

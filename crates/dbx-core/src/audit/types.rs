@@ -91,6 +91,8 @@ pub struct AuditScanRequest {
     pub limit: usize,
     #[serde(default)]
     pub mask: bool,
+    #[serde(default)]
+    pub include_system: bool,
     #[serde(default = "default_workers")]
     pub workers: usize,
     #[serde(default = "default_timeout_secs")]
@@ -183,6 +185,12 @@ pub struct AuditSample {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AuditFinding {
+    #[serde(default)]
+    pub connection_id: Option<String>,
+    #[serde(default)]
+    pub connection_name: Option<String>,
+    #[serde(default)]
+    pub db_type: Option<String>,
     pub database: String,
     #[serde(default)]
     pub schema: Option<String>,

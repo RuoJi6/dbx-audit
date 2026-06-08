@@ -10,9 +10,9 @@ use uuid::Uuid;
 use crate::commands::connection::AppState;
 use dbx_core::audit::scanner::AuditSqlDialect;
 use dbx_core::audit::{
-    audit_column_findings, audit_findings_to_xlsx, audit_job_to_json, build_sample_rows_sql, mask_sensitive_value,
-    parse_fscan_text, AuditExportFormat, AuditExportResult, AuditFinding, AuditJobState, AuditJobStatus, AuditLogEntry,
-    AuditSample, AuditScanRequest, ParsedFscanTargets,
+    audit_column_findings, audit_job_to_json, audit_job_to_xlsx, build_sample_rows_sql, detect_field, detect_value,
+    mask_sensitive_value, parse_fscan_text, AuditExportFormat, AuditExportResult, AuditFinding, AuditJobState,
+    AuditJobStatus, AuditLogEntry, AuditSample, AuditScanRequest, ParsedFscanTargets,
 };
 use dbx_core::models::connection::DatabaseType;
 use dbx_core::query::QueryExecutionOptions;
@@ -130,11 +130,34 @@ pub async fn audit_export_report(
             std::fs::write(&path_buf, json).map_err(|err| err.to_string())?;
         }
         AuditExportFormat::Xlsx => {
-            let workbook = audit_findings_to_xlsx(&job.findings)?;
+            let workbook = audit_job_to_xlsx(&job)?;
             std::fs::write(&path_buf, workbook).map_err(|err| err.to_string())?;
         }
     }
 
+    Ok(AuditExportResult { path: path_buf.to_string_lossy().to_string(), format, finding_count: job.findings.len() })
+}
+
+#[tauri::command]
+pub async fn audit_export_report_snapshot(
+    job: AuditJobState,
+    format: AuditExportFormat,
+    path: String,
+) -> Result<AuditExportResult, String> {
+    let path_buf = PathBuf::from(path.trim());
+    if path_buf.as_os_str().is_empty() {
+        return Err("请填写导出路径".to_string());
+    }
+    match format {
+        AuditExportFormat::Json => {
+            let json = audit_job_to_json(&job)?;
+            std::fs::write(&path_buf, json).map_err(|err| err.to_string())?;
+        }
+        AuditExportFormat::Xlsx => {
+            let workbook = audit_job_to_xlsx(&job)?;
+            std::fs::write(&path_buf, workbook).map_err(|err| err.to_string())?;
+        }
+    }
     Ok(AuditExportResult { path: path_buf.to_string_lossy().to_string(), format, finding_count: job.findings.len() })
 }
 
@@ -190,6 +213,9 @@ pub async fn audit_save_task_store(state: State<'_, Arc<AppState>>, store: serde
 }
 
 async fn run_field_name_scan(state: Arc<AppState>, request: AuditScanRequest, job_id: &str) -> Result<(), String> {
+    if connection_db_type(&state, &request.connection_id).await == Some(DatabaseType::Redis) {
+        return run_redis_scan(state, request, job_id).await;
+    }
     let schema = request.schema.clone().unwrap_or_default();
     let databases = audit_target_databases(&state, &request, job_id).await?;
     let total_databases = databases.len().max(1);
@@ -230,6 +256,7 @@ async fn run_field_name_scan(state: Arc<AppState>, request: AuditScanRequest, jo
                 request.mode,
                 request.level,
             );
+            apply_connection_meta(&state, &request.connection_id, &mut findings).await;
 
             if request.mode.includes_content() && !findings.is_empty() {
                 match attach_sample_rows(
@@ -371,7 +398,7 @@ async fn audit_target_databases(
         .await?
         .into_iter()
         .map(|database| database.name)
-        .filter(|name| !is_system_database(name))
+        .filter(|name| request.include_system || !is_system_database(name))
         .collect::<Vec<_>>();
 
     if databases.is_empty() {
@@ -379,6 +406,131 @@ async fn audit_target_databases(
     }
 
     Ok(databases)
+}
+
+async fn run_redis_scan(state: Arc<AppState>, request: AuditScanRequest, job_id: &str) -> Result<(), String> {
+    update_job(job_id, |job| {
+        job.progress = 5;
+        job.logs.push(log_entry("info", "正在扫描 Redis keys"));
+    });
+    let databases = if let Some(database) = request.database.as_ref().map(|value| value.trim()).filter(|value| !value.is_empty()) {
+        vec![database.parse::<u32>().map_err(|_| "Redis 数据库必须是数字".to_string())?]
+    } else {
+        let mut dbs = dbx_core::redis_ops::redis_list_databases_core(&state, &request.connection_id)
+            .await?
+            .into_iter()
+            .filter(|db| db.keys > 0)
+            .map(|db| db.db)
+            .collect::<Vec<_>>();
+        if dbs.is_empty() {
+            dbs.push(0);
+        }
+        dbs
+    };
+    let total_dbs = databases.len().max(1);
+    for (db_index, db) in databases.iter().enumerate() {
+        if is_cancelled(job_id) {
+            return Ok(());
+        }
+        let mut cursor = 0u64;
+        loop {
+            let page = dbx_core::redis_ops::redis_scan_keys_core(&state, &request.connection_id, *db, cursor, "*", 200).await?;
+            let mut findings = Vec::new();
+            for key in page.keys {
+                if is_cancelled(job_id) {
+                    return Ok(());
+                }
+                let value = dbx_core::redis_ops::redis_get_value_in_db_core(&state, &request.connection_id, *db, &key.key_raw)
+                    .await
+                    .ok();
+                findings.extend(redis_key_findings(&request, *db, &key.key_display, value.as_ref()));
+            }
+            apply_connection_meta(&state, &request.connection_id, &mut findings).await;
+            update_job(job_id, |job| {
+                job.findings.extend(findings);
+                job.progress = (10 + ((db_index + 1) * 85) / total_dbs).min(95) as u8;
+                job.logs.push(log_entry("info", format!("已扫描 Redis DB {db}，cursor {}", page.cursor)));
+            });
+            if page.cursor == 0 {
+                break;
+            }
+            cursor = page.cursor;
+        }
+    }
+    Ok(())
+}
+
+fn redis_key_findings(
+    request: &AuditScanRequest,
+    db: u32,
+    key: &str,
+    value: Option<&dbx_core::db::redis_driver::RedisValue>,
+) -> Vec<AuditFinding> {
+    let mut findings = Vec::new();
+    if request.mode.includes_field_name() {
+        for kind in detect_field(key, key, request.level) {
+            findings.push(redis_finding(request, db, key, "key", kind, "field-name", key.to_string()));
+        }
+    }
+    if request.mode.includes_content() {
+        let value_text = value.map(|value| redis_value_text(&value.value)).unwrap_or_default();
+        for kind in detect_value(&value_text, request.level) {
+            let sample = if request.mask { mask_sensitive_value(&value_text) } else { value_text.clone() };
+            findings.push(redis_finding(request, db, key, "value", kind, "content", sample));
+        }
+    }
+    findings
+}
+
+fn redis_finding(
+    _request: &AuditScanRequest,
+    db: u32,
+    key: &str,
+    column: &str,
+    kind: dbx_core::audit::AuditKind,
+    basis: &str,
+    sample: String,
+) -> AuditFinding {
+    AuditFinding {
+        connection_id: None,
+        connection_name: None,
+        db_type: Some("redis".to_string()),
+        database: format!("redis-db{db}"),
+        schema: Some("redis-key".to_string()),
+        table: key.to_string(),
+        column: column.to_string(),
+        data_type: Some("redis".to_string()),
+        kind,
+        level: kind.level(),
+        mode: if basis == "content" { dbx_core::audit::AuditMode::Content } else { dbx_core::audit::AuditMode::FieldName },
+        basis: basis.to_string(),
+        count: 1,
+        samples: vec![AuditSample { column: column.to_string(), value: sample }],
+    }
+}
+
+fn redis_value_text(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::String(value) => value.clone(),
+        other => other.to_string(),
+    }
+}
+
+async fn apply_connection_meta(state: &AppState, connection_id: &str, findings: &mut [AuditFinding]) {
+    let configs = state.configs.read().await;
+    let Some(config) = configs.get(connection_id) else {
+        return;
+    };
+    for finding in findings {
+        finding.connection_id = Some(connection_id.to_string());
+        finding.connection_name = Some(config.name.clone());
+        finding.db_type = Some(format!("{:?}", config.db_type).to_ascii_lowercase());
+    }
+}
+
+async fn connection_db_type(state: &AppState, connection_id: &str) -> Option<DatabaseType> {
+    state.configs.read().await.get(connection_id).map(|config| config.db_type)
 }
 
 fn is_system_database(name: &str) -> bool {

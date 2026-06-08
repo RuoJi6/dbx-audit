@@ -363,6 +363,7 @@ pub fn run() {
             commands::audit::audit_cancel_scan,
             commands::audit::audit_get_job,
             commands::audit::audit_export_report,
+            commands::audit::audit_export_report_snapshot,
             commands::audit::audit_open_output_directory,
             commands::audit::audit_parse_fscan,
             commands::audit::audit_load_task_store,

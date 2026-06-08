@@ -6,7 +6,6 @@ import {
   Clipboard,
   Database,
   Download,
-  FileJson,
   FileSpreadsheet,
   FolderOpen,
   ListChecks,
@@ -60,6 +59,7 @@ type AuditTask = {
   splitOutput: boolean;
   textEncoding: string;
   outputPath: string;
+  outputs: string[];
   fscanText: string;
   targets: ParsedFscanTarget[];
   jobId?: string;
@@ -120,7 +120,7 @@ const props = defineProps<{
   connections: ConnectionConfig[];
 }>();
 
-const { locale } = useI18n();
+const { locale, tm } = useI18n();
 
 const AUDIT_STORE_LOCATION = "dbx.db / app_settings.audit_task_store";
 const LEGACY_TASK_STORE_KEY = "dbx-audit-tasks-v1";
@@ -138,11 +138,13 @@ const zh = {
   newTaskName: "新建审计任务",
   dataManager: "数据管理",
   dataManagerTitle: "审计数据管理",
-  dataManagerHint: "任务、配置和扫描结果保存到 DBX 官方 dbx.db。可在这里导出或导入 JSON 备份。",
+  dataManagerHint: "任务、配置和扫描结果保存到 DBX 官方 dbx.db。可在这里导出或导入 ZIP 备份。",
   storageKey: "存储 Key",
   backupData: "备份数据",
   exportBackup: "导出备份",
   importBackup: "导入备份",
+  includeLogsInBackup: "包含运行日志",
+  backupPassword: "备份密码（可选）",
   clearTasks: "清空任务",
   close: "关闭",
   search: "搜索任务 / 数据库 / 表",
@@ -166,12 +168,14 @@ const zh = {
   cancelExport: "已取消导出",
   cancelImport: "已取消导入",
   exportedTasks: "已导出 {count} 个任务到 {path}",
-  downloadedBackup: "已下载 {count} 个任务的 JSON 备份",
+  downloadedZipBackup: "已下载 {count} 个任务的 ZIP 备份",
   importedTasks: "已导入 {count} 个任务",
   clearedTasks: "已清空 dbx.db 中的审计任务",
   exportFailed: "导出失败：{error}",
   importFailed: "导入失败：{error}",
   invalidBackup: "备份内容中没有 tasks 数组",
+  importedSnapshotRefreshHint: "这是导入的任务快照，不能刷新运行态；可重新开始任务或直接导出表格。",
+  missingConnections: "已跳过不存在的连接：{ids}",
   nameRequired: "{name}不能为空",
   connectionRequired: "请选择连接",
   sqlRequired: "请填写 SQL 内容",
@@ -179,7 +183,7 @@ const zh = {
   limitRequired: "样例数量必须大于 0",
   runTaskFirst: "请先运行任务",
   jobNotFound: "未找到扫描任务：{id}",
-  copiedTaskInfo: "已复制任务信息",
+  copiedDatabaseInfo: "已复制数据库信息",
   copyFailed: "复制失败：{error}",
   backList: "返回任务列表",
   copy: "复制",
@@ -236,12 +240,31 @@ const zh = {
   risk: "风险",
   basis: "依据",
   rows: "存在行数",
+  connectionName: "连接名称",
+  hostIp: "IP/Host",
+  port: "端口",
+  passwordLabel: "密码",
+  connectionString: "连接串",
+  redisMode: "Redis 模式",
+  sentinelMaster: "哨兵 Master",
+  sentinelNodes: "哨兵节点",
+  clusterNodes: "集群节点",
+  etcdEndpoints: "etcd Endpoints",
+  driver: "驱动",
+  scanDatabase: "扫描数据库",
+  scanSchema: "扫描 Schema",
+  scanTables: "扫描表",
+  fscanLine: "fscan 行",
+  rawTarget: "原始目标",
   noFindings: "暂无扫描结果",
   noSamples: "暂无样例数据",
   noTargets: "暂无批量目标",
-  json: "JSON",
   xlsx: "XLSX",
   openFolder: "打开目录",
+  outputFiles: "输出文件",
+  connectionResultOverview: "连接结果概览",
+  noHits: "无命中",
+  hasHits: "有命中",
   chooseOutput: "选择输出文件",
   chooseOutputUnavailable: "Web 开发模式无法选择本地输出路径，请在桌面 App 中使用或手动填写路径。",
   exportReport: "报告导出",
@@ -341,11 +364,13 @@ const en = {
   dataManager: "Data Manager",
   dataManagerTitle: "Audit Data Manager",
   dataManagerHint:
-    "Tasks, configuration, and scan results are saved in DBX's official dbx.db. Export or import JSON backups here.",
+    "Tasks, configuration, and scan results are saved in DBX's official dbx.db. Export or import ZIP backups here.",
   storageKey: "Storage key",
   backupData: "Backup data",
   exportBackup: "Export backup",
   importBackup: "Import backup",
+  includeLogsInBackup: "Include run logs",
+  backupPassword: "Backup password (optional)",
   clearTasks: "Clear tasks",
   close: "Close",
   search: "Search tasks / database / table",
@@ -369,12 +394,14 @@ const en = {
   cancelExport: "Export cancelled",
   cancelImport: "Import cancelled",
   exportedTasks: "Exported {count} tasks to {path}",
-  downloadedBackup: "Downloaded JSON backup for {count} tasks",
+  downloadedZipBackup: "Downloaded ZIP backup for {count} tasks",
   importedTasks: "Imported {count} tasks",
   clearedTasks: "Cleared audit tasks from dbx.db",
   exportFailed: "Export failed: {error}",
   importFailed: "Import failed: {error}",
   invalidBackup: "Backup content does not include a tasks array",
+  importedSnapshotRefreshHint: "This imported task is a snapshot. It cannot refresh runtime state; restart it or export the saved table.",
+  missingConnections: "Skipped missing connections: {ids}",
   nameRequired: "{name} is required",
   connectionRequired: "Please select a connection",
   sqlRequired: "Please enter SQL",
@@ -382,7 +409,7 @@ const en = {
   limitRequired: "Sample limit must be greater than 0",
   runTaskFirst: "Run the task first",
   jobNotFound: "Scan job not found: {id}",
-  copiedTaskInfo: "Task info copied",
+  copiedDatabaseInfo: "Database info copied",
   copyFailed: "Copy failed: {error}",
   backList: "Back to tasks",
   copy: "Copy",
@@ -439,10 +466,30 @@ const en = {
   risk: "Risk",
   basis: "Basis",
   rows: "Rows",
+  connectionName: "Connection name",
+  hostIp: "IP/Host",
+  port: "Port",
+  passwordLabel: "Password",
+  connectionString: "Connection string",
+  redisMode: "Redis mode",
+  sentinelMaster: "Sentinel master",
+  sentinelNodes: "Sentinel nodes",
+  clusterNodes: "Cluster nodes",
+  etcdEndpoints: "etcd endpoints",
+  driver: "Driver",
+  scanDatabase: "Scan database",
+  scanSchema: "Scan schema",
+  scanTables: "Scan tables",
+  fscanLine: "fscan line",
+  rawTarget: "Raw target",
   noFindings: "No findings yet",
   noSamples: "No samples yet",
   noTargets: "No batch targets",
   exportReport: "Export report",
+  outputFiles: "Output files",
+  connectionResultOverview: "Connection results",
+  noHits: "No hits",
+  hasHits: "Has hits",
   chooseOutput: "Choose output file",
   chooseOutputUnavailable:
     "Web dev mode cannot choose local output paths. Use the desktop app or enter a path manually.",
@@ -530,7 +577,94 @@ const en = {
   },
 };
 
-const ui = computed(() => (String(locale.value).toLowerCase().startsWith("zh") ? zh : en));
+type AuditUi = typeof zh;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function textFrom(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
+}
+
+function mergeTextMap<T extends Record<string, string>>(base: T, value: unknown): T {
+  if (!isRecord(value)) {
+    return base;
+  }
+  const next = { ...base };
+  for (const [key, item] of Object.entries(value)) {
+    if (typeof item === "string") {
+      next[key as keyof T] = item as T[keyof T];
+    }
+  }
+  return next;
+}
+
+function overlayGlobalAuditMessages(base: AuditUi, messages: unknown): AuditUi {
+  if (!isRecord(messages)) {
+    return base;
+  }
+  const next: AuditUi = { ...base };
+  const directKeys: Array<keyof AuditUi> = [
+    "title",
+    "subtitle",
+    "connection",
+    "database",
+    "schema",
+    "tables",
+    "fscanText",
+    "parse",
+    "start",
+    "table",
+    "column",
+    "logs",
+    "noFindings",
+  ];
+
+  for (const key of directKeys) {
+    const translated = textFrom(messages[key]);
+    if (translated) {
+      next[key] = translated as never;
+    }
+  }
+
+  const mappedKeys: Array<[keyof typeof messages, keyof AuditUi]> = [
+    ["sampleLimit", "limit"],
+    ["maskSamples", "mask"],
+    ["exportPath", "output"],
+    ["parsedTargets", "parsed"],
+    ["findings", "hits"],
+    ["modeLabel", "mode"],
+    ["levelLabel", "level"],
+    ["kindLabel", "kind"],
+    ["levelColumn", "risk"],
+    ["basisLabel", "basis"],
+    ["cancel", "stop"],
+  ];
+
+  for (const [source, target] of mappedKeys) {
+    const translated = textFrom(messages[source]);
+    if (translated) {
+      next[target] = translated as never;
+    }
+  }
+
+  next.status = mergeTextMap(next.status, messages.status);
+  next.modeLabel = mergeTextMap(next.modeLabel, messages.mode);
+  next.levelLabel = mergeTextMap(next.levelLabel, messages.level);
+  next.kindLabel = mergeTextMap(next.kindLabel, messages.kind);
+  next.riskAll = textFrom(isRecord(messages.level) ? messages.level.all : undefined) || next.riskAll;
+  next.riskHigh = textFrom(isRecord(messages.level) ? messages.level.high : undefined) || next.riskHigh;
+  next.riskMedium = textFrom(isRecord(messages.level) ? messages.level.medium : undefined) || next.riskMedium;
+  next.riskLow = textFrom(isRecord(messages.level) ? messages.level.low : undefined) || next.riskLow;
+
+  return next;
+}
+
+const ui = computed<AuditUi>(() => {
+  const base = String(locale.value).toLowerCase().startsWith("zh") ? zh : en;
+  return overlayGlobalAuditMessages(base, tm("audit"));
+});
 const view = ref<"overview" | "wizard" | "detail">("overview");
 const wizardStep = ref<WizardStep>(1);
 const activeTab = ref<DetailTab>("hits");
@@ -548,6 +682,8 @@ const showDataManager = ref(false);
 const dataManagerMessage = ref("");
 const selectedFieldKey = ref("");
 const auditStoreLoaded = ref(false);
+const backupIncludeLogs = ref(true);
+const backupPassword = ref("");
 let auditStoreSaveTimer: ReturnType<typeof setTimeout> | undefined;
 
 const selectedTask = computed(() => tasks.value.find((task) => task.id === selectedTaskId.value) || null);
@@ -627,6 +763,28 @@ const filteredSampleSummary = computed(() =>
     .replace("{groups}", String(filteredSampleGroups.value.length))
     .replace("{rows}", String(filteredSampleRowCount.value)),
 );
+const connectionResultRows = computed(() => {
+  const task = selectedTask.value;
+  if (!task) return [];
+  const ids = rawConnectionIds(task);
+  const findings = findingsWithConnectionMeta(task);
+  return ids.map((id) => {
+    const connection = props.connections.find((item) => item.id === id);
+    const name = connection?.name || id;
+    const relatedFindings = findings.filter((finding) => finding.connectionId === id || finding.connectionName === name);
+    const relatedErrors = (task.errors || []).filter((entry) => entry.includes(id) || entry.includes(name));
+    return {
+      id,
+      name,
+      dbType: connectionIconType(connection) || relatedFindings[0]?.dbType || "",
+      status: relatedErrors.length
+        ? relatedErrors.join("; ")
+        : relatedFindings.length
+          ? `${ui.value.hasHits} ${relatedFindings.length}`
+          : ui.value.noHits,
+    };
+  });
+});
 
 watch(
   () => props.connections,
@@ -760,6 +918,7 @@ function newTask(seed?: Partial<AuditTask>): AuditTask {
     splitOutput: seed?.splitOutput || false,
     textEncoding: seed?.textEncoding || "auto",
     outputPath: seed?.outputPath || "/tmp/dbx-audit-report.xlsx",
+    outputs: seed?.outputs || [],
     fscanText: seed?.fscanText || "",
     targets: seed?.targets || [],
     jobId: seed?.jobId,
@@ -773,11 +932,13 @@ function newTask(seed?: Partial<AuditTask>): AuditTask {
 }
 
 function normalizeTask(task: AuditTask) {
-  const connectionIds = task.connectionIds?.length ? task.connectionIds : task.connectionId ? [task.connectionId] : [];
+  const connectionIds = (task.connectionIds?.length ? task.connectionIds : task.connectionId ? [task.connectionId] : [])
+    .filter((connectionId, index, ids) => ids.indexOf(connectionId) === index);
   return {
     ...task,
     connectionId: task.connectionId || connectionIds[0] || "",
     connectionIds,
+    outputs: task.outputs || [],
   };
 }
 
@@ -841,47 +1002,42 @@ function toggleDataManager() {
   dataManagerMessage.value = "";
 }
 
-function buildBackupJson() {
-  return JSON.stringify(
-    {
-      app: "dbx-audit",
-      version: 1,
-      exportedAt: new Date().toISOString(),
-      storageKey: AUDIT_STORE_LOCATION,
-      tasks: tasks.value,
-    },
-    null,
-    2,
-  );
+function backupTasks() {
+  if (backupIncludeLogs.value) return tasks.value;
+  return tasks.value.map((task) => ({
+    ...task,
+    errors: [],
+    job: task.job ? { ...task.job, logs: [], errors: [] } : undefined,
+  }));
 }
 
 async function exportTaskBackup() {
   dataManagerMessage.value = "";
   error.value = "";
   try {
-    const content = buildBackupJson();
-    const fileName = `dbx-audit-backup-${new Date().toISOString().slice(0, 10)}.json`;
+    const backupBytes = await buildBackupZip();
+    const fileName = `dbx-audit-backup-${new Date().toISOString().slice(0, 10)}.zip`;
     if (isTauriRuntime()) {
-      const [{ save }, { writeTextFile }] = await Promise.all([
+      const [{ save }, { writeFile }] = await Promise.all([
         import("@tauri-apps/plugin-dialog"),
         import("@tauri-apps/plugin-fs"),
       ]);
       const path = await save({
         defaultPath: fileName,
-        filters: [{ name: "JSON", extensions: ["json"] }],
+        filters: [{ name: "ZIP", extensions: ["zip"] }],
       });
       if (!path) {
         dataManagerMessage.value = ui.value.cancelExport;
         return;
       }
-      await writeTextFile(path, content);
+      await writeFile(path, backupBytes);
       dataManagerMessage.value = ui.value.exportedTasks
         .replace("{count}", String(tasks.value.length))
         .replace("{path}", path);
       return;
     }
-    downloadBackupFile(fileName, content);
-    dataManagerMessage.value = ui.value.downloadedBackup.replace("{count}", String(tasks.value.length));
+    downloadBackupFile(fileName, backupBytes);
+    dataManagerMessage.value = ui.value.downloadedZipBackup.replace("{count}", String(tasks.value.length));
   } catch (err) {
     error.value = ui.value.exportFailed.replace("{error}", String(err));
   }
@@ -891,11 +1047,12 @@ async function importTaskBackup() {
   dataManagerMessage.value = "";
   error.value = "";
   try {
-    const backupText = await readBackupFile();
-    if (!backupText?.trim()) {
+    const backupBytes = await readBackupFile();
+    if (!backupBytes?.length) {
       dataManagerMessage.value = ui.value.cancelImport;
       return;
     }
+    const backupText = await readBackupText(backupBytes);
     const parsed = JSON.parse(backupText) as { tasks?: AuditTask[] } | AuditTask[];
     const imported = Array.isArray(parsed) ? parsed : parsed.tasks;
     if (!Array.isArray(imported)) {
@@ -914,8 +1071,8 @@ async function importTaskBackup() {
   }
 }
 
-function downloadBackupFile(fileName: string, content: string) {
-  const blob = new Blob([content], { type: "application/json;charset=utf-8" });
+function downloadBackupFile(fileName: string, content: Uint8Array) {
+  const blob = new Blob([toArrayBuffer(content)], { type: "application/zip" });
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
@@ -928,25 +1085,274 @@ function downloadBackupFile(fileName: string, content: string) {
 
 async function readBackupFile() {
   if (isTauriRuntime()) {
-    const [{ open }, { readTextFile }] = await Promise.all([
+    const [{ open }, { readFile }] = await Promise.all([
       import("@tauri-apps/plugin-dialog"),
       import("@tauri-apps/plugin-fs"),
     ]);
     const selected = await open({
       multiple: false,
-      filters: [{ name: "JSON", extensions: ["json"] }],
+      filters: [{ name: "Audit backup", extensions: ["zip", "json"] }],
     });
     const path = Array.isArray(selected) ? selected[0] : selected;
-    return path ? await readTextFile(path) : "";
+    return path ? await readFile(path) : new Uint8Array();
   }
   const file = await new Promise<File | null>((resolve) => {
     const input = document.createElement("input");
     input.type = "file";
-    input.accept = ".json,application/json";
+    input.accept = ".zip,.json,application/zip,application/json";
     input.onchange = () => resolve(input.files?.[0] ?? null);
     input.click();
   });
-  return file ? await file.text() : "";
+  return file ? new Uint8Array(await file.arrayBuffer()) : new Uint8Array();
+}
+
+async function buildBackupZip() {
+  const exportedAt = new Date().toISOString();
+  const payload = encodeText(
+    JSON.stringify(
+      {
+        app: "dbx-audit",
+        version: 2,
+        exportedAt,
+        storageKey: AUDIT_STORE_LOCATION,
+        tasks: backupTasks(),
+      },
+      null,
+      2,
+    ),
+  );
+  const password = backupPassword.value.trim();
+  const manifest: Record<string, unknown> = {
+    app: "dbx-audit",
+    version: 2,
+    format: "dbx-audit.backup.zip",
+    exportedAt,
+    encrypted: !!password,
+    includeLogs: backupIncludeLogs.value,
+  };
+  const files: Record<string, Uint8Array> = {};
+  if (password) {
+    const encrypted = await encryptBackupPayload(payload, password);
+    manifest.crypto = encrypted.manifest;
+    files["payload.enc"] = encrypted.data;
+  } else {
+    files["tasks.json"] = payload;
+  }
+  files["manifest.json"] = encodeText(JSON.stringify(manifest, null, 2));
+  if (backupIncludeLogs.value) {
+    for (const task of tasks.value) {
+      const logs = [
+        ...(task.job?.logs || []).map((entry) => JSON.stringify(entry)),
+        ...(task.errors || []).map((entry) => JSON.stringify({ level: "error", message: entry })),
+      ].join("\n");
+      if (logs) files[`logs/${sanitizeFilePart(task.id)}.jsonl`] = encodeText(logs);
+    }
+  }
+  const outputLines = tasks.value.flatMap((task) => (task.outputs || []).map((path) => `${task.id}\t${path}`));
+  if (outputLines.length) files["outputs/manifest.tsv"] = encodeText(outputLines.join("\n"));
+  return createStoredZip(files);
+}
+
+async function readBackupText(bytes: Uint8Array) {
+  if (!isZip(bytes)) return decodeText(bytes);
+  const files = parseStoredZip(bytes);
+  const manifestText = files.get("manifest.json");
+  if (!manifestText) throw new Error(ui.value.invalidBackup);
+  const manifest = JSON.parse(decodeText(manifestText)) as { encrypted?: boolean; crypto?: BackupCryptoManifest };
+  if (manifest.encrypted) {
+    if (!backupPassword.value.trim()) throw new Error(ui.value.backupPassword);
+    const encrypted = files.get("payload.enc");
+    if (!encrypted || !manifest.crypto) throw new Error(ui.value.invalidBackup);
+    const decrypted = await decryptBackupPayload(encrypted, backupPassword.value.trim(), manifest.crypto);
+    return decodeText(decrypted);
+  }
+  const tasks = files.get("tasks.json");
+  if (!tasks) throw new Error(ui.value.invalidBackup);
+  return decodeText(tasks);
+}
+
+type BackupCryptoManifest = {
+  algorithm: "AES-GCM";
+  kdf: "PBKDF2-SHA-256";
+  iterations: number;
+  salt: string;
+  iv: string;
+};
+
+async function encryptBackupPayload(data: Uint8Array, password: string) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const iterations = 120_000;
+  const key = await deriveBackupKey(password, salt, iterations);
+  const encrypted = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv: toArrayBuffer(iv) }, key, toArrayBuffer(data)));
+  return {
+    data: encrypted,
+    manifest: {
+      algorithm: "AES-GCM" as const,
+      kdf: "PBKDF2-SHA-256" as const,
+      iterations,
+      salt: bytesToBase64(salt),
+      iv: bytesToBase64(iv),
+    },
+  };
+}
+
+async function decryptBackupPayload(data: Uint8Array, password: string, manifest: BackupCryptoManifest) {
+  const key = await deriveBackupKey(password, base64ToBytes(manifest.salt), manifest.iterations);
+  return new Uint8Array(
+    await crypto.subtle.decrypt({ name: "AES-GCM", iv: toArrayBuffer(base64ToBytes(manifest.iv)) }, key, toArrayBuffer(data)),
+  );
+}
+
+async function deriveBackupKey(password: string, salt: Uint8Array, iterations: number) {
+  const material = await crypto.subtle.importKey("raw", toArrayBuffer(encodeText(password)), "PBKDF2", false, ["deriveKey"]);
+  return crypto.subtle.deriveKey(
+    { name: "PBKDF2", hash: "SHA-256", salt: toArrayBuffer(salt), iterations },
+    material,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt", "decrypt"],
+  );
+}
+
+function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+}
+
+function createStoredZip(files: Record<string, Uint8Array>) {
+  const localParts: Uint8Array[] = [];
+  const centralParts: Uint8Array[] = [];
+  let offset = 0;
+  for (const [name, data] of Object.entries(files)) {
+    const nameBytes = encodeText(name);
+    const crc = crc32(data);
+    const local = concatBytes([
+      u32(0x04034b50),
+      u16(20),
+      u16(0),
+      u16(0),
+      u16(0),
+      u16(0),
+      u32(crc),
+      u32(data.length),
+      u32(data.length),
+      u16(nameBytes.length),
+      u16(0),
+      nameBytes,
+      data,
+    ]);
+    localParts.push(local);
+    centralParts.push(
+      concatBytes([
+        u32(0x02014b50),
+        u16(20),
+        u16(20),
+        u16(0),
+        u16(0),
+        u16(0),
+        u16(0),
+        u32(crc),
+        u32(data.length),
+        u32(data.length),
+        u16(nameBytes.length),
+        u16(0),
+        u16(0),
+        u16(0),
+        u16(0),
+        u32(0),
+        u32(offset),
+        nameBytes,
+      ]),
+    );
+    offset += local.length;
+  }
+  const central = concatBytes(centralParts);
+  const end = concatBytes([
+    u32(0x06054b50),
+    u16(0),
+    u16(0),
+    u16(centralParts.length),
+    u16(centralParts.length),
+    u32(central.length),
+    u32(offset),
+    u16(0),
+  ]);
+  return concatBytes([...localParts, central, end]);
+}
+
+function parseStoredZip(bytes: Uint8Array) {
+  const files = new Map<string, Uint8Array>();
+  let offset = 0;
+  while (offset + 30 <= bytes.length && readU32(bytes, offset) === 0x04034b50) {
+    const method = readU16(bytes, offset + 8);
+    if (method !== 0) throw new Error("Only stored ZIP backups are supported");
+    const compressedSize = readU32(bytes, offset + 18);
+    const fileNameLength = readU16(bytes, offset + 26);
+    const extraLength = readU16(bytes, offset + 28);
+    const nameStart = offset + 30;
+    const dataStart = nameStart + fileNameLength + extraLength;
+    const dataEnd = dataStart + compressedSize;
+    const name = decodeText(bytes.slice(nameStart, nameStart + fileNameLength));
+    files.set(name, bytes.slice(dataStart, dataEnd));
+    offset = dataEnd;
+  }
+  return files;
+}
+
+function isZip(bytes: Uint8Array) {
+  return bytes.length >= 4 && readU32(bytes, 0) === 0x04034b50;
+}
+
+function encodeText(value: string) {
+  return new TextEncoder().encode(value);
+}
+
+function decodeText(value: Uint8Array) {
+  return new TextDecoder().decode(value);
+}
+
+function u16(value: number) {
+  return new Uint8Array([value & 0xff, (value >>> 8) & 0xff]);
+}
+
+function u32(value: number) {
+  return new Uint8Array([value & 0xff, (value >>> 8) & 0xff, (value >>> 16) & 0xff, (value >>> 24) & 0xff]);
+}
+
+function readU16(bytes: Uint8Array, offset: number) {
+  return bytes[offset] | (bytes[offset + 1] << 8);
+}
+
+function readU32(bytes: Uint8Array, offset: number) {
+  return (bytes[offset] | (bytes[offset + 1] << 8) | (bytes[offset + 2] << 16) | (bytes[offset + 3] << 24)) >>> 0;
+}
+
+function concatBytes(parts: Uint8Array[]) {
+  const total = parts.reduce((sum, part) => sum + part.length, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const part of parts) {
+    out.set(part, offset);
+    offset += part.length;
+  }
+  return out;
+}
+
+function crc32(bytes: Uint8Array) {
+  let crc = 0xffffffff;
+  for (const byte of bytes) {
+    crc ^= byte;
+    for (let i = 0; i < 8; i += 1) crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function bytesToBase64(bytes: Uint8Array) {
+  return btoa(String.fromCharCode(...bytes));
+}
+
+function base64ToBytes(value: string) {
+  return Uint8Array.from(atob(value), (char) => char.charCodeAt(0));
 }
 
 function clearAuditTasks() {
@@ -1041,10 +1447,16 @@ function selectField(field: FieldHit) {
 }
 
 function activeConnectionIds(task: Pick<AuditTask, "kind" | "connectionId" | "connectionIds">) {
-  if (task.kind === "fscan") {
-    return task.connectionIds?.length ? task.connectionIds : task.connectionId ? [task.connectionId] : [];
-  }
-  return task.connectionId ? [task.connectionId] : [];
+  return rawConnectionIds(task).filter((connectionId) => props.connections.some((connection) => connection.id === connectionId));
+}
+
+function rawConnectionIds(task: Pick<AuditTask, "kind" | "connectionId" | "connectionIds">) {
+  const ids = task.kind === "fscan" ? (task.connectionIds?.length ? task.connectionIds : task.connectionId ? [task.connectionId] : []) : task.connectionId ? [task.connectionId] : [];
+  return ids.filter((connectionId, index) => !!connectionId && ids.indexOf(connectionId) === index);
+}
+
+function missingConnectionIds(task: Pick<AuditTask, "kind" | "connectionId" | "connectionIds">) {
+  return rawConnectionIds(task).filter((connectionId) => !props.connections.some((connection) => connection.id === connectionId));
 }
 
 function isDraftConnectionSelected(connectionId: string) {
@@ -1067,17 +1479,29 @@ async function startTask(task: AuditTask) {
   }
   stopPolling(task.id);
   error.value = "";
+  const missing = missingConnectionIds(task);
+  const connectionIds = activeConnectionIds(task);
+  if (connectionIds.length === 0) {
+    error.value = missing.length
+      ? ui.value.missingConnections.replace("{ids}", missing.join(", "))
+      : ui.value.connectionRequired;
+    return;
+  }
   const running = persistTask({
     ...task,
+    connectionId: connectionIds[0],
+    connectionIds,
     status: "running",
     progress: 5,
-    message: ui.value.queued,
-    errors: [],
+    message: missing.length ? ui.value.missingConnections.replace("{ids}", missing.join(", ")) : ui.value.queued,
+    jobId: undefined,
+    job: undefined,
+    outputs: [],
+    errors: missing.map((id) => ui.value.missingConnections.replace("{ids}", id)),
     startedAt: new Date().toISOString(),
     finishedAt: undefined,
   });
   try {
-    const connectionIds = activeConnectionIds(running);
     if (running.kind === "fscan" && connectionIds.length > 1) {
       await startConnectionBatchTask(running, connectionIds);
       return;
@@ -1091,6 +1515,7 @@ async function startTask(task: AuditTask) {
       level: running.level,
       limit: Number(running.limit) || 15,
       mask: running.mask,
+      includeSystem: running.includeSystem,
       workers: Number(running.workers) || 1,
       timeoutSecs: Number(running.timeoutSecs) || 15,
     });
@@ -1125,6 +1550,7 @@ async function startConnectionBatchTask(task: AuditTask, connectionIds: string[]
       level: task.level,
       limit: Number(task.limit) || 15,
       mask: task.mask,
+      includeSystem: task.includeSystem,
       workers: Number(task.workers) || 1,
       timeoutSecs: Number(task.timeoutSecs) || 15,
     },
@@ -1145,6 +1571,7 @@ async function startConnectionBatchTask(task: AuditTask, connectionIds: string[]
       });
       persistTask({
         ...task,
+        jobId: aggregate.jobId,
         job: { ...aggregate, progress: Math.round((index / connectionIds.length) * 100) },
         status: "running",
         progress: Math.round((index / connectionIds.length) * 100),
@@ -1154,7 +1581,7 @@ async function startConnectionBatchTask(task: AuditTask, connectionIds: string[]
         ...aggregate.request,
         connectionId,
       });
-      const job = await waitForAuditJob(jobId, task.id, label, index, connectionIds.length);
+      const job = await waitForAuditJobSnapshot(jobId, task.id, label, index, connectionIds.length, aggregate);
       aggregate.findings.push(
         ...(job.findings || []).map((finding) => ({
           ...finding,
@@ -1190,7 +1617,14 @@ async function startConnectionBatchTask(task: AuditTask, connectionIds: string[]
   });
 }
 
-async function waitForAuditJob(jobId: string, taskId: string, label: string, index: number, total: number) {
+async function waitForAuditJobSnapshot(
+  jobId: string,
+  taskId: string,
+  label: string,
+  index: number,
+  total: number,
+  aggregate: AuditJobState,
+) {
   for (;;) {
     const job = await api.auditGetJob(jobId);
     if (!job) throw new Error(ui.value.jobNotFound.replace("{id}", jobId));
@@ -1200,8 +1634,8 @@ async function waitForAuditJob(jobId: string, taskId: string, label: string, ind
     if (task) {
       persistTask({
         ...task,
-        jobId,
-        job,
+        jobId: aggregate.jobId,
+        job: { ...aggregate, progress: currentProgress },
         status: "running",
         progress: currentProgress,
         message: ui.value.scanningConnection.replace("{name}", label),
@@ -1222,6 +1656,10 @@ async function refreshTaskJob(taskId: string, jobId?: string) {
   const task = tasks.value.find((item) => item.id === taskId);
   const effectiveJobId = jobId || task?.jobId;
   if (!task || !effectiveJobId) return;
+  if (effectiveJobId.startsWith("batch-")) {
+    exportMessage.value = ui.value.importedSnapshotRefreshHint;
+    return;
+  }
   try {
     const job = await api.auditGetJob(effectiveJobId);
     if (!job) return;
@@ -1245,8 +1683,8 @@ async function refreshTaskJob(taskId: string, jobId?: string) {
   }
 }
 
-async function exportReport(task: AuditTask, format: "json" | "xlsx") {
-  if (!task.jobId) {
+async function exportReport(task: AuditTask, format: "xlsx") {
+  if (!task.job) {
     error.value = ui.value.runTaskFirst;
     return;
   }
@@ -1254,12 +1692,50 @@ async function exportReport(task: AuditTask, format: "json" | "xlsx") {
   exportMessage.value = "";
   try {
     const base = task.outputPath.trim() || `/tmp/${task.name.replace(/\s+/g, "-")}.${format}`;
-    const path = format === "json" ? base.replace(/\.xlsx$/i, ".json") : base.replace(/\.json$/i, ".xlsx");
-    const result = await api.auditExportReport(task.jobId, format, path);
+    const path = ensureXlsxPath(base);
+    const result = await api.auditExportReportSnapshot(task.job, format, path);
+    const outputs = [result.path];
+    if (task.splitOutput) {
+      for (const [connectionId, findings] of findingsByConnection(task.job.findings).entries()) {
+        const splitJob = { ...task.job, jobId: `${task.job.jobId}-${connectionId}`, findings };
+        const splitPath = splitOutputPath(path, connectionId, findings);
+        const splitResult = await api.auditExportReportSnapshot(splitJob, format, splitPath);
+        outputs.push(splitResult.path);
+      }
+    }
+    persistTask({ ...task, outputs });
     exportMessage.value = `${ui.value.exportReport}: ${result.path}`;
   } catch (err) {
     error.value = String(err);
   }
+}
+
+function ensureXlsxPath(path: string) {
+  const trimmed = path.trim() || "/tmp/dbx-audit-report.xlsx";
+  return trimmed.replace(/\.json$/i, ".xlsx").match(/\.xlsx$/i) ? trimmed.replace(/\.json$/i, ".xlsx") : `${trimmed}.xlsx`;
+}
+
+function findingsByConnection(findings: AuditFinding[]) {
+  const groups = new Map<string, AuditFinding[]>();
+  for (const finding of findings) {
+    const key = finding.connectionId || finding.connectionName || finding.dbType || "target";
+    groups.set(key, [...(groups.get(key) || []), finding]);
+  }
+  return groups;
+}
+
+function splitOutputPath(path: string, connectionId: string, findings: AuditFinding[]) {
+  const index = path.toLowerCase().lastIndexOf(".xlsx");
+  const stem = index >= 0 ? path.slice(0, index) : path;
+  const suffixSource = [
+    findings[0]?.dbType || "db",
+    findings[0]?.connectionName || connectionId,
+  ].join("_");
+  return `${stem}-${sanitizeFilePart(suffixSource)}.xlsx`;
+}
+
+function sanitizeFilePart(value: string) {
+  return value.replace(/[^a-z0-9._-]+/gi, "_").replace(/^_+|_+$/g, "") || "target";
 }
 
 async function chooseOutputPath() {
@@ -1271,12 +1747,8 @@ async function chooseOutputPath() {
   try {
     const { save } = await import("@tauri-apps/plugin-dialog");
     const path = await save({
-      defaultPath: draft.value.outputPath.trim() || "/tmp/dbx-audit-report.xlsx",
-      filters: [
-        { name: "Audit report", extensions: ["xlsx", "json"] },
-        { name: "Excel", extensions: ["xlsx"] },
-        { name: "JSON", extensions: ["json"] },
-      ],
+      defaultPath: ensureXlsxPath(draft.value.outputPath.trim() || "/tmp/dbx-audit-report.xlsx"),
+      filters: [{ name: "Excel", extensions: ["xlsx"] }],
     });
     if (path) draft.value.outputPath = path;
   } catch (err) {
@@ -1334,6 +1806,12 @@ function lastLog(job?: AuditJobState) {
 
 function connectionFor(task: AuditTask) {
   return props.connections.find((connection) => connection.id === activeConnectionIds(task)[0]);
+}
+
+function connectionsFor(task: AuditTask) {
+  return activeConnectionIds(task)
+    .map((connectionId) => props.connections.find((connection) => connection.id === connectionId))
+    .filter((connection): connection is ConnectionConfig => !!connection);
 }
 
 function draftConnectionIcon() {
@@ -1511,30 +1989,74 @@ function kindName(kind: string) {
 }
 
 async function copyTask(task: AuditTask) {
-  const totals = taskTotals(task);
-  const text = [
-    `${ui.value.name}: ${task.name}`,
-    `${ui.value.statusLabel}: ${ui.value.status[task.status]}`,
-    `${ui.value.connection}: ${connectionLabel(task)}`,
-    `${ui.value.mode}: ${ui.value.modeLabel[task.mode]}`,
-    task.database ? `${ui.value.database}: ${task.database}` : "",
-    task.tables ? `${ui.value.tables}: ${task.tables}` : "",
-    `${ui.value.riskHigh}: ${totals.high}`,
-    `${ui.value.riskMedium}: ${totals.medium}`,
-    `${ui.value.riskLow}: ${totals.low}`,
-    `${ui.value.currentProgress}: ${task.progress}%`,
-    task.outputPath ? `${ui.value.output}: ${task.outputPath}` : "",
-  ]
-    .filter(Boolean)
-    .join("\n");
+  const text = buildDatabaseInfoCopyText(task);
   try {
     await writeClipboardText(text);
-    dataManagerMessage.value = ui.value.copiedTaskInfo;
-    exportMessage.value = ui.value.copiedTaskInfo;
+    dataManagerMessage.value = ui.value.copiedDatabaseInfo;
+    exportMessage.value = ui.value.copiedDatabaseInfo;
     error.value = "";
   } catch (err) {
     error.value = ui.value.copyFailed.replace("{error}", String(err));
   }
+}
+
+function buildDatabaseInfoCopyText(task: AuditTask) {
+  const sections = connectionsFor(task).map((connection) => formatConnectionInfo(connection, task));
+  const importedTargets = task.targets.map((target) => formatFscanTargetInfo(target));
+  const rawTargets = task.fscanText.trim() && importedTargets.length === 0 ? formatRawFscanTargets(task.fscanText) : "";
+  const text = [...sections, ...importedTargets, rawTargets].filter(Boolean).join("\n\n");
+  return text || `${ui.value.connection}: ${connectionLabel(task)}`;
+}
+
+function formatConnectionInfo(connection: ConnectionConfig, task: AuditTask) {
+  const database = task.database.trim() || connection.database || "";
+  const fields: Array<[string, string] | undefined> = [
+    [ui.value.connectionName, connection.name],
+    [ui.value.type, connection.db_type],
+    connection.driver_label || connection.driver_profile
+      ? [ui.value.driver, connection.driver_label || connection.driver_profile || ""]
+      : undefined,
+    [ui.value.hostIp, connection.host],
+    [ui.value.port, String(connection.port || "")],
+    [ui.value.usernameLabel, connection.username],
+    [ui.value.passwordLabel, connection.password],
+    database ? [ui.value.database, database] : undefined,
+    task.schema.trim() ? [ui.value.scanSchema, task.schema.trim()] : undefined,
+    task.tables.trim() ? [ui.value.scanTables, task.tables.trim()] : undefined,
+    task.proxy.trim() ? [ui.value.proxy, task.proxy.trim()] : undefined,
+    connection.connection_string ? [ui.value.connectionString, connection.connection_string] : undefined,
+    connection.redis_connection_mode ? [ui.value.redisMode, connection.redis_connection_mode] : undefined,
+    connection.redis_sentinel_master ? [ui.value.sentinelMaster, connection.redis_sentinel_master] : undefined,
+    connection.redis_sentinel_nodes ? [ui.value.sentinelNodes, connection.redis_sentinel_nodes] : undefined,
+    connection.redis_sentinel_username ? [ui.value.usernameLabel, connection.redis_sentinel_username] : undefined,
+    connection.redis_sentinel_password ? [ui.value.passwordLabel, connection.redis_sentinel_password] : undefined,
+    connection.redis_cluster_nodes ? [ui.value.clusterNodes, connection.redis_cluster_nodes] : undefined,
+    connection.etcd_endpoints ? [ui.value.etcdEndpoints, connection.etcd_endpoints] : undefined,
+  ];
+  return formatInfoLines(fields);
+}
+
+function formatFscanTargetInfo(target: ParsedFscanTarget) {
+  return formatInfoLines([
+    [ui.value.source, `${ui.value.fscanLine} ${target.line}`],
+    [ui.value.type, target.dbType],
+    [ui.value.hostIp, target.host],
+    [ui.value.port, String(target.port || "")],
+    [ui.value.usernameLabel, target.username],
+    [ui.value.passwordLabel, target.password],
+    target.raw ? [ui.value.rawTarget, target.raw] : undefined,
+  ]);
+}
+
+function formatRawFscanTargets(text: string) {
+  return formatInfoLines([[ui.value.rawTarget, text.trim()]]);
+}
+
+function formatInfoLines(fields: Array<[string, string] | undefined>) {
+  return fields
+    .filter((field): field is [string, string] => !!field && field[1] !== undefined && field[1] !== "")
+    .map(([label, value]) => `${label}: ${value}`)
+    .join("\n");
 }
 
 async function writeClipboardText(text: string) {
@@ -1637,6 +2159,13 @@ onUnmounted(() => {
               {{ ui.clearTasks }}
             </Button>
           </div>
+        </div>
+        <div class="mt-3 grid gap-3 md:grid-cols-[180px_minmax(0,320px)]">
+          <label class="flex items-center gap-2 text-xs">
+            <input v-model="backupIncludeLogs" type="checkbox" />
+            {{ ui.includeLogsInBackup }}
+          </label>
+          <Input v-model="backupPassword" class="h-8" type="password" :placeholder="ui.backupPassword" />
         </div>
         <p v-if="dataManagerMessage" class="mt-3 text-xs text-muted-foreground">{{ dataManagerMessage }}</p>
         <p v-if="error" class="mt-3 text-xs text-destructive">{{ error }}</p>
@@ -2088,21 +2617,30 @@ onUnmounted(() => {
               variant="outline"
               size="sm"
               class="gap-1"
-              :disabled="!selectedTask.jobId"
-              @click="exportReport(selectedTask, 'json')"
-              ><FileJson class="h-3.5 w-3.5" />{{ ui.json }}</Button
-            >
-            <Button
-              variant="outline"
-              size="sm"
-              class="gap-1"
-              :disabled="!selectedTask.jobId"
+              :disabled="!selectedTask.job"
               @click="exportReport(selectedTask, 'xlsx')"
               ><FileSpreadsheet class="h-3.5 w-3.5" />{{ ui.xlsx }}</Button
             >
             <Button variant="outline" size="sm" class="gap-1" @click="openOutputDirectory(selectedTask)"
               ><FolderOpen class="h-3.5 w-3.5" />{{ ui.openFolder }}</Button
             >
+          </div>
+          <div v-if="selectedTask.outputs.length" class="mt-3 text-xs">
+            <div class="text-muted-foreground">{{ ui.outputFiles }}</div>
+            <div v-for="path in selectedTask.outputs" :key="path" class="truncate font-mono">{{ path }}</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="mb-4 rounded-md border bg-background p-4">
+        <div class="font-semibold">{{ ui.connectionResultOverview }}</div>
+        <div class="mt-3 grid gap-2 md:grid-cols-2 xl:grid-cols-3">
+          <div v-for="row in connectionResultRows" :key="row.id" class="rounded-md border p-3 text-xs">
+            <div class="flex items-center gap-2">
+              <DatabaseIcon :db-type="row.dbType" class="h-3.5 w-3.5 shrink-0" />
+              <span class="font-medium">{{ row.name }}</span>
+            </div>
+            <div class="mt-2 text-muted-foreground">{{ row.status }}</div>
           </div>
         </div>
       </div>

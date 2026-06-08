@@ -1622,6 +1622,14 @@ export async function auditExportReport(
   return post("/api/audit/export", { jobId, format, path });
 }
 
+export async function auditExportReportSnapshot(
+  job: import("./tauri").AuditJobState,
+  format: import("./tauri").AuditExportFormat,
+  path: string,
+): Promise<import("./tauri").AuditExportResult> {
+  return post("/api/audit/export-snapshot", { job, format, path });
+}
+
 export async function auditOpenOutputDirectory(_path: string): Promise<void> {
   throw new Error("Web dev mode cannot open local folders directly.");
 }

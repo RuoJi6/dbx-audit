@@ -181,16 +181,26 @@ fn worksheet_xml(data: &XlsxWorksheetData) -> String {
     )
 }
 
-fn content_types_xml() -> &'static str {
-    concat!(
+fn content_types_xml(sheet_count: usize) -> String {
+    let overrides = (1..=sheet_count)
+        .map(|index| {
+            format!(
+                "<Override PartName=\"/xl/worksheets/sheet{index}.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>"
+            )
+        })
+        .collect::<String>();
+    format!(
+        concat!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>",
         "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">",
         "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>",
         "<Default Extension=\"xml\" ContentType=\"application/xml\"/>",
         "<Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>",
-        "<Override PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>",
+        "{}",
         "<Override PartName=\"/xl/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml\"/>",
         "</Types>"
+        ),
+        overrides
     )
 }
 
@@ -203,25 +213,47 @@ fn root_rels_xml() -> &'static str {
     )
 }
 
-fn workbook_xml(sheet_name: &str) -> String {
+fn workbook_xml(sheet_names: &[String]) -> String {
+    let sheets = sheet_names
+        .iter()
+        .enumerate()
+        .map(|(index, sheet_name)| {
+            let sheet_id = index + 1;
+            format!(
+                "<sheet name=\"{}\" sheetId=\"{sheet_id}\" r:id=\"rId{sheet_id}\"/>",
+                escape_xml(sheet_name)
+            )
+        })
+        .collect::<String>();
     format!(
         concat!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>",
             "<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">",
-            "<sheets><sheet name=\"{}\" sheetId=\"1\" r:id=\"rId1\"/></sheets>",
+            "<sheets>{}</sheets>",
             "</workbook>"
         ),
-        escape_xml(sheet_name)
+        sheets
     )
 }
 
-fn workbook_rels_xml() -> &'static str {
-    concat!(
+fn workbook_rels_xml(sheet_count: usize) -> String {
+    let sheet_rels = (1..=sheet_count)
+        .map(|index| {
+            format!(
+                "<Relationship Id=\"rId{index}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet{index}.xml\"/>"
+            )
+        })
+        .collect::<String>();
+    let style_id = sheet_count + 1;
+    format!(
+        concat!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>",
         "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">",
-        "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/>",
-        "<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>",
+        "{}",
+        "<Relationship Id=\"rId{}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>",
         "</Relationships>"
+        ),
+        sheet_rels, style_id
     )
 }
 
@@ -240,15 +272,33 @@ fn styles_xml() -> &'static str {
 }
 
 pub fn build_xlsx_workbook(data: &XlsxWorksheetData) -> Result<Vec<u8>, String> {
-    let sheet_name = normalize_sheet_name(data.sheet_name.as_deref());
-    let files = vec![
-        ("[Content_Types].xml", content_types_xml().to_string()),
-        ("_rels/.rels", root_rels_xml().to_string()),
-        ("xl/workbook.xml", workbook_xml(&sheet_name)),
-        ("xl/_rels/workbook.xml.rels", workbook_rels_xml().to_string()),
-        ("xl/styles.xml", styles_xml().to_string()),
-        ("xl/worksheets/sheet1.xml", worksheet_xml(data)),
+    build_xlsx_workbook_multi(std::slice::from_ref(data))
+}
+
+pub fn build_xlsx_workbook_multi(sheets: &[XlsxWorksheetData]) -> Result<Vec<u8>, String> {
+    let sheets = if sheets.is_empty() {
+        vec![XlsxWorksheetData {
+            sheet_name: Some("Sheet1".to_string()),
+            columns: vec!["Result".to_string()],
+            rows: vec![vec![Value::String("No data".to_string())]],
+        }]
+    } else {
+        sheets.to_vec()
+    };
+    let sheet_names = unique_sheet_names(&sheets);
+    let mut files = vec![
+        ("[Content_Types].xml".to_string(), content_types_xml(sheets.len())),
+        ("_rels/.rels".to_string(), root_rels_xml().to_string()),
+        ("xl/workbook.xml".to_string(), workbook_xml(&sheet_names)),
+        ("xl/_rels/workbook.xml.rels".to_string(), workbook_rels_xml(sheets.len())),
+        ("xl/styles.xml".to_string(), styles_xml().to_string()),
     ];
+    files.extend(
+        sheets
+            .iter()
+            .enumerate()
+            .map(|(index, sheet)| (format!("xl/worksheets/sheet{}.xml", index + 1), worksheet_xml(sheet))),
+    );
 
     let cursor = Cursor::new(Vec::<u8>::new());
     let mut zip = zip::ZipWriter::new(cursor);
@@ -261,6 +311,24 @@ pub fn build_xlsx_workbook(data: &XlsxWorksheetData) -> Result<Vec<u8>, String> 
 
     let output = zip.finish().map_err(|err| err.to_string())?;
     Ok(output.into_inner())
+}
+
+fn unique_sheet_names(sheets: &[XlsxWorksheetData]) -> Vec<String> {
+    let mut used = std::collections::HashMap::<String, usize>::new();
+    sheets
+        .iter()
+        .map(|sheet| {
+            let base = normalize_sheet_name(sheet.sheet_name.as_deref());
+            let count = used.entry(base.clone()).or_insert(0);
+            *count += 1;
+            if *count == 1 {
+                return base;
+            }
+            let suffix = format!(" ({count})");
+            let max_base_len = 31usize.saturating_sub(suffix.chars().count());
+            format!("{}{}", base.chars().take(max_base_len).collect::<String>(), suffix)
+        })
+        .collect()
 }
 
 #[cfg(test)]

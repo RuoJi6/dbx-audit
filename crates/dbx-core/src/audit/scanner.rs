@@ -27,6 +27,9 @@ pub fn audit_column_findings(
         .iter()
         .flat_map(|column| {
             detect_field(table, &column.name, level).into_iter().map(|kind| AuditFinding {
+                connection_id: None,
+                connection_name: None,
+                db_type: None,
                 database: database.to_string(),
                 schema: schema.map(str::to_string),
                 table: table.to_string(),
