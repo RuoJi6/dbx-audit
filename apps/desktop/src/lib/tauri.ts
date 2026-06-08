@@ -156,6 +156,7 @@ export type AuditTaskKind = "single" | "fscan" | "sql";
 
 export interface AuditScanRequest {
   connectionId: string;
+  connection?: ConnectionConfig;
   database?: string;
   schema?: string;
   tables: string[];

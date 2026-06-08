@@ -78,6 +78,8 @@ impl AuditKind {
 pub struct AuditScanRequest {
     pub connection_id: String,
     #[serde(default)]
+    pub connection: Option<serde_json::Value>,
+    #[serde(default)]
     pub database: Option<String>,
     #[serde(default)]
     pub schema: Option<String>,

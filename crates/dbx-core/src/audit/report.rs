@@ -280,6 +280,7 @@ mod tests {
             progress: 100,
             request: AuditScanRequest {
                 connection_id: "local".to_string(),
+                connection: None,
                 database: Some("app".to_string()),
                 schema: Some("public".to_string()),
                 tables: vec!["users".to_string()],

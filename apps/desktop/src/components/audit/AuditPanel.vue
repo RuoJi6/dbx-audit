@@ -1469,6 +1469,7 @@ async function startTask(task: AuditTask) {
     }
     const jobId = await api.auditStartScan({
       connectionId: connectionIds[0] || running.connectionId,
+      connection: props.connections.find((connection) => connection.id === (connectionIds[0] || running.connectionId)),
       database: running.database.trim() || undefined,
       schema: running.schema.trim() || undefined,
       tables: splitList(running.tables),
@@ -1541,6 +1542,7 @@ async function startConnectionBatchTask(task: AuditTask, connectionIds: string[]
       const jobId = await api.auditStartScan({
         ...aggregate.request,
         connectionId,
+        connection,
       });
       const job = await waitForAuditJobSnapshot(jobId, task.id, label, index, connectionIds.length, aggregate);
       aggregate.findings.push(

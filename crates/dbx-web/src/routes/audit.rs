@@ -15,6 +15,7 @@ use dbx_core::audit::{
     AuditLogEntry, AuditSample, AuditScanRequest, ParsedFscanTargets,
 };
 use dbx_core::models::connection::DatabaseType;
+use dbx_core::models::connection::ConnectionConfig;
 use serde_json::Value;
 
 #[derive(Deserialize)]
@@ -228,6 +229,7 @@ pub async fn save_task_store(
 }
 
 async fn run_field_name_scan(state: Arc<WebState>, request: AuditScanRequest, job_id: &str) -> Result<(), String> {
+    prepare_audit_connection(&state, &request).await?;
     if connection_db_type(&state, &request.connection_id).await == Some(DatabaseType::Redis) {
         return run_redis_scan(state, request, job_id).await;
     }
@@ -291,6 +293,22 @@ async fn run_field_name_scan(state: Arc<WebState>, request: AuditScanRequest, jo
         }
     }
 
+    Ok(())
+}
+
+async fn prepare_audit_connection(state: &WebState, request: &AuditScanRequest) -> Result<(), String> {
+    if let Some(snapshot) = &request.connection {
+        let mut config: ConnectionConfig = serde_json::from_value(snapshot.clone()).map_err(|err| err.to_string())?;
+        config.id = request.connection_id.clone();
+        let config = config.canonicalized();
+        state.app.configs.write().await.insert(request.connection_id.clone(), config);
+    }
+
+    if state.app.configs.read().await.get(&request.connection_id).is_none() {
+        return Err("Connection config not found".to_string());
+    }
+
+    state.app.get_or_create_pool(&request.connection_id, None).await?;
     Ok(())
 }
 
