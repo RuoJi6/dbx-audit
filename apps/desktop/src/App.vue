@@ -711,7 +711,7 @@ function changeActiveSchema(schema: string | undefined) {
   if (tab) queryStore.updateSchema(tab.id, schema);
 }
 function openGitHub() {
-  openUrl("https://github.com/t8y2/dbx");
+  openUrl("https://github.com/RuoJi6/dbx-audit");
 }
 function openMcpGuide() {
   openUrl("https://dbxio.com/cn/docs/mcp");

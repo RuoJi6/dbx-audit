@@ -255,6 +255,15 @@ pnpm tauri build
 
 安装包输出在 `src-tauri/target/release/bundle/` 目录。
 
+macOS 本地构建如果遇到“DBX Audit.app 已损坏，无法打开”，请使用：
+
+```bash
+pnpm tauri:build:mac
+```
+
+该命令会对本地构建的 `.app` 做 ad-hoc 签名，并清理 macOS 隔离属性。正式分发仍建议使用 Developer ID 证书签名并公证。
+它会跳过 updater artifact 签名；完整发布包仍使用 `pnpm tauri build` 并配置 `TAURI_SIGNING_PRIVATE_KEY`。
+
 ## 技术栈
 
 | 层级 | 技术 |

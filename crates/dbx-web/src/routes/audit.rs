@@ -40,6 +40,12 @@ pub struct ParseFscanRequest {
     pub text_or_file: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveTaskStoreRequest {
+    pub store: serde_json::Value,
+}
+
 fn now_rfc3339() -> String {
     Utc::now().to_rfc3339()
 }
@@ -172,6 +178,20 @@ pub async fn parse_fscan(Json(body): Json<ParseFscanRequest>) -> Result<Json<Par
         body.text_or_file
     };
     Ok(Json(parse_fscan_text(&input)))
+}
+
+pub async fn load_task_store(
+    State(state): State<Arc<WebState>>,
+) -> Result<Json<Option<serde_json::Value>>, AppError> {
+    Ok(Json(state.app.storage.load_audit_task_store().await.map_err(AppError)?))
+}
+
+pub async fn save_task_store(
+    State(state): State<Arc<WebState>>,
+    Json(body): Json<SaveTaskStoreRequest>,
+) -> Result<Json<bool>, AppError> {
+    state.app.storage.save_audit_task_store(&body.store).await.map_err(AppError)?;
+    Ok(Json(true))
 }
 
 async fn run_field_name_scan(state: Arc<WebState>, request: AuditScanRequest, job_id: &str) -> Result<(), String> {

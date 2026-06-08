@@ -290,6 +290,7 @@ async fn main() {
         .route("/audit/job/{jobId}", get(routes::audit::get_job))
         .route("/audit/export", post(routes::audit::export_report))
         .route("/audit/parse-fscan", post(routes::audit::parse_fscan))
+        .route("/audit/task-store", get(routes::audit::load_task_store).post(routes::audit::save_task_store))
         // Transfer
         .route("/transfer/start", post(routes::transfer::start_transfer))
         .route("/transfer/progress/{transferId}", get(routes::transfer::transfer_progress))

@@ -1622,6 +1622,18 @@ export async function auditExportReport(
   return post("/api/audit/export", { jobId, format, path });
 }
 
+export async function auditOpenOutputDirectory(_path: string): Promise<void> {
+  throw new Error("Web dev mode cannot open local folders directly.");
+}
+
 export async function auditParseFscan(textOrFile: string): Promise<import("./tauri").ParsedFscanTargets> {
   return post("/api/audit/parse-fscan", { textOrFile });
+}
+
+export async function auditLoadTaskStore(): Promise<unknown | null> {
+  return get("/api/audit/task-store");
+}
+
+export async function auditSaveTaskStore(store: unknown): Promise<void> {
+  await post("/api/audit/task-store", { store });
 }

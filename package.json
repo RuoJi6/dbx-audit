@@ -22,6 +22,8 @@
     "test": "vitest run",
     "preview": "vite preview --config apps/desktop/vite.config.ts",
     "tauri": "tauri",
+    "tauri:build:mac": "node scripts/build-macos-local.mjs",
+    "fix:macos-app": "node scripts/fix-macos-app.mjs",
     "prepare": "husky"
   },
   "dependencies": {

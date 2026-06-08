@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::Utc;
@@ -145,6 +146,37 @@ pub async fn audit_export_report(
 }
 
 #[tauri::command]
+pub async fn audit_open_output_directory(path: String) -> Result<(), String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err("请填写输出路径".to_string());
+    }
+
+    let directory = PathBuf::from(path);
+    if !directory.exists() {
+        return Err(format!("目录不存在：{}", directory.to_string_lossy()));
+    }
+    if !directory.is_dir() {
+        return Err(format!("不是有效目录：{}", directory.to_string_lossy()));
+    }
+
+    let status = if cfg!(target_os = "macos") {
+        Command::new("open").arg(&directory).status()
+    } else if cfg!(target_os = "windows") {
+        Command::new("explorer").arg(&directory).status()
+    } else {
+        Command::new("xdg-open").arg(&directory).status()
+    }
+    .map_err(|err| err.to_string())?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("打开目录失败：{}", directory.to_string_lossy()))
+    }
+}
+
+#[tauri::command]
 pub async fn audit_parse_fscan(text_or_file: String) -> Result<ParsedFscanTargets, String> {
     let input = if std::path::Path::new(&text_or_file).is_file() {
         std::fs::read_to_string(&text_or_file).map_err(|err| err.to_string())?
@@ -152,6 +184,19 @@ pub async fn audit_parse_fscan(text_or_file: String) -> Result<ParsedFscanTarget
         text_or_file
     };
     Ok(parse_fscan_text(&input))
+}
+
+#[tauri::command]
+pub async fn audit_load_task_store(state: State<'_, Arc<AppState>>) -> Result<Option<serde_json::Value>, String> {
+    state.storage.load_audit_task_store().await
+}
+
+#[tauri::command]
+pub async fn audit_save_task_store(
+    state: State<'_, Arc<AppState>>,
+    store: serde_json::Value,
+) -> Result<(), String> {
+    state.storage.save_audit_task_store(&store).await
 }
 
 async fn run_field_name_scan(

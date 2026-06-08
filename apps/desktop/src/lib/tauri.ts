@@ -194,6 +194,9 @@ export interface AuditTaskRequest {
 }
 
 export interface AuditFinding {
+  connectionId?: string;
+  connectionName?: string;
+  dbType?: string;
   database: string;
   schema?: string;
   table: string;
@@ -1975,6 +1978,18 @@ export async function auditExportReport(
   return invoke("audit_export_report", { jobId, format, path });
 }
 
+export async function auditOpenOutputDirectory(path: string): Promise<void> {
+  return invoke("audit_open_output_directory", { path });
+}
+
 export async function auditParseFscan(textOrFile: string): Promise<ParsedFscanTargets> {
   return invoke("audit_parse_fscan", { textOrFile });
+}
+
+export async function auditLoadTaskStore(): Promise<unknown | null> {
+  return invoke("audit_load_task_store");
+}
+
+export async function auditSaveTaskStore(store: unknown): Promise<void> {
+  return invoke("audit_save_task_store", { store });
 }

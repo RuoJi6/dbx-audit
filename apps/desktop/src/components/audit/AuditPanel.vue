@@ -25,7 +25,7 @@ import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import * as api from "@/lib/api";
 import { connectionIconType } from "@/lib/connectionPresentation";
-import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/safeStorage";
+import { safeLocalStorageGet, safeLocalStorageRemove } from "@/lib/safeStorage";
 import { isTauriRuntime } from "@/lib/tauriRuntime";
 import type { AuditFinding, AuditJobState, AuditLevelFilter, AuditMode, ParsedFscanTarget } from "@/lib/tauri";
 import type { ConnectionConfig } from "@/types/database";
@@ -79,6 +79,9 @@ type RiskTotals = {
 
 type TableHit = {
   key: string;
+  connectionId?: string;
+  connectionName?: string;
+  dbType?: string;
   database: string;
   schema?: string;
   table: string;
@@ -89,6 +92,9 @@ type TableHit = {
 
 type FieldHit = {
   key: string;
+  connectionId?: string;
+  connectionName?: string;
+  dbType?: string;
   database: string;
   schema?: string;
   table: string;
@@ -99,14 +105,26 @@ type FieldHit = {
   samples: string[];
 };
 
+type SampleGroup = {
+  key: string;
+  connectionId?: string;
+  connectionName?: string;
+  dbType?: string;
+  database: string;
+  table: string;
+  fields: FieldHit[];
+  rows: Record<string, string>[];
+};
+
 const props = defineProps<{
   connections: ConnectionConfig[];
 }>();
 
 const { locale } = useI18n();
 
-const TASK_STORE_KEY = "dbx-audit-tasks-v1";
-const LAST_DRAFT_KEY = "dbx-audit-task-draft-v1";
+const AUDIT_STORE_LOCATION = "dbx.db / app_settings.audit_task_store";
+const LEGACY_TASK_STORE_KEY = "dbx-audit-tasks-v1";
+const LEGACY_LAST_DRAFT_KEY = "dbx-audit-task-draft-v1";
 const pollTimers = new Map<string, ReturnType<typeof setInterval>>();
 const wizardSteps: WizardStep[] = [1, 2, 3, 4];
 const taskKinds: AuditTaskKind[] = ["single", "fscan", "sql"];
@@ -120,7 +138,7 @@ const zh = {
   newTaskName: "新建审计任务",
   dataManager: "数据管理",
   dataManagerTitle: "审计数据管理",
-  dataManagerHint: "任务、配置和扫描结果按 DBX 本地存储保存。可在这里导出或导入 JSON 备份。",
+  dataManagerHint: "任务、配置和扫描结果保存到 DBX 官方 dbx.db。可在这里导出或导入 JSON 备份。",
   storageKey: "存储 Key",
   backupData: "备份数据",
   exportBackup: "导出备份",
@@ -150,7 +168,7 @@ const zh = {
   exportedTasks: "已导出 {count} 个任务到 {path}",
   downloadedBackup: "已下载 {count} 个任务的 JSON 备份",
   importedTasks: "已导入 {count} 个任务",
-  clearedTasks: "已清空本地审计任务",
+  clearedTasks: "已清空 dbx.db 中的审计任务",
   exportFailed: "导出失败：{error}",
   importFailed: "导入失败：{error}",
   invalidBackup: "备份内容中没有 tasks 数组",
@@ -161,6 +179,8 @@ const zh = {
   limitRequired: "样例数量必须大于 0",
   runTaskFirst: "请先运行任务",
   jobNotFound: "未找到扫描任务：{id}",
+  copiedTaskInfo: "已复制任务信息",
+  copyFailed: "复制失败：{error}",
   backList: "返回任务列表",
   copy: "复制",
   config: "配置",
@@ -178,6 +198,7 @@ const zh = {
   params: "扫描参数",
   name: "任务名称",
   description: "任务描述",
+  statusLabel: "状态",
   single: "单目标扫描",
   fscan: "多目标加载",
   sql: "SQL 结果扫描",
@@ -208,6 +229,8 @@ const zh = {
   logs: "日志输出",
   sqlResult: "SQL 结果",
   table: "表",
+  databaseType: "数据库类型",
+  connectionSource: "连接来源",
   column: "字段 / Key",
   kind: "类型",
   risk: "风险",
@@ -219,6 +242,8 @@ const zh = {
   json: "JSON",
   xlsx: "XLSX",
   openFolder: "打开目录",
+  chooseOutput: "选择输出文件",
+  chooseOutputUnavailable: "Web 开发模式无法选择本地输出路径，请在桌面 App 中使用或手动填写路径。",
   exportReport: "报告导出",
   fieldSearch: "phone / id_card / token",
   contentSearch: "手机号 / 邮箱 / token 值",
@@ -265,6 +290,7 @@ const zh = {
   sqlPlaceholder: "SQL 结果扫描任务会在这里展示原始 SQL 和结果集敏感命中。",
   matchSearch: "高敏感 / 密码 / token / 邮箱",
   sampleCount: "{count} 条样例",
+  sampleSummary: "{groups} 个分组 / {rows} 条样例行",
   databaseName: "数据库名",
   tableName: "表名",
   sampleRows: "样例行",
@@ -314,7 +340,7 @@ const en = {
   newTaskName: "New audit task",
   dataManager: "Data Manager",
   dataManagerTitle: "Audit Data Manager",
-  dataManagerHint: "Tasks, configuration, and scan results are saved in DBX local storage. Export or import JSON backups here.",
+  dataManagerHint: "Tasks, configuration, and scan results are saved in DBX's official dbx.db. Export or import JSON backups here.",
   storageKey: "Storage key",
   backupData: "Backup data",
   exportBackup: "Export backup",
@@ -344,7 +370,7 @@ const en = {
   exportedTasks: "Exported {count} tasks to {path}",
   downloadedBackup: "Downloaded JSON backup for {count} tasks",
   importedTasks: "Imported {count} tasks",
-  clearedTasks: "Cleared local audit tasks",
+  clearedTasks: "Cleared audit tasks from dbx.db",
   exportFailed: "Export failed: {error}",
   importFailed: "Import failed: {error}",
   invalidBackup: "Backup content does not include a tasks array",
@@ -355,6 +381,8 @@ const en = {
   limitRequired: "Sample limit must be greater than 0",
   runTaskFirst: "Run the task first",
   jobNotFound: "Scan job not found: {id}",
+  copiedTaskInfo: "Task info copied",
+  copyFailed: "Copy failed: {error}",
   backList: "Back to tasks",
   copy: "Copy",
   config: "Configure",
@@ -372,6 +400,7 @@ const en = {
   params: "Scan parameters",
   name: "Task name",
   description: "Description",
+  statusLabel: "Status",
   single: "Single target",
   fscan: "Multi-target load",
   sql: "SQL result scan",
@@ -402,6 +431,8 @@ const en = {
   logs: "Logs",
   sqlResult: "SQL result",
   table: "Table",
+  databaseType: "Database type",
+  connectionSource: "Connection",
   column: "Column / Key",
   kind: "Kind",
   risk: "Risk",
@@ -411,6 +442,8 @@ const en = {
   noSamples: "No samples yet",
   noTargets: "No batch targets",
   exportReport: "Export report",
+  chooseOutput: "Choose output file",
+  chooseOutputUnavailable: "Web dev mode cannot choose local output paths. Use the desktop app or enter a path manually.",
   fieldSearch: "phone / id_card / token",
   contentSearch: "phone / email / token value",
   riskHighShort: "High",
@@ -452,6 +485,7 @@ const en = {
   sqlPlaceholder: "SQL result scan tasks show the original SQL and sensitive result-set hits here.",
   matchSearch: "high risk / password / token / email",
   sampleCount: "{count} samples",
+  sampleSummary: "{groups} groups / {rows} sample rows",
   databaseName: "Database",
   tableName: "Table",
   sampleRows: "Sample rows",
@@ -502,12 +536,14 @@ const matchQuery = ref("");
 const riskFilter = ref<"all" | "high" | "medium" | "low">("all");
 const selectedTaskId = ref("");
 const draft = ref<AuditTask>(newTask());
-const tasks = ref<AuditTask[]>(loadTasks());
+const tasks = ref<AuditTask[]>([]);
 const exportMessage = ref("");
 const error = ref("");
 const showDataManager = ref(false);
 const dataManagerMessage = ref("");
 const selectedFieldKey = ref("");
+const auditStoreLoaded = ref(false);
+let auditStoreSaveTimer: ReturnType<typeof setTimeout> | undefined;
 
 const selectedTask = computed(() => tasks.value.find((task) => task.id === selectedTaskId.value) || null);
 const selectedConnection = computed(() => props.connections.find((connection) => connection.id === draft.value.connectionId));
@@ -533,7 +569,7 @@ const stats = computed(() => ({
   failed: tasks.value.filter((task) => task.status === "failed").length,
 }));
 
-const detailFindings = computed(() => selectedTask.value?.job?.findings || []);
+const detailFindings = computed(() => (selectedTask.value ? findingsWithConnectionMeta(selectedTask.value) : []));
 const detailTotals = computed(() => riskTotals(detailFindings.value));
 const detailTables = computed(() => tableHits(detailFindings.value));
 const detailFields = computed(() => fieldHits(detailFindings.value));
@@ -550,13 +586,15 @@ const filteredTables = computed(() => {
   return detailTables.value.filter((item) => {
     if (riskFilter.value !== "all" && item.risk !== riskFilter.value) return false;
     if (!query) return true;
-    return [item.database, item.table, item.columns.join(" ")].join(" ").toLowerCase().includes(query);
+    return [item.dbType, item.connectionName, item.database, item.table, item.columns.join(" ")]
+      .join(" ")
+      .toLowerCase()
+      .includes(query);
   });
 });
 const filteredFields = computed(() => {
   return detailFields.value.filter((field) => riskFilter.value === "all" || field.level === riskFilter.value);
 });
-const selectedField = computed(() => detailFields.value.find((field) => field.key === selectedFieldKey.value) || null);
 const sampleGroups = computed(() => buildSampleGroups(detailFindings.value));
 const filteredSampleGroups = computed(() => {
   const valueQuery = sampleQuery.value.trim().toLowerCase();
@@ -567,6 +605,11 @@ const filteredSampleGroups = computed(() => {
   });
 });
 const filteredSampleRowCount = computed(() => filteredSampleGroups.value.reduce((total, group) => total + group.rows.length, 0));
+const filteredSampleSummary = computed(() =>
+  ui.value.sampleSummary
+    .replace("{groups}", String(filteredSampleGroups.value.length))
+    .replace("{rows}", String(filteredSampleRowCount.value)),
+);
 
 watch(
   () => props.connections,
@@ -583,13 +626,13 @@ watch(
 
 watch(
   tasks,
-  (next) => safeLocalStorageSet(TASK_STORE_KEY, JSON.stringify(next)),
+  () => scheduleAuditTaskStoreSave(),
   { deep: true },
 );
 
 watch(
   draft,
-  (next) => safeLocalStorageSet(LAST_DRAFT_KEY, JSON.stringify(next)),
+  () => scheduleAuditTaskStoreSave(),
   { deep: true },
 );
 
@@ -601,15 +644,78 @@ watch(
   { immediate: true },
 );
 
-function loadTasks(): AuditTask[] {
+type AuditTaskStore = {
+  app?: string;
+  version?: number;
+  tasks?: AuditTask[];
+  draft?: Partial<AuditTask>;
+};
+
+async function loadAuditTaskStore() {
   try {
-    const raw = safeLocalStorageGet(TASK_STORE_KEY);
-    const parsed = raw ? (JSON.parse(raw) as AuditTask[]) : [];
-    return parsed.map((task) => normalizeTask({ ...newTask(), ...task, targets: task.targets || [], errors: task.errors || [] }));
-  } catch {
-    return [];
+    const store = (await api.auditLoadTaskStore()) as AuditTaskStore | null;
+    let loadedTasks = Array.isArray(store?.tasks) ? store.tasks : [];
+    let loadedDraft = store?.draft;
+
+    if (loadedTasks.length === 0 && !loadedDraft) {
+      const legacy = loadLegacyAuditTaskStore();
+      loadedTasks = legacy.tasks;
+      loadedDraft = legacy.draft;
+      if (loadedTasks.length || loadedDraft) {
+        await saveAuditTaskStore(loadedTasks, loadedDraft);
+        safeLocalStorageRemove(LEGACY_TASK_STORE_KEY);
+        safeLocalStorageRemove(LEGACY_LAST_DRAFT_KEY);
+      }
+    }
+
+    tasks.value = normalizeTasks(loadedTasks);
+    if (loadedDraft) draft.value = newTask(loadedDraft);
+  } catch (err) {
+    error.value = String(err);
+  } finally {
+    auditStoreLoaded.value = true;
   }
-} 
+}
+
+function loadLegacyAuditTaskStore(): { tasks: AuditTask[]; draft?: Partial<AuditTask> } {
+  try {
+    const rawTasks = safeLocalStorageGet(LEGACY_TASK_STORE_KEY);
+    const rawDraft = safeLocalStorageGet(LEGACY_LAST_DRAFT_KEY);
+    return {
+      tasks: rawTasks ? (JSON.parse(rawTasks) as AuditTask[]) : [],
+      draft: rawDraft ? (JSON.parse(rawDraft) as Partial<AuditTask>) : undefined,
+    };
+  } catch {
+    return { tasks: [] };
+  }
+}
+
+function normalizeTasks(value: AuditTask[]) {
+  return value.map((task) => normalizeTask({ ...newTask(), ...task, targets: task.targets || [], errors: task.errors || [] }));
+}
+
+function scheduleAuditTaskStoreSave() {
+  if (!auditStoreLoaded.value) return;
+  if (auditStoreSaveTimer) clearTimeout(auditStoreSaveTimer);
+  auditStoreSaveTimer = setTimeout(() => {
+    void saveAuditTaskStore(tasks.value, draft.value);
+  }, 250);
+}
+
+async function saveAuditTaskStore(nextTasks: AuditTask[], nextDraft?: Partial<AuditTask>) {
+  try {
+    await api.auditSaveTaskStore({
+      app: "dbx-audit",
+      version: 1,
+      storage: AUDIT_STORE_LOCATION,
+      updatedAt: new Date().toISOString(),
+      tasks: nextTasks,
+      draft: nextDraft,
+    });
+  } catch (err) {
+    error.value = String(err);
+  }
+}
 
 function newTask(seed?: Partial<AuditTask>): AuditTask {
   const now = new Date().toISOString();
@@ -660,6 +766,8 @@ function normalizeTask(task: AuditTask) {
   };
 }
 
+void loadAuditTaskStore();
+
 function persistTask(task: AuditTask) {
   const next = { ...task, updatedAt: new Date().toISOString() };
   const index = tasks.value.findIndex((item) => item.id === task.id);
@@ -672,12 +780,7 @@ function persistTask(task: AuditTask) {
 function createTask() {
   error.value = "";
   wizardStep.value = 1;
-  const saved = safeLocalStorageGet(LAST_DRAFT_KEY);
-  try {
-    draft.value = newTask(saved ? JSON.parse(saved) : undefined);
-  } catch {
-    draft.value = newTask();
-  }
+  draft.value = newTask(draft.value);
   draft.value.id = `audit-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   draft.value.status = "draft";
   draft.value.progress = 0;
@@ -692,21 +795,6 @@ function configureTask(task: AuditTask) {
   draft.value = newTask(task);
   wizardStep.value = 1;
   view.value = "wizard";
-}
-
-function duplicateTask(task: AuditTask) {
-  const copy = newTask({
-    ...task,
-    id: undefined,
-    name: `${task.name} copy`,
-    status: "draft",
-    progress: 0,
-    message: ui.value.notStarted,
-    job: undefined,
-    jobId: undefined,
-    errors: [],
-  });
-  persistTask(copy);
 }
 
 function saveDraft() {
@@ -741,7 +829,7 @@ function buildBackupJson() {
       app: "dbx-audit",
       version: 1,
       exportedAt: new Date().toISOString(),
-      storageKey: TASK_STORE_KEY,
+      storageKey: AUDIT_STORE_LOCATION,
       tasks: tasks.value,
     },
     null,
@@ -1029,7 +1117,14 @@ async function startConnectionBatchTask(task: AuditTask, connectionIds: string[]
         connectionId,
       });
       const job = await waitForAuditJob(jobId, task.id, label, index, connectionIds.length);
-      aggregate.findings.push(...(job.findings || []));
+      aggregate.findings.push(
+        ...(job.findings || []).map((finding) => ({
+          ...finding,
+          connectionId,
+          connectionName: label,
+          dbType: connection?.db_type,
+        })),
+      );
       aggregate.logs.push(...(job.logs || []).map((entry) => ({ ...entry, message: `${label}: ${entry.message}` })));
       aggregate.errors.push(...(job.errors || []).map((entry) => `${label}: ${entry}`));
     } catch (err) {
@@ -1125,6 +1220,28 @@ async function exportReport(task: AuditTask, format: "json" | "xlsx") {
   }
 }
 
+async function chooseOutputPath() {
+  error.value = "";
+  if (!isTauriRuntime()) {
+    error.value = ui.value.chooseOutputUnavailable;
+    return;
+  }
+  try {
+    const { save } = await import("@tauri-apps/plugin-dialog");
+    const path = await save({
+      defaultPath: draft.value.outputPath.trim() || "/tmp/dbx-audit-report.xlsx",
+      filters: [
+        { name: "Audit report", extensions: ["xlsx", "json"] },
+        { name: "Excel", extensions: ["xlsx"] },
+        { name: "JSON", extensions: ["json"] },
+      ],
+    });
+    if (path) draft.value.outputPath = path;
+  } catch (err) {
+    error.value = String(err);
+  }
+}
+
 async function openOutputDirectory(task: AuditTask) {
   const directory = outputDirectory(task.outputPath || "/tmp/dbx-audit-report.xlsx");
   exportMessage.value = "";
@@ -1134,8 +1251,7 @@ async function openOutputDirectory(task: AuditTask) {
     return;
   }
   try {
-    const { open } = await import("@tauri-apps/plugin-shell");
-    await open(directory);
+    await api.auditOpenOutputDirectory(directory);
     exportMessage.value = ui.value.openedFolder.replace("{path}", directory);
   } catch (err) {
     error.value = String(err);
@@ -1189,7 +1305,9 @@ function taskConnectionIcon(task: AuditTask) {
 function connectionLabel(task: AuditTask) {
   const connectionIds = activeConnectionIds(task);
   if (task.kind === "fscan" && connectionIds.length > 1) {
-    return ui.value.dbxConnectionCount.replace("{count}", String(connectionIds.length));
+    const types = connectionTypesLabel(task);
+    const count = ui.value.dbxConnectionCount.replace("{count}", String(connectionIds.length));
+    return types ? `${count} · ${types}` : count;
   }
   const connection = connectionFor(task);
   if (!connection) return ui.value.noConnection;
@@ -1198,14 +1316,21 @@ function connectionLabel(task: AuditTask) {
 
 function targetSummary(task: AuditTask) {
   if (task.kind === "fscan") {
-    const dbxTargets = activeConnectionIds(task).length;
     const parsedTargets = task.targets.length || splitList(task.fscanText).length;
-    return `${ui.value.targetMultiPrefix} · ${ui.value.dbxConnectionCount.replace("{count}", String(dbxTargets))}${
+    return `${ui.value.targetMultiPrefix} · ${connectionLabel(task)}${
       parsedTargets ? ` · ${ui.value.importedTargetCount.replace("{count}", String(parsedTargets))}` : ""
     }`;
   }
   if (task.kind === "sql") return `${ui.value.targetSqlPrefix} · ${connectionLabel(task)}`;
   return `${ui.value.targetSinglePrefix} · ${connectionLabel(task)}`;
+}
+
+function connectionTypesLabel(task: Pick<AuditTask, "kind" | "connectionId" | "connectionIds">) {
+  const types = activeConnectionIds(task)
+    .map((connectionId) => props.connections.find((connection) => connection.id === connectionId)?.db_type)
+    .filter(Boolean)
+    .map(String);
+  return Array.from(new Set(types)).join(" / ");
 }
 
 function localizedTaskMessage(task: AuditTask) {
@@ -1238,14 +1363,27 @@ function taskTotals(task: AuditTask) {
   return riskTotals(task.job?.findings || []);
 }
 
+function findingsWithConnectionMeta(task: AuditTask): AuditFinding[] {
+  const fallbackConnection = connectionFor(task);
+  return (task.job?.findings || []).map((finding) => ({
+    ...finding,
+    connectionId: finding.connectionId || fallbackConnection?.id,
+    connectionName: finding.connectionName || fallbackConnection?.name,
+    dbType: finding.dbType || fallbackConnection?.db_type,
+  }));
+}
+
 function tableHits(findings: AuditFinding[]): TableHit[] {
   const byTable = new Map<string, TableHit>();
   for (const finding of findings) {
-    const key = `${finding.database}/${finding.schema || ""}/${finding.table}`;
+    const key = `${finding.connectionId || finding.dbType || ""}/${finding.database}/${finding.schema || ""}/${finding.table}`;
     const existing =
       byTable.get(key) ||
       ({
         key,
+        connectionId: finding.connectionId,
+        connectionName: finding.connectionName,
+        dbType: finding.dbType,
         database: finding.database,
         schema: finding.schema,
         table: finding.table,
@@ -1263,7 +1401,10 @@ function tableHits(findings: AuditFinding[]): TableHit[] {
 
 function fieldHits(findings: AuditFinding[]): FieldHit[] {
   return findings.map((finding, index) => ({
-    key: `${finding.database}/${finding.table}/${finding.column}/${index}`,
+    key: `${finding.connectionId || finding.dbType || ""}/${finding.database}/${finding.table}/${finding.column}/${index}`,
+    connectionId: finding.connectionId,
+    connectionName: finding.connectionName,
+    dbType: finding.dbType,
     database: finding.database,
     schema: finding.schema,
     table: finding.table,
@@ -1272,29 +1413,36 @@ function fieldHits(findings: AuditFinding[]): FieldHit[] {
     level: finding.level as "high" | "medium" | "low",
     count: Number(finding.count || finding.samples?.length || 1),
     samples: (finding.samples || []).map((sample) => sample.value),
-  }));
+}));
 }
 
 function buildSampleGroups(findings: AuditFinding[]) {
-  const groups = new Map<string, { key: string; database: string; table: string; fields: FieldHit[]; rows: Record<string, string>[] }>();
+  const groups = new Map<string, SampleGroup>();
   for (const field of fieldHits(findings)) {
-    const key = `${field.database}/${field.table}`;
+    const key = `${field.connectionId || field.dbType || ""}/${field.database}/${field.table}`;
     const group =
       groups.get(key) ||
       ({
         key,
+        connectionId: field.connectionId,
+        connectionName: field.connectionName,
+        dbType: field.dbType,
         database: field.database,
         table: field.table,
         fields: [],
         rows: [],
-      } satisfies { key: string; database: string; table: string; fields: FieldHit[]; rows: Record<string, string>[] });
+      } satisfies SampleGroup);
     group.fields.push(field);
     field.samples.forEach((value, index) => {
-      group.rows[index] = { ...(group.rows[index] || {}), [field.column]: value };
+      group.rows[index] = { ...group.rows[index], [field.column]: value };
     });
     groups.set(key, group);
   }
   return Array.from(groups.values());
+}
+
+function databaseScopeText(item: Pick<TableHit | FieldHit | SampleGroup, "connectionName" | "dbType">) {
+  return [item.dbType, item.connectionName].filter(Boolean).join(" · ");
 }
 
 function highestRisk(a: "high" | "medium" | "low", b: "high" | "medium" | "low") {
@@ -1320,9 +1468,43 @@ function kindName(kind: string) {
   return labels[kind] || kind;
 }
 
-function copyTask(task: AuditTask) {
-  const text = `${connectionLabel(task)} ${task.database || ""} ${task.tables || ""}`.trim();
-  void navigator.clipboard?.writeText(text);
+async function copyTask(task: AuditTask) {
+  const totals = taskTotals(task);
+  const text = [
+    `${ui.value.name}: ${task.name}`,
+    `${ui.value.statusLabel}: ${ui.value.status[task.status]}`,
+    `${ui.value.connection}: ${connectionLabel(task)}`,
+    `${ui.value.mode}: ${ui.value.modeLabel[task.mode]}`,
+    task.database ? `${ui.value.database}: ${task.database}` : "",
+    task.tables ? `${ui.value.tables}: ${task.tables}` : "",
+    `${ui.value.riskHigh}: ${totals.high}`,
+    `${ui.value.riskMedium}: ${totals.medium}`,
+    `${ui.value.riskLow}: ${totals.low}`,
+    `${ui.value.currentProgress}: ${task.progress}%`,
+    task.outputPath ? `${ui.value.output}: ${task.outputPath}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+  try {
+    await writeClipboardText(text);
+    dataManagerMessage.value = ui.value.copiedTaskInfo;
+    exportMessage.value = ui.value.copiedTaskInfo;
+    error.value = "";
+  } catch (err) {
+    error.value = ui.value.copyFailed.replace("{error}", String(err));
+  }
+}
+
+async function writeClipboardText(text: string) {
+  if (isTauriRuntime()) {
+    const { writeText } = await import("@tauri-apps/plugin-clipboard-manager");
+    await writeText(text);
+    return;
+  }
+  if (!navigator.clipboard?.writeText) {
+    throw new Error("Clipboard API is unavailable");
+  }
+  await navigator.clipboard.writeText(text);
 }
 
 function formatTime(value?: string) {
@@ -1332,6 +1514,10 @@ function formatTime(value?: string) {
 
 onUnmounted(() => {
   for (const taskId of pollTimers.keys()) stopPolling(taskId);
+  if (auditStoreSaveTimer) {
+    clearTimeout(auditStoreSaveTimer);
+    if (auditStoreLoaded.value) void saveAuditTaskStore(tasks.value, draft.value);
+  }
 });
 </script>
 
@@ -1386,7 +1572,7 @@ onUnmounted(() => {
         <div class="mt-4 grid gap-4 lg:grid-cols-[260px_minmax(0,1fr)]">
           <div class="rounded-md border bg-muted/20 p-3 text-xs">
             <div class="text-muted-foreground">{{ ui.storageKey }}</div>
-            <div class="mt-1 font-mono">{{ TASK_STORE_KEY }}</div>
+            <div class="mt-1 font-mono">{{ AUDIT_STORE_LOCATION }}</div>
             <div class="mt-3 text-muted-foreground">{{ ui.allTasks }}</div>
             <div class="mt-1 text-2xl font-semibold">{{ tasks.length }}</div>
           </div>
@@ -1427,6 +1613,7 @@ onUnmounted(() => {
           <div class="mt-2 text-3xl font-semibold">{{ stats.failed }}</div>
         </div>
       </div>
+      <p v-if="dataManagerMessage && !showDataManager" class="mb-3 text-xs text-muted-foreground">{{ dataManagerMessage }}</p>
 
       <div class="rounded-md border bg-background">
         <div class="flex flex-wrap items-center justify-between gap-3 border-b px-4 py-3">
@@ -1464,7 +1651,7 @@ onUnmounted(() => {
             </div>
           </div>
           <div class="flex flex-wrap items-center gap-2">
-            <Button variant="outline" size="sm" @click="duplicateTask(task)">{{ ui.copy }}</Button>
+            <Button variant="outline" size="sm" @click="copyTask(task)">{{ ui.copy }}</Button>
             <Button variant="outline" size="sm" @click="configureTask(task)">{{ ui.config }}</Button>
             <Button variant="outline" size="sm" @click="viewTask(task)">{{ ui.detail }}</Button>
             <Button v-if="task.status !== 'running'" size="sm" @click="startTask(task)">{{ ui.start }}</Button>
@@ -1649,7 +1836,19 @@ onUnmounted(() => {
             </label>
             <label class="space-y-1 text-xs font-medium md:col-span-3">
               {{ ui.output }}
-              <Input v-model="draft.outputPath" class="h-9" />
+              <div class="flex gap-2">
+                <Input v-model="draft.outputPath" class="h-9 min-w-0" />
+                <Button
+                  type="button"
+                  variant="outline"
+                  class="h-9 w-9 shrink-0 p-0"
+                  :title="ui.chooseOutput"
+                  :aria-label="ui.chooseOutput"
+                  @click="chooseOutputPath"
+                >
+                  <FolderOpen class="h-4 w-4" />
+                </Button>
+              </div>
             </label>
             <label class="flex items-center gap-2 text-xs"><input v-model="draft.mask" type="checkbox" />{{ ui.mask }}</label>
             <label class="flex items-center gap-2 text-xs"><input v-model="draft.includeSystem" type="checkbox" />{{ ui.includeSystem }}</label>
@@ -1753,17 +1952,23 @@ onUnmounted(() => {
           </div>
           <table class="w-full text-xs">
             <thead class="bg-muted/60 text-muted-foreground">
-              <tr><th class="px-3 py-2 text-left">{{ ui.database }}</th><th class="px-3 py-2 text-left">{{ ui.table }}</th><th class="px-3 py-2 text-left">{{ ui.sensitiveFields }}</th><th class="px-3 py-2 text-left">{{ ui.rows }}</th><th class="px-3 py-2 text-left">{{ ui.risk }}</th></tr>
+              <tr><th class="px-3 py-2 text-left">{{ ui.connectionSource }}</th><th class="px-3 py-2 text-left">{{ ui.database }}</th><th class="px-3 py-2 text-left">{{ ui.table }}</th><th class="px-3 py-2 text-left">{{ ui.sensitiveFields }}</th><th class="px-3 py-2 text-left">{{ ui.rows }}</th><th class="px-3 py-2 text-left">{{ ui.risk }}</th></tr>
             </thead>
             <tbody>
               <tr v-for="hit in filteredTables" :key="hit.key" class="border-t">
+                <td class="px-3 py-2">
+                  <span class="flex items-center gap-1.5">
+                    <DatabaseIcon :db-type="hit.dbType || ''" class="h-3.5 w-3.5 shrink-0" />
+                    <span class="truncate">{{ databaseScopeText(hit) || "-" }}</span>
+                  </span>
+                </td>
                 <td class="px-3 py-2 font-mono">{{ hit.database }}</td>
                 <td class="px-3 py-2 font-mono">{{ hit.table }}</td>
                 <td class="px-3 py-2">{{ hit.columns.join(", ") }}</td>
                 <td class="px-3 py-2">{{ hit.rowCount }}</td>
                 <td class="px-3 py-2"><span class="rounded-full border px-2 py-0.5" :class="riskClass(hit.risk)">{{ hit.risk }}</span></td>
               </tr>
-              <tr v-if="filteredTables.length === 0"><td class="px-3 py-8 text-center text-muted-foreground" colspan="5">{{ ui.noFindings }}</td></tr>
+              <tr v-if="filteredTables.length === 0"><td class="px-3 py-8 text-center text-muted-foreground" colspan="6">{{ ui.noFindings }}</td></tr>
             </tbody>
           </table>
         </div>
@@ -1781,70 +1986,62 @@ onUnmounted(() => {
             </Select>
             <span class="text-xs text-muted-foreground">{{ ui.fieldCount.replace('{count}', String(filteredFields.length)) }}</span>
           </div>
-          <div v-if="selectedField" class="mb-4 rounded-md border bg-background p-4 shadow-sm">
-            <div class="flex items-start justify-between gap-3">
-              <div>
-                <div class="text-xs text-muted-foreground">{{ ui.fieldDetail }}</div>
-                <div class="mt-1 font-mono text-xl font-semibold">{{ selectedField.column }}</div>
-              </div>
-              <Button variant="outline" size="sm" @click="selectedFieldKey = ''">{{ ui.close }}</Button>
-            </div>
-            <div class="mt-4 grid gap-3 md:grid-cols-3">
-              <div class="rounded-md border p-3">
-                <div class="text-xs text-muted-foreground">{{ ui.database }}</div>
-                <div class="mt-1 truncate font-mono text-sm">{{ selectedField.database }}</div>
-              </div>
-              <div class="rounded-md border p-3">
-                <div class="text-xs text-muted-foreground">{{ ui.table }}</div>
-                <div class="mt-1 truncate font-mono text-sm">{{ selectedField.table }}</div>
-              </div>
-              <div class="rounded-md border p-3">
-                <div class="text-xs text-muted-foreground">{{ ui.risk }}</div>
-                <div class="mt-1">
-                  <span class="rounded-full border px-2 py-0.5 text-xs" :class="riskClass(selectedField.level)">
-                    {{ ui.levelLabel[selectedField.level] }}
-                  </span>
-                </div>
-              </div>
-              <div class="rounded-md border p-3">
-                <div class="text-xs text-muted-foreground">{{ ui.kind }}</div>
-                <div class="mt-1 text-sm">{{ kindName(selectedField.kind) }}</div>
-              </div>
-              <div class="rounded-md border p-3">
-                <div class="text-xs text-muted-foreground">{{ ui.mode }}</div>
-                <div class="mt-1 text-sm">{{ selectedTask ? ui.modeLabel[selectedTask.mode] : "-" }}</div>
-              </div>
-              <div class="rounded-md border p-3">
-                <div class="text-xs text-muted-foreground">{{ ui.rows }}</div>
-                <div class="mt-1 text-sm font-semibold">{{ selectedField.count }}</div>
-              </div>
-            </div>
-            <div class="mt-4">
-              <div class="text-xs text-muted-foreground">{{ ui.sampleValues }}</div>
-              <div v-if="selectedField.samples.length" class="mt-2 max-h-28 overflow-auto rounded-md border bg-muted/20 p-3 font-mono text-xs">
-                <div v-for="sample in selectedField.samples" :key="sample">{{ sample }}</div>
-              </div>
-              <div v-else class="mt-2 rounded-md border bg-muted/20 p-3 text-xs text-muted-foreground">
-                {{ ui.noFieldSamplesHint }}
-              </div>
-            </div>
-          </div>
           <div class="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-            <button
+            <div
               v-for="field in filteredFields"
               :key="field.key"
-              class="rounded-md border p-4 text-left transition hover:border-primary"
+              class="relative rounded-md border p-4 text-left transition hover:border-primary"
               :class="[riskClass(field.level), selectedFieldKey === field.key ? 'ring-2 ring-primary' : '']"
+              role="button"
+              tabindex="0"
               @click="selectField(field)"
+              @keydown.enter="selectField(field)"
             >
               <div class="font-mono text-base font-semibold">{{ field.column }}</div>
+              <div class="mt-2 flex items-center gap-1.5 text-xs">
+                <DatabaseIcon :db-type="field.dbType || ''" class="h-3.5 w-3.5 shrink-0" />
+                <span>{{ databaseScopeText(field) || "-" }}</span>
+              </div>
               <div class="mt-2 text-xs">{{ field.database }} / {{ field.table }}</div>
               <div class="mt-2 text-xs">{{ kindName(field.kind) }} · {{ ui.levelLabel[field.level] }}</div>
               <div class="mt-2 text-xs font-semibold">{{ ui.rowHits.replace('{count}', String(field.count)) }}</div>
               <div v-if="field.samples.length" class="mt-3 max-h-20 overflow-auto rounded bg-background/70 p-2 font-mono text-xs">
                 <div v-for="sample in field.samples" :key="sample">{{ sample }}</div>
               </div>
-            </button>
+              <div
+                v-if="selectedFieldKey === field.key"
+                class="absolute left-0 top-full z-30 mt-2 w-80 rounded-md border bg-background p-4 text-foreground shadow-xl md:left-full md:top-0 md:ml-3 md:mt-0"
+                @click.stop
+              >
+                <div class="flex items-start justify-between gap-3">
+                  <div>
+                    <div class="text-xs text-muted-foreground">{{ ui.fieldDetail }}</div>
+                    <div class="mt-1 break-all font-mono text-base font-semibold">{{ field.column }}</div>
+                  </div>
+                  <Button variant="outline" size="sm" @click.stop="selectedFieldKey = ''">{{ ui.close }}</Button>
+                </div>
+                <div class="mt-3 space-y-2 text-xs">
+                  <div class="flex items-center gap-1.5">
+                    <DatabaseIcon :db-type="field.dbType || ''" class="h-3.5 w-3.5 shrink-0" />
+                    <span>{{ databaseScopeText(field) || "-" }}</span>
+                  </div>
+                  <div><span class="text-muted-foreground">{{ ui.database }}：</span><span class="font-mono">{{ field.database }}</span></div>
+                  <div><span class="text-muted-foreground">{{ ui.table }}：</span><span class="font-mono">{{ field.table }}</span></div>
+                  <div><span class="text-muted-foreground">{{ ui.kind }}：</span>{{ kindName(field.kind) }}</div>
+                  <div><span class="text-muted-foreground">{{ ui.risk }}：</span><span class="rounded-full border px-2 py-0.5" :class="riskClass(field.level)">{{ ui.levelLabel[field.level] }}</span></div>
+                  <div><span class="text-muted-foreground">{{ ui.rows }}：</span><b>{{ field.count }}</b></div>
+                </div>
+                <div class="mt-3">
+                  <div class="text-xs text-muted-foreground">{{ ui.sampleValues }}</div>
+                  <div v-if="field.samples.length" class="mt-2 max-h-32 overflow-auto rounded-md border bg-muted/20 p-3 font-mono text-xs">
+                    <div v-for="sample in field.samples" :key="sample">{{ sample }}</div>
+                  </div>
+                  <div v-else class="mt-2 rounded-md border bg-muted/20 p-3 text-xs text-muted-foreground">
+                    {{ ui.noFieldSamplesHint }}
+                  </div>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -1871,15 +2068,19 @@ onUnmounted(() => {
           <div class="grid gap-3 md:grid-cols-[1fr_1fr_160px]">
             <Input v-model="sampleQuery" class="h-9" :placeholder="ui.contentSearch" />
             <Input v-model="matchQuery" class="h-9" :placeholder="ui.matchSearch" />
-            <div class="text-xs text-muted-foreground">{{ ui.sampleCount.replace('{count}', String(filteredSampleRowCount)) }}</div>
+            <div class="text-xs text-muted-foreground">{{ filteredSampleSummary }}</div>
           </div>
           <div v-for="group in filteredSampleGroups" :key="group.key" class="overflow-hidden rounded-md border">
-            <div class="bg-blue-50 px-3 py-2 text-xs dark:bg-blue-950/20">
-              <span class="text-muted-foreground">{{ ui.databaseName }}</span> <b>{{ group.database }}</b>
-              <span class="ml-4 text-muted-foreground">{{ ui.tableName }}</span> <b>{{ group.table }}</b>
-              <span class="ml-4 text-muted-foreground">{{ ui.fieldEvidence }}</span> <b>{{ group.fields.length }}</b>
-              <span v-if="group.rows.length" class="ml-4 text-muted-foreground">{{ ui.sampleRows }}</span>
-              <b v-if="group.rows.length">{{ group.rows.length }}</b>
+            <div class="flex flex-wrap items-center gap-x-4 gap-y-1 bg-blue-50 px-3 py-2 text-xs dark:bg-blue-950/20">
+              <span class="inline-flex items-center gap-1.5">
+                <DatabaseIcon :db-type="group.dbType || ''" class="h-3.5 w-3.5 shrink-0" />
+                <span class="text-muted-foreground">{{ ui.connectionSource }}</span>
+                <b>{{ databaseScopeText(group) || "-" }}</b>
+              </span>
+              <span><span class="text-muted-foreground">{{ ui.databaseName }}</span> <b>{{ group.database }}</b></span>
+              <span><span class="text-muted-foreground">{{ ui.tableName }}</span> <b>{{ group.table }}</b></span>
+              <span><span class="text-muted-foreground">{{ ui.fieldEvidence }}</span> <b>{{ group.fields.length }}</b></span>
+              <span v-if="group.rows.length"><span class="text-muted-foreground">{{ ui.sampleRows }}</span> <b>{{ group.rows.length }}</b></span>
             </div>
             <div v-if="group.rows.length" class="max-w-full overflow-x-auto border-t">
               <table class="min-w-max table-fixed text-xs">

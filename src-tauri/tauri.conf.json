@@ -52,7 +52,8 @@
       }
     ],
     "macOS": {
-      "entitlements": "Entitlements.plist"
+      "entitlements": "Entitlements.plist",
+      "signingIdentity": "-"
     },
     "windows": {
       "nsis": {

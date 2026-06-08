@@ -255,6 +255,15 @@ pnpm tauri build
 
 The installer will be in `src-tauri/target/release/bundle/`.
 
+For local macOS builds, if macOS says "DBX Audit.app is damaged and can't be opened", use:
+
+```bash
+pnpm tauri:build:mac
+```
+
+This command ad-hoc signs the local `.app` bundle and clears macOS quarantine attributes. Public distribution should still use Developer ID signing and notarization.
+It skips updater artifact signing; full release builds should still use `pnpm tauri build` with `TAURI_SIGNING_PRIVATE_KEY` configured.
+
 ## Tech Stack
 
 | Layer     | Technology                                                                                                                                                                                                       |

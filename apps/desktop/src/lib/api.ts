@@ -188,7 +188,10 @@ export const auditStartScan = forward("auditStartScan");
 export const auditCancelScan = forward("auditCancelScan");
 export const auditGetJob = forward("auditGetJob");
 export const auditExportReport = forward("auditExportReport");
+export const auditOpenOutputDirectory = forward("auditOpenOutputDirectory");
 export const auditParseFscan = forward("auditParseFscan");
+export const auditLoadTaskStore = forward("auditLoadTaskStore");
+export const auditSaveTaskStore = forward("auditSaveTaskStore");
 
 // System
 export const listSystemFonts = forward("listSystemFonts");
