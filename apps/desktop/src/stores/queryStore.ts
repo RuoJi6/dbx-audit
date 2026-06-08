@@ -382,6 +382,29 @@ export const useQueryStore = defineStore("query", () => {
     return id;
   }
 
+  function openAuditTab(connectionId?: string) {
+    const connStore = useConnectionStore();
+    const resolvedConnectionId = connectionId || connStore.activeConnectionId || connStore.connections[0]?.id || "";
+    const conn = resolvedConnectionId ? connStore.getConfig(resolvedConnectionId) : undefined;
+    const titleBase = t("audit.title");
+    const existingCount = tabs.value.filter((tab) => tab.mode === "audit").length;
+    const id = uuid();
+    const tab: QueryTab = {
+      id,
+      title: existingCount === 0 ? titleBase : `${titleBase} ${existingCount + 1}`,
+      connectionId: resolvedConnectionId,
+      database: conn?.database || "",
+      sql: "",
+      isExecuting: false,
+      isCancelling: false,
+      isExplaining: false,
+      mode: "audit",
+    };
+    tabs.value.push(tab);
+    activeTabId.value = id;
+    return id;
+  }
+
   function openTableStructure(connectionId: string, database: string, schema?: string, tableName?: string) {
     const resolvedTableName = tableName || "";
     if (resolvedTableName) {
@@ -1744,6 +1767,7 @@ export const useQueryStore = defineStore("query", () => {
     renameTab,
     openObjectBrowser,
     openUserAdmin,
+    openAuditTab,
     openTableStructure,
     linkSavedSql,
     openSavedSql,

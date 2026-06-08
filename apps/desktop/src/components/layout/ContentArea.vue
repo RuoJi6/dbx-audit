@@ -51,9 +51,11 @@ const MongoDocBrowser = defineAsyncComponent(() => import("@/components/mongo/Mo
 const ObjectBrowser = defineAsyncComponent(() => import("@/components/objects/ObjectBrowser.vue"));
 const TableStructureEditor = defineAsyncComponent(() => import("@/components/structure/TableStructureEditor.vue"));
 const DatabaseUserAdmin = defineAsyncComponent(() => import("@/components/admin/DatabaseUserAdmin.vue"));
+const AuditPanel = defineAsyncComponent(() => import("@/components/audit/AuditPanel.vue"));
 const ExplainPlanViewer = defineAsyncComponent(() => import("@/components/explain/ExplainPlanViewer.vue"));
 const QueryChart = defineAsyncComponent(() => import("@/components/chart/QueryChart.vue"));
 import { useQueryStore } from "@/stores/queryStore";
+import { useConnectionStore } from "@/stores/connectionStore";
 import { canCancelQueryExecution, queryExecutionLabelKey } from "@/lib/queryExecutionState";
 import { databaseDisplayNameForTab, executionSummaryItems, tabularResultItems } from "@/lib/tabPresentation";
 import { isTableDataEditable } from "@/lib/tableEditing";
@@ -121,6 +123,7 @@ const emit = defineEmits<{
 
 const { t } = useI18n();
 const queryStore = useQueryStore();
+const connectionStore = useConnectionStore();
 
 onMounted(() => {
   const preload = () => preloadDataGridComponent();
@@ -396,7 +399,11 @@ defineExpose({ focusSearch, refreshData, handleModRTarget });
 <template>
   <div class="flex flex-col flex-1 min-h-0">
     <!-- Query mode: editor + results -->
-    <template v-if="activeTab.mode === 'query'">
+    <template v-if="activeTab.mode === 'audit'">
+      <AuditPanel :key="activeTab.id" class="flex-1 min-h-0" :connections="connectionStore.connections" />
+    </template>
+
+    <template v-else-if="activeTab.mode === 'query'">
       <Splitpanes horizontal class="flex-1">
         <Pane :size="resultsPaneOpen ? 40 : 100" :min-size="resultsPaneOpen ? 15 : 100">
           <div class="h-full flex flex-col relative">

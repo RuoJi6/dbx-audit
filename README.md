@@ -1,4 +1,6 @@
 <div align="center">
+  <h1>DBX Audit</h1>
+  <p><strong>A DBX fork focused on database sensitive field auditing.</strong></p>
   <p style="font-size: 18px; white-space: nowrap;"><strong>40+ databases in 15 MB. Desktop & Docker self-hosting, with built-in AI assistant.</strong></p>
 
   <p>
@@ -252,6 +254,15 @@ pnpm tauri build
 ```
 
 The installer will be in `src-tauri/target/release/bundle/`.
+
+For local macOS builds, if macOS says "DBX Audit.app is damaged and can't be opened", use:
+
+```bash
+pnpm tauri:build:mac
+```
+
+This command ad-hoc signs the local `.app` bundle and clears macOS quarantine attributes. Public distribution should still use Developer ID signing and notarization.
+It skips updater artifact signing; full release builds should still use `pnpm tauri build` with `TAURI_SIGNING_PRIVATE_KEY` configured.
 
 ## Tech Stack
 

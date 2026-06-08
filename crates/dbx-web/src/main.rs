@@ -78,6 +78,7 @@ async fn main() {
         sql_file_executions: RwLock::new(HashMap::new()),
         login_rate_limit: tokio::sync::Mutex::new(state::LoginRateLimit { fail_count: 0, locked_until: None }),
         export_files: RwLock::new(HashMap::new()),
+        audit_jobs: RwLock::new(HashMap::new()),
     });
 
     // CORS
@@ -283,6 +284,13 @@ async fn main() {
         .route("/ai/cancel-stream", post(routes::ai::ai_cancel_stream))
         .route("/ai/test-connection", post(routes::ai::ai_test_connection))
         .route("/ai/models", post(routes::ai::ai_list_models))
+        // Audit
+        .route("/audit/start", post(routes::audit::start_scan))
+        .route("/audit/cancel", post(routes::audit::cancel_scan))
+        .route("/audit/job/{jobId}", get(routes::audit::get_job))
+        .route("/audit/export", post(routes::audit::export_report))
+        .route("/audit/parse-fscan", post(routes::audit::parse_fscan))
+        .route("/audit/task-store", get(routes::audit::load_task_store).post(routes::audit::save_task_store))
         // Transfer
         .route("/transfer/start", post(routes::transfer::start_transfer))
         .route("/transfer/progress/{transferId}", get(routes::transfer::transfer_progress))

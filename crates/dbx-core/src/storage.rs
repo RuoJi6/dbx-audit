@@ -473,6 +473,17 @@ impl Storage {
         Ok(array.iter().filter_map(|item| item.as_str().map(|value| value.to_string())).collect())
     }
 
+    pub async fn save_audit_task_store(&self, store: &serde_json::Value) -> Result<(), String> {
+        let mut settings = self.load_app_settings_json().await?;
+        settings.insert("audit_task_store".to_string(), store.clone());
+        self.save_app_settings_json(&settings).await
+    }
+
+    pub async fn load_audit_task_store(&self) -> Result<Option<serde_json::Value>, String> {
+        let settings = self.load_app_settings_json().await?;
+        Ok(settings.get("audit_task_store").cloned())
+    }
+
     pub async fn load_or_create_local_device_secret(&self) -> Result<String, String> {
         let mut settings = self.load_app_settings_json().await?;
         if let Some(secret) = settings.get("local_device_secret").and_then(|value| value.as_str()) {

@@ -148,6 +148,137 @@ export interface DesktopSettings {
   debug_logging_enabled: boolean;
 }
 
+export type AuditMode = "field-content" | "field-name" | "content" | "all";
+export type AuditLevelFilter = "all" | "low" | "medium" | "high";
+export type AuditJobStatus = "running" | "completed" | "failed" | "cancelled";
+export type AuditExportFormat = "json" | "xlsx";
+export type AuditTaskKind = "single" | "fscan" | "sql";
+
+export interface AuditScanRequest {
+  connectionId: string;
+  database?: string;
+  schema?: string;
+  tables: string[];
+  mode: AuditMode;
+  level: AuditLevelFilter;
+  limit: number;
+  mask: boolean;
+  workers: number;
+  timeoutSecs: number;
+}
+
+export interface AuditTarget {
+  dbType: string;
+  host: string;
+  port: number;
+  username: string;
+  password: string;
+  database?: string;
+  table?: string;
+  proxy?: string;
+  source?: string;
+}
+
+export interface AuditTaskRequest {
+  name: string;
+  description: string;
+  kind: AuditTaskKind;
+  scan: AuditScanRequest;
+  sql?: string;
+  targets: AuditTarget[];
+  proxy?: string;
+  includeSystem: boolean;
+  splitOutput: boolean;
+  textEncoding: string;
+  outputPath?: string;
+}
+
+export interface AuditFinding {
+  connectionId?: string;
+  connectionName?: string;
+  dbType?: string;
+  database: string;
+  schema?: string;
+  table: string;
+  column: string;
+  dataType?: string;
+  kind: string;
+  level: string;
+  mode: string;
+  basis: string;
+  count: number;
+  samples: { column: string; value: string }[];
+}
+
+export interface AuditTableResult {
+  database: string;
+  schema?: string;
+  table: string;
+  sensitiveFields: string[];
+  rowCount: number;
+  level: string;
+}
+
+export interface AuditFieldResult {
+  database: string;
+  schema?: string;
+  table: string;
+  column: string;
+  kind: string;
+  level: string;
+  hitCount: number;
+  sampleValues: string[];
+}
+
+export interface AuditSampleGroup {
+  database: string;
+  schema?: string;
+  table: string;
+  fields: AuditFieldResult[];
+  rows: { column: string; value: string }[][];
+}
+
+export interface AuditSqlResult {
+  sql: string;
+  columns: string[];
+  rows: string[][];
+  error?: string;
+  findings: AuditFinding[];
+}
+
+export interface AuditJobState {
+  jobId: string;
+  status: AuditJobStatus;
+  progress: number;
+  request: AuditScanRequest;
+  logs: { time: string; level: string; message: string }[];
+  findings: AuditFinding[];
+  errors: string[];
+  startedAt: string;
+  finishedAt?: string;
+}
+
+export interface AuditExportResult {
+  path: string;
+  format: AuditExportFormat;
+  findingCount: number;
+}
+
+export interface ParsedFscanTarget {
+  dbType: string;
+  host: string;
+  port: number;
+  username: string;
+  password: string;
+  line: number;
+  raw: string;
+}
+
+export interface ParsedFscanTargets {
+  targets: ParsedFscanTarget[];
+  total: number;
+}
+
 export interface WebDavConfig {
   endpoint: string;
   username?: string;
@@ -1825,4 +1956,40 @@ export async function exportQueryResultMarkdown(
       rows,
     },
   });
+}
+
+export async function auditStartScan(request: AuditScanRequest): Promise<string> {
+  return invoke("audit_start_scan", { request });
+}
+
+export async function auditCancelScan(jobId: string): Promise<boolean> {
+  return invoke("audit_cancel_scan", { jobId });
+}
+
+export async function auditGetJob(jobId: string): Promise<AuditJobState | null> {
+  return invoke("audit_get_job", { jobId });
+}
+
+export async function auditExportReport(
+  jobId: string,
+  format: AuditExportFormat,
+  path: string,
+): Promise<AuditExportResult> {
+  return invoke("audit_export_report", { jobId, format, path });
+}
+
+export async function auditOpenOutputDirectory(path: string): Promise<void> {
+  return invoke("audit_open_output_directory", { path });
+}
+
+export async function auditParseFscan(textOrFile: string): Promise<ParsedFscanTargets> {
+  return invoke("audit_parse_fscan", { textOrFile });
+}
+
+export async function auditLoadTaskStore(): Promise<unknown | null> {
+  return invoke("audit_load_task_store");
+}
+
+export async function auditSaveTaskStore(store: unknown): Promise<void> {
+  return invoke("audit_save_task_store", { store });
 }

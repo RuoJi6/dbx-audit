@@ -1,6 +1,7 @@
 pub mod agents;
 pub mod ai;
 pub mod app_settings;
+pub mod audit;
 pub mod cloud_sync;
 pub mod connection;
 #[allow(dead_code, unused_imports)]

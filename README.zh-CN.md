@@ -1,4 +1,6 @@
 <div align="center">
+  <h1>DBX Audit</h1>
+  <p><strong>基于 DBX 的数据库敏感字段审计增强分支。</strong></p>
   <p style="font-size: 18px; white-space: nowrap;"><strong>15 MB 驾驭 40+ 种数据库。桌面端 & Docker 自托管，内置 AI 助手。</strong></p>
 
   <p>
@@ -252,6 +254,15 @@ pnpm tauri build
 ```
 
 安装包输出在 `src-tauri/target/release/bundle/` 目录。
+
+macOS 本地构建如果遇到“DBX Audit.app 已损坏，无法打开”，请使用：
+
+```bash
+pnpm tauri:build:mac
+```
+
+该命令会对本地构建的 `.app` 做 ad-hoc 签名，并清理 macOS 隔离属性。正式分发仍建议使用 Developer ID 证书签名并公证。
+它会跳过 updater artifact 签名；完整发布包仍使用 `pnpm tauri build` 并配置 `TAURI_SIGNING_PRIVATE_KEY`。
 
 ## 技术栈
 
