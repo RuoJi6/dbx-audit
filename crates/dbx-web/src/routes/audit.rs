@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -10,12 +11,14 @@ use uuid::Uuid;
 use crate::error::AppError;
 use crate::state::WebState;
 use dbx_core::audit::{
-    audit_column_findings, audit_job_to_json, audit_job_to_xlsx, detect_field, detect_value, mask_sensitive_value,
-    parse_fscan_text, AuditExportFormat, AuditExportResult, AuditFinding, AuditJobState, AuditJobStatus,
-    AuditLogEntry, AuditSample, AuditScanRequest, ParsedFscanTargets,
+    audit_column_findings, audit_document_findings, audit_job_to_json, audit_job_to_xlsx, build_non_empty_count_sql,
+    build_sample_rows_sql, build_table_count_sql, detect_field, detect_value, mask_sensitive_value, parse_fscan_text,
+    AuditExportFormat, AuditExportResult, AuditFinding, AuditJobState, AuditJobStatus, AuditLogEntry, AuditSample,
+    AuditScanRequest, AuditTableEvidence, AuditTableField, ParsedFscanTargets,
 };
-use dbx_core::models::connection::DatabaseType;
-use dbx_core::models::connection::ConnectionConfig;
+use dbx_core::models::connection::{ConnectionConfig, DatabaseType};
+use dbx_core::query::QueryExecutionOptions;
+use dbx_core::types::ColumnInfo;
 use serde_json::Value;
 
 #[derive(Deserialize)]
@@ -90,6 +93,7 @@ pub async fn start_scan(
         request: request.clone(),
         logs: vec![log_entry("info", "审计扫描已加入任务队列")],
         findings: Vec::new(),
+        table_results: Vec::new(),
         errors: Vec::new(),
         started_at: now_rfc3339(),
         finished_at: None,
@@ -230,10 +234,13 @@ pub async fn save_task_store(
 
 async fn run_field_name_scan(state: Arc<WebState>, request: AuditScanRequest, job_id: &str) -> Result<(), String> {
     prepare_audit_connection(&state, &request).await?;
-    if connection_db_type(&state, &request.connection_id).await == Some(DatabaseType::Redis) {
-        return run_redis_scan(state, request, job_id).await;
+    match connection_db_type(&state, &request.connection_id).await {
+        Some(DatabaseType::Redis) => return run_redis_scan(state, request, job_id).await,
+        Some(DatabaseType::MongoDb | DatabaseType::Elasticsearch) => {
+            return run_document_scan(state, request, job_id).await;
+        }
+        _ => {}
     }
-    let schema = request.schema.clone().unwrap_or_default();
     let databases = audit_target_databases(&state, &request, job_id).await?;
     let total_databases = databases.len().max(1);
 
@@ -248,48 +255,86 @@ async fn run_field_name_scan(state: Arc<WebState>, request: AuditScanRequest, jo
         })
         .await;
 
-        let tables = if request.tables.is_empty() {
-            dbx_core::schema::list_tables_core(&state.app, &request.connection_id, database, &schema, None, None)
-                .await?
-                .into_iter()
-                .map(|table| table.name)
-                .collect::<Vec<_>>()
-        } else {
-            request.tables.clone()
-        };
+        let schemas = audit_target_schemas(&state, &request, database).await?;
+        let total_schemas = schemas.len().max(1);
 
-        let total_tables = tables.len().max(1);
-        for (table_index, table) in tables.iter().enumerate() {
-            if is_cancelled(&state, job_id).await {
-                return Ok(());
-            }
+        for (schema_index, schema) in schemas.iter().enumerate() {
+            let tables = if request.tables.is_empty() {
+                dbx_core::schema::list_tables_core(&state.app, &request.connection_id, database, schema, None, None)
+                    .await?
+                    .into_iter()
+                    .map(|table| table.name)
+                    .collect::<Vec<_>>()
+            } else {
+                requested_tables_for_schema(&request.tables, schema)
+            };
 
-            let columns =
-                dbx_core::schema::get_columns_core(&state.app, &request.connection_id, database, &schema, table)
-                    .await?;
-            let mut findings = audit_column_findings(
-                database,
-                if schema.is_empty() { None } else { Some(schema.as_str()) },
-                table,
-                &columns,
-                request.mode,
-                request.level,
-            );
-            apply_connection_meta(&state, &request.connection_id, &mut findings).await;
-            if request.mask {
-                for finding in &mut findings {
-                    finding.samples.clear();
+            let total_tables = tables.len().max(1);
+            for (table_index, table) in tables.iter().enumerate() {
+                if is_cancelled(&state, job_id).await {
+                    return Ok(());
                 }
-            }
 
-            update_job(&state, job_id, |job| {
-                job.findings.extend(findings);
-                let database_progress = (database_index * 85) / total_databases;
-                let table_progress = ((table_index + 1) * 85) / (total_databases * total_tables);
-                job.progress = (10 + database_progress + table_progress).min(95) as u8;
-                job.logs.push(log_entry("info", format!("已扫描表：{database}.{table}")));
-            })
-            .await;
+                let schema_opt = schema_option(schema);
+                let columns =
+                    dbx_core::schema::get_columns_core(&state.app, &request.connection_id, database, schema, table)
+                        .await?;
+                let mut findings =
+                    audit_column_findings(database, schema_opt, table, &columns, request.mode, request.level);
+                apply_connection_meta(&state, &request.connection_id, &mut findings).await;
+
+                for finding in findings.iter_mut() {
+                    match count_non_empty_rows(&state, &request, database, schema_opt, table, &finding.column).await {
+                        Ok(count) => finding.count = count,
+                        Err(err) => {
+                            update_job(&state, job_id, |job| {
+                                job.logs.push(log_entry(
+                                    "warn",
+                                    format!(
+                                        "字段存在行数统计失败：{}.{table}.{}，{err}",
+                                        schema_label(schema),
+                                        finding.column
+                                    ),
+                                ));
+                            })
+                            .await;
+                        }
+                    }
+                }
+
+                if request.mode.includes_content() && !findings.is_empty() {
+                    match attach_sample_rows(&state, &request, database, schema_opt, table, &mut findings).await {
+                        Ok(()) => {}
+                        Err(err) => {
+                            update_job(&state, job_id, |job| {
+                                job.logs.push(log_entry("warn", format!("样例采集失败：{database}.{table}，{err}")));
+                            })
+                            .await;
+                        }
+                    }
+                }
+
+                let table_result =
+                    collect_table_evidence(&state, &request, database, schema_opt, table, &columns, &findings).await;
+
+                update_job(&state, job_id, |job| {
+                    job.findings.extend(findings);
+                    match table_result {
+                        Ok(table_result) if !table_result.fields.is_empty() => job.table_results.push(table_result),
+                        Ok(_) => {}
+                        Err(err) => {
+                            job.logs.push(log_entry("warn", format!("表样例记录失败：{database}.{table}，{err}")));
+                        }
+                    }
+                    let database_progress = (database_index * 85) / total_databases;
+                    let schema_progress = (schema_index * 85) / (total_databases * total_schemas);
+                    let table_progress = ((table_index + 1) * 85) / (total_databases * total_schemas * total_tables);
+                    job.progress = (10 + database_progress + schema_progress + table_progress).min(95) as u8;
+                    let qualified = if schema.is_empty() { table.to_string() } else { format!("{schema}.{table}") };
+                    job.logs.push(log_entry("info", format!("已扫描表：{database}.{qualified}")));
+                })
+                .await;
+            }
         }
     }
 
@@ -310,6 +355,327 @@ async fn prepare_audit_connection(state: &WebState, request: &AuditScanRequest) 
 
     state.app.get_or_create_pool(&request.connection_id, None).await?;
     Ok(())
+}
+
+async fn audit_target_schemas(
+    state: &WebState,
+    request: &AuditScanRequest,
+    database: &str,
+) -> Result<Vec<String>, String> {
+    if let Some(schema) = request.schema.as_ref().map(|value| value.trim()).filter(|value| !value.is_empty()) {
+        return Ok(vec![schema.to_string()]);
+    }
+    let db_type = connection_db_type(state, &request.connection_id).await;
+    if !db_type.is_some_and(audit_should_enumerate_schemas) {
+        return Ok(vec![String::new()]);
+    }
+    let schemas = dbx_core::schema::list_schemas_core(&state.app, &request.connection_id, database)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|schema| request.include_system || !is_system_schema(db_type, schema))
+        .collect::<Vec<_>>();
+    if schemas.is_empty() {
+        Ok(default_audit_schemas(state, &request.connection_id, db_type).await)
+    } else {
+        Ok(schemas)
+    }
+}
+
+fn requested_tables_for_schema(tables: &[String], schema: &str) -> Vec<String> {
+    tables
+        .iter()
+        .filter_map(|table| {
+            let trimmed = table.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            let Some((table_schema, table_name)) = trimmed.split_once('.') else {
+                return Some(trimmed.to_string());
+            };
+            if table_schema.trim_matches('"').eq_ignore_ascii_case(schema) {
+                Some(table_name.trim_matches('"').to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn schema_option(schema: &str) -> Option<&str> {
+    if schema.trim().is_empty() {
+        None
+    } else {
+        Some(schema)
+    }
+}
+
+fn schema_label(schema: &str) -> String {
+    if schema.trim().is_empty() {
+        "-".to_string()
+    } else {
+        schema.to_string()
+    }
+}
+
+async fn attach_sample_rows(
+    state: &WebState,
+    request: &AuditScanRequest,
+    database: &str,
+    schema: Option<&str>,
+    table: &str,
+    findings: &mut [AuditFinding],
+) -> Result<(), String> {
+    let dialect = audit_sql_dialect(state, &request.connection_id).await.ok_or("当前数据库暂不支持样例采集")?;
+    let columns =
+        findings.iter().map(|finding| finding.column.clone()).fold(Vec::<String>::new(), |mut columns, column| {
+            if !columns.contains(&column) {
+                columns.push(column);
+            }
+            columns
+        });
+    if columns.is_empty() {
+        return Ok(());
+    }
+    let sql = build_sample_rows_sql(dialect, schema, table, &columns, request.limit.max(1));
+    let result = dbx_core::query::execute_sql_statement_with_options(
+        &state.app,
+        &request.connection_id,
+        database,
+        &sql,
+        schema,
+        None,
+        QueryExecutionOptions {
+            max_rows: Some(request.limit.max(1)),
+            timeout_secs: Some(request.timeout_secs),
+            ..Default::default()
+        },
+    )
+    .await?;
+    for finding in findings.iter_mut() {
+        let Some(column_index) = result.columns.iter().position(|column| column.eq_ignore_ascii_case(&finding.column))
+        else {
+            continue;
+        };
+        finding.samples = result
+            .rows
+            .iter()
+            .filter_map(|row| row.get(column_index))
+            .filter_map(sample_value)
+            .map(|value| AuditSample {
+                column: finding.column.clone(),
+                value: if request.mask { mask_sensitive_value(&value) } else { value },
+            })
+            .collect();
+    }
+    Ok(())
+}
+
+async fn audit_sql_dialect(state: &WebState, connection_id: &str) -> Option<dbx_core::audit::scanner::AuditSqlDialect> {
+    let configs = state.app.configs.read().await;
+    let db_type = &configs.get(connection_id)?.db_type;
+    match db_type {
+        DatabaseType::Mysql
+        | DatabaseType::Doris
+        | DatabaseType::StarRocks
+        | DatabaseType::Databend
+        | DatabaseType::Goldendb
+        | DatabaseType::Gbase => Some(dbx_core::audit::scanner::AuditSqlDialect::Mysql),
+        DatabaseType::Postgres
+        | DatabaseType::OpenGauss
+        | DatabaseType::Redshift
+        | DatabaseType::Kingbase
+        | DatabaseType::Highgo
+        | DatabaseType::Vastbase
+        | DatabaseType::Gaussdb
+        | DatabaseType::Kwdb => Some(dbx_core::audit::scanner::AuditSqlDialect::Postgres),
+        DatabaseType::SqlServer => Some(dbx_core::audit::scanner::AuditSqlDialect::Mssql),
+        DatabaseType::Oracle | DatabaseType::Dameng | DatabaseType::OceanbaseOracle | DatabaseType::Yashandb => {
+            Some(dbx_core::audit::scanner::AuditSqlDialect::Oracle)
+        }
+        DatabaseType::Sqlite | DatabaseType::Rqlite => Some(dbx_core::audit::scanner::AuditSqlDialect::Sqlite),
+        DatabaseType::ClickHouse => Some(dbx_core::audit::scanner::AuditSqlDialect::ClickHouse),
+        DatabaseType::DuckDb
+        | DatabaseType::H2
+        | DatabaseType::Snowflake
+        | DatabaseType::Trino
+        | DatabaseType::Hive
+        | DatabaseType::Databricks
+        | DatabaseType::SapHana
+        | DatabaseType::Teradata
+        | DatabaseType::Vertica
+        | DatabaseType::Db2
+        | DatabaseType::Informix
+        | DatabaseType::Kylin
+        | DatabaseType::Sundb
+        | DatabaseType::Xugu
+        | DatabaseType::Iris
+        | DatabaseType::Jdbc => Some(dbx_core::audit::scanner::AuditSqlDialect::Ansi),
+        _ => None,
+    }
+}
+
+async fn count_non_empty_rows(
+    state: &WebState,
+    request: &AuditScanRequest,
+    database: &str,
+    schema: Option<&str>,
+    table: &str,
+    column: &str,
+) -> Result<u64, String> {
+    let dialect = audit_sql_dialect(state, &request.connection_id).await.ok_or("当前数据库暂不支持行数统计")?;
+    let sql = build_non_empty_count_sql(dialect, schema, table, column);
+    let result = dbx_core::query::execute_sql_statement_with_options(
+        &state.app,
+        &request.connection_id,
+        database,
+        &sql,
+        schema,
+        None,
+        QueryExecutionOptions { max_rows: Some(1), timeout_secs: Some(request.timeout_secs), ..Default::default() },
+    )
+    .await?;
+    Ok(result.rows.first().and_then(|row| row.first()).and_then(value_as_u64).unwrap_or(0))
+}
+
+async fn collect_table_evidence(
+    state: &WebState,
+    request: &AuditScanRequest,
+    database: &str,
+    schema: Option<&str>,
+    table: &str,
+    columns: &[ColumnInfo],
+    findings: &[AuditFinding],
+) -> Result<AuditTableEvidence, String> {
+    let row_count = count_table_rows(state, request, database, schema, table).await.unwrap_or(0);
+    let column_names = columns.iter().map(|column| column.name.clone()).collect::<Vec<_>>();
+    let rows = if request.mode.includes_content() && !findings.is_empty() {
+        collect_sample_rows(state, request, database, schema, table, &column_names, findings).await?
+    } else {
+        Vec::new()
+    };
+    let mut evidence = AuditTableEvidence {
+        connection_id: None,
+        connection_name: None,
+        db_type: None,
+        database: database.to_string(),
+        schema: schema.map(str::to_string),
+        table: table.to_string(),
+        row_count,
+        columns: column_names,
+        fields: table_fields(findings),
+        rows,
+    };
+    apply_table_connection_meta(state, &request.connection_id, &mut evidence).await;
+    Ok(evidence)
+}
+
+async fn count_table_rows(
+    state: &WebState,
+    request: &AuditScanRequest,
+    database: &str,
+    schema: Option<&str>,
+    table: &str,
+) -> Result<u64, String> {
+    let dialect = audit_sql_dialect(state, &request.connection_id).await.ok_or("当前数据库暂不支持行数统计")?;
+    let sql = build_table_count_sql(dialect, schema, table);
+    let result = dbx_core::query::execute_sql_statement_with_options(
+        &state.app,
+        &request.connection_id,
+        database,
+        &sql,
+        schema,
+        None,
+        QueryExecutionOptions { max_rows: Some(1), timeout_secs: Some(request.timeout_secs), ..Default::default() },
+    )
+    .await?;
+    Ok(result.rows.first().and_then(|row| row.first()).and_then(value_as_u64).unwrap_or(0))
+}
+
+async fn collect_sample_rows(
+    state: &WebState,
+    request: &AuditScanRequest,
+    database: &str,
+    schema: Option<&str>,
+    table: &str,
+    columns: &[String],
+    findings: &[AuditFinding],
+) -> Result<Vec<BTreeMap<String, String>>, String> {
+    let dialect = audit_sql_dialect(state, &request.connection_id).await.ok_or("当前数据库暂不支持样例采集")?;
+    let sql = build_sample_rows_sql(dialect, schema, table, columns, request.limit.max(1));
+    let result = dbx_core::query::execute_sql_statement_with_options(
+        &state.app,
+        &request.connection_id,
+        database,
+        &sql,
+        schema,
+        None,
+        QueryExecutionOptions {
+            max_rows: Some(request.limit.max(1)),
+            timeout_secs: Some(request.timeout_secs),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let sensitive = findings.iter().fold(BTreeMap::<String, dbx_core::audit::AuditKind>::new(), |mut map, finding| {
+        map.entry(finding.column.clone()).or_insert(finding.kind);
+        map
+    });
+    Ok(result
+        .rows
+        .iter()
+        .map(|row| {
+            let mut values = BTreeMap::new();
+            for (index, column) in result.columns.iter().enumerate() {
+                let mut value = row.get(index).and_then(sample_value).unwrap_or_default();
+                if request.mask && sensitive.contains_key(column) {
+                    value = mask_sensitive_value(&value);
+                }
+                values.insert(column.clone(), value);
+            }
+            values
+        })
+        .collect())
+}
+
+fn sample_value(value: &Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::String(value) if value.trim().is_empty() => None,
+        Value::String(value) => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        Value::Bool(value) => Some(value.to_string()),
+        other => Some(other.to_string()),
+    }
+}
+
+fn value_as_u64(value: &Value) -> Option<u64> {
+    match value {
+        Value::Number(value) => value.as_u64().or_else(|| value.as_i64().and_then(|value| u64::try_from(value).ok())),
+        Value::String(value) => value.parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
+fn table_fields(findings: &[AuditFinding]) -> Vec<AuditTableField> {
+    let mut fields = BTreeMap::<String, AuditTableField>::new();
+    for finding in findings {
+        let field = fields.entry(finding.column.clone()).or_insert_with(|| AuditTableField {
+            name: finding.column.clone(),
+            kinds: Vec::new(),
+            level: finding.level,
+            mode: finding.mode,
+            total: finding.count,
+        });
+        if !field.kinds.contains(&finding.kind) {
+            field.kinds.push(finding.kind);
+        }
+        if finding.level > field.level {
+            field.level = finding.level;
+        }
+        field.total = field.total.max(finding.count);
+    }
+    fields.into_values().collect()
 }
 
 async fn audit_target_databases(
@@ -341,26 +707,112 @@ async fn audit_target_databases(
     Ok(databases)
 }
 
+async fn run_document_scan(state: Arc<WebState>, request: AuditScanRequest, job_id: &str) -> Result<(), String> {
+    update_job(&state, job_id, |job| {
+        job.progress = 5;
+        job.logs.push(log_entry("info", "正在扫描文档集合/索引"));
+    })
+    .await;
+
+    let databases =
+        if let Some(database) = request.database.as_ref().map(|value| value.trim()).filter(|value| !value.is_empty()) {
+            vec![database.to_string()]
+        } else {
+            dbx_core::mongo_ops::mongo_list_databases_core(&state.app, &request.connection_id)
+                .await?
+                .into_iter()
+                .filter(|database| request.include_system || !is_system_database(database))
+                .collect::<Vec<_>>()
+        };
+    if databases.is_empty() {
+        return Err("未发现可扫描数据库，请手工填写数据库名".to_string());
+    }
+
+    let total_databases = databases.len().max(1);
+    let schema = document_schema(&state, &request.connection_id).await;
+    for (database_index, database) in databases.iter().enumerate() {
+        if is_cancelled(&state, job_id).await {
+            return Ok(());
+        }
+        let collections = if request.tables.is_empty() {
+            dbx_core::mongo_ops::mongo_list_collections_core(&state.app, &request.connection_id, database).await?
+        } else {
+            request
+                .tables
+                .iter()
+                .filter_map(|table| table.trim().rsplit('.').next().map(str::to_string))
+                .filter(|table| !table.is_empty())
+                .collect::<Vec<_>>()
+        };
+        let total_collections = collections.len().max(1);
+        for (collection_index, collection) in collections.iter().enumerate() {
+            if is_cancelled(&state, job_id).await {
+                return Ok(());
+            }
+            let result = dbx_core::mongo_ops::mongo_find_documents_core(
+                &state.app,
+                &request.connection_id,
+                database,
+                collection,
+                0,
+                request.limit.max(1) as i64,
+                None,
+                None,
+            )
+            .await?;
+            let (mut findings, table_result) = audit_document_findings(
+                database,
+                Some(&schema),
+                collection,
+                &result.documents,
+                request.mode,
+                request.level,
+                request.limit,
+                request.mask,
+            );
+            apply_connection_meta(&state, &request.connection_id, &mut findings).await;
+            let mut table_result = table_result;
+            if let Some(table) = table_result.as_mut() {
+                apply_table_connection_meta(&state, &request.connection_id, table).await;
+                table.row_count = result.total;
+            }
+            update_job(&state, job_id, |job| {
+                job.findings.extend(findings);
+                if let Some(table_result) = table_result {
+                    job.table_results.push(table_result);
+                }
+                let database_progress = (database_index * 90) / total_databases;
+                let collection_progress = ((collection_index + 1) * 90) / (total_databases * total_collections);
+                job.progress = (5 + database_progress + collection_progress).min(95) as u8;
+                job.logs.push(log_entry("info", format!("已扫描文档目标：{database}.{collection}")));
+            })
+            .await;
+        }
+    }
+    Ok(())
+}
+
 async fn run_redis_scan(state: Arc<WebState>, request: AuditScanRequest, job_id: &str) -> Result<(), String> {
     update_job(&state, job_id, |job| {
         job.progress = 5;
         job.logs.push(log_entry("info", "正在扫描 Redis keys"));
     })
     .await;
-    let databases = if let Some(database) = request.database.as_ref().map(|value| value.trim()).filter(|value| !value.is_empty()) {
-        vec![database.parse::<u32>().map_err(|_| "Redis 数据库必须是数字".to_string())?]
-    } else {
-        let mut dbs = dbx_core::redis_ops::redis_list_databases_core(&state.app, &request.connection_id)
-            .await?
-            .into_iter()
-            .filter(|db| db.keys > 0)
-            .map(|db| db.db)
-            .collect::<Vec<_>>();
-        if dbs.is_empty() {
-            dbs.push(0);
-        }
-        dbs
-    };
+    let databases =
+        if let Some(database) = request.database.as_ref().map(|value| value.trim()).filter(|value| !value.is_empty()) {
+            vec![database.parse::<u32>().map_err(|_| "Redis 数据库必须是数字".to_string())?]
+        } else {
+            let mut dbs = dbx_core::redis_ops::redis_list_databases_core(&state.app, &request.connection_id)
+                .await?
+                .into_iter()
+                .filter(|db| db.keys > 0)
+                .map(|db| db.db)
+                .collect::<Vec<_>>();
+            if dbs.is_empty() {
+                dbs.push(0);
+            }
+            dbs
+        };
     let total_dbs = databases.len().max(1);
     for (db_index, db) in databases.iter().enumerate() {
         if is_cancelled(&state, job_id).await {
@@ -368,17 +820,22 @@ async fn run_redis_scan(state: Arc<WebState>, request: AuditScanRequest, job_id:
         }
         let mut cursor = 0u64;
         loop {
-            let page = dbx_core::redis_ops::redis_scan_keys_core(&state.app, &request.connection_id, *db, cursor, "*", 200)
-                .await?;
+            let page =
+                dbx_core::redis_ops::redis_scan_keys_core(&state.app, &request.connection_id, *db, cursor, "*", 200)
+                    .await?;
             let mut findings = Vec::new();
             for key in page.keys {
                 if is_cancelled(&state, job_id).await {
                     return Ok(());
                 }
-                let value =
-                    dbx_core::redis_ops::redis_get_value_in_db_core(&state.app, &request.connection_id, *db, &key.key_raw)
-                        .await
-                        .ok();
+                let value = dbx_core::redis_ops::redis_get_value_in_db_core(
+                    &state.app,
+                    &request.connection_id,
+                    *db,
+                    &key.key_raw,
+                )
+                .await
+                .ok();
                 findings.extend(redis_key_findings(&request, *db, &key.key_display, value.as_ref()));
             }
             apply_connection_meta(&state, &request.connection_id, &mut findings).await;
@@ -438,7 +895,11 @@ fn redis_finding(
         data_type: Some("redis".to_string()),
         kind,
         level: kind.level(),
-        mode: if basis == "content" { dbx_core::audit::AuditMode::Content } else { dbx_core::audit::AuditMode::FieldName },
+        mode: if basis == "content" {
+            dbx_core::audit::AuditMode::Content
+        } else {
+            dbx_core::audit::AuditMode::FieldName
+        },
         basis: basis.to_string(),
         count: 1,
         samples: vec![AuditSample { column: column.to_string(), value: sample }],
@@ -465,8 +926,80 @@ async fn apply_connection_meta(state: &WebState, connection_id: &str, findings: 
     }
 }
 
+async fn apply_table_connection_meta(state: &WebState, connection_id: &str, table: &mut AuditTableEvidence) {
+    let configs = state.app.configs.read().await;
+    let Some(config) = configs.get(connection_id) else {
+        return;
+    };
+    table.connection_id = Some(connection_id.to_string());
+    table.connection_name = Some(config.name.clone());
+    table.db_type = Some(format!("{:?}", config.db_type).to_ascii_lowercase());
+}
+
 async fn connection_db_type(state: &WebState, connection_id: &str) -> Option<DatabaseType> {
     state.app.configs.read().await.get(connection_id).map(|config| config.db_type)
+}
+
+async fn document_schema(state: &WebState, connection_id: &str) -> String {
+    match connection_db_type(state, connection_id).await {
+        Some(DatabaseType::Elasticsearch) => "index".to_string(),
+        _ => "document".to_string(),
+    }
+}
+
+fn audit_should_enumerate_schemas(db_type: DatabaseType) -> bool {
+    !matches!(
+        db_type,
+        DatabaseType::Mysql
+            | DatabaseType::Doris
+            | DatabaseType::StarRocks
+            | DatabaseType::Databend
+            | DatabaseType::Goldendb
+            | DatabaseType::Gbase
+            | DatabaseType::ClickHouse
+            | DatabaseType::Sqlite
+            | DatabaseType::Rqlite
+            | DatabaseType::Redis
+            | DatabaseType::MongoDb
+            | DatabaseType::Elasticsearch
+            | DatabaseType::Neo4j
+            | DatabaseType::Cassandra
+            | DatabaseType::Bigquery
+            | DatabaseType::Tdengine
+            | DatabaseType::Iotdb
+            | DatabaseType::Etcd
+    )
+}
+
+async fn default_audit_schemas(state: &WebState, connection_id: &str, db_type: Option<DatabaseType>) -> Vec<String> {
+    let username = state
+        .app
+        .configs
+        .read()
+        .await
+        .get(connection_id)
+        .map(|config| config.username.trim().to_string())
+        .filter(|username| !username.is_empty());
+    match db_type {
+        Some(
+            DatabaseType::Postgres
+            | DatabaseType::OpenGauss
+            | DatabaseType::Redshift
+            | DatabaseType::Kingbase
+            | DatabaseType::Highgo
+            | DatabaseType::Vastbase
+            | DatabaseType::Gaussdb
+            | DatabaseType::Kwdb,
+        ) => vec!["public".to_string()],
+        Some(DatabaseType::SqlServer) => vec!["dbo".to_string()],
+        Some(DatabaseType::DuckDb) => vec!["main".to_string()],
+        Some(DatabaseType::Trino | DatabaseType::Hive | DatabaseType::Databricks) => vec!["default".to_string()],
+        Some(DatabaseType::Snowflake) => vec!["PUBLIC".to_string()],
+        Some(DatabaseType::Oracle | DatabaseType::Dameng | DatabaseType::OceanbaseOracle | DatabaseType::Yashandb) => {
+            username.map(|value| vec![value.to_ascii_uppercase()]).unwrap_or_else(|| vec![String::new()])
+        }
+        _ => vec![String::new()],
+    }
 }
 
 fn is_system_database(name: &str) -> bool {
@@ -474,6 +1007,62 @@ fn is_system_database(name: &str) -> bool {
         name.to_ascii_lowercase().as_str(),
         "information_schema" | "mysql" | "performance_schema" | "sys" | "template0" | "template1" | "postgres"
     )
+}
+
+fn is_system_schema(db_type: Option<DatabaseType>, name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let upper = name.to_ascii_uppercase();
+    if matches!(lower.as_str(), "information_schema" | "pg_catalog" | "sys" | "system" | "mysql" | "performance_schema")
+        || lower.starts_with("pg_toast")
+        || lower.starts_with("pg_temp_")
+        || lower.starts_with("pg_toast_temp_")
+    {
+        return true;
+    }
+    match db_type {
+        Some(DatabaseType::SqlServer) => matches!(
+            lower.as_str(),
+            "guest"
+                | "db_owner"
+                | "db_accessadmin"
+                | "db_securityadmin"
+                | "db_ddladmin"
+                | "db_backupoperator"
+                | "db_datareader"
+                | "db_datawriter"
+                | "db_denydatareader"
+                | "db_denydatawriter"
+        ),
+        Some(DatabaseType::Oracle | DatabaseType::Dameng | DatabaseType::OceanbaseOracle | DatabaseType::Yashandb) => {
+            matches!(
+                upper.as_str(),
+                "SYS"
+                    | "SYSTEM"
+                    | "OUTLN"
+                    | "DBSNMP"
+                    | "XDB"
+                    | "MDSYS"
+                    | "ORDSYS"
+                    | "ORDDATA"
+                    | "CTXSYS"
+                    | "WMSYS"
+                    | "APPQOSSYS"
+                    | "AUDSYS"
+                    | "DVSYS"
+                    | "GSMADMIN_INTERNAL"
+                    | "LBACSYS"
+                    | "OJVMSYS"
+                    | "OLAPSYS"
+                    | "SI_INFORMTN_SCHEMA"
+            )
+        }
+        Some(DatabaseType::Db2) => upper.starts_with("SYS") || matches!(upper.as_str(), "SQLJ" | "NULLID"),
+        Some(DatabaseType::Snowflake) => upper == "INFORMATION_SCHEMA",
+        Some(DatabaseType::Teradata) => {
+            matches!(upper.as_str(), "DBC" | "SYS_CALENDAR" | "SYSUDTLIB") || upper.starts_with("SYS")
+        }
+        _ => false,
+    }
 }
 
 async fn is_cancelled(state: &WebState, job_id: &str) -> bool {

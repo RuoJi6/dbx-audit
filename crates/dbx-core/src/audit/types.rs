@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "kebab-case")]
@@ -28,7 +29,7 @@ impl AuditLevelFilter {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "kebab-case")]
 pub enum AuditMode {
     FieldContent,
@@ -47,7 +48,7 @@ impl AuditMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "kebab-case")]
 pub enum AuditKind {
     Phone,
@@ -186,6 +187,39 @@ pub struct AuditSample {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct AuditTableField {
+    pub name: String,
+    #[serde(default)]
+    pub kinds: Vec<AuditKind>,
+    pub level: AuditLevel,
+    pub mode: AuditMode,
+    pub total: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditTableEvidence {
+    #[serde(default)]
+    pub connection_id: Option<String>,
+    #[serde(default)]
+    pub connection_name: Option<String>,
+    #[serde(default)]
+    pub db_type: Option<String>,
+    pub database: String,
+    #[serde(default)]
+    pub schema: Option<String>,
+    pub table: String,
+    pub row_count: u64,
+    #[serde(default)]
+    pub columns: Vec<String>,
+    #[serde(default)]
+    pub fields: Vec<AuditTableField>,
+    #[serde(default)]
+    pub rows: Vec<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct AuditFinding {
     #[serde(default)]
     pub connection_id: Option<String>,
@@ -292,6 +326,8 @@ pub struct AuditJobState {
     pub logs: Vec<AuditLogEntry>,
     #[serde(default)]
     pub findings: Vec<AuditFinding>,
+    #[serde(default)]
+    pub table_results: Vec<AuditTableEvidence>,
     #[serde(default)]
     pub errors: Vec<String>,
     pub started_at: String,

@@ -31,7 +31,7 @@ import type { ConnectionConfig } from "@/types/database";
 
 type AuditTaskKind = "single" | "fscan" | "sql";
 type AuditTaskStatus = "draft" | "running" | "completed" | "failed" | "cancelled";
-type DetailTab = "hits" | "fields" | "targets" | "sql" | "samples" | "logs";
+type DetailTab = "hits" | "fields" | "sql" | "samples" | "logs";
 type WizardStep = 1 | 2 | 3 | 4;
 
 type AuditTask = {
@@ -55,6 +55,7 @@ type AuditTask = {
   timeoutSecs: number;
   mask: boolean;
   includeSystem: boolean;
+  outputEnabled: boolean;
   splitOutput: boolean;
   textEncoding: string;
   outputPath: string;
@@ -217,6 +218,8 @@ const zh = {
   timeout: "超时秒数",
   encoding: "内容编码",
   output: "输出路径",
+  outputEnabled: "输出表格",
+  outputRequired: "请先勾选输出表格",
   mask: "报告中脱敏样例",
   includeSystem: "包含系统库",
   splitOutput: "按目标拆分输出",
@@ -439,6 +442,8 @@ const en = {
   timeout: "Timeout seconds",
   encoding: "Encoding",
   output: "Output path",
+  outputEnabled: "Output table",
+  outputRequired: "Please enable output table first",
   mask: "Mask samples in report",
   includeSystem: "Include system databases",
   splitOutput: "Split output by target",
@@ -714,7 +719,6 @@ const detailFields = computed(() => fieldHits(detailFindings.value));
 const detailTabs = computed<DetailTab[]>(() => {
   const task = selectedTask.value;
   const tabs: DetailTab[] = ["hits", "fields"];
-  if (task?.kind === "fscan") tabs.push("targets");
   if (task?.kind === "sql" || !!task?.sql.trim()) tabs.push("sql");
   tabs.push("samples", "logs");
   return tabs;
@@ -901,6 +905,7 @@ function newTask(seed?: Partial<AuditTask>): AuditTask {
     timeoutSecs: seed?.timeoutSecs || 15,
     mask: seed?.mask ?? false,
     includeSystem: seed?.includeSystem || false,
+    outputEnabled: seed?.outputEnabled || false,
     splitOutput: seed?.splitOutput || false,
     textEncoding: seed?.textEncoding || "auto",
     outputPath: seed?.outputPath || "/tmp/dbx-audit-report.xlsx",
@@ -924,6 +929,8 @@ function normalizeTask(task: AuditTask) {
     ...task,
     connectionId: task.connectionId || connectionIds[0] || "",
     connectionIds,
+    job: task.job ? { ...task.job, tableResults: task.job.tableResults || [] } : undefined,
+    outputEnabled: task.outputEnabled || false,
     outputs: task.outputs || [],
   };
 }
@@ -1518,6 +1525,7 @@ async function startConnectionBatchTask(task: AuditTask, connectionIds: string[]
     },
     logs: [],
     findings: [],
+    tableResults: [],
     errors: [],
     startedAt,
   };
@@ -1548,6 +1556,14 @@ async function startConnectionBatchTask(task: AuditTask, connectionIds: string[]
       aggregate.findings.push(
         ...(job.findings || []).map((finding) => ({
           ...finding,
+          connectionId,
+          connectionName: label,
+          dbType: connection?.db_type,
+        })),
+      );
+      aggregate.tableResults.push(
+        ...(job.tableResults || []).map((table) => ({
+          ...table,
           connectionId,
           connectionName: label,
           dbType: connection?.db_type,
@@ -1647,6 +1663,10 @@ async function refreshTaskJob(taskId: string, jobId?: string) {
 }
 
 async function exportReport(task: AuditTask, format: "xlsx") {
+  if (!task.outputEnabled) {
+    error.value = ui.value.outputRequired;
+    return;
+  }
   if (!task.job) {
     error.value = ui.value.runTaskFirst;
     return;
@@ -1660,7 +1680,10 @@ async function exportReport(task: AuditTask, format: "xlsx") {
     const outputs = [result.path];
     if (task.splitOutput) {
       for (const [connectionId, findings] of findingsByConnection(task.job.findings).entries()) {
-        const splitJob = { ...task.job, jobId: `${task.job.jobId}-${connectionId}`, findings };
+        const tableResults = (task.job.tableResults || []).filter(
+          (table) => table.connectionId === connectionId || table.connectionName === findings[0]?.connectionName,
+        );
+        const splitJob = { ...task.job, jobId: `${task.job.jobId}-${connectionId}`, findings, tableResults };
         const splitPath = splitOutputPath(path, connectionId, findings);
         const splitResult = await api.auditExportReportSnapshot(splitJob, format, splitPath);
         outputs.push(splitResult.path);
@@ -2421,7 +2444,10 @@ onUnmounted(() => {
                 </SelectContent>
               </Select>
             </label>
-            <label class="space-y-1 text-xs font-medium md:col-span-3">
+            <label class="flex items-center gap-2 text-xs md:col-span-3"
+              ><input v-model="draft.outputEnabled" type="checkbox" />{{ ui.outputEnabled }}</label
+            >
+            <label v-if="draft.outputEnabled" class="space-y-1 text-xs font-medium md:col-span-3">
               {{ ui.output }}
               <div class="flex gap-2">
                 <Input v-model="draft.outputPath" class="h-9 min-w-0" />
@@ -2443,7 +2469,7 @@ onUnmounted(() => {
             <label class="flex items-center gap-2 text-xs"
               ><input v-model="draft.includeSystem" type="checkbox" />{{ ui.includeSystem }}</label
             >
-            <label class="flex items-center gap-2 text-xs"
+            <label v-if="draft.outputEnabled" class="flex items-center gap-2 text-xs"
               ><input v-model="draft.splitOutput" type="checkbox" />{{ ui.splitOutput }}</label
             >
           </div>
@@ -2554,17 +2580,17 @@ onUnmounted(() => {
               <div class="text-muted-foreground">{{ ui.encoding }}</div>
               <div class="font-medium">{{ selectedTask.textEncoding }}</div>
             </div>
-            <div>
+            <div v-if="selectedTask.outputEnabled">
               <div class="text-muted-foreground">{{ ui.output }}</div>
               <div class="truncate font-medium">{{ selectedTask.outputPath }}</div>
             </div>
           </div>
-          <div class="mt-4 flex flex-wrap gap-2">
+          <div v-if="selectedTask.outputEnabled" class="mt-4 flex flex-wrap gap-2">
             <Button
               variant="outline"
               size="sm"
               class="gap-1"
-              :disabled="!selectedTask.job"
+              :disabled="!selectedTask.job || !selectedTask.outputEnabled"
               @click="exportReport(selectedTask, 'xlsx')"
               ><FileSpreadsheet class="h-3.5 w-3.5" />{{ ui.xlsx }}</Button
             >
@@ -2608,13 +2634,11 @@ onUnmounted(() => {
                 ? ui.hits
                 : tab === "fields"
                   ? ui.fields
-                  : tab === "targets"
-                    ? ui.targets
-                    : tab === "sql"
-                      ? ui.sqlResult
-                      : tab === "samples"
-                        ? ui.samples
-                        : ui.logs
+                  : tab === "sql"
+                    ? ui.sqlResult
+                    : tab === "samples"
+                      ? ui.samples
+                      : ui.logs
             }}
           </button>
         </div>
@@ -2759,28 +2783,6 @@ onUnmounted(() => {
               </div>
             </div>
           </div>
-        </div>
-
-        <div v-else-if="activeTab === 'targets'" class="p-4">
-          <table v-if="selectedTask.targets.length" class="w-full text-xs">
-            <thead class="bg-muted/60 text-muted-foreground">
-              <tr>
-                <th class="px-3 py-2 text-left">{{ ui.type }}</th>
-                <th class="px-3 py-2 text-left">{{ ui.address }}</th>
-                <th class="px-3 py-2 text-left">{{ ui.usernameLabel }}</th>
-                <th class="px-3 py-2 text-left">{{ ui.source }}</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="target in selectedTask.targets" :key="`${target.line}-${target.raw}`" class="border-t">
-                <td class="px-3 py-2">{{ target.dbType }}</td>
-                <td class="px-3 py-2 font-mono">{{ target.host }}:{{ target.port }}</td>
-                <td class="px-3 py-2">{{ target.username || "-" }}</td>
-                <td class="px-3 py-2 text-muted-foreground">line {{ target.line }}</td>
-              </tr>
-            </tbody>
-          </table>
-          <div v-else class="p-8 text-center text-sm text-muted-foreground">{{ ui.noTargets }}</div>
         </div>
 
         <div v-else-if="activeTab === 'sql'" class="p-4">

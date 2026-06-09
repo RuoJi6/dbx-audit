@@ -9,6 +9,9 @@ pub enum AuditSqlDialect {
     Postgres,
     Mssql,
     Oracle,
+    Sqlite,
+    ClickHouse,
+    Ansi,
 }
 
 pub fn audit_column_findings(
@@ -48,8 +51,10 @@ pub fn audit_column_findings(
 
 pub fn quote_ident(dialect: AuditSqlDialect, ident: &str) -> String {
     match dialect {
-        AuditSqlDialect::Mysql => format!("`{}`", ident.replace('`', "``")),
-        AuditSqlDialect::Postgres | AuditSqlDialect::Oracle => format!("\"{}\"", ident.replace('"', "\"\"")),
+        AuditSqlDialect::Mysql | AuditSqlDialect::ClickHouse => format!("`{}`", ident.replace('`', "``")),
+        AuditSqlDialect::Postgres | AuditSqlDialect::Oracle | AuditSqlDialect::Sqlite | AuditSqlDialect::Ansi => {
+            format!("\"{}\"", ident.replace('"', "\"\""))
+        }
         AuditSqlDialect::Mssql => format!("[{}]", ident.replace(']', "]]")),
     }
 }
@@ -70,7 +75,53 @@ pub fn build_sample_rows_sql(
     match dialect {
         AuditSqlDialect::Mssql => format!("select top ({limit}) {select} from {table_name}"),
         AuditSqlDialect::Oracle => format!("select {select} from {table_name} fetch first {limit} rows only"),
-        _ => format!("select {select} from {table_name} limit {limit}"),
+        AuditSqlDialect::Mysql
+        | AuditSqlDialect::Postgres
+        | AuditSqlDialect::Sqlite
+        | AuditSqlDialect::ClickHouse
+        | AuditSqlDialect::Ansi => {
+            format!("select {select} from {table_name} limit {limit}")
+        }
+    }
+}
+
+pub fn build_table_count_sql(dialect: AuditSqlDialect, schema: Option<&str>, table: &str) -> String {
+    format!("select count(*) from {}", qualified_table_name(dialect, schema, table))
+}
+
+pub fn build_non_empty_count_sql(dialect: AuditSqlDialect, schema: Option<&str>, table: &str, column: &str) -> String {
+    let table_name = qualified_table_name(dialect, schema, table);
+    let column_name = quote_ident(dialect, column);
+    match dialect {
+        AuditSqlDialect::Mysql => {
+            format!("select count(*) from {table_name} where {column_name} is not null and cast({column_name} as char) <> ''")
+        }
+        AuditSqlDialect::Postgres => {
+            format!("select count(*) from {table_name} where {column_name} is not null and {column_name}::text <> ''")
+        }
+        AuditSqlDialect::Mssql => {
+            format!("select count(*) from {table_name} where {column_name} is not null and cast({column_name} as nvarchar(max)) <> ''")
+        }
+        AuditSqlDialect::Oracle => {
+            format!(
+                "select count(*) from {table_name} where {column_name} is not null and to_char({column_name}) <> ''"
+            )
+        }
+        AuditSqlDialect::Sqlite => {
+            format!(
+                "select count(*) from {table_name} where {column_name} is not null and cast({column_name} as text) <> ''"
+            )
+        }
+        AuditSqlDialect::ClickHouse => {
+            format!(
+                "select count(*) from {table_name} where {column_name} is not null and toString({column_name}) != ''"
+            )
+        }
+        AuditSqlDialect::Ansi => {
+            format!(
+                "select count(*) from {table_name} where {column_name} is not null and cast({column_name} as varchar) <> ''"
+            )
+        }
     }
 }
 
@@ -97,6 +148,21 @@ pub fn build_content_match_sql(
         }
         AuditSqlDialect::Oracle => {
             format!("select {column_name} from {table_name} where regexp_like({column_name}, {pattern:?}) fetch first {limit} rows only")
+        }
+        AuditSqlDialect::Sqlite => {
+            let like = regex_to_like(pattern);
+            format!(
+                "select {column_name} from {table_name} where cast({column_name} as text) like {like:?} limit {limit}"
+            )
+        }
+        AuditSqlDialect::ClickHouse => {
+            format!(
+                "select {column_name} from {table_name} where match(toString({column_name}), {pattern:?}) limit {limit}"
+            )
+        }
+        AuditSqlDialect::Ansi => {
+            let like = regex_to_like(pattern);
+            format!("select {column_name} from {table_name} where cast({column_name} as varchar) like {like:?} limit {limit}")
         }
     }
 }
@@ -165,6 +231,26 @@ mod tests {
             build_sample_rows_sql(AuditSqlDialect::Oracle, Some("HR"), "USERS", &["EMAIL".into()], 5),
             "select \"EMAIL\" from \"HR\".\"USERS\" fetch first 5 rows only"
         );
+    }
+
+    #[test]
+    fn builds_count_sql_for_postgres_schema() {
+        assert_eq!(
+            super::build_table_count_sql(AuditSqlDialect::Postgres, Some("public"), "users"),
+            "select count(*) from \"public\".\"users\""
+        );
+        assert!(super::build_non_empty_count_sql(AuditSqlDialect::Postgres, Some("public"), "users", "email")
+            .contains("\"email\"::text <> ''"));
+    }
+
+    #[test]
+    fn builds_count_sql_for_ansi_schema() {
+        assert_eq!(
+            super::build_table_count_sql(AuditSqlDialect::Ansi, Some("PUBLIC"), "USERS"),
+            "select count(*) from \"PUBLIC\".\"USERS\""
+        );
+        assert!(super::build_non_empty_count_sql(AuditSqlDialect::Ansi, Some("PUBLIC"), "USERS", "EMAIL")
+            .contains("cast(\"EMAIL\" as varchar) <> ''"));
     }
 
     #[test]

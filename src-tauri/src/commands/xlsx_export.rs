@@ -15,6 +15,7 @@ pub struct QueryResultXlsxExportRequest {
 pub fn export_query_result_xlsx(request: QueryResultXlsxExportRequest) -> Result<(), String> {
     let workbook = build_xlsx_workbook(&XlsxWorksheetData {
         sheet_name: request.sheet_name,
+        cells: Vec::new(),
         columns: request.columns,
         rows: request.rows,
     })?;

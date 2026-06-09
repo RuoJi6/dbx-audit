@@ -395,8 +395,12 @@ pub async fn export_table_data_core(
             });
 
             // Build XLSX workbook from accumulated rows
-            let workbook_data =
-                XlsxWorksheetData { sheet_name: Some(request.table_name.clone()), columns: col_names, rows: all_rows };
+            let workbook_data = XlsxWorksheetData {
+                sheet_name: Some(request.table_name.clone()),
+                cells: Vec::new(),
+                columns: col_names,
+                rows: all_rows,
+            };
             let xlsx_bytes = build_xlsx_workbook(&workbook_data)?;
             file.write_all(&xlsx_bytes).map_err(|e| format!("Failed to write XLSX file: {e}"))?;
         }
@@ -748,6 +752,7 @@ mod tests {
     fn builds_xlsx_workbook_with_table_export_data() {
         let data = XlsxWorksheetData {
             sheet_name: Some("employees".to_string()),
+            cells: Vec::new(),
             columns: vec!["id".to_string(), "name".to_string(), "salary".to_string()],
             rows: vec![
                 vec![json!(1), json!("Alice"), json!(75000.50)],

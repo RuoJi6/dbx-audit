@@ -6,8 +6,18 @@ use std::io::{Cursor, Write};
 #[serde(rename_all = "camelCase")]
 pub struct XlsxWorksheetData {
     pub sheet_name: Option<String>,
+    #[serde(default)]
+    pub cells: Vec<Vec<XlsxCellData>>,
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Value>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct XlsxCellData {
+    pub value: Value,
+    #[serde(default)]
+    pub style: Option<usize>,
 }
 
 fn escape_xml(value: &str) -> String {
@@ -64,35 +74,40 @@ fn normalize_sheet_name(input: Option<&str>) -> String {
     fallback.chars().take(31).collect()
 }
 
-fn value_text(value: Option<&Value>) -> String {
-    match value {
-        Some(Value::Null) | None => String::new(),
-        Some(Value::Bool(v)) => {
-            if *v {
-                "true".to_string()
-            } else {
-                "false".to_string()
-            }
-        }
-        Some(Value::Number(n)) => n.to_string(),
-        Some(Value::String(s)) => s.clone(),
-        Some(other) => other.to_string(),
-    }
+fn display_width(value: &str) -> usize {
+    value.chars().map(|ch| if ch.is_ascii() { 1 } else { 2 }).sum()
 }
 
 fn estimate_column_widths(columns: &[String], rows: &[Vec<Value>]) -> Vec<usize> {
-    columns
-        .iter()
-        .enumerate()
-        .map(|(col_index, column)| {
-            let values = rows.iter().take(100).map(|row| value_text(row.get(col_index)));
-            let max_len = std::iter::once(column.clone())
-                .chain(values)
-                .map(|v| v.chars().count().min(60))
-                .fold(8usize, usize::max);
-            (max_len + 2).clamp(10, 60)
-        })
-        .collect()
+    let cells = std::iter::once(columns.iter().map(|column| column.as_str()).collect::<Vec<_>>())
+        .chain(rows.iter().take(100).map(|row| row.iter().map(value_string).collect::<Vec<_>>()));
+    estimate_text_column_widths(cells)
+}
+
+fn estimate_cell_column_widths(rows: &[Vec<XlsxCellData>]) -> Vec<usize> {
+    estimate_text_column_widths(
+        rows.iter().take(100).map(|row| row.iter().map(|cell| value_string(&cell.value)).collect::<Vec<_>>()),
+    )
+}
+
+fn estimate_text_column_widths<'a>(rows: impl Iterator<Item = Vec<&'a str>>) -> Vec<usize> {
+    let mut max_by_column = Vec::<usize>::new();
+    for row in rows {
+        for (index, value) in row.iter().enumerate() {
+            if index >= max_by_column.len() {
+                max_by_column.resize(index + 1, 0);
+            }
+            max_by_column[index] = max_by_column[index].max(display_width(value).min(60));
+        }
+    }
+    max_by_column.into_iter().map(|width| (width + 3).clamp(8, 60)).collect()
+}
+
+fn value_string(value: &Value) -> &str {
+    match value {
+        Value::String(value) => value.as_str(),
+        _ => "",
+    }
 }
 
 fn cell_xml(value: Option<&Value>, row_index: usize, col_index: usize, style: Option<usize>) -> String {
@@ -125,6 +140,9 @@ fn cell_xml(value: Option<&Value>, row_index: usize, col_index: usize, style: Op
 }
 
 fn worksheet_xml(data: &XlsxWorksheetData) -> String {
+    if !data.cells.is_empty() {
+        return worksheet_cells_xml(&data.cells);
+    }
     let total_rows = data.rows.len() + 1;
     let range = sheet_range(data.columns.len(), total_rows);
     let widths = estimate_column_widths(&data.columns, &data.rows);
@@ -181,6 +199,47 @@ fn worksheet_xml(data: &XlsxWorksheetData) -> String {
     )
 }
 
+fn worksheet_cells_xml(rows: &[Vec<XlsxCellData>]) -> String {
+    let max_cols = rows.iter().map(Vec::len).max().unwrap_or(1);
+    let range = sheet_range(max_cols, rows.len().max(1));
+    let cols_xml = estimate_cell_column_widths(rows)
+        .iter()
+        .enumerate()
+        .map(|(index, width)| {
+            format!("<col min=\"{}\" max=\"{}\" width=\"{}\" customWidth=\"1\"/>", index + 1, index + 1, width)
+        })
+        .collect::<String>();
+    let body_xml = rows
+        .iter()
+        .enumerate()
+        .map(|(row_index, row)| {
+            let excel_row = row_index + 1;
+            let cells = row
+                .iter()
+                .enumerate()
+                .map(|(col_index, cell)| cell_xml(Some(&cell.value), row_index, col_index, cell.style))
+                .collect::<String>();
+            format!("<row r=\"{excel_row}\">{cells}</row>")
+        })
+        .collect::<String>();
+
+    format!(
+        concat!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>",
+            "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">",
+            "<dimension ref=\"{range}\"/>",
+            "<sheetViews><sheetView workbookViewId=\"0\"/></sheetViews>",
+            "<sheetFormatPr defaultRowHeight=\"15\"/>",
+            "<cols>{cols_xml}</cols>",
+            "<sheetData>{body_xml}</sheetData>",
+            "</worksheet>"
+        ),
+        range = range,
+        cols_xml = cols_xml,
+        body_xml = body_xml,
+    )
+}
+
 fn content_types_xml(sheet_count: usize) -> String {
     let overrides = (1..=sheet_count)
         .map(|index| {
@@ -219,10 +278,7 @@ fn workbook_xml(sheet_names: &[String]) -> String {
         .enumerate()
         .map(|(index, sheet_name)| {
             let sheet_id = index + 1;
-            format!(
-                "<sheet name=\"{}\" sheetId=\"{sheet_id}\" r:id=\"rId{sheet_id}\"/>",
-                escape_xml(sheet_name)
-            )
+            format!("<sheet name=\"{}\" sheetId=\"{sheet_id}\" r:id=\"rId{sheet_id}\"/>", escape_xml(sheet_name))
         })
         .collect::<String>();
     format!(
@@ -261,11 +317,11 @@ fn styles_xml() -> &'static str {
     concat!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>",
         "<styleSheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">",
-        "<fonts count=\"2\"><font><sz val=\"11\"/><name val=\"Calibri\"/></font><font><b/><sz val=\"11\"/><name val=\"Calibri\"/></font></fonts>",
+        "<fonts count=\"5\"><font><sz val=\"11\"/><name val=\"Calibri\"/></font><font><b/><sz val=\"11\"/><name val=\"Calibri\"/></font><font><sz val=\"11\"/><color rgb=\"FFFF0000\"/><name val=\"Calibri\"/></font><font><sz val=\"11\"/><color rgb=\"FFFFC000\"/><name val=\"Calibri\"/></font><font><sz val=\"11\"/><color rgb=\"FF00A6A6\"/><name val=\"Calibri\"/></font></fonts>",
         "<fills count=\"2\"><fill><patternFill patternType=\"none\"/></fill><fill><patternFill patternType=\"gray125\"/></fill></fills>",
         "<borders count=\"1\"><border><left/><right/><top/><bottom/><diagonal/></border></borders>",
         "<cellStyleXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\"/></cellStyleXfs>",
-        "<cellXfs count=\"2\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/><xf numFmtId=\"0\" fontId=\"1\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyFont=\"1\"/></cellXfs>",
+        "<cellXfs count=\"5\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/><xf numFmtId=\"0\" fontId=\"1\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyFont=\"1\"/><xf numFmtId=\"0\" fontId=\"2\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyFont=\"1\"/><xf numFmtId=\"0\" fontId=\"3\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyFont=\"1\"/><xf numFmtId=\"0\" fontId=\"4\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyFont=\"1\"/></cellXfs>",
         "<cellStyles count=\"1\"><cellStyle name=\"Normal\" xfId=\"0\" builtinId=\"0\"/></cellStyles>",
         "</styleSheet>"
     )
@@ -279,6 +335,7 @@ pub fn build_xlsx_workbook_multi(sheets: &[XlsxWorksheetData]) -> Result<Vec<u8>
     let sheets = if sheets.is_empty() {
         vec![XlsxWorksheetData {
             sheet_name: Some("Sheet1".to_string()),
+            cells: Vec::new(),
             columns: vec!["Result".to_string()],
             rows: vec![vec![Value::String("No data".to_string())]],
         }]
@@ -340,6 +397,7 @@ mod tests {
     fn builds_xlsx_zip_with_sheet_data() {
         let workbook = build_xlsx_workbook(&XlsxWorksheetData {
             sheet_name: Some("Users".to_string()),
+            cells: Vec::new(),
             columns: vec!["id".to_string(), "name".to_string(), "active".to_string()],
             rows: vec![vec![json!(1), json!("Ada & Bob"), json!(true)], vec![json!(2), json!(null), json!(false)]],
         })
@@ -360,6 +418,7 @@ mod tests {
     fn sanitizes_invalid_sheet_name() {
         let workbook = build_xlsx_workbook(&XlsxWorksheetData {
             sheet_name: Some("bad/name:with*chars?and-a-very-long-tail".to_string()),
+            cells: Vec::new(),
             columns: vec!["value".to_string()],
             rows: vec![vec![json!("ok")]],
         })

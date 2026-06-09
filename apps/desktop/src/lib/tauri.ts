@@ -221,6 +221,19 @@ export interface AuditTableResult {
   level: string;
 }
 
+export interface AuditTableEvidence {
+  connectionId?: string;
+  connectionName?: string;
+  dbType?: string;
+  database: string;
+  schema?: string;
+  table: string;
+  rowCount: number;
+  columns: string[];
+  fields: { name: string; kinds: string[]; level: string; mode: string; total: number }[];
+  rows: Record<string, string>[];
+}
+
 export interface AuditFieldResult {
   database: string;
   schema?: string;
@@ -255,6 +268,7 @@ export interface AuditJobState {
   request: AuditScanRequest;
   logs: { time: string; level: string; message: string }[];
   findings: AuditFinding[];
+  tableResults: AuditTableEvidence[];
   errors: string[];
   startedAt: string;
   finishedAt?: string;
