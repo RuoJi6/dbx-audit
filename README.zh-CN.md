@@ -46,7 +46,7 @@
     <a href="https://hellogithub.com/repository/t8y2/dbx" target="_blank"><img src="https://api.hellogithub.com/v1/widgets/recommend.svg?rid=7f74ffda697241bf996e17e1b0900a21&claim_uid=p0UjnC1TLtyvWSx" alt="Featured｜HelloGitHub" style="width: 250px; height: 54px;" width="250" height="54" /></a>
   </p>
   <p>
-    <a href="README.md">English</a> | 简体中文
+    <a href="README.en-US.md">English</a> | 简体中文
   </p>
 
   <p>
