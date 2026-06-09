@@ -3177,9 +3177,9 @@ onUnmounted(() => {
                 <th class="whitespace-nowrap px-3 py-2 text-left">{{ ui.connectionSource }}</th>
                 <th class="whitespace-nowrap px-3 py-2 text-left">{{ ui.database }}</th>
                 <th class="whitespace-nowrap px-3 py-2 text-left">{{ ui.table }}</th>
-                <th class="whitespace-nowrap px-3 py-2 text-left">{{ ui.sensitiveFields }}</th>
                 <th class="whitespace-nowrap px-3 py-2 text-left">{{ ui.rows }}</th>
-                <th class="whitespace-nowrap px-3 py-2 text-left">{{ ui.risk }}</th>
+                <th class="whitespace-nowrap px-3 py-2 text-left">{{ ui.level }}</th>
+                <th class="whitespace-nowrap px-3 py-2 text-left">{{ ui.sensitiveFields }}</th>
               </tr>
             </thead>
             <tbody>
@@ -3192,11 +3192,13 @@ onUnmounted(() => {
                 </td>
                 <td class="whitespace-nowrap px-3 py-2 font-mono">{{ hit.database }}</td>
                 <td class="whitespace-nowrap px-3 py-2 font-mono">{{ hit.table }}</td>
-                <td class="whitespace-nowrap px-3 py-2 font-mono">{{ hit.columns.join(", ") }}</td>
                 <td class="whitespace-nowrap px-3 py-2">{{ hit.rowCount }}</td>
                 <td class="whitespace-nowrap px-3 py-2">
-                  <span class="rounded-full border px-2 py-0.5" :class="riskClass(hit.risk)">{{ hit.risk }}</span>
+                  <span class="rounded-full border px-2 py-0.5" :class="riskClass(hit.risk)">{{
+                    ui.levelLabel[hit.risk]
+                  }}</span>
                 </td>
+                <td class="whitespace-nowrap px-3 py-2 font-mono">{{ hit.columns.join(", ") }}</td>
               </tr>
               <tr v-if="filteredTables.length === 0">
                 <td class="px-3 py-8 text-center text-muted-foreground" colspan="6">{{ ui.noFindings }}</td>
