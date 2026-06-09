@@ -107,6 +107,9 @@ fn fallback_tables_from_findings(findings: &[AuditFinding]) -> Vec<AuditTableEvi
                 connection_id: first.connection_id.clone(),
                 connection_name: first.connection_name.clone(),
                 db_type: first.db_type.clone(),
+                connection_host: first.connection_host.clone(),
+                connection_port: first.connection_port,
+                connection_user: first.connection_user.clone(),
                 database: first.database.clone(),
                 schema: first.schema.clone(),
                 table: first.table.clone(),
@@ -155,6 +158,7 @@ fn summary_sheet(tables: &[AuditTableEvidence]) -> XlsxWorksheetData {
         if index > 0 {
             rows.push(Vec::new());
         }
+        rows.extend(audit_target_rows(table));
         rows.push(row(["[数据库]", table.database.as_str()]));
         rows.push(row(["[表]", &format!("{}【实际数据行数：{}】", table_label(table), table.row_count)]));
         for field in &table.fields {
@@ -169,7 +173,18 @@ fn summary_sheet(tables: &[AuditTableEvidence]) -> XlsxWorksheetData {
 }
 
 fn table_detail_sheet(table: &AuditTableEvidence, findings: Vec<&AuditFinding>) -> XlsxWorksheetData {
-    let mut rows = vec![
+    let mut rows = audit_target_rows(table)
+        .into_iter()
+        .map(|mut row| {
+            if let Some(first) = row.first_mut() {
+                if let Value::String(value) = &mut first.value {
+                    *value = value.trim_matches(['[', ']']).to_string();
+                }
+            }
+            row
+        })
+        .collect::<Vec<_>>();
+    rows.extend([
         row(["数据库", table.database.as_str()]),
         row(["Schema", table.schema.as_deref().unwrap_or("")]),
         row(["表名", table.table.as_str()]),
@@ -177,7 +192,7 @@ fn table_detail_sheet(table: &AuditTableEvidence, findings: Vec<&AuditFinding>) 
         Vec::new(),
         row(["敏感字段清单"]),
         row(["字段名", "疑似类型", "敏感级别", "判断依据", "字段非空行数"]),
-    ];
+    ]);
     for field in &table.fields {
         rows.push(vec![
             cell(field.name.clone(), Some(style_for_level(field.level))),
@@ -253,14 +268,27 @@ fn errors_sheet(errors: &[String]) -> XlsxWorksheetData {
 
 fn redis_header(with_value: bool) -> Vec<XlsxCellData> {
     if with_value {
-        row(["Target", "DB", "Key", "Type", "TTL", "Path/Field", "Value", "命中类型", "敏感级别", "判断依据"])
+        row([
+            "数据库类型",
+            "Target",
+            "DB",
+            "Key",
+            "Redis类型",
+            "TTL",
+            "Path/Field",
+            "Value",
+            "命中类型",
+            "敏感级别",
+            "判断依据",
+        ])
     } else {
-        row(["Target", "DB", "Key", "Type", "TTL", "Path/Field", "命中类型", "敏感级别", "判断依据"])
+        row(["数据库类型", "Target", "DB", "Key", "Redis类型", "TTL", "Path/Field", "命中类型", "敏感级别", "判断依据"])
     }
 }
 
 fn redis_row(finding: &AuditFinding, with_value: bool) -> Vec<XlsxCellData> {
     let mut values = vec![
+        cell(database_type_label(finding.db_type.as_deref()), None),
         cell(finding.connection_name.clone().or_else(|| finding.connection_id.clone()).unwrap_or_default(), None),
         cell(finding.database.trim_start_matches("redis-db").to_string(), None),
         cell(finding.table.clone(), None),
@@ -292,7 +320,11 @@ fn cell(value: impl Into<String>, style: Option<usize>) -> XlsxCellData {
 }
 
 fn table_sort_key(table: &AuditTableEvidence) -> String {
-    table_key_parts(&table.connection_id, &table.database, table.schema.as_deref(), &table.table)
+    format!(
+        "{}\u{0}{}",
+        table.db_type.clone().unwrap_or_default(),
+        table_key_parts(&table.connection_id, &table.database, table.schema.as_deref(), &table.table)
+    )
 }
 
 fn table_key_parts(connection_id: &Option<String>, database: &str, schema: Option<&str>, table: &str) -> String {
@@ -323,11 +355,37 @@ fn table_label(table: &AuditTableEvidence) -> String {
 }
 
 fn table_sheet_name(table: &AuditTableEvidence) -> String {
-    [table.database.as_str(), table.schema.as_deref().unwrap_or_default(), table.table.as_str()]
+    [
+        table.db_type.as_deref().unwrap_or_default(),
+        table.database.as_str(),
+        table.schema.as_deref().unwrap_or_default(),
+        table.table.as_str(),
+    ]
         .into_iter()
         .filter(|part| !part.trim().is_empty())
         .collect::<Vec<_>>()
         .join(".")
+}
+
+fn audit_target_rows(table: &AuditTableEvidence) -> Vec<Vec<XlsxCellData>> {
+    vec![
+        row(["[数据库类型]", database_type_label(table.db_type.as_deref()).as_str()]),
+        row(["[连接来源]", table.connection_name.as_deref().unwrap_or("")]),
+        row(["[目标]", target_address(table).as_str()]),
+        row(["[用户]", table.connection_user.as_deref().unwrap_or("")]),
+    ]
+}
+
+fn target_address(table: &AuditTableEvidence) -> String {
+    match (table.connection_host.as_deref(), table.connection_port) {
+        (Some(host), Some(port)) if !host.trim().is_empty() => format!("{host}:{port}"),
+        (Some(host), _) => host.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn database_type_label(value: Option<&str>) -> String {
+    value.unwrap_or("").trim().to_ascii_lowercase()
 }
 
 fn table_field_styles(table: &AuditTableEvidence) -> BTreeMap<String, usize> {
@@ -405,6 +463,9 @@ mod tests {
             connection_id: Some("conn-1".to_string()),
             connection_name: Some("local".to_string()),
             db_type: Some("postgres".to_string()),
+            connection_host: Some("127.0.0.1".to_string()),
+            connection_port: Some(5432),
+            connection_user: Some("audit".to_string()),
             database: "audit_demo".to_string(),
             schema: Some("public".to_string()),
             table: "users".to_string(),
@@ -424,6 +485,9 @@ mod tests {
             connection_id: Some("redis-1".to_string()),
             connection_name: Some("Redis_q3u0".to_string()),
             db_type: Some("redis".to_string()),
+            connection_host: Some("127.0.0.1".to_string()),
+            connection_port: Some(6379),
+            connection_user: Some("default".to_string()),
             database: "redis-db0".to_string(),
             schema: Some("redis-key".to_string()),
             table: "session:token".to_string(),
@@ -446,6 +510,9 @@ mod tests {
             connection_id: Some("conn-1".to_string()),
             connection_name: Some("local".to_string()),
             db_type: Some("postgres".to_string()),
+            connection_host: Some("127.0.0.1".to_string()),
+            connection_port: Some(5432),
+            connection_user: Some("audit".to_string()),
             database: "audit_demo".to_string(),
             schema: Some("public".to_string()),
             table: "users".to_string(),
@@ -514,9 +581,12 @@ mod tests {
         let text = String::from_utf8_lossy(&bytes);
         for expected in [
             "敏感信息汇总",
-            "audit_demo.public.users",
+            "postgres.audit_demo.public.user",
             "Redis 汇总",
             "Redis Keys",
+            "数据库类型",
+            "postgres",
+            "127.0.0.1:5432",
             "[数据库]",
             "[表]",
             "实际数据行数",

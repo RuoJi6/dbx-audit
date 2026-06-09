@@ -199,6 +199,9 @@ export interface AuditFinding {
   connectionId?: string;
   connectionName?: string;
   dbType?: string;
+  connectionHost?: string;
+  connectionPort?: number;
+  connectionUser?: string;
   database: string;
   schema?: string;
   table: string;
@@ -225,6 +228,9 @@ export interface AuditTableEvidence {
   connectionId?: string;
   connectionName?: string;
   dbType?: string;
+  connectionHost?: string;
+  connectionPort?: number;
+  connectionUser?: string;
   database: string;
   schema?: string;
   table: string;

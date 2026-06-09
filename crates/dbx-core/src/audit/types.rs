@@ -205,6 +205,12 @@ pub struct AuditTableEvidence {
     pub connection_name: Option<String>,
     #[serde(default)]
     pub db_type: Option<String>,
+    #[serde(default)]
+    pub connection_host: Option<String>,
+    #[serde(default)]
+    pub connection_port: Option<u16>,
+    #[serde(default)]
+    pub connection_user: Option<String>,
     pub database: String,
     #[serde(default)]
     pub schema: Option<String>,
@@ -227,6 +233,12 @@ pub struct AuditFinding {
     pub connection_name: Option<String>,
     #[serde(default)]
     pub db_type: Option<String>,
+    #[serde(default)]
+    pub connection_host: Option<String>,
+    #[serde(default)]
+    pub connection_port: Option<u16>,
+    #[serde(default)]
+    pub connection_user: Option<String>,
     pub database: String,
     #[serde(default)]
     pub schema: Option<String>,

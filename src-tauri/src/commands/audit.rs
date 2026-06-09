@@ -435,6 +435,9 @@ async fn collect_table_evidence(
         connection_id: None,
         connection_name: None,
         db_type: None,
+        connection_host: None,
+        connection_port: None,
+        connection_user: None,
         database: database.to_string(),
         schema: schema.map(str::to_string),
         table: table.to_string(),
@@ -669,11 +672,12 @@ async fn audit_target_databases(
         job.logs.push(log_entry("info", "数据库为空，正在枚举可访问数据库"));
     });
 
+    let db_type = connection_db_type(state, &request.connection_id).await;
     let databases = dbx_core::schema::list_databases_core(state, &request.connection_id)
         .await?
         .into_iter()
         .map(|database| database.name)
-        .filter(|name| request.include_system || !is_system_database(name))
+        .filter(|name| request.include_system || !is_system_database(db_type, name))
         .collect::<Vec<_>>();
 
     if databases.is_empty() {
@@ -689,6 +693,7 @@ async fn run_document_scan(state: Arc<AppState>, request: AuditScanRequest, job_
         job.logs.push(log_entry("info", "正在扫描文档集合/索引"));
     });
 
+    let db_type = connection_db_type(&state, &request.connection_id).await;
     let databases =
         if let Some(database) = request.database.as_ref().map(|value| value.trim()).filter(|value| !value.is_empty()) {
             vec![database.to_string()]
@@ -696,7 +701,7 @@ async fn run_document_scan(state: Arc<AppState>, request: AuditScanRequest, job_
             dbx_core::mongo_ops::mongo_list_databases_core(&state, &request.connection_id)
                 .await?
                 .into_iter()
-                .filter(|database| request.include_system || !is_system_database(database))
+                .filter(|database| request.include_system || !is_system_database(db_type, database))
                 .collect::<Vec<_>>()
         };
     if databases.is_empty() {
@@ -710,7 +715,11 @@ async fn run_document_scan(state: Arc<AppState>, request: AuditScanRequest, job_
             return Ok(());
         }
         let collections = if request.tables.is_empty() {
-            dbx_core::mongo_ops::mongo_list_collections_core(&state, &request.connection_id, database).await?
+            dbx_core::mongo_ops::mongo_list_collections_core(&state, &request.connection_id, database)
+                .await?
+                .into_iter()
+                .filter(|collection| request.include_system || !is_system_document_collection(db_type, collection))
+                .collect::<Vec<_>>()
         } else {
             request
                 .tables
@@ -724,7 +733,7 @@ async fn run_document_scan(state: Arc<AppState>, request: AuditScanRequest, job_
             if is_cancelled(job_id) {
                 return Ok(());
             }
-            let result = dbx_core::mongo_ops::mongo_find_documents_core(
+            let result = match dbx_core::mongo_ops::mongo_find_documents_core(
                 &state,
                 &request.connection_id,
                 database,
@@ -734,7 +743,17 @@ async fn run_document_scan(state: Arc<AppState>, request: AuditScanRequest, job_
                 None,
                 None,
             )
-            .await?;
+            .await
+            {
+                Ok(result) => result,
+                Err(err) => {
+                    update_job(job_id, |job| {
+                        job.logs.push(log_entry("warn", format!("文档集合扫描跳过：{database}.{collection}，{err}")));
+                        job.errors.push(format!("{database}.{collection}: {err}"));
+                    });
+                    continue;
+                }
+            };
             let (mut findings, table_result) = audit_document_findings(
                 database,
                 Some(&schema),
@@ -856,6 +875,9 @@ fn redis_finding(
         connection_id: None,
         connection_name: None,
         db_type: Some("redis".to_string()),
+        connection_host: None,
+        connection_port: None,
+        connection_user: None,
         database: format!("redis-db{db}"),
         schema: Some("redis-key".to_string()),
         table: key.to_string(),
@@ -891,6 +913,9 @@ async fn apply_connection_meta(state: &AppState, connection_id: &str, findings: 
         finding.connection_id = Some(connection_id.to_string());
         finding.connection_name = Some(config.name.clone());
         finding.db_type = Some(format!("{:?}", config.db_type).to_ascii_lowercase());
+        finding.connection_host = Some(config.host.clone());
+        finding.connection_port = Some(config.port);
+        finding.connection_user = Some(config.username.clone());
     }
 }
 
@@ -902,6 +927,9 @@ async fn apply_table_connection_meta(state: &AppState, connection_id: &str, tabl
     table.connection_id = Some(connection_id.to_string());
     table.connection_name = Some(config.name.clone());
     table.db_type = Some(format!("{:?}", config.db_type).to_ascii_lowercase());
+    table.connection_host = Some(config.host.clone());
+    table.connection_port = Some(config.port);
+    table.connection_user = Some(config.username.clone());
 }
 
 async fn document_schema(state: &AppState, connection_id: &str) -> String {
@@ -969,11 +997,37 @@ async fn default_audit_schemas(state: &AppState, connection_id: &str, db_type: O
     }
 }
 
-fn is_system_database(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "information_schema" | "mysql" | "performance_schema" | "sys" | "template0" | "template1" | "postgres"
-    )
+fn is_system_database(db_type: Option<DatabaseType>, name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let upper = name.to_ascii_uppercase();
+    if matches!(
+        lower.as_str(),
+        "information_schema" | "mysql" | "performance_schema" | "sys" | "system" | "template0" | "template1" | "postgres"
+    ) {
+        return true;
+    }
+    match db_type {
+        Some(DatabaseType::MongoDb) => matches!(lower.as_str(), "admin" | "local" | "config"),
+        Some(DatabaseType::SqlServer) => matches!(lower.as_str(), "master" | "model" | "msdb" | "tempdb"),
+        Some(DatabaseType::ClickHouse) => lower == "system",
+        Some(DatabaseType::Snowflake) => upper == "SNOWFLAKE",
+        Some(DatabaseType::Trino | DatabaseType::Hive | DatabaseType::Databricks) => {
+            matches!(lower.as_str(), "system" | "information_schema")
+        }
+        Some(DatabaseType::Cassandra) => lower == "system" || lower.starts_with("system_"),
+        Some(DatabaseType::Neo4j) => lower == "system",
+        Some(DatabaseType::Informix) => matches!(lower.as_str(), "sysmaster" | "sysadmin" | "sysuser" | "sysutils"),
+        _ => false,
+    }
+}
+
+fn is_system_document_collection(db_type: Option<DatabaseType>, name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    match db_type {
+        Some(DatabaseType::MongoDb) => lower.starts_with("system."),
+        Some(DatabaseType::Elasticsearch) => lower.starts_with('.'),
+        _ => false,
+    }
 }
 
 fn is_system_schema(db_type: Option<DatabaseType>, name: &str) -> bool {
@@ -1001,16 +1055,24 @@ fn is_system_schema(db_type: Option<DatabaseType>, name: &str) -> bool {
                 | "db_denydatawriter"
         ),
         Some(DatabaseType::Oracle | DatabaseType::Dameng | DatabaseType::OceanbaseOracle | DatabaseType::Yashandb) => {
-            matches!(
+            upper.starts_with("APEX_")
+                || matches!(
                 upper.as_str(),
                 "SYS"
                     | "SYSTEM"
+                    | "ANONYMOUS"
                     | "OUTLN"
+                    | "DIP"
+                    | "DMSYS"
                     | "DBSNMP"
+                    | "EXFSYS"
+                    | "FLOWS_FILES"
                     | "XDB"
+                    | "MDDATA"
                     | "MDSYS"
                     | "ORDSYS"
                     | "ORDDATA"
+                    | "ORDPLUGINS"
                     | "CTXSYS"
                     | "WMSYS"
                     | "APPQOSSYS"
@@ -1020,14 +1082,35 @@ fn is_system_schema(db_type: Option<DatabaseType>, name: &str) -> bool {
                     | "LBACSYS"
                     | "OJVMSYS"
                     | "OLAPSYS"
+                    | "REMOTE_SCHEDULER_AGENT"
                     | "SI_INFORMTN_SCHEMA"
-            )
+                    | "SPATIAL_CSW_ADMIN_USR"
+                    | "SYSBACKUP"
+                    | "SYSDG"
+                    | "SYSKM"
+                    | "SYSRAC"
+                )
         }
         Some(DatabaseType::Db2) => upper.starts_with("SYS") || matches!(upper.as_str(), "SQLJ" | "NULLID"),
-        Some(DatabaseType::Snowflake) => upper == "INFORMATION_SCHEMA",
+        Some(DatabaseType::Snowflake) => matches!(
+            upper.as_str(),
+            "INFORMATION_SCHEMA"
+                | "ACCOUNT_USAGE"
+                | "READER_ACCOUNT_USAGE"
+                | "ORGANIZATION_USAGE"
+                | "DATA_SHARING_USAGE"
+                | "CORE"
+                | "TELEMETRY"
+        ),
+        Some(DatabaseType::SapHana) => upper == "SYS" || upper.starts_with("_SYS_"),
+        Some(DatabaseType::Vertica) => matches!(upper.as_str(), "V_CATALOG" | "V_MONITOR" | "V_INTERNAL"),
+        Some(DatabaseType::Exasol) => {
+            upper == "SYS" || matches!(upper.as_str(), "EXA_STATISTICS" | "EXA_TOOLBOX" | "EXA_DB_SIZE")
+        }
         Some(DatabaseType::Teradata) => {
             matches!(upper.as_str(), "DBC" | "SYS_CALENDAR" | "SYSUDTLIB") || upper.starts_with("SYS")
         }
+        Some(DatabaseType::Informix) => matches!(upper.as_str(), "INFORMIX" | "SYSADMIN" | "SYSMASTER"),
         _ => false,
     }
 }

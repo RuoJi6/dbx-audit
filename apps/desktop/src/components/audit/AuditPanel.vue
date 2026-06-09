@@ -64,6 +64,8 @@ type AuditTask = {
   targets: ParsedFscanTarget[];
   jobId?: string;
   job?: AuditJobState;
+  logHistory: AuditJobState["logs"];
+  errorHistory: string[];
   errors: string[];
   createdAt: string;
   updatedAt: string;
@@ -232,6 +234,7 @@ const zh = {
   targets: "批量目标",
   samples: "样例数据",
   logs: "日志输出",
+  rescanStarted: "重新扫描开始",
   sqlResult: "SQL 结果",
   table: "表",
   databaseType: "数据库类型",
@@ -456,6 +459,7 @@ const en = {
   targets: "Batch targets",
   samples: "Samples",
   logs: "Logs",
+  rescanStarted: "Rescan started",
   sqlResult: "SQL result",
   table: "Table",
   databaseType: "Database type",
@@ -915,6 +919,8 @@ function newTask(seed?: Partial<AuditTask>): AuditTask {
     targets: seed?.targets || [],
     jobId: seed?.jobId,
     job: seed?.job,
+    logHistory: seed?.logHistory || [],
+    errorHistory: seed?.errorHistory || [],
     errors: seed?.errors || [],
     createdAt: seed?.createdAt || now,
     updatedAt: now,
@@ -933,6 +939,8 @@ function normalizeTask(task: AuditTask) {
     job: task.job ? { ...task.job, tableResults: task.job.tableResults || [] } : undefined,
     outputEnabled: task.outputEnabled || false,
     outputs: task.outputs || [],
+    logHistory: task.logHistory || [],
+    errorHistory: task.errorHistory || [],
   };
 }
 
@@ -957,6 +965,9 @@ function createTask() {
   draft.value.mask = false;
   draft.value.job = undefined;
   draft.value.jobId = undefined;
+  draft.value.logHistory = [];
+  draft.value.errorHistory = [];
+  draft.value.errors = [];
   view.value = "wizard";
 }
 
@@ -1001,6 +1012,8 @@ function backupTasks() {
   return tasks.value.map((task) => ({
     ...task,
     errors: [],
+    logHistory: [],
+    errorHistory: [],
     job: task.job ? { ...task.job, logs: [], errors: [] } : undefined,
   }));
 }
@@ -1456,6 +1469,8 @@ async function startTask(task: AuditTask) {
       : ui.value.connectionRequired;
     return;
   }
+  const logHistory = nextRunLogHistory(task);
+  const errorHistory = [...(task.errors || [])];
   const running = persistTask({
     ...task,
     connectionId: connectionIds[0],
@@ -1466,7 +1481,9 @@ async function startTask(task: AuditTask) {
     jobId: undefined,
     job: undefined,
     outputs: [],
-    errors: missing.map((id) => ui.value.missingConnections.replace("{ids}", id)),
+    logHistory,
+    errorHistory,
+    errors: [...errorHistory, ...missing.map((id) => ui.value.missingConnections.replace("{ids}", id))],
     startedAt: new Date().toISOString(),
     finishedAt: undefined,
   });
@@ -1502,7 +1519,7 @@ async function startTask(task: AuditTask) {
       status: "failed",
       progress: 0,
       message: String(err),
-      errors: [String(err)],
+      errors: [...running.errorHistory, String(err)],
       finishedAt: new Date().toISOString(),
     });
   }
@@ -1529,10 +1546,10 @@ async function startConnectionBatchTask(task: AuditTask, connectionIds: string[]
       workers: Number(task.workers) || 1,
       timeoutSecs: Number(task.timeoutSecs) || 15,
     },
-    logs: [],
+    logs: [...task.logHistory],
     findings: [],
     tableResults: [],
-    errors: [],
+    errors: [...task.errorHistory],
     startedAt,
   };
 
@@ -1567,12 +1584,18 @@ async function startConnectionBatchTask(task: AuditTask, connectionIds: string[]
           connectionId,
           connectionName: label,
           dbType: connection?.db_type,
+          connectionHost: connection?.host,
+          connectionPort: connection?.port,
+          connectionUser: connection?.username,
         })),
         tableResults: (job.tableResults || []).map((table) => ({
           ...table,
           connectionId,
           connectionName: label,
           dbType: connection?.db_type,
+          connectionHost: connection?.host,
+          connectionPort: connection?.port,
+          connectionUser: connection?.username,
         })),
       };
       aggregate.findings.push(
@@ -1600,16 +1623,17 @@ async function startConnectionBatchTask(task: AuditTask, connectionIds: string[]
     }
   }
 
-  aggregate.status = aggregate.errors.length ? "failed" : "completed";
+  const hasNewErrors = aggregate.errors.length > task.errorHistory.length;
+  aggregate.status = hasNewErrors ? "failed" : "completed";
   aggregate.progress = 100;
   aggregate.finishedAt = new Date().toISOString();
   const finalTask = persistTask({
     ...task,
     jobId: aggregate.jobId,
     job: aggregate,
-    status: aggregate.errors.length ? "failed" : "completed",
+    status: hasNewErrors ? "failed" : "completed",
     progress: 100,
-    message: aggregate.errors.length ? ui.value.batchScanFailed : ui.value.batchScanCompleted,
+    message: hasNewErrors ? ui.value.batchScanFailed : ui.value.batchScanCompleted,
     errors: aggregate.errors,
     outputs,
     finishedAt: aggregate.finishedAt,
@@ -1665,23 +1689,24 @@ async function refreshTaskJob(taskId: string, jobId?: string) {
   try {
     const job = await api.auditGetJob(effectiveJobId);
     if (!job) return;
+    const mergedJob = mergeTaskLogHistory(task, job);
     const status = mapJobStatus(job.status);
     const next = persistTask({
       ...task,
       jobId: effectiveJobId,
-      job,
+      job: mergedJob,
       status,
       progress: job.progress,
-      message: lastLog(job) || ui.value.status[status],
-      errors: job.errors || [],
+      message: lastLog(mergedJob) || ui.value.status[status],
+      errors: mergeTaskErrors(task, job.errors || []),
       finishedAt: job.finishedAt || task.finishedAt,
     });
     if (job.status !== "running") {
       stopPolling(next.id);
-      await autoExportTask(next, job);
+      await autoExportTask(next, mergedJob);
     }
   } catch (err) {
-    persistTask({ ...task, status: "failed", message: String(err), errors: [String(err)] });
+    persistTask({ ...task, status: "failed", message: String(err), errors: [...(task.errorHistory || []), String(err)] });
     stopPolling(task.id);
   }
 }
@@ -1940,6 +1965,33 @@ function mapJobStatus(status: AuditJobState["status"]): AuditTaskStatus {
 
 function lastLog(job?: AuditJobState) {
   return job?.logs?.[job.logs.length - 1]?.message || "";
+}
+
+function nextRunLogHistory(task: AuditTask) {
+  const previous = task.job?.logs?.length ? task.job.logs : task.logHistory || [];
+  if (!previous.length) return [];
+  return [
+    ...previous,
+    {
+      time: new Date().toLocaleTimeString(),
+      level: "info",
+      message: `--- ${ui.value.rescanStarted} ---`,
+    },
+  ];
+}
+
+function mergeTaskLogHistory(task: AuditTask, job: AuditJobState): AuditJobState {
+  const history = task.logHistory || [];
+  if (!history.length) return job;
+  return {
+    ...job,
+    logs: [...history, ...(job.logs || [])],
+    errors: mergeTaskErrors(task, job.errors || []),
+  };
+}
+
+function mergeTaskErrors(task: AuditTask, errors: string[]) {
+  return [...(task.errorHistory || []), ...errors];
 }
 
 function connectionFor(task: AuditTask) {
