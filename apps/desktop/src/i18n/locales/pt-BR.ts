@@ -2022,11 +2022,11 @@ export default {
     tableWorkers: "Concorrência de tabelas/coleções",
     fieldWorkers: "Concorrência de campos",
     concurrencyModel: "Modelo de concorrência",
-    concurrencyHint:
-      "Alvos {targetWorkers}; tabelas/coleções {tableWorkers}; campos {fieldWorkers}",
+    concurrencyHint: "Alvos {targetWorkers}; tabelas/coleções {tableWorkers}; campos {fieldWorkers}",
     targetWorkersHint: "Conexões escaneadas ao mesmo tempo em tarefas multi-alvo",
     tableWorkersHint: "Tabelas SQL, coleções Mongo/Elasticsearch ou índices escaneados ao mesmo tempo por conexão",
-    fieldWorkersHint: "Consultas concorrentes de contagem de campos sensíveis dentro de uma tabela; Redis também usa isso para ler valores por página",
+    fieldWorkersHint:
+      "Consultas concorrentes de contagem de campos sensíveis dentro de uma tabela; Redis também usa isso para ler valores por página",
     singleTargetConcurrency: "Alvo único",
     multiTargetSequential: "{count} alvos sequenciais",
     outputFiles: "Arquivos de saída",

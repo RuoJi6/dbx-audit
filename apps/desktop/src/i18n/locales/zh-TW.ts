@@ -1893,8 +1893,7 @@ export default {
     tableWorkers: "表/集合並發",
     fieldWorkers: "欄位查詢並發",
     concurrencyModel: "並發模型",
-    concurrencyHint:
-      "目標並發 {targetWorkers}；表/集合並發 {tableWorkers}；欄位查詢並發 {fieldWorkers}",
+    concurrencyHint: "目標並發 {targetWorkers}；表/集合並發 {tableWorkers}；欄位查詢並發 {fieldWorkers}",
     targetWorkersHint: "多目標任務同時掃描的連線數",
     tableWorkersHint: "單連線內同時掃描的 SQL 表、Mongo/Elasticsearch 集合或索引數",
     fieldWorkersHint: "單表內敏感欄位存在行數統計並發數，Redis 每頁 Key 取值也使用此並發",

@@ -1884,11 +1884,11 @@ export default {
     tableWorkers: "Concurrencia de tablas/colecciones",
     fieldWorkers: "Concurrencia de campos",
     concurrencyModel: "Modelo de concurrencia",
-    concurrencyHint:
-      "Objetivos {targetWorkers}; tablas/colecciones {tableWorkers}; campos {fieldWorkers}",
+    concurrencyHint: "Objetivos {targetWorkers}; tablas/colecciones {tableWorkers}; campos {fieldWorkers}",
     targetWorkersHint: "Conexiones escaneadas al mismo tiempo en tareas multiobjetivo",
     tableWorkersHint: "Tablas SQL, colecciones Mongo/Elasticsearch o índices escaneados al mismo tiempo por conexión",
-    fieldWorkersHint: "Consultas concurrentes de conteo de campos sensibles dentro de una tabla; Redis también lo usa para leer valores por página",
+    fieldWorkersHint:
+      "Consultas concurrentes de conteo de campos sensibles dentro de una tabla; Redis también lo usa para leer valores por página",
     singleTargetConcurrency: "Objetivo único",
     multiTargetSequential: "{count} objetivos secuenciales",
     outputFiles: "Archivos de salida",

@@ -150,6 +150,8 @@ type DatabaseFilterItem = {
 type DatabaseFilterOption = {
   key: string;
   label: string;
+  sourceLabel: string;
+  databaseLabel: string;
   dbType?: string;
 };
 
@@ -258,8 +260,7 @@ const zh = {
   tableWorkers: "表/集合并发",
   fieldWorkers: "字段查询并发",
   concurrencyModel: "并发模型",
-  concurrencyHint:
-    "目标并发 {targetWorkers}；表/集合并发 {tableWorkers}；字段查询并发 {fieldWorkers}",
+  concurrencyHint: "目标并发 {targetWorkers}；表/集合并发 {tableWorkers}；字段查询并发 {fieldWorkers}",
   targetWorkersHint: "多目标任务同时扫描的连接数",
   tableWorkersHint: "单连接内同时扫描的 SQL 表、Mongo/Elasticsearch 集合或索引数",
   fieldWorkersHint: "单表内敏感字段存在行数统计并发数，Redis 每页 Key 取值也使用此并发",
@@ -456,7 +457,8 @@ const en = {
   exportFailed: "Export failed: {error}",
   importFailed: "Import failed: {error}",
   invalidBackup: "Backup content does not include a tasks array",
-  importedSnapshotRefreshHint: "This imported task is a snapshot. It cannot refresh runtime state; restart it or export the saved table.",
+  importedSnapshotRefreshHint:
+    "This imported task is a snapshot. It cannot refresh runtime state; restart it or export the saved table.",
   missingConnections: "Skipped missing connections: {ids}",
   nameRequired: "{name} is required",
   connectionRequired: "Please select a connection",
@@ -505,7 +507,8 @@ const en = {
     "Target workers {targetWorkers}; table/collection workers {tableWorkers}; field query workers {fieldWorkers}",
   targetWorkersHint: "Connections scanned at the same time in multi-target tasks",
   tableWorkersHint: "SQL tables, Mongo/Elasticsearch collections or indices scanned at the same time per connection",
-  fieldWorkersHint: "Concurrent sensitive-field count queries inside one table; Redis key value reads per page also use this",
+  fieldWorkersHint:
+    "Concurrent sensitive-field count queries inside one table; Redis key value reads per page also use this",
   singleTargetConcurrency: "Single target",
   multiTargetSequential: "{count} targets sequentially",
   timeout: "Timeout seconds",
@@ -784,21 +787,13 @@ const databaseFilterOptions = computed<DatabaseFilterOption[]>(() => {
   for (const finding of detailFindings.value) {
     const key = databaseFilterKey(finding);
     if (!key || options.has(key)) continue;
-    options.set(key, {
-      key,
-      label: databaseFilterLabel(finding),
-      dbType: finding.dbType,
-    });
+    options.set(key, databaseFilterOption(finding, key));
   }
   if (task?.job?.targetSummaries?.length) {
     for (const target of task.job.targetSummaries) {
       const key = databaseFilterKey(target);
       if (!key || options.has(key)) continue;
-      options.set(key, {
-        key,
-        label: databaseFilterLabel(target),
-        dbType: target.dbType,
-      });
+      options.set(key, databaseFilterOption(target, key));
     }
   }
   if (task?.database.trim()) {
@@ -812,11 +807,7 @@ const databaseFilterOptions = computed<DatabaseFilterOption[]>(() => {
       };
       const key = databaseFilterKey(item);
       if (!key || options.has(key)) continue;
-      options.set(key, {
-        key,
-        label: databaseFilterLabel(item),
-        dbType: item.dbType,
-      });
+      options.set(key, databaseFilterOption(item, key));
     }
   }
   return Array.from(options.values()).sort((a, b) => a.label.localeCompare(b.label));
@@ -854,7 +845,9 @@ const filteredSampleGroups = computed(() => {
     if (!matchesDatabaseFilter(group)) return false;
     const valueText = sampleGroupValueSearchText(group);
     const sensitiveText = sampleGroupSensitiveSearchText(group);
-    return (!valueQuery || valueText.includes(valueQuery)) && (!sensitiveQuery || sensitiveText.includes(sensitiveQuery));
+    return (
+      (!valueQuery || valueText.includes(valueQuery)) && (!sensitiveQuery || sensitiveText.includes(sensitiveQuery))
+    );
   });
 });
 const filteredSampleRowCount = computed(() =>
@@ -874,7 +867,9 @@ const connectionResultRows = computed(() => {
   return ids.map((id) => {
     const connection = props.connections.find((item) => item.id === id);
     const name = connection?.name || id;
-    const relatedFindings = findings.filter((finding) => finding.connectionId === id || finding.connectionName === name);
+    const relatedFindings = findings.filter(
+      (finding) => finding.connectionId === id || finding.connectionName === name,
+    );
     const relatedTables = tables.filter((table) => table.connectionId === id || table.connectionName === name);
     const relatedErrors = (task.errors || []).filter((entry) => entry.includes(id) || entry.includes(name));
     const targetSummary = task.job?.targetSummaries?.find(
@@ -891,7 +886,12 @@ const connectionResultRows = computed(() => {
         : relatedFindings.length
           ? `${ui.value.hasHits} ${relatedFindings.length}`
           : ui.value.noHits,
-      database: targetSummary?.database || relatedTables[0]?.database || relatedFindings[0]?.database || connection?.database || "",
+      database:
+        targetSummary?.database ||
+        relatedTables[0]?.database ||
+        relatedFindings[0]?.database ||
+        connection?.database ||
+        "",
       tableCount: targetSummary?.tableCount ?? relatedTables.length,
       findingCount: targetSummary?.findingCount ?? relatedFindings.length,
       rowCount,
@@ -1065,8 +1065,9 @@ function newTask(seed?: Partial<AuditTask>): AuditTask {
 }
 
 function normalizeTask(task: AuditTask) {
-  const connectionIds = (task.connectionIds?.length ? task.connectionIds : task.connectionId ? [task.connectionId] : [])
-    .filter((connectionId, index, ids) => ids.indexOf(connectionId) === index);
+  const connectionIds = (
+    task.connectionIds?.length ? task.connectionIds : task.connectionId ? [task.connectionId] : []
+  ).filter((connectionId, index, ids) => ids.indexOf(connectionId) === index);
   return {
     ...task,
     connectionId: task.connectionId || connectionIds[0] || "",
@@ -1325,7 +1326,9 @@ async function encryptBackupPayload(data: Uint8Array, password: string) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const iterations = 120_000;
   const key = await deriveBackupKey(password, salt, iterations);
-  const encrypted = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv: toArrayBuffer(iv) }, key, toArrayBuffer(data)));
+  const encrypted = new Uint8Array(
+    await crypto.subtle.encrypt({ name: "AES-GCM", iv: toArrayBuffer(iv) }, key, toArrayBuffer(data)),
+  );
   return {
     data: encrypted,
     manifest: {
@@ -1341,12 +1344,18 @@ async function encryptBackupPayload(data: Uint8Array, password: string) {
 async function decryptBackupPayload(data: Uint8Array, password: string, manifest: BackupCryptoManifest) {
   const key = await deriveBackupKey(password, base64ToBytes(manifest.salt), manifest.iterations);
   return new Uint8Array(
-    await crypto.subtle.decrypt({ name: "AES-GCM", iv: toArrayBuffer(base64ToBytes(manifest.iv)) }, key, toArrayBuffer(data)),
+    await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: toArrayBuffer(base64ToBytes(manifest.iv)) },
+      key,
+      toArrayBuffer(data),
+    ),
   );
 }
 
 async function deriveBackupKey(password: string, salt: Uint8Array, iterations: number) {
-  const material = await crypto.subtle.importKey("raw", toArrayBuffer(encodeText(password)), "PBKDF2", false, ["deriveKey"]);
+  const material = await crypto.subtle.importKey("raw", toArrayBuffer(encodeText(password)), "PBKDF2", false, [
+    "deriveKey",
+  ]);
   return crypto.subtle.deriveKey(
     { name: "PBKDF2", hash: "SHA-256", salt: toArrayBuffer(salt), iterations },
     material,
@@ -1563,16 +1572,29 @@ function selectField(field: FieldHit) {
 }
 
 function activeConnectionIds(task: Pick<AuditTask, "kind" | "connectionId" | "connectionIds">) {
-  return rawConnectionIds(task).filter((connectionId) => props.connections.some((connection) => connection.id === connectionId));
+  return rawConnectionIds(task).filter((connectionId) =>
+    props.connections.some((connection) => connection.id === connectionId),
+  );
 }
 
 function rawConnectionIds(task: Pick<AuditTask, "kind" | "connectionId" | "connectionIds">) {
-  const ids = task.kind === "fscan" ? (task.connectionIds?.length ? task.connectionIds : task.connectionId ? [task.connectionId] : []) : task.connectionId ? [task.connectionId] : [];
+  const ids =
+    task.kind === "fscan"
+      ? task.connectionIds?.length
+        ? task.connectionIds
+        : task.connectionId
+          ? [task.connectionId]
+          : []
+      : task.connectionId
+        ? [task.connectionId]
+        : [];
   return ids.filter((connectionId, index) => !!connectionId && ids.indexOf(connectionId) === index);
 }
 
 function missingConnectionIds(task: Pick<AuditTask, "kind" | "connectionId" | "connectionIds">) {
-  return rawConnectionIds(task).filter((connectionId) => !props.connections.some((connection) => connection.id === connectionId));
+  return rawConnectionIds(task).filter(
+    (connectionId) => !props.connections.some((connection) => connection.id === connectionId),
+  );
 }
 
 function isDraftConnectionSelected(connectionId: string) {
@@ -1740,7 +1762,15 @@ async function startConnectionBatchTask(task: AuditTask, connectionIds: string[]
         connectionId,
         connection,
       });
-      const job = await waitForAuditJobSnapshot(jobId, task.id, label, connectionId, connectionIds.length, aggregate, targetProgress);
+      const job = await waitForAuditJobSnapshot(
+        jobId,
+        task.id,
+        label,
+        connectionId,
+        connectionIds.length,
+        aggregate,
+        targetProgress,
+      );
       targetProgress.set(connectionId, job.status === "cancelled" ? job.progress || aggregateProgress() : 100);
       const connectionJob: AuditJobState = {
         ...job,
@@ -1764,12 +1794,8 @@ async function startConnectionBatchTask(task: AuditTask, connectionIds: string[]
           connectionUser: connection?.username,
         })),
       };
-      aggregate.findings.push(
-        ...connectionJob.findings,
-      );
-      aggregate.tableResults.push(
-        ...connectionJob.tableResults,
-      );
+      aggregate.findings.push(...connectionJob.findings);
+      aggregate.tableResults.push(...connectionJob.tableResults);
       aggregate.targetSummaries.push(auditTargetSummary(connectionId, label, connection, connectionJob));
       aggregate.logs.push(...(job.logs || []).map((entry) => ({ ...entry, message: `${label}: ${entry.message}` })));
       aggregate.errors.push(...(job.errors || []).map((entry) => `${label}: ${entry}`));
@@ -1824,7 +1850,11 @@ async function startConnectionBatchTask(task: AuditTask, connectionIds: string[]
     job: aggregate,
     status: wasCancelled ? "cancelled" : hasNewErrors ? "failed" : "completed",
     progress: aggregate.progress,
-    message: wasCancelled ? ui.value.status.cancelled : hasNewErrors ? ui.value.batchScanFailed : ui.value.batchScanCompleted,
+    message: wasCancelled
+      ? ui.value.status.cancelled
+      : hasNewErrors
+        ? ui.value.batchScanFailed
+        : ui.value.batchScanCompleted,
     errors: aggregate.errors,
     outputs,
     finishedAt: aggregate.finishedAt,
@@ -1886,7 +1916,9 @@ async function waitForAuditJobSnapshot(
     const currentProgress = targetProgress
       ? Math.min(
           99,
-          Math.round(Array.from(targetProgress.values()).reduce((total, value) => total + value, 0) / Math.max(1, total)),
+          Math.round(
+            Array.from(targetProgress.values()).reduce((total, value) => total + value, 0) / Math.max(1, total),
+          ),
         )
       : Math.min(99, job.progress || 0);
     aggregate.progress = currentProgress;
@@ -1965,7 +1997,9 @@ async function refreshTaskJob(taskId: string, jobId?: string) {
     if (!job) return;
     if (cancelledTaskIds.has(taskId)) return;
     const mergedJob =
-      job.status === "running" ? mergeTaskLogHistory(task, job) : ensureJobTargetSummaries(task, mergeTaskLogHistory(task, job));
+      job.status === "running"
+        ? mergeTaskLogHistory(task, job)
+        : ensureJobTargetSummaries(task, mergeTaskLogHistory(task, job));
     const status = mapJobStatus(job.status);
     const next = persistTask({
       ...task,
@@ -1982,7 +2016,12 @@ async function refreshTaskJob(taskId: string, jobId?: string) {
       await autoExportTask(next, mergedJob);
     }
   } catch (err) {
-    persistTask({ ...task, status: "failed", message: String(err), errors: [...(task.errorHistory || []), String(err)] });
+    persistTask({
+      ...task,
+      status: "failed",
+      message: String(err),
+      errors: [...(task.errorHistory || []), String(err)],
+    });
     stopPolling(task.id);
   }
 }
@@ -2063,7 +2102,13 @@ async function writeAuditOutputs(
   let mergedPath = "";
   if (includeSplits) {
     for (const context of splitContextsForTask(task, job)) {
-      const splitResult = await writeSplitOutput(task, filterJobForConnection(job, context), context.connectionId, context.label, context.connection);
+      const splitResult = await writeSplitOutput(
+        task,
+        filterJobForConnection(job, context),
+        context.connectionId,
+        context.label,
+        context.connection,
+      );
       if (splitResult) outputs.push(splitResult);
     }
   }
@@ -2098,7 +2143,9 @@ async function writeSplitOutput(
 
 function ensureXlsxPath(path: string) {
   const trimmed = path.trim() || "/tmp/dbx-audit-report.xlsx";
-  return trimmed.replace(/\.json$/i, ".xlsx").match(/\.xlsx$/i) ? trimmed.replace(/\.json$/i, ".xlsx") : `${trimmed}.xlsx`;
+  return trimmed.replace(/\.json$/i, ".xlsx").match(/\.xlsx$/i)
+    ? trimmed.replace(/\.json$/i, ".xlsx")
+    : `${trimmed}.xlsx`;
 }
 
 function outputPathForTask(task: AuditTask) {
@@ -2127,7 +2174,9 @@ function splitContextsForTask(task: AuditTask, job: AuditJobState) {
       contexts.set(key, {
         connectionId: finding.connectionId || key,
         label: finding.connectionName || key,
-        connection: finding.connectionId ? props.connections.find((item) => item.id === finding.connectionId) : undefined,
+        connection: finding.connectionId
+          ? props.connections.find((item) => item.id === finding.connectionId)
+          : undefined,
       });
     }
   }
@@ -2142,7 +2191,9 @@ function splitContextsForTask(task: AuditTask, job: AuditJobState) {
     }
   }
   return Array.from(contexts.values()).filter((context) => {
-    const hasError = (job.errors || []).some((entry) => entry.startsWith(`${context.label}:`) || entry.startsWith(`${context.connectionId}:`));
+    const hasError = (job.errors || []).some(
+      (entry) => entry.startsWith(`${context.label}:`) || entry.startsWith(`${context.connectionId}:`),
+    );
     const hasResult =
       (job.findings || []).some((finding) => matchesConnection(finding, context)) ||
       (job.tableResults || []).some((table) => matchesConnection(table, context));
@@ -2156,9 +2207,14 @@ function filterJobForConnection(job: AuditJobState, context: SplitContext): Audi
     findings: (job.findings || []).filter((finding) => matchesConnection(finding, context)),
     tableResults: (job.tableResults || []).filter((table) => matchesConnection(table, context)),
     logs: (job.logs || []).filter(
-      (entry) => entry.message.startsWith(`${context.label}:`) || entry.message.startsWith(`${context.connectionId}:`) || !entry.message.includes(":"),
+      (entry) =>
+        entry.message.startsWith(`${context.label}:`) ||
+        entry.message.startsWith(`${context.connectionId}:`) ||
+        !entry.message.includes(":"),
     ),
-    errors: (job.errors || []).filter((entry) => entry.startsWith(`${context.label}:`) || entry.startsWith(`${context.connectionId}:`)),
+    errors: (job.errors || []).filter(
+      (entry) => entry.startsWith(`${context.label}:`) || entry.startsWith(`${context.connectionId}:`),
+    ),
   };
 }
 
@@ -2174,7 +2230,13 @@ function matchesConnection(
   );
 }
 
-function splitOutputPath(path: string, connectionId: string, findings: AuditFinding[], connection?: ConnectionConfig, label?: string) {
+function splitOutputPath(
+  path: string,
+  connectionId: string,
+  findings: AuditFinding[],
+  connection?: ConnectionConfig,
+  label?: string,
+) {
   const index = path.toLowerCase().lastIndexOf(".xlsx");
   const stem = index >= 0 ? path.slice(0, index) : path;
   const suffixSource = [
@@ -2396,7 +2458,16 @@ function findingsWithConnectionMeta(task: AuditTask): AuditFinding[] {
     ...finding,
     connectionId: finding.connectionId || fallbackConnection?.id,
     connectionName: finding.connectionName || fallbackConnection?.name,
-    dbType: finding.dbType || fallbackConnection?.db_type,
+    dbType:
+      connectionIconType(
+        props.connections.find(
+          (connection) =>
+            (!!finding.connectionId && connection.id === finding.connectionId) ||
+            (!!finding.connectionName && connection.name === finding.connectionName),
+        ) || fallbackConnection,
+      ) ||
+      finding.dbType ||
+      fallbackConnection?.db_type,
   }));
 }
 
@@ -2532,6 +2603,18 @@ function databaseFilterLabel(item: DatabaseFilterItem) {
   return [scope, database].filter(Boolean).join(" / ");
 }
 
+function databaseFilterOption(item: DatabaseFilterItem, key: string): DatabaseFilterOption {
+  const sourceLabel = databaseScopeText(item) || "-";
+  const databaseLabel = item.database?.trim() || "-";
+  return {
+    key,
+    label: databaseFilterLabel(item),
+    sourceLabel,
+    databaseLabel,
+    dbType: item.dbType,
+  };
+}
+
 function databaseFilterButtonText() {
   if (databaseFilterKeys.value.length === 0) return ui.value.databaseFilterAll;
   return ui.value.databaseFilterCount.replace("{count}", String(databaseFilterKeys.value.length));
@@ -2563,10 +2646,7 @@ function toggleConnectionResult(id: string) {
   selectedConnectionResultId.value = selectedConnectionResultId.value === id ? "" : id;
 }
 
-function connectionResultRowCount(
-  tables: NonNullable<AuditJobState["tableResults"]>,
-  findings: AuditFinding[],
-) {
+function connectionResultRowCount(tables: NonNullable<AuditJobState["tableResults"]>, findings: AuditFinding[]) {
   const tableRows = tables.reduce((total, table) => total + Number(table.rowCount || 0), 0);
   if (tableRows > 0) return tableRows;
   return findings.reduce((total, finding) => total + Number(finding.count || 0), 0);
@@ -2600,7 +2680,10 @@ function kindName(kind: string) {
 }
 
 function searchText(parts: Array<unknown>) {
-  return parts.filter((part) => part !== undefined && part !== null && part !== "").join("\n").toLowerCase();
+  return parts
+    .filter((part) => part !== undefined && part !== null && part !== "")
+    .join("\n")
+    .toLowerCase();
 }
 
 function sampleGroupValueSearchText(group: SampleGroup) {
@@ -2842,11 +2925,7 @@ onUnmounted(() => {
         <div v-if="filteredTasks.length === 0" class="p-10 text-center text-sm text-muted-foreground">
           {{ ui.noTasks }}
         </div>
-        <div
-          v-for="task in filteredTasks"
-          :key="task.id"
-          class="flex flex-wrap items-start gap-4 border-b p-4"
-        >
+        <div v-for="task in filteredTasks" :key="task.id" class="flex flex-wrap items-start gap-4 border-b p-4">
           <div class="min-w-[220px] flex-[1_1_240px]">
             <button
               class="block max-w-full truncate text-left text-base font-semibold hover:text-primary"
@@ -2855,7 +2934,10 @@ onUnmounted(() => {
             >
               {{ task.name }}
             </button>
-            <div class="mt-1 max-w-full truncate text-xs text-muted-foreground" :title="task.description || ui.noDescription">
+            <div
+              class="mt-1 max-w-full truncate text-xs text-muted-foreground"
+              :title="task.description || ui.noDescription"
+            >
               {{ task.description || ui.noDescription }}
             </div>
           </div>
@@ -3396,12 +3478,16 @@ onUnmounted(() => {
             <Input v-model="fieldQuery" class="h-9" :placeholder="ui.fieldSearch" />
             <DropdownMenu>
               <DropdownMenuTrigger as-child>
-                <Button variant="outline" class="h-9 justify-start gap-2 px-3" :disabled="databaseFilterOptions.length === 0">
+                <Button
+                  variant="outline"
+                  class="h-9 justify-start gap-2 px-3"
+                  :disabled="databaseFilterOptions.length === 0"
+                >
                   <Database class="h-4 w-4 shrink-0" />
                   <span class="truncate">{{ databaseFilterButtonText() }}</span>
                 </Button>
               </DropdownMenuTrigger>
-              <DropdownMenuContent class="max-h-64 min-w-64 overflow-y-auto">
+              <DropdownMenuContent class="max-h-80 w-[min(420px,calc(100vw-3rem))] overflow-y-auto p-1">
                 <DropdownMenuCheckboxItem
                   :checked="databaseFilterKeys.length === 0"
                   :class="databaseFilterItemClass(databaseFilterKeys.length === 0)"
@@ -3428,9 +3514,9 @@ onUnmounted(() => {
                   @select.prevent
                   @click="toggleDatabaseFilter(option.key)"
                 >
-                  <span class="inline-flex min-w-0 items-center gap-1.5">
+                  <span class="flex min-w-0 flex-1 items-start gap-2">
                     <span
-                      class="mr-1 flex h-4 w-4 shrink-0 items-center justify-center rounded border"
+                      class="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded border"
                       :class="
                         isDatabaseFilterSelected(option.key)
                           ? 'border-primary bg-primary text-primary-foreground'
@@ -3439,8 +3525,15 @@ onUnmounted(() => {
                     >
                       <Check class="h-3 w-3" />
                     </span>
-                    <DatabaseIcon :db-type="option.dbType || ''" class="h-3.5 w-3.5 shrink-0" />
-                    <span class="truncate">{{ option.label }}</span>
+                    <DatabaseIcon :db-type="option.dbType || ''" class="mt-0.5 h-4 w-4 shrink-0" />
+                    <span class="min-w-0 flex-1">
+                      <span class="block truncate text-sm font-medium" :title="option.sourceLabel">
+                        {{ option.sourceLabel }}
+                      </span>
+                      <span class="block truncate text-xs text-muted-foreground" :title="option.databaseLabel">
+                        {{ option.databaseLabel }}
+                      </span>
+                    </span>
                   </span>
                 </DropdownMenuCheckboxItem>
                 <div v-if="databaseFilterOptions.length === 0" class="px-3 py-2 text-xs text-muted-foreground">
@@ -3459,40 +3552,40 @@ onUnmounted(() => {
             </Select>
           </div>
           <div class="max-w-full overflow-x-auto">
-          <table class="min-w-[980px] w-full text-xs">
-            <thead class="bg-muted/60 text-muted-foreground">
-              <tr>
-                <th class="whitespace-nowrap px-3 py-2 text-left">{{ ui.connectionSource }}</th>
-                <th class="whitespace-nowrap px-3 py-2 text-left">{{ ui.database }}</th>
-                <th class="whitespace-nowrap px-3 py-2 text-left">{{ ui.table }}</th>
-                <th class="whitespace-nowrap px-3 py-2 text-left">{{ ui.rows }}</th>
-                <th class="whitespace-nowrap px-3 py-2 text-left">{{ ui.level }}</th>
-                <th class="whitespace-nowrap px-3 py-2 text-left">{{ ui.sensitiveFields }}</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="hit in filteredTables" :key="hit.key" class="border-t">
-                <td class="whitespace-nowrap px-3 py-2">
-                  <span class="flex items-center gap-1.5">
-                    <DatabaseIcon :db-type="hit.dbType || ''" class="h-3.5 w-3.5 shrink-0" />
-                    <span class="truncate">{{ databaseScopeText(hit) || "-" }}</span>
-                  </span>
-                </td>
-                <td class="whitespace-nowrap px-3 py-2 font-mono">{{ hit.database }}</td>
-                <td class="whitespace-nowrap px-3 py-2 font-mono">{{ hit.table }}</td>
-                <td class="whitespace-nowrap px-3 py-2">{{ hit.rowCount }}</td>
-                <td class="whitespace-nowrap px-3 py-2">
-                  <span class="rounded-full border px-2 py-0.5" :class="riskClass(hit.risk)">{{
-                    ui.levelLabel[hit.risk]
-                  }}</span>
-                </td>
-                <td class="whitespace-nowrap px-3 py-2 font-mono">{{ hit.columns.join(", ") }}</td>
-              </tr>
-              <tr v-if="filteredTables.length === 0">
-                <td class="px-3 py-8 text-center text-muted-foreground" colspan="6">{{ ui.noFindings }}</td>
-              </tr>
-            </tbody>
-          </table>
+            <table class="min-w-[980px] w-full text-xs">
+              <thead class="bg-muted/60 text-muted-foreground">
+                <tr>
+                  <th class="whitespace-nowrap px-3 py-2 text-left">{{ ui.connectionSource }}</th>
+                  <th class="whitespace-nowrap px-3 py-2 text-left">{{ ui.database }}</th>
+                  <th class="whitespace-nowrap px-3 py-2 text-left">{{ ui.table }}</th>
+                  <th class="whitespace-nowrap px-3 py-2 text-left">{{ ui.rows }}</th>
+                  <th class="whitespace-nowrap px-3 py-2 text-left">{{ ui.level }}</th>
+                  <th class="whitespace-nowrap px-3 py-2 text-left">{{ ui.sensitiveFields }}</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="hit in filteredTables" :key="hit.key" class="border-t">
+                  <td class="whitespace-nowrap px-3 py-2">
+                    <span class="flex items-center gap-1.5">
+                      <DatabaseIcon :db-type="hit.dbType || ''" class="h-3.5 w-3.5 shrink-0" />
+                      <span class="truncate">{{ databaseScopeText(hit) || "-" }}</span>
+                    </span>
+                  </td>
+                  <td class="whitespace-nowrap px-3 py-2 font-mono">{{ hit.database }}</td>
+                  <td class="whitespace-nowrap px-3 py-2 font-mono">{{ hit.table }}</td>
+                  <td class="whitespace-nowrap px-3 py-2">{{ hit.rowCount }}</td>
+                  <td class="whitespace-nowrap px-3 py-2">
+                    <span class="rounded-full border px-2 py-0.5" :class="riskClass(hit.risk)">{{
+                      ui.levelLabel[hit.risk]
+                    }}</span>
+                  </td>
+                  <td class="whitespace-nowrap px-3 py-2 font-mono">{{ hit.columns.join(", ") }}</td>
+                </tr>
+                <tr v-if="filteredTables.length === 0">
+                  <td class="px-3 py-8 text-center text-muted-foreground" colspan="6">{{ ui.noFindings }}</td>
+                </tr>
+              </tbody>
+            </table>
           </div>
         </div>
 
@@ -3510,7 +3603,7 @@ onUnmounted(() => {
                     <span class="truncate">{{ databaseFilterButtonText() }}</span>
                   </Button>
                 </DropdownMenuTrigger>
-                <DropdownMenuContent class="max-h-64 min-w-64 overflow-y-auto">
+                <DropdownMenuContent class="max-h-80 w-[min(420px,calc(100vw-3rem))] overflow-y-auto p-1">
                   <DropdownMenuCheckboxItem
                     :checked="databaseFilterKeys.length === 0"
                     :class="databaseFilterItemClass(databaseFilterKeys.length === 0)"
@@ -3537,9 +3630,9 @@ onUnmounted(() => {
                     @select.prevent
                     @click="toggleDatabaseFilter(option.key)"
                   >
-                    <span class="inline-flex min-w-0 items-center gap-1.5">
+                    <span class="flex min-w-0 flex-1 items-start gap-2">
                       <span
-                        class="mr-1 flex h-4 w-4 shrink-0 items-center justify-center rounded border"
+                        class="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded border"
                         :class="
                           isDatabaseFilterSelected(option.key)
                             ? 'border-primary bg-primary text-primary-foreground'
@@ -3548,8 +3641,15 @@ onUnmounted(() => {
                       >
                         <Check class="h-3 w-3" />
                       </span>
-                      <DatabaseIcon :db-type="option.dbType || ''" class="h-3.5 w-3.5 shrink-0" />
-                      <span class="truncate">{{ option.label }}</span>
+                      <DatabaseIcon :db-type="option.dbType || ''" class="mt-0.5 h-4 w-4 shrink-0" />
+                      <span class="min-w-0 flex-1">
+                        <span class="block truncate text-sm font-medium" :title="option.sourceLabel">
+                          {{ option.sourceLabel }}
+                        </span>
+                        <span class="block truncate text-xs text-muted-foreground" :title="option.databaseLabel">
+                          {{ option.databaseLabel }}
+                        </span>
+                      </span>
                     </span>
                   </DropdownMenuCheckboxItem>
                   <div v-if="databaseFilterOptions.length === 0" class="px-3 py-2 text-xs text-muted-foreground">
@@ -3665,12 +3765,16 @@ onUnmounted(() => {
             <Input v-model="matchQuery" class="h-9" :placeholder="ui.matchSearch" />
             <DropdownMenu>
               <DropdownMenuTrigger as-child>
-                <Button variant="outline" class="h-9 justify-start gap-2 px-3" :disabled="databaseFilterOptions.length === 0">
+                <Button
+                  variant="outline"
+                  class="h-9 justify-start gap-2 px-3"
+                  :disabled="databaseFilterOptions.length === 0"
+                >
                   <Database class="h-4 w-4 shrink-0" />
                   <span class="truncate">{{ databaseFilterButtonText() }}</span>
                 </Button>
               </DropdownMenuTrigger>
-              <DropdownMenuContent class="max-h-64 min-w-64 overflow-y-auto">
+              <DropdownMenuContent class="max-h-80 w-[min(420px,calc(100vw-3rem))] overflow-y-auto p-1">
                 <DropdownMenuCheckboxItem
                   :checked="databaseFilterKeys.length === 0"
                   :class="databaseFilterItemClass(databaseFilterKeys.length === 0)"
@@ -3697,9 +3801,9 @@ onUnmounted(() => {
                   @select.prevent
                   @click="toggleDatabaseFilter(option.key)"
                 >
-                  <span class="inline-flex min-w-0 items-center gap-1.5">
+                  <span class="flex min-w-0 flex-1 items-start gap-2">
                     <span
-                      class="mr-1 flex h-4 w-4 shrink-0 items-center justify-center rounded border"
+                      class="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded border"
                       :class="
                         isDatabaseFilterSelected(option.key)
                           ? 'border-primary bg-primary text-primary-foreground'
@@ -3708,8 +3812,15 @@ onUnmounted(() => {
                     >
                       <Check class="h-3 w-3" />
                     </span>
-                    <DatabaseIcon :db-type="option.dbType || ''" class="h-3.5 w-3.5 shrink-0" />
-                    <span class="truncate">{{ option.label }}</span>
+                    <DatabaseIcon :db-type="option.dbType || ''" class="mt-0.5 h-4 w-4 shrink-0" />
+                    <span class="min-w-0 flex-1">
+                      <span class="block truncate text-sm font-medium" :title="option.sourceLabel">
+                        {{ option.sourceLabel }}
+                      </span>
+                      <span class="block truncate text-xs text-muted-foreground" :title="option.databaseLabel">
+                        {{ option.databaseLabel }}
+                      </span>
+                    </span>
                   </span>
                 </DropdownMenuCheckboxItem>
                 <div v-if="databaseFilterOptions.length === 0" class="px-3 py-2 text-xs text-muted-foreground">
@@ -3738,8 +3849,7 @@ onUnmounted(() => {
                 <b>{{ group.fields.length }}</b></span
               >
               <span
-                ><span class="text-muted-foreground">{{ ui.rows }}</span>
-                <b>{{ sampleGroupRowCount(group) }}</b></span
+                ><span class="text-muted-foreground">{{ ui.rows }}</span> <b>{{ sampleGroupRowCount(group) }}</b></span
               >
               <span v-if="group.rows.length"
                 ><span class="text-muted-foreground">{{ ui.sampleRows }}</span> <b>{{ group.rows.length }}</b></span

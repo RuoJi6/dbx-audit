@@ -2033,11 +2033,12 @@ export default {
     tableWorkers: "Concorrenza tabelle/collezioni",
     fieldWorkers: "Concorrenza campi",
     concurrencyModel: "Modello concorrenza",
-    concurrencyHint:
-      "Target {targetWorkers}; tabelle/collezioni {tableWorkers}; campi {fieldWorkers}",
+    concurrencyHint: "Target {targetWorkers}; tabelle/collezioni {tableWorkers}; campi {fieldWorkers}",
     targetWorkersHint: "Connessioni scansionate contemporaneamente nelle attività multi-target",
-    tableWorkersHint: "Tabelle SQL, collezioni Mongo/Elasticsearch o indici scansionati contemporaneamente per connessione",
-    fieldWorkersHint: "Query concorrenti per il conteggio dei campi sensibili in una tabella; Redis lo usa anche per leggere valori per pagina",
+    tableWorkersHint:
+      "Tabelle SQL, collezioni Mongo/Elasticsearch o indici scansionati contemporaneamente per connessione",
+    fieldWorkersHint:
+      "Query concorrenti per il conteggio dei campi sensibili in una tabella; Redis lo usa anche per leggere valori per pagina",
     singleTargetConcurrency: "Target singolo",
     multiTargetSequential: "{count} target sequenziali",
     outputFiles: "File di output",

@@ -7,16 +7,12 @@ const EMAIL_PATTERN: &str = r"(?i)[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}";
 const ID_CARD_PATTERN: &str = r"(?i)\b\d{17}[\dxX]\b";
 const BANK_CARD_PATTERN: &str = r"\b(?:\d[ -]?){13,19}\b";
 const TOKEN_PATTERN: &str = r"(?i)\b(?:ak|sk|token|secret|bearer|api[_-]?key)[a-z0-9_\-:=.]{8,}\b";
-const IPV4_PATTERN: &str =
-    r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b";
-const HAE_JWT_PATTERN: &str =
-    r"(?i)\beyJ[A-Za-z0-9_/+\-]{10,}\.[A-Za-z0-9._/+\-]{10,}(?:\.[A-Za-z0-9._/+\-]{8,})?\b";
+const IPV4_PATTERN: &str = r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b";
+const HAE_JWT_PATTERN: &str = r"(?i)\beyJ[A-Za-z0-9_/+\-]{10,}\.[A-Za-z0-9._/+\-]{10,}(?:\.[A-Za-z0-9._/+\-]{8,})?\b";
 const HAE_CLOUD_KEY_PATTERN: &str = r"(?i)\b(?:access[-_]?key[-_]?(?:id|secret)|LTAI[a-z0-9]{12,20})\b";
 const HAE_AUTH_HEADER_PATTERN: &str = r"(?i)\b(?:basic|bearer)\s+[a-z0-9=:_+/.\-]{5,100}\b";
-const HAE_PASSWORD_FIELD_PATTERN: &str =
-    r#"(?i)(?:"?[\.\w]{0,32}(?:pass|pwd|passwd|password)[\.\w]{0,32}"?\s*(?::|={1,3}|!={1,2})\s*["'][^"']+["']|["'][^"']+["']\s*(?::|={1,3}|!={1,2})\s*"?[\.\w]{0,32}(?:pass|pwd|passwd|password)[\.\w]{0,32}"?)"#;
-const HAE_SENSITIVE_FIELD_PATTERN: &str =
-    r#"(?i)(?:"?[\.\w]{0,32}(?:key|secret|token|config|auth|access|admin|ticket)[\.\w]{0,32}"?\s*(?::|={1,3}|!={1,2})\s*["'][^"']+["']|["'][^"']+["']\s*(?::|={1,3}|!={1,2})\s*"?[\.\w]{0,32}(?:key|secret|token|config|auth|access|admin|ticket)[\.\w]{0,32}"?)"#;
+const HAE_PASSWORD_FIELD_PATTERN: &str = r#"(?i)(?:"?[\.\w]{0,32}(?:pass|pwd|passwd|password)[\.\w]{0,32}"?\s*(?::|={1,3}|!={1,2})\s*["'][^"']+["']|["'][^"']+["']\s*(?::|={1,3}|!={1,2})\s*"?[\.\w]{0,32}(?:pass|pwd|passwd|password)[\.\w]{0,32}"?)"#;
+const HAE_SENSITIVE_FIELD_PATTERN: &str = r#"(?i)(?:"?[\.\w]{0,32}(?:key|secret|token|config|auth|access|admin|ticket)[\.\w]{0,32}"?\s*(?::|={1,3}|!={1,2})\s*["'][^"']+["']|["'][^"']+["']\s*(?::|={1,3}|!={1,2})\s*"?[\.\w]{0,32}(?:key|secret|token|config|auth|access|admin|ticket)[\.\w]{0,32}"?)"#;
 
 pub fn detect_field(table: &str, column: &str, level: AuditLevelFilter) -> Vec<AuditKind> {
     let column_key = column.to_ascii_lowercase();
@@ -228,9 +224,12 @@ mod tests {
             .contains(&AuditKind::TokenSecret));
         assert!(detect_value("Authorization: Bearer abcdefghijklmnopqrstuvwxyz123456", AuditLevelFilter::All)
             .contains(&AuditKind::TokenSecret));
-        assert!(detect_value(r#""password":"auditpass123""#, AuditLevelFilter::All).contains(&AuditKind::PasswordSecret));
-        assert!(detect_value(r#""secret_key":"abcdef1234567890""#, AuditLevelFilter::All)
-            .contains(&AuditKind::TokenSecret));
+        assert!(
+            detect_value(r#""password":"auditpass123""#, AuditLevelFilter::All).contains(&AuditKind::PasswordSecret)
+        );
+        assert!(
+            detect_value(r#""secret_key":"abcdef1234567890""#, AuditLevelFilter::All).contains(&AuditKind::TokenSecret)
+        );
         assert!(detect_value("10.211.55.16", AuditLevelFilter::All).contains(&AuditKind::IpAddress));
     }
 
