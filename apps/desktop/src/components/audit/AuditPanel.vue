@@ -16,6 +16,7 @@ import {
   Search,
   ShieldCheck,
   Square,
+  Table2,
   Trash2,
   Upload,
 } from "@lucide/vue";
@@ -130,6 +131,7 @@ type SampleGroup = {
   connectionName?: string;
   dbType?: string;
   database: string;
+  schema?: string;
   table: string;
   fields: FieldHit[];
   rows: Record<string, string>[];
@@ -157,6 +159,12 @@ type DatabaseFilterOption = {
 
 const props = defineProps<{
   connections: ConnectionConfig[];
+}>();
+
+const emit = defineEmits<{
+  openSampleTarget: [
+    target: { connectionId: string; dbType?: string; database: string; schema?: string; tableName: string },
+  ];
 }>();
 
 const { locale, tm } = useI18n();
@@ -228,6 +236,7 @@ const zh = {
   copyFailed: "复制失败：{error}",
   backList: "返回任务列表",
   copy: "复制",
+  openData: "打开数据",
   config: "配置",
   detail: "详情",
   start: "开始",
@@ -471,6 +480,7 @@ const en = {
   copyFailed: "Copy failed: {error}",
   backList: "Back to tasks",
   copy: "Copy",
+  openData: "Open data",
   config: "Configure",
   detail: "Detail",
   start: "Start",
@@ -2526,6 +2536,7 @@ function buildSampleGroups(findings: AuditFinding[]) {
         connectionName: field.connectionName,
         dbType: field.dbType,
         database: field.database,
+        schema: field.schema,
         table: field.table,
         fields: [],
         rows: [],
@@ -2654,6 +2665,27 @@ function connectionResultRowCount(tables: NonNullable<AuditJobState["tableResult
 
 function sampleGroupRowCount(group: SampleGroup) {
   return group.fields.reduce((max, field) => Math.max(max, Number(field.count || 0)), 0);
+}
+
+function sampleGroupConnection(group: SampleGroup) {
+  return group.connectionId ? props.connections.find((connection) => connection.id === group.connectionId) : undefined;
+}
+
+function canOpenSampleGroup(group: SampleGroup) {
+  const connection = sampleGroupConnection(group);
+  return !!connection && connection.db_type !== "etcd" && !!group.database && !!group.table;
+}
+
+function openSampleGroup(group: SampleGroup) {
+  if (!canOpenSampleGroup(group)) return;
+  const connection = sampleGroupConnection(group);
+  emit("openSampleTarget", {
+    connectionId: group.connectionId!,
+    dbType: connection?.db_type || group.dbType,
+    database: group.database,
+    schema: group.schema,
+    tableName: group.table,
+  });
 }
 
 function highestRisk(a: "high" | "medium" | "low", b: "high" | "medium" | "low") {
@@ -3838,6 +3870,16 @@ onUnmounted(() => {
               <span v-if="group.rows.length"
                 ><span class="text-muted-foreground">{{ ui.sampleRows }}</span> <b>{{ group.rows.length }}</b></span
               >
+              <Button
+                variant="outline"
+                size="sm"
+                class="ml-auto h-7 gap-1.5 px-2 text-xs"
+                :disabled="!canOpenSampleGroup(group)"
+                @click="openSampleGroup(group)"
+              >
+                <Table2 class="h-3.5 w-3.5" />
+                {{ ui.openData }}
+              </Button>
             </div>
             <div v-if="group.rows.length" class="max-w-full overflow-x-auto border-t">
               <table class="min-w-max table-fixed text-xs">

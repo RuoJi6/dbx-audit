@@ -37,7 +37,7 @@ import { resolveExecutableSql, resolveExecutableSqlWithBackend } from "@/lib/sql
 import { uuid } from "@/lib/utils";
 import { isTauriRuntime } from "@/lib/tauriRuntime";
 import { sqlFileTitleFromPath } from "@/lib/sqlFileOpen";
-import type { ConnectionConfig } from "@/types/database";
+import type { ConnectionConfig, DatabaseType } from "@/types/database";
 import { parseConnectionDeepLink, type ConnectionDeepLinkDraft } from "@/lib/connectionDeepLink";
 import {
   isBrowserReloadShortcut,
@@ -74,6 +74,14 @@ const LoginPage = defineAsyncComponent(() => import("@/components/auth/LoginPage
 
 type AiAssistantHandle = {
   triggerAction: (action: AiAction, instruction?: string) => void;
+};
+
+type AuditSampleTarget = {
+  connectionId: string;
+  dbType?: string;
+  database: string;
+  schema?: string;
+  tableName: string;
 };
 
 const { t } = useI18n();
@@ -225,6 +233,59 @@ const { setupTauriListeners, cleanupTauriListeners } = useTauriEvents({
   openConnectionDeepLink,
 });
 useVisibilityChange();
+
+function auditSampleDatabaseType(target: AuditSampleTarget): DatabaseType | string | undefined {
+  return connectionStore.getConfig(target.connectionId)?.db_type || target.dbType?.toLowerCase();
+}
+
+function redisAuditDatabaseId(database: string) {
+  const redisLabel = database.match(/^redis-db(\d+)$/i);
+  if (redisLabel) return redisLabel[1];
+  const numeric = database.match(/^\d+$/);
+  return numeric ? numeric[0] : "0";
+}
+
+async function openAuditSampleTarget(target: AuditSampleTarget) {
+  try {
+    const config = connectionStore.getConfig(target.connectionId);
+    if (!config) {
+      toast(t("ai.noConnection"), 3000);
+      return;
+    }
+
+    connectionStore.activeConnectionId = target.connectionId;
+    await connectionStore.ensureConnected(target.connectionId);
+
+    const dbType = auditSampleDatabaseType(target);
+    if (dbType === "redis") {
+      const database = redisAuditDatabaseId(target.database);
+      const tabTitle = `${config.name || "Redis"}:db${database}`;
+      queryStore.createTab(target.connectionId, database, tabTitle, "redis");
+      return;
+    }
+
+    if (dbType === "mongodb" || dbType === "elasticsearch") {
+      const tabTitle = `${target.database}.${target.tableName}`;
+      const tabId = queryStore.createTab(target.connectionId, target.database, tabTitle, "mongo");
+      queryStore.updateSql(tabId, target.tableName);
+      return;
+    }
+
+    if (dbType === "etcd") {
+      toast(t("grid.dataUnavailable"), 3000);
+      return;
+    }
+
+    await openTableTarget({
+      connectionId: target.connectionId,
+      database: target.database,
+      schema: target.schema,
+      tableName: target.tableName,
+    });
+  } catch (e: any) {
+    toast(translateBackendError(t, e?.message || String(e)), 5000);
+  }
+}
 
 const appVersion = ref("");
 const isClassicLayout = computed(() => settingsStore.editorSettings.appLayout === "classic");
@@ -1161,6 +1222,7 @@ onUnmounted(() => {
                     @sort="onSort"
                     @execute-sql="onExecuteSql"
                     @click-table="onClickTable"
+                    @open-audit-sample-target="openAuditSampleTarget"
                     @open-object-table="
                       (target) =>
                         activeTab &&

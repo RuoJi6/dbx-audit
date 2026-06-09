@@ -89,6 +89,14 @@ type SearchableBrowserHandle = {
   focusSearch: () => boolean;
 };
 
+type AuditSampleTarget = {
+  connectionId: string;
+  dbType?: string;
+  database: string;
+  schema?: string;
+  tableName: string;
+};
+
 const props = defineProps<{
   activeTab: QueryTab;
   activeConnection?: ConnectionConfig;
@@ -116,6 +124,7 @@ const emit = defineEmits<{
   executeSql: [sql: string];
   clickTable: [tableName: string];
   openObjectTable: [target: { tableName: string; schema?: string }];
+  openAuditSampleTarget: [target: AuditSampleTarget];
   objectSchemaChange: [schema: string | undefined];
   structureEditorSaved: [commentChanged: boolean];
   structureEditorClose: [];
@@ -400,7 +409,12 @@ defineExpose({ focusSearch, refreshData, handleModRTarget });
   <div class="flex flex-col flex-1 min-h-0">
     <!-- Query mode: editor + results -->
     <template v-if="activeTab.mode === 'audit'">
-      <AuditPanel :key="activeTab.id" class="flex-1 min-h-0" :connections="connectionStore.connections" />
+      <AuditPanel
+        :key="activeTab.id"
+        class="flex-1 min-h-0"
+        :connections="connectionStore.connections"
+        @open-sample-target="emit('openAuditSampleTarget', $event)"
+      />
     </template>
 
     <template v-else-if="activeTab.mode === 'query'">
