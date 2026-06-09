@@ -3426,6 +3426,71 @@ onUnmounted(() => {
                 {{ connectionLabel(selectedTask) }}
               </span>
             </div>
+            <div class="mt-6 rounded-md border bg-muted/20 p-3">
+              <button
+                type="button"
+                class="flex w-full items-center gap-2 text-left"
+                @click="connectionResultsExpanded = !connectionResultsExpanded"
+              >
+                <ChevronDown v-if="connectionResultsExpanded" class="h-4 w-4 shrink-0 text-muted-foreground" />
+                <ChevronRight v-else class="h-4 w-4 shrink-0 text-muted-foreground" />
+                <span class="font-semibold">{{ ui.connectionResultOverview }}</span>
+                <span class="ml-auto text-xs text-muted-foreground">{{ connectionResultSummary }}</span>
+              </button>
+              <div v-if="connectionResultsExpanded" class="mt-3 grid items-start gap-2 md:grid-cols-2 xl:grid-cols-3">
+                <div
+                  v-for="row in connectionResultRows"
+                  :key="row.id"
+                  class="rounded-md border bg-background p-3 text-xs transition hover:border-primary"
+                  :class="
+                    selectedConnectionResultId === row.id ? 'border-primary bg-primary/5 ring-1 ring-primary/30' : ''
+                  "
+                  role="button"
+                  tabindex="0"
+                  @click="toggleConnectionResult(row.id)"
+                  @keydown.enter="toggleConnectionResult(row.id)"
+                >
+                  <div class="flex items-center gap-2">
+                    <DatabaseIcon :db-type="row.dbType" class="h-3.5 w-3.5 shrink-0" />
+                    <span class="font-medium">{{ row.name }}</span>
+                  </div>
+                  <div class="mt-2 text-muted-foreground">{{ row.status }}</div>
+                  <div v-if="selectedConnectionResultId === row.id" class="mt-3 rounded-md border bg-background/80 p-3">
+                    <div v-if="row.database" class="mb-2 truncate font-mono text-[11px] text-muted-foreground">
+                      {{ row.database }}
+                    </div>
+                    <div class="grid grid-cols-2 gap-2">
+                      <div>
+                        <div class="text-muted-foreground">{{ ui.sensitiveFields }}</div>
+                        <div class="font-semibold">{{ row.findingCount }}</div>
+                      </div>
+                      <div>
+                        <div class="text-muted-foreground">{{ ui.hitTables }}</div>
+                        <div class="font-semibold">{{ row.tableCount }}</div>
+                      </div>
+                      <div>
+                        <div class="text-muted-foreground">{{ ui.rows }}</div>
+                        <div class="font-semibold">{{ row.rowCount }}</div>
+                      </div>
+                      <div>
+                        <div class="text-muted-foreground">{{ ui.risk }}</div>
+                        <div class="mt-1 flex flex-wrap gap-1">
+                          <span class="rounded-full border px-1.5 py-0.5" :class="riskClass('high')"
+                            >{{ ui.riskHighShort }} {{ row.high }}</span
+                          >
+                          <span class="rounded-full border px-1.5 py-0.5" :class="riskClass('medium')"
+                            >{{ ui.riskMediumShort }} {{ row.medium }}</span
+                          >
+                          <span class="rounded-full border px-1.5 py-0.5" :class="riskClass('low')"
+                            >{{ ui.riskLowShort }} {{ row.low }}</span
+                          >
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
           </div>
 
           <div class="border-t pt-4 lg:border-l lg:border-t-0 lg:pl-5 lg:pt-0">
@@ -3477,70 +3542,6 @@ onUnmounted(() => {
                 <div v-for="path in selectedTask.outputs" :key="path" class="min-w-0" :title="path">
                   <div class="truncate font-mono font-medium">{{ fileNameFromPath(path) }}</div>
                   <div class="truncate font-mono text-[11px] text-muted-foreground">{{ outputDirectory(path) }}</div>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <div class="mb-4 rounded-md border bg-background p-4">
-        <button
-          type="button"
-          class="flex w-full items-center gap-2 text-left"
-          @click="connectionResultsExpanded = !connectionResultsExpanded"
-        >
-          <ChevronDown v-if="connectionResultsExpanded" class="h-4 w-4 shrink-0 text-muted-foreground" />
-          <ChevronRight v-else class="h-4 w-4 shrink-0 text-muted-foreground" />
-          <span class="font-semibold">{{ ui.connectionResultOverview }}</span>
-          <span class="ml-auto text-xs text-muted-foreground">{{ connectionResultSummary }}</span>
-        </button>
-        <div v-if="connectionResultsExpanded" class="mt-3 grid items-start gap-2 md:grid-cols-2 xl:grid-cols-3">
-          <div
-            v-for="row in connectionResultRows"
-            :key="row.id"
-            class="rounded-md border p-3 text-xs transition hover:border-primary"
-            :class="selectedConnectionResultId === row.id ? 'border-primary bg-primary/5 ring-1 ring-primary/30' : ''"
-            role="button"
-            tabindex="0"
-            @click="toggleConnectionResult(row.id)"
-            @keydown.enter="toggleConnectionResult(row.id)"
-          >
-            <div class="flex items-center gap-2">
-              <DatabaseIcon :db-type="row.dbType" class="h-3.5 w-3.5 shrink-0" />
-              <span class="font-medium">{{ row.name }}</span>
-            </div>
-            <div class="mt-2 text-muted-foreground">{{ row.status }}</div>
-            <div v-if="selectedConnectionResultId === row.id" class="mt-3 rounded-md border bg-background/80 p-3">
-              <div v-if="row.database" class="mb-2 truncate font-mono text-[11px] text-muted-foreground">
-                {{ row.database }}
-              </div>
-              <div class="grid grid-cols-2 gap-2">
-                <div>
-                  <div class="text-muted-foreground">{{ ui.sensitiveFields }}</div>
-                  <div class="font-semibold">{{ row.findingCount }}</div>
-                </div>
-                <div>
-                  <div class="text-muted-foreground">{{ ui.hitTables }}</div>
-                  <div class="font-semibold">{{ row.tableCount }}</div>
-                </div>
-                <div>
-                  <div class="text-muted-foreground">{{ ui.rows }}</div>
-                  <div class="font-semibold">{{ row.rowCount }}</div>
-                </div>
-                <div>
-                  <div class="text-muted-foreground">{{ ui.risk }}</div>
-                  <div class="mt-1 flex flex-wrap gap-1">
-                    <span class="rounded-full border px-1.5 py-0.5" :class="riskClass('high')"
-                      >{{ ui.riskHighShort }} {{ row.high }}</span
-                    >
-                    <span class="rounded-full border px-1.5 py-0.5" :class="riskClass('medium')"
-                      >{{ ui.riskMediumShort }} {{ row.medium }}</span
-                    >
-                    <span class="rounded-full border px-1.5 py-0.5" :class="riskClass('low')"
-                      >{{ ui.riskLowShort }} {{ row.low }}</span
-                    >
-                  </div>
                 </div>
               </div>
             </div>
