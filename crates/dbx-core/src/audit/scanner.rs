@@ -117,7 +117,7 @@ pub fn build_non_empty_count_sql(dialect: AuditSqlDialect, schema: Option<&str>,
         }
         AuditSqlDialect::ClickHouse => {
             format!(
-                "select count(*) from {table_name} where {column_name} is not null and toString({column_name}) != ''"
+                "select count() from {table_name} where {column_name} is not null and notEmpty(toString({column_name})) settings max_threads = 1"
             )
         }
         AuditSqlDialect::Ansi => {

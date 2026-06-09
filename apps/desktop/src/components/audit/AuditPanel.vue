@@ -852,8 +852,9 @@ const filteredSampleGroups = computed(() => {
   const sensitiveQuery = matchQuery.value.trim().toLowerCase();
   return sampleGroups.value.filter((group) => {
     if (!matchesDatabaseFilter(group)) return false;
-    const text = JSON.stringify(group).toLowerCase();
-    return (!valueQuery || text.includes(valueQuery)) && (!sensitiveQuery || text.includes(sensitiveQuery));
+    const valueText = sampleGroupValueSearchText(group);
+    const sensitiveText = sampleGroupSensitiveSearchText(group);
+    return (!valueQuery || valueText.includes(valueQuery)) && (!sensitiveQuery || sensitiveText.includes(sensitiveQuery));
   });
 });
 const filteredSampleRowCount = computed(() =>
@@ -1038,9 +1039,9 @@ function newTask(seed?: Partial<AuditTask>): AuditTask {
     level: seed?.level || "all",
     limit: seed?.limit || 15,
     workers: seed?.workers || seed?.tableWorkers || 1,
-    targetWorkers: seed?.targetWorkers || 1,
-    tableWorkers: seed?.tableWorkers || seed?.workers || 1,
-    fieldWorkers: seed?.fieldWorkers || 1,
+    targetWorkers: seed?.targetWorkers || 10,
+    tableWorkers: seed?.tableWorkers || seed?.workers || 5,
+    fieldWorkers: seed?.fieldWorkers || 5,
     timeoutSecs: seed?.timeoutSecs || 15,
     mask: seed?.mask ?? false,
     includeSystem: seed?.includeSystem || false,
@@ -1072,9 +1073,9 @@ function normalizeTask(task: AuditTask) {
     connectionIds,
     job: task.job ? { ...task.job, tableResults: task.job.tableResults || [] } : undefined,
     workers: Number(task.workers) || Number(task.tableWorkers) || 1,
-    targetWorkers: Number(task.targetWorkers) || 1,
-    tableWorkers: Number(task.tableWorkers) || Number(task.workers) || 1,
-    fieldWorkers: Number(task.fieldWorkers) || 1,
+    targetWorkers: Number(task.targetWorkers) || 10,
+    tableWorkers: Number(task.tableWorkers) || Number(task.workers) || 5,
+    fieldWorkers: Number(task.fieldWorkers) || 5,
     outputEnabled: task.outputEnabled || false,
     outputs: task.outputs || [],
     logHistory: task.logHistory || [],
@@ -2244,15 +2245,15 @@ function taskConcurrencyText(task: AuditTask) {
 }
 
 function taskTargetWorkerCount(task: Pick<AuditTask, "targetWorkers">) {
-  return Math.max(1, Math.min(32, Number(task.targetWorkers) || 1));
+  return Math.max(1, Math.min(32, Number(task.targetWorkers) || 10));
 }
 
 function taskTableWorkerCount(task: Pick<AuditTask, "workers" | "tableWorkers">) {
-  return Math.max(1, Math.min(32, Number(task.tableWorkers) || Number(task.workers) || 1));
+  return Math.max(1, Math.min(32, Number(task.tableWorkers) || Number(task.workers) || 5));
 }
 
 function taskFieldWorkerCount(task: Pick<AuditTask, "fieldWorkers">) {
-  return Math.max(1, Math.min(32, Number(task.fieldWorkers) || 1));
+  return Math.max(1, Math.min(32, Number(task.fieldWorkers) || 5));
 }
 
 function taskWorkerSummary(task: AuditTask) {
@@ -2596,6 +2597,37 @@ function riskTextClass(risk: string) {
 function kindName(kind: string) {
   const labels = ui.value.kindLabel as Record<string, string>;
   return labels[kind] || kind;
+}
+
+function searchText(parts: Array<unknown>) {
+  return parts.filter((part) => part !== undefined && part !== null && part !== "").join("\n").toLowerCase();
+}
+
+function sampleGroupValueSearchText(group: SampleGroup) {
+  return searchText([
+    group.database,
+    group.table,
+    ...group.fields.map((field) => field.column),
+    ...group.rows.flatMap((row) => Object.values(row)),
+  ]);
+}
+
+function sampleGroupSensitiveSearchText(group: SampleGroup) {
+  return searchText([
+    group.dbType,
+    group.connectionName,
+    group.database,
+    group.table,
+    ...group.fields.flatMap((field) => [
+      field.column,
+      field.kind,
+      kindName(field.kind),
+      field.level,
+      ui.value.levelLabel[field.level],
+      field.count,
+      ...field.samples,
+    ]),
+  ]);
 }
 
 async function copyTask(task: AuditTask) {
@@ -3171,7 +3203,7 @@ onUnmounted(() => {
 
       <div class="mb-4 grid gap-4 lg:grid-cols-[1fr_340px]">
         <div class="rounded-md border bg-background p-4">
-          <div class="grid gap-4 md:grid-cols-6">
+          <div class="grid gap-4 md:grid-cols-4">
             <div>
               <div class="text-xs text-muted-foreground">{{ ui.hitTables }}</div>
               <div class="mt-1 text-3xl font-semibold">{{ detailTables.length }}</div>
@@ -3183,18 +3215,6 @@ onUnmounted(() => {
             <div>
               <div class="text-xs text-muted-foreground">{{ ui.highRiskHits }}</div>
               <div class="mt-1 text-3xl font-semibold">{{ detailTotals.high }}</div>
-            </div>
-            <div>
-              <div class="text-xs text-muted-foreground">{{ ui.targetWorkers }}</div>
-              <div class="mt-1 text-3xl font-semibold">{{ taskTargetWorkerCount(selectedTask) }}</div>
-            </div>
-            <div>
-              <div class="text-xs text-muted-foreground">{{ ui.tableWorkers }}</div>
-              <div class="mt-1 text-3xl font-semibold">{{ taskTableWorkerCount(selectedTask) }}</div>
-            </div>
-            <div>
-              <div class="text-xs text-muted-foreground">{{ ui.fieldWorkers }}</div>
-              <div class="mt-1 text-3xl font-semibold">{{ taskFieldWorkerCount(selectedTask) }}</div>
             </div>
             <div>
               <div class="text-xs text-muted-foreground">{{ ui.currentProgress }}</div>

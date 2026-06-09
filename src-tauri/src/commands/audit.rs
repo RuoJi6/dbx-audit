@@ -537,6 +537,7 @@ async fn count_non_empty_rows_for_findings(
     let schema_label_value = schema_label_value.to_string();
     let columns = findings.iter().map(|finding| finding.column.clone()).collect::<Vec<_>>();
     let mut logs = Vec::new();
+    let workers = effective_field_worker_count(&state, &request).await;
     let mut counts = stream::iter(columns)
         .map(|column| {
             let state = state.clone();
@@ -553,7 +554,7 @@ async fn count_non_empty_rows_for_findings(
                 (column, count)
             }
         })
-        .buffer_unordered(request.field_worker_count());
+        .buffer_unordered(workers);
 
     while let Some((column, result)) = counts.next().await {
         if is_cancelled(&job_id) {
@@ -595,6 +596,13 @@ async fn count_non_empty_rows(
     )
     .await?;
     Ok(result.rows.first().and_then(|row| row.first()).and_then(value_as_u64).unwrap_or(0))
+}
+
+async fn effective_field_worker_count(state: &AppState, request: &AuditScanRequest) -> usize {
+    match connection_db_type(state, &request.connection_id).await {
+        Some(DatabaseType::ClickHouse) => 1,
+        _ => request.field_worker_count(),
+    }
 }
 
 async fn collect_table_evidence(
