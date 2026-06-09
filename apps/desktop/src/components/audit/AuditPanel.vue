@@ -4,6 +4,8 @@ import { useI18n } from "vue-i18n";
 import {
   ArrowLeft,
   Check,
+  ChevronDown,
+  ChevronRight,
   Clipboard,
   Database,
   Download,
@@ -135,6 +137,8 @@ type SampleGroup = {
   table: string;
   fields: FieldHit[];
   rows: Record<string, string>[];
+  valueSearchText: string;
+  sensitiveSearchText: string;
 };
 
 type SampleCellPair = {
@@ -318,6 +322,9 @@ const zh = {
   scanTables: "扫描表",
   fscanLine: "fscan 行",
   rawTarget: "原始目标",
+  expand: "展开",
+  collapse: "收起",
+  connectionResultSummary: "{connections} 个连接 / {findings} 条命中",
   noFindings: "暂无扫描结果",
   noSamples: "暂无样例数据",
   noTargets: "暂无批量目标",
@@ -378,6 +385,8 @@ const zh = {
   matchSearch: "高敏感 / 密码 / token / 邮箱",
   sampleCount: "{count} 条样例",
   sampleSummary: "{groups} 个分组 / {rows} 条样例行",
+  sampleShowAll: "展开 {count} 行",
+  sampleCollapse: "收起样例",
   databaseName: "数据库名",
   tableName: "表名",
   sampleRows: "样例行",
@@ -565,6 +574,9 @@ const en = {
   scanTables: "Scan tables",
   fscanLine: "fscan line",
   rawTarget: "Raw target",
+  expand: "Expand",
+  collapse: "Collapse",
+  connectionResultSummary: "{connections} connections / {findings} hits",
   noFindings: "No findings yet",
   noSamples: "No samples yet",
   noTargets: "No batch targets",
@@ -621,6 +633,8 @@ const en = {
   matchSearch: "high risk / password / token / email",
   sampleCount: "{count} samples",
   sampleSummary: "{groups} groups / {rows} sample rows",
+  sampleShowAll: "Show {count} rows",
+  sampleCollapse: "Collapse samples",
   databaseName: "Database",
   tableName: "Table",
   sampleRows: "Sample rows",
@@ -754,6 +768,8 @@ const showDataManager = ref(false);
 const dataManagerMessage = ref("");
 const selectedFieldKey = ref("");
 const selectedConnectionResultId = ref("");
+const connectionResultsExpanded = ref(false);
+const expandedSampleGroupKeys = ref<string[]>([]);
 const auditStoreLoaded = ref(false);
 const backupIncludeLogs = ref(true);
 const backupPassword = ref("");
@@ -855,10 +871,9 @@ const filteredSampleGroups = computed(() => {
   const sensitiveQuery = matchQuery.value.trim().toLowerCase();
   return sampleGroups.value.filter((group) => {
     if (!matchesDatabaseFilter(group)) return false;
-    const valueText = sampleGroupValueSearchText(group);
-    const sensitiveText = sampleGroupSensitiveSearchText(group);
     return (
-      (!valueQuery || valueText.includes(valueQuery)) && (!sensitiveQuery || sensitiveText.includes(sensitiveQuery))
+      (!valueQuery || group.valueSearchText.includes(valueQuery)) &&
+      (!sensitiveQuery || group.sensitiveSearchText.includes(sensitiveQuery))
     );
   });
 });
@@ -913,6 +928,14 @@ const connectionResultRows = computed(() => {
     };
   });
 });
+const connectionResultSummary = computed(() =>
+  ui.value.connectionResultSummary
+    .replace("{connections}", String(connectionResultRows.value.length))
+    .replace(
+      "{findings}",
+      String(connectionResultRows.value.reduce((total, row) => total + Number(row.findingCount || 0), 0)),
+    ),
+);
 
 watch(
   () => props.connections,
@@ -935,12 +958,20 @@ watch(selectedTaskId, () => {
   databaseFilterKeys.value = [];
   selectedFieldKey.value = "";
   selectedConnectionResultId.value = "";
+  connectionResultsExpanded.value = false;
+  expandedSampleGroupKeys.value = [];
 });
 
 watch(databaseFilterOptions, (options) => {
   if (databaseFilterKeys.value.length === 0) return;
   const available = new Set(options.map((option) => option.key));
   databaseFilterKeys.value = databaseFilterKeys.value.filter((key) => available.has(key));
+});
+
+watch(filteredSampleGroups, (groups) => {
+  if (expandedSampleGroupKeys.value.length === 0) return;
+  const available = new Set(groups.map((group) => group.key));
+  expandedSampleGroupKeys.value = expandedSampleGroupKeys.value.filter((key) => available.has(key));
 });
 
 watch(
@@ -2559,6 +2590,8 @@ function buildSampleGroups(findings: AuditFinding[]) {
         table: field.table,
         fields: [],
         rows: [],
+        valueSearchText: "",
+        sensitiveSearchText: "",
       } satisfies SampleGroup);
     group.fields.push(field);
     field.samples.forEach((value, index) => {
@@ -2566,7 +2599,11 @@ function buildSampleGroups(findings: AuditFinding[]) {
     });
     groups.set(key, group);
   }
-  return Array.from(groups.values());
+  return Array.from(groups.values()).map((group) => ({
+    ...group,
+    valueSearchText: sampleGroupValueSearchText(group),
+    sensitiveSearchText: sampleGroupSensitiveSearchText(group),
+  }));
 }
 
 function databaseNameText(database?: string, dbType?: string) {
@@ -2684,6 +2721,25 @@ function connectionResultRowCount(tables: NonNullable<AuditJobState["tableResult
 
 function sampleGroupRowCount(group: SampleGroup) {
   return group.fields.reduce((max, field) => Math.max(max, Number(field.count || 0)), 0);
+}
+
+function isSampleGroupExpanded(group: SampleGroup) {
+  return expandedSampleGroupKeys.value.includes(group.key);
+}
+
+function visibleSampleRows(group: SampleGroup) {
+  return isSampleGroupExpanded(group) ? group.rows : group.rows.slice(0, 1);
+}
+
+function toggleSampleGroup(group: SampleGroup) {
+  expandedSampleGroupKeys.value = isSampleGroupExpanded(group)
+    ? expandedSampleGroupKeys.value.filter((key) => key !== group.key)
+    : [...expandedSampleGroupKeys.value, group.key];
+}
+
+function sampleGroupToggleText(group: SampleGroup) {
+  if (isSampleGroupExpanded(group)) return ui.value.sampleCollapse;
+  return ui.value.sampleShowAll.replace("{count}", String(group.rows.length));
 }
 
 function sampleGroupConnection(group: SampleGroup) {
@@ -3429,8 +3485,17 @@ onUnmounted(() => {
       </div>
 
       <div class="mb-4 rounded-md border bg-background p-4">
-        <div class="font-semibold">{{ ui.connectionResultOverview }}</div>
-        <div class="mt-3 grid items-start gap-2 md:grid-cols-2 xl:grid-cols-3">
+        <button
+          type="button"
+          class="flex w-full items-center gap-2 text-left"
+          @click="connectionResultsExpanded = !connectionResultsExpanded"
+        >
+          <ChevronDown v-if="connectionResultsExpanded" class="h-4 w-4 shrink-0 text-muted-foreground" />
+          <ChevronRight v-else class="h-4 w-4 shrink-0 text-muted-foreground" />
+          <span class="font-semibold">{{ ui.connectionResultOverview }}</span>
+          <span class="ml-auto text-xs text-muted-foreground">{{ connectionResultSummary }}</span>
+        </button>
+        <div v-if="connectionResultsExpanded" class="mt-3 grid items-start gap-2 md:grid-cols-2 xl:grid-cols-3">
           <div
             v-for="row in connectionResultRows"
             :key="row.id"
@@ -3890,9 +3955,21 @@ onUnmounted(() => {
                 ><span class="text-muted-foreground">{{ ui.sampleRows }}</span> <b>{{ group.rows.length }}</b></span
               >
               <Button
+                v-if="group.rows.length > 1"
                 variant="outline"
                 size="sm"
                 class="ml-auto h-7 gap-1.5 px-2 text-xs"
+                @click="toggleSampleGroup(group)"
+              >
+                <ChevronDown v-if="isSampleGroupExpanded(group)" class="h-3.5 w-3.5" />
+                <ChevronRight v-else class="h-3.5 w-3.5" />
+                {{ sampleGroupToggleText(group) }}
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                class="h-7 gap-1.5 px-2 text-xs"
+                :class="group.rows.length > 1 ? '' : 'ml-auto'"
                 :disabled="!canOpenSampleGroup(group)"
                 @click="openSampleGroup(group)"
               >
@@ -3918,7 +3995,7 @@ onUnmounted(() => {
                   </tr>
                 </thead>
                 <tbody>
-                  <tr v-for="(row, index) in group.rows" :key="index" class="border-t">
+                  <tr v-for="(row, index) in visibleSampleRows(group)" :key="index" class="border-t">
                     <td
                       v-for="field in group.fields"
                       :key="field.key"
