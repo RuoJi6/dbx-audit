@@ -126,6 +126,7 @@ const AUDIT_STORE_LOCATION = "dbx.db / app_settings.audit_task_store";
 const LEGACY_TASK_STORE_KEY = "dbx-audit-tasks-v1";
 const LEGACY_LAST_DRAFT_KEY = "dbx-audit-task-draft-v1";
 const pollTimers = new Map<string, ReturnType<typeof setInterval>>();
+const exportingTaskIds = new Set<string>();
 const wizardSteps: WizardStep[] = [1, 2, 3, 4];
 const taskKinds: AuditTaskKind[] = ["single", "fscan", "sql"];
 
@@ -1490,8 +1491,11 @@ async function startTask(task: AuditTask) {
     });
     persistTask({ ...running, jobId, message: ui.value.scanning });
     await refreshTaskJob(running.id, jobId);
-    const timer = setInterval(() => void refreshTaskJob(running.id, jobId), 1000);
-    pollTimers.set(running.id, timer);
+    const current = tasks.value.find((item) => item.id === running.id);
+    if (current?.status === "running") {
+      const timer = setInterval(() => void refreshTaskJob(running.id, jobId), 1000);
+      pollTimers.set(running.id, timer);
+    }
   } catch (err) {
     persistTask({
       ...running,
@@ -1506,6 +1510,8 @@ async function startTask(task: AuditTask) {
 
 async function startConnectionBatchTask(task: AuditTask, connectionIds: string[]) {
   const startedAt = new Date().toISOString();
+  const outputs: string[] = [];
+  let completedTargets = 0;
   const aggregate: AuditJobState = {
     jobId: `batch-${task.id}`,
     status: "running",
@@ -1553,24 +1559,37 @@ async function startConnectionBatchTask(task: AuditTask, connectionIds: string[]
         connection,
       });
       const job = await waitForAuditJobSnapshot(jobId, task.id, label, index, connectionIds.length, aggregate);
-      aggregate.findings.push(
-        ...(job.findings || []).map((finding) => ({
+      const connectionJob: AuditJobState = {
+        ...job,
+        request: { ...job.request, connectionId },
+        findings: (job.findings || []).map((finding) => ({
           ...finding,
           connectionId,
           connectionName: label,
           dbType: connection?.db_type,
         })),
-      );
-      aggregate.tableResults.push(
-        ...(job.tableResults || []).map((table) => ({
+        tableResults: (job.tableResults || []).map((table) => ({
           ...table,
           connectionId,
           connectionName: label,
           dbType: connection?.db_type,
         })),
+      };
+      aggregate.findings.push(
+        ...connectionJob.findings,
+      );
+      aggregate.tableResults.push(
+        ...connectionJob.tableResults,
       );
       aggregate.logs.push(...(job.logs || []).map((entry) => ({ ...entry, message: `${label}: ${entry.message}` })));
       aggregate.errors.push(...(job.errors || []).map((entry) => `${label}: ${entry}`));
+      if (job.status !== "failed") {
+        completedTargets += 1;
+        if (task.outputEnabled && task.splitOutput) {
+          const splitResult = await writeSplitOutput(task, connectionJob, connectionId, label, connection);
+          if (splitResult) outputs.push(splitResult);
+        }
+      }
     } catch (err) {
       aggregate.errors.push(`${label}: ${String(err)}`);
       aggregate.logs.push({
@@ -1584,7 +1603,7 @@ async function startConnectionBatchTask(task: AuditTask, connectionIds: string[]
   aggregate.status = aggregate.errors.length ? "failed" : "completed";
   aggregate.progress = 100;
   aggregate.finishedAt = new Date().toISOString();
-  persistTask({
+  const finalTask = persistTask({
     ...task,
     jobId: aggregate.jobId,
     job: aggregate,
@@ -1592,8 +1611,12 @@ async function startConnectionBatchTask(task: AuditTask, connectionIds: string[]
     progress: 100,
     message: aggregate.errors.length ? ui.value.batchScanFailed : ui.value.batchScanCompleted,
     errors: aggregate.errors,
+    outputs,
     finishedAt: aggregate.finishedAt,
   });
+  if (task.outputEnabled && completedTargets > 0) {
+    await autoExportTask({ ...finalTask, outputs }, aggregate, { includeSplits: false, existingOutputs: outputs });
+  }
 }
 
 async function waitForAuditJobSnapshot(
@@ -1655,6 +1678,7 @@ async function refreshTaskJob(taskId: string, jobId?: string) {
     });
     if (job.status !== "running") {
       stopPolling(next.id);
+      await autoExportTask(next, job);
     }
   } catch (err) {
     persistTask({ ...task, status: "failed", message: String(err), errors: [String(err)] });
@@ -1662,7 +1686,7 @@ async function refreshTaskJob(taskId: string, jobId?: string) {
   }
 }
 
-async function exportReport(task: AuditTask, format: "xlsx") {
+async function exportReport(task: AuditTask) {
   if (!task.outputEnabled) {
     error.value = ui.value.outputRequired;
     return;
@@ -1674,26 +1698,90 @@ async function exportReport(task: AuditTask, format: "xlsx") {
   error.value = "";
   exportMessage.value = "";
   try {
-    const base = task.outputPath.trim() || `/tmp/${task.name.replace(/\s+/g, "-")}.${format}`;
-    const path = ensureXlsxPath(base);
-    const result = await api.auditExportReportSnapshot(task.job, format, path);
-    const outputs = [result.path];
-    if (task.splitOutput) {
-      for (const [connectionId, findings] of findingsByConnection(task.job.findings).entries()) {
-        const tableResults = (task.job.tableResults || []).filter(
-          (table) => table.connectionId === connectionId || table.connectionName === findings[0]?.connectionName,
-        );
-        const splitJob = { ...task.job, jobId: `${task.job.jobId}-${connectionId}`, findings, tableResults };
-        const splitPath = splitOutputPath(path, connectionId, findings);
-        const splitResult = await api.auditExportReportSnapshot(splitJob, format, splitPath);
-        outputs.push(splitResult.path);
-      }
-    }
-    persistTask({ ...task, outputs });
-    exportMessage.value = `${ui.value.exportReport}: ${result.path}`;
+    const result = await writeAuditOutputs(task, task.job);
+    persistTask({ ...task, outputs: result.outputs });
+    exportMessage.value = `${ui.value.exportReport}: ${result.mergedPath || lastOutputPath(result.outputs)}`;
   } catch (err) {
     error.value = String(err);
   }
+}
+
+async function autoExportTask(
+  task: AuditTask,
+  job: AuditJobState,
+  options: { includeSplits?: boolean; existingOutputs?: string[] } = {},
+) {
+  if (!task.outputEnabled || !shouldAutoExportJob(job) || exportingTaskIds.has(task.id)) return;
+  exportingTaskIds.add(task.id);
+  try {
+    const current = tasks.value.find((item) => item.id === task.id) || task;
+    const result = await writeAuditOutputs(current, job, options);
+    persistTask({ ...current, job, outputs: result.outputs });
+    exportMessage.value = `${ui.value.exportReport}: ${result.mergedPath || lastOutputPath(result.outputs)}`;
+  } catch (err) {
+    const current = tasks.value.find((item) => item.id === task.id) || task;
+    const message = `${ui.value.exportReport}: ${String(err)}`;
+    persistTask({
+      ...current,
+      job,
+      message,
+      errors: [...(current.errors || []), message],
+    });
+    exportMessage.value = message;
+  } finally {
+    exportingTaskIds.delete(task.id);
+  }
+}
+
+function shouldAutoExportJob(job: AuditJobState) {
+  if (job.status === "cancelled") return false;
+  if (job.status !== "failed") return true;
+  return (job.findings?.length || 0) > 0 || (job.tableResults?.length || 0) > 0;
+}
+
+async function writeAuditOutputs(
+  task: AuditTask,
+  job: AuditJobState,
+  options: { includeSplits?: boolean; includeMerged?: boolean; existingOutputs?: string[] } = {},
+) {
+  const includeSplits = options.includeSplits ?? (task.splitOutput && rawConnectionIds(task).length > 1);
+  const includeMerged = options.includeMerged ?? true;
+  const path = outputPathForTask(task);
+  const outputs = [...(options.existingOutputs || [])];
+  let mergedPath = "";
+  if (includeSplits) {
+    for (const context of splitContextsForTask(task, job)) {
+      const splitResult = await writeSplitOutput(task, filterJobForConnection(job, context), context.connectionId, context.label, context.connection);
+      if (splitResult) outputs.push(splitResult);
+    }
+  }
+  if (includeMerged) {
+    const result = await api.auditExportReportSnapshot(job, "xlsx", path);
+    mergedPath = result.path;
+    outputs.push(result.path);
+  }
+  return { outputs, mergedPath };
+}
+
+async function writeSplitOutput(
+  task: AuditTask,
+  job: AuditJobState,
+  connectionId: string,
+  label: string,
+  connection?: ConnectionConfig,
+) {
+  const path = outputPathForTask(task);
+  const splitPath = splitOutputPath(path, connectionId, job.findings || [], connection, label);
+  const splitJob: AuditJobState = {
+    ...job,
+    jobId: `${job.jobId}-${sanitizeFilePart(connectionId || label)}`,
+    request: {
+      ...job.request,
+      connectionId,
+    },
+  };
+  const result = await api.auditExportReportSnapshot(splitJob, "xlsx", splitPath);
+  return result.path;
 }
 
 function ensureXlsxPath(path: string) {
@@ -1701,21 +1789,85 @@ function ensureXlsxPath(path: string) {
   return trimmed.replace(/\.json$/i, ".xlsx").match(/\.xlsx$/i) ? trimmed.replace(/\.json$/i, ".xlsx") : `${trimmed}.xlsx`;
 }
 
-function findingsByConnection(findings: AuditFinding[]) {
-  const groups = new Map<string, AuditFinding[]>();
-  for (const finding of findings) {
-    const key = finding.connectionId || finding.connectionName || finding.dbType || "target";
-    groups.set(key, [...(groups.get(key) || []), finding]);
-  }
-  return groups;
+function outputPathForTask(task: AuditTask) {
+  return ensureXlsxPath(task.outputPath.trim() || `/tmp/${task.name.replace(/\s+/g, "-")}.xlsx`);
 }
 
-function splitOutputPath(path: string, connectionId: string, findings: AuditFinding[]) {
+function lastOutputPath(outputs: string[]) {
+  return outputs.length ? outputs[outputs.length - 1] : "";
+}
+
+type SplitContext = {
+  connectionId: string;
+  label: string;
+  connection?: ConnectionConfig;
+};
+
+function splitContextsForTask(task: AuditTask, job: AuditJobState) {
+  const contexts = new Map<string, SplitContext>();
+  for (const connectionId of activeConnectionIds(task)) {
+    const connection = props.connections.find((item) => item.id === connectionId);
+    contexts.set(connectionId, { connectionId, label: connection?.name || connectionId, connection });
+  }
+  for (const finding of job.findings || []) {
+    const key = finding.connectionId || finding.connectionName || finding.dbType || "target";
+    if (!contexts.has(key)) {
+      contexts.set(key, {
+        connectionId: finding.connectionId || key,
+        label: finding.connectionName || key,
+        connection: finding.connectionId ? props.connections.find((item) => item.id === finding.connectionId) : undefined,
+      });
+    }
+  }
+  for (const table of job.tableResults || []) {
+    const key = table.connectionId || table.connectionName || table.dbType || "target";
+    if (!contexts.has(key)) {
+      contexts.set(key, {
+        connectionId: table.connectionId || key,
+        label: table.connectionName || key,
+        connection: table.connectionId ? props.connections.find((item) => item.id === table.connectionId) : undefined,
+      });
+    }
+  }
+  return Array.from(contexts.values()).filter((context) => {
+    const hasError = (job.errors || []).some((entry) => entry.startsWith(`${context.label}:`) || entry.startsWith(`${context.connectionId}:`));
+    const hasResult =
+      (job.findings || []).some((finding) => matchesConnection(finding, context)) ||
+      (job.tableResults || []).some((table) => matchesConnection(table, context));
+    return hasResult || !hasError;
+  });
+}
+
+function filterJobForConnection(job: AuditJobState, context: SplitContext): AuditJobState {
+  return {
+    ...job,
+    findings: (job.findings || []).filter((finding) => matchesConnection(finding, context)),
+    tableResults: (job.tableResults || []).filter((table) => matchesConnection(table, context)),
+    logs: (job.logs || []).filter(
+      (entry) => entry.message.startsWith(`${context.label}:`) || entry.message.startsWith(`${context.connectionId}:`) || !entry.message.includes(":"),
+    ),
+    errors: (job.errors || []).filter((entry) => entry.startsWith(`${context.label}:`) || entry.startsWith(`${context.connectionId}:`)),
+  };
+}
+
+function matchesConnection(
+  item: Pick<AuditFinding, "connectionId" | "connectionName" | "dbType">,
+  context: SplitContext,
+) {
+  return (
+    item.connectionId === context.connectionId ||
+    item.connectionName === context.label ||
+    (!!context.connection && item.dbType === context.connection.db_type) ||
+    (!item.connectionId && !item.connectionName && !context.connectionId)
+  );
+}
+
+function splitOutputPath(path: string, connectionId: string, findings: AuditFinding[], connection?: ConnectionConfig, label?: string) {
   const index = path.toLowerCase().lastIndexOf(".xlsx");
   const stem = index >= 0 ? path.slice(0, index) : path;
   const suffixSource = [
-    findings[0]?.dbType || "db",
-    findings[0]?.connectionName || connectionId,
+    connection?.db_type || findings[0]?.dbType || "db",
+    label || connection?.name || findings[0]?.connectionName || connectionId,
   ].join("_");
   return `${stem}-${sanitizeFilePart(suffixSource)}.xlsx`;
 }
@@ -2591,7 +2743,7 @@ onUnmounted(() => {
               size="sm"
               class="gap-1"
               :disabled="!selectedTask.job || !selectedTask.outputEnabled"
-              @click="exportReport(selectedTask, 'xlsx')"
+              @click="exportReport(selectedTask)"
               ><FileSpreadsheet class="h-3.5 w-3.5" />{{ ui.xlsx }}</Button
             >
             <Button variant="outline" size="sm" class="gap-1" @click="openOutputDirectory(selectedTask)"
