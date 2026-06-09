@@ -60,6 +60,9 @@ pub enum AuditKind {
     Address,
     Username,
     Account,
+    IpAddress,
+    BusinessIdentifier,
+    RiskEvidence,
 }
 
 impl AuditKind {
@@ -68,8 +71,10 @@ impl AuditKind {
             AuditKind::IdCard | AuditKind::BankCard | AuditKind::PasswordSecret | AuditKind::TokenSecret => {
                 AuditLevel::High
             }
-            AuditKind::Phone | AuditKind::Email => AuditLevel::Medium,
-            AuditKind::Address | AuditKind::Username | AuditKind::Account => AuditLevel::Low,
+            AuditKind::Phone | AuditKind::Email | AuditKind::IpAddress | AuditKind::RiskEvidence => AuditLevel::Medium,
+            AuditKind::Address | AuditKind::Username | AuditKind::Account | AuditKind::BusinessIdentifier => {
+                AuditLevel::Low
+            }
         }
     }
 }
@@ -319,6 +324,30 @@ pub struct AuditLogEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditTargetSummary {
+    #[serde(default)]
+    pub connection_id: Option<String>,
+    #[serde(default)]
+    pub connection_name: Option<String>,
+    #[serde(default)]
+    pub db_type: Option<String>,
+    #[serde(default)]
+    pub connection_host: Option<String>,
+    #[serde(default)]
+    pub connection_port: Option<u16>,
+    #[serde(default)]
+    pub connection_user: Option<String>,
+    #[serde(default)]
+    pub database: Option<String>,
+    pub status: String,
+    pub finding_count: usize,
+    pub table_count: usize,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum AuditJobStatus {
     Running,
@@ -340,6 +369,8 @@ pub struct AuditJobState {
     pub findings: Vec<AuditFinding>,
     #[serde(default)]
     pub table_results: Vec<AuditTableEvidence>,
+    #[serde(default)]
+    pub target_summaries: Vec<AuditTargetSummary>,
     #[serde(default)]
     pub errors: Vec<String>,
     pub started_at: String,

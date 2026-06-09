@@ -1922,6 +1922,9 @@ export default {
       address: "Dirección",
       username: "Usuario",
       account: "Cuenta",
+      "ip-address": "Dirección IP",
+      "business-identifier": "ID de negocio",
+      "risk-evidence": "Riesgo/evidencia",
     },
     basis: {
       "field-name": "Nombre de campo",

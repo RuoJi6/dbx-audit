@@ -7,6 +7,8 @@ const EMAIL_PATTERN: &str = r"(?i)[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}";
 const ID_CARD_PATTERN: &str = r"(?i)\b\d{17}[\dxX]\b";
 const BANK_CARD_PATTERN: &str = r"\b(?:\d[ -]?){13,19}\b";
 const TOKEN_PATTERN: &str = r"(?i)\b(?:ak|sk|token|secret|bearer|api[_-]?key)[a-z0-9_\-:=.]{8,}\b";
+const IPV4_PATTERN: &str =
+    r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b";
 
 pub fn detect_field(table: &str, column: &str, level: AuditLevelFilter) -> Vec<AuditKind> {
     let haystack = format!("{} {}", table, column).to_ascii_lowercase();
@@ -42,9 +44,70 @@ pub fn detect_field(table: &str, column: &str, level: AuditLevelFilter) -> Vec<A
         &mut kinds,
         AuditKind::Username,
         level,
-        any_contains(&haystack, &["username", "user_name", "nickname", "realname", "姓名", "用户名"]),
+        any_contains(
+            &haystack,
+            &["username", "user_name", "nickname", "realname", "actor", "operator", "姓名", "用户名"],
+        ),
     );
     push_if(&mut kinds, AuditKind::Account, level, any_contains(&haystack, &["account", "acct", "账号", "账户"]));
+    push_if(
+        &mut kinds,
+        AuditKind::IpAddress,
+        level,
+        matches_exactish(&haystack, &["ip", "client_ip", "remote_ip", "source_ip", "ip_addr", "ip_address"])
+            || any_contains(&haystack, &["ip地址", "来源ip"]),
+    );
+    push_if(
+        &mut kinds,
+        AuditKind::BusinessIdentifier,
+        level,
+        matches_exactish(
+            &haystack,
+            &[
+                "customer_id",
+                "customerid",
+                "cust_id",
+                "entity_id",
+                "entityid",
+                "event_id",
+                "eventid",
+                "order_no",
+                "orderno",
+                "order_id",
+                "orderid",
+                "finding_id",
+                "findingid",
+                "asset_id",
+                "assetid",
+                "trace_id",
+                "traceid",
+                "request_id",
+                "requestid",
+                "session_id",
+                "sessionid",
+            ],
+        ) || any_contains(&haystack, &["客户id", "订单号", "事件id", "实体id", "资产id"]),
+    );
+    push_if(
+        &mut kinds,
+        AuditKind::RiskEvidence,
+        level,
+        matches_exactish(
+            &haystack,
+            &[
+                "evidence",
+                "risk_score",
+                "risk_decision",
+                "severity",
+                "detector",
+                "message",
+                "tags",
+                "finding",
+                "audit_log",
+                "audit_logs",
+            ],
+        ) || any_contains(&haystack, &["风险", "证据", "审计", "日志"]),
+    );
     kinds
 }
 
@@ -55,6 +118,7 @@ pub fn detect_value(value: &str, level: AuditLevelFilter) -> Vec<AuditKind> {
     push_if(&mut kinds, AuditKind::IdCard, level, regex_match(ID_CARD_PATTERN, value));
     push_if(&mut kinds, AuditKind::BankCard, level, regex_match(BANK_CARD_PATTERN, value) && luhn_like(value));
     push_if(&mut kinds, AuditKind::TokenSecret, level, regex_match(TOKEN_PATTERN, value));
+    push_if(&mut kinds, AuditKind::IpAddress, level, regex_match(IPV4_PATTERN, value));
     kinds
 }
 
@@ -76,6 +140,13 @@ fn push_if(kinds: &mut Vec<AuditKind>, kind: AuditKind, level: AuditLevelFilter,
 
 fn any_contains(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
+}
+
+fn matches_exactish(haystack: &str, needles: &[&str]) -> bool {
+    haystack.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_')).any(|part| {
+        let part = part.trim_matches('_');
+        needles.iter().any(|needle| part == *needle)
+    })
 }
 
 fn regex_match(pattern: &str, value: &str) -> bool {
@@ -102,6 +173,15 @@ mod tests {
 
         let kinds = detect_field("users", "mobile", AuditLevelFilter::Medium);
         assert!(kinds.contains(&AuditKind::Phone));
+
+        let kinds = detect_field("events", "customer_id", AuditLevelFilter::All);
+        assert!(kinds.contains(&AuditKind::BusinessIdentifier));
+
+        let kinds = detect_field("payments", "ip", AuditLevelFilter::All);
+        assert!(kinds.contains(&AuditKind::IpAddress));
+
+        let kinds = detect_field("security_findings", "evidence", AuditLevelFilter::All);
+        assert!(kinds.contains(&AuditKind::RiskEvidence));
     }
 
     #[test]
@@ -116,6 +196,7 @@ mod tests {
         assert!(detect_value("alice@example.com", AuditLevelFilter::All).contains(&AuditKind::Email));
         assert!(detect_value("11010519491231002X", AuditLevelFilter::All).contains(&AuditKind::IdCard));
         assert!(detect_value("api_key=abcdef1234567890", AuditLevelFilter::All).contains(&AuditKind::TokenSecret));
+        assert!(detect_value("10.211.55.16", AuditLevelFilter::All).contains(&AuditKind::IpAddress));
     }
 
     #[test]

@@ -2084,6 +2084,9 @@ export default {
       address: "地址",
       username: "用户名",
       account: "账号",
+      "ip-address": "IP 地址",
+      "business-identifier": "业务标识",
+      "risk-evidence": "风险/证据",
     },
     basis: {
       "field-name": "字段名",

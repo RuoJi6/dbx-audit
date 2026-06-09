@@ -94,6 +94,7 @@ pub async fn start_scan(
         logs: vec![log_entry("info", "审计扫描已加入任务队列")],
         findings: Vec::new(),
         table_results: Vec::new(),
+        target_summaries: Vec::new(),
         errors: Vec::new(),
         started_at: now_rfc3339(),
         finished_at: None,

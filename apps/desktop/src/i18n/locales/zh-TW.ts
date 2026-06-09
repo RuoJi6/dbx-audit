@@ -1931,6 +1931,9 @@ export default {
       address: "地址",
       username: "使用者名稱",
       account: "帳號",
+      "ip-address": "IP 地址",
+      "business-identifier": "業務標識",
+      "risk-evidence": "風險/證據",
     },
     basis: {
       "field-name": "欄位名",

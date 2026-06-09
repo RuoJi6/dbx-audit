@@ -3,6 +3,7 @@ import { computed, onUnmounted, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import {
   ArrowLeft,
+  Check,
   Clipboard,
   Database,
   Download,
@@ -20,13 +21,26 @@ import {
 } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import DatabaseIcon from "@/components/icons/DatabaseIcon.vue";
+import {
+  DropdownMenu,
+  DropdownMenuCheckboxItem,
+  DropdownMenuContent,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import * as api from "@/lib/api";
 import { connectionIconType } from "@/lib/connectionPresentation";
 import { safeLocalStorageGet, safeLocalStorageRemove } from "@/lib/safeStorage";
 import { isTauriRuntime } from "@/lib/tauriRuntime";
-import type { AuditFinding, AuditJobState, AuditLevelFilter, AuditMode, ParsedFscanTarget } from "@/lib/tauri";
+import type {
+  AuditFinding,
+  AuditJobState,
+  AuditLevelFilter,
+  AuditMode,
+  AuditTargetSummary,
+  ParsedFscanTarget,
+} from "@/lib/tauri";
 import type { ConnectionConfig } from "@/types/database";
 
 type AuditTaskKind = "single" | "fscan" | "sql";
@@ -116,6 +130,19 @@ type SampleGroup = {
   table: string;
   fields: FieldHit[];
   rows: Record<string, string>[];
+};
+
+type DatabaseFilterItem = {
+  connectionId?: string;
+  connectionName?: string;
+  dbType?: string;
+  database?: string;
+};
+
+type DatabaseFilterOption = {
+  key: string;
+  label: string;
+  dbType?: string;
 };
 
 const props = defineProps<{
@@ -274,6 +301,10 @@ const zh = {
   exportReport: "报告导出",
   fieldSearch: "phone / id_card / token",
   contentSearch: "手机号 / 邮箱 / token 值",
+  databaseFilter: "数据库筛选",
+  databaseFilterAll: "全部数据库",
+  databaseFilterCount: "已选 {count} 个数据库",
+  databaseFilterEmpty: "暂无可筛选数据库",
   riskAll: "全部",
   riskHigh: "高危",
   riskMedium: "中危",
@@ -352,6 +383,9 @@ const zh = {
     address: "地址",
     username: "用户名",
     account: "账号",
+    "ip-address": "IP 地址",
+    "business-identifier": "业务标识",
+    "risk-evidence": "风险/证据",
   },
 };
 
@@ -498,6 +532,10 @@ const en = {
     "Web dev mode cannot choose local output paths. Use the desktop app or enter a path manually.",
   fieldSearch: "phone / id_card / token",
   contentSearch: "phone / email / token value",
+  databaseFilter: "Database filter",
+  databaseFilterAll: "All databases",
+  databaseFilterCount: "{count} databases selected",
+  databaseFilterEmpty: "No databases",
   riskHighShort: "High",
   riskMediumShort: "Med",
   riskLowShort: "Low",
@@ -575,6 +613,9 @@ const en = {
     address: "Address",
     username: "Username",
     account: "Account",
+    "ip-address": "IP address",
+    "business-identifier": "Business ID",
+    "risk-evidence": "Risk/evidence",
   },
 };
 
@@ -674,6 +715,7 @@ const fieldQuery = ref("");
 const sampleQuery = ref("");
 const matchQuery = ref("");
 const riskFilter = ref<"all" | "high" | "medium" | "low">("all");
+const databaseFilterKeys = ref<string[]>([]);
 const selectedTaskId = ref("");
 const draft = ref<AuditTask>(newTask());
 const tasks = ref<AuditTask[]>([]);
@@ -682,6 +724,7 @@ const error = ref("");
 const showDataManager = ref(false);
 const dataManagerMessage = ref("");
 const selectedFieldKey = ref("");
+const selectedConnectionResultId = ref("");
 const auditStoreLoaded = ref(false);
 const backupIncludeLogs = ref(true);
 const backupPassword = ref("");
@@ -721,6 +764,50 @@ const detailFindings = computed(() => (selectedTask.value ? findingsWithConnecti
 const detailTotals = computed(() => riskTotals(detailFindings.value));
 const detailTables = computed(() => tableHits(detailFindings.value));
 const detailFields = computed(() => fieldHits(detailFindings.value));
+const databaseFilterOptions = computed<DatabaseFilterOption[]>(() => {
+  const options = new Map<string, DatabaseFilterOption>();
+  const task = selectedTask.value;
+  for (const finding of detailFindings.value) {
+    const key = databaseFilterKey(finding);
+    if (!key || options.has(key)) continue;
+    options.set(key, {
+      key,
+      label: databaseFilterLabel(finding),
+      dbType: finding.dbType,
+    });
+  }
+  if (task?.job?.targetSummaries?.length) {
+    for (const target of task.job.targetSummaries) {
+      const key = databaseFilterKey(target);
+      if (!key || options.has(key)) continue;
+      options.set(key, {
+        key,
+        label: databaseFilterLabel(target),
+        dbType: target.dbType,
+      });
+    }
+  }
+  if (task?.database.trim()) {
+    for (const id of rawConnectionIds(task)) {
+      const connection = props.connections.find((item) => item.id === id);
+      const item: DatabaseFilterItem = {
+        connectionId: id,
+        connectionName: connection?.name || id,
+        dbType: connectionIconType(connection),
+        database: task.database.trim(),
+      };
+      const key = databaseFilterKey(item);
+      if (!key || options.has(key)) continue;
+      options.set(key, {
+        key,
+        label: databaseFilterLabel(item),
+        dbType: item.dbType,
+      });
+    }
+  }
+  return Array.from(options.values()).sort((a, b) => a.label.localeCompare(b.label));
+});
+const selectedDatabaseFilterSet = computed(() => new Set(databaseFilterKeys.value));
 const detailTabs = computed<DetailTab[]>(() => {
   const task = selectedTask.value;
   const tabs: DetailTab[] = ["hits", "fields"];
@@ -731,6 +818,7 @@ const detailTabs = computed<DetailTab[]>(() => {
 const filteredTables = computed(() => {
   const query = fieldQuery.value.trim().toLowerCase();
   return detailTables.value.filter((item) => {
+    if (!matchesDatabaseFilter(item)) return false;
     if (riskFilter.value !== "all" && item.risk !== riskFilter.value) return false;
     if (!query) return true;
     return [item.dbType, item.connectionName, item.database, item.table, item.columns.join(" ")]
@@ -740,13 +828,16 @@ const filteredTables = computed(() => {
   });
 });
 const filteredFields = computed(() => {
-  return detailFields.value.filter((field) => riskFilter.value === "all" || field.level === riskFilter.value);
+  return detailFields.value.filter(
+    (field) => matchesDatabaseFilter(field) && (riskFilter.value === "all" || field.level === riskFilter.value),
+  );
 });
 const sampleGroups = computed(() => buildSampleGroups(detailFindings.value));
 const filteredSampleGroups = computed(() => {
   const valueQuery = sampleQuery.value.trim().toLowerCase();
   const sensitiveQuery = matchQuery.value.trim().toLowerCase();
   return sampleGroups.value.filter((group) => {
+    if (!matchesDatabaseFilter(group)) return false;
     const text = JSON.stringify(group).toLowerCase();
     return (!valueQuery || text.includes(valueQuery)) && (!sensitiveQuery || text.includes(sensitiveQuery));
   });
@@ -764,20 +855,34 @@ const connectionResultRows = computed(() => {
   if (!task) return [];
   const ids = rawConnectionIds(task);
   const findings = findingsWithConnectionMeta(task);
+  const tables = task.job?.tableResults || [];
   return ids.map((id) => {
     const connection = props.connections.find((item) => item.id === id);
     const name = connection?.name || id;
     const relatedFindings = findings.filter((finding) => finding.connectionId === id || finding.connectionName === name);
+    const relatedTables = tables.filter((table) => table.connectionId === id || table.connectionName === name);
     const relatedErrors = (task.errors || []).filter((entry) => entry.includes(id) || entry.includes(name));
+    const targetSummary = task.job?.targetSummaries?.find(
+      (target) => target.connectionId === id || target.connectionName === name,
+    );
+    const totals = riskTotals(relatedFindings);
+    const rowCount = connectionResultRowCount(relatedTables, relatedFindings);
     return {
       id,
       name,
-      dbType: connectionIconType(connection) || relatedFindings[0]?.dbType || "",
+      dbType: connectionIconType(connection) || targetSummary?.dbType || relatedFindings[0]?.dbType || "",
       status: relatedErrors.length
         ? relatedErrors.join("; ")
         : relatedFindings.length
           ? `${ui.value.hasHits} ${relatedFindings.length}`
           : ui.value.noHits,
+      database: targetSummary?.database || relatedTables[0]?.database || relatedFindings[0]?.database || connection?.database || "",
+      tableCount: targetSummary?.tableCount ?? relatedTables.length,
+      findingCount: targetSummary?.findingCount ?? relatedFindings.length,
+      rowCount,
+      high: totals.high,
+      medium: totals.medium,
+      low: totals.low,
     };
   });
 });
@@ -798,6 +903,18 @@ watch(
 watch(tasks, () => scheduleAuditTaskStoreSave(), { deep: true });
 
 watch(draft, () => scheduleAuditTaskStoreSave(), { deep: true });
+
+watch(selectedTaskId, () => {
+  databaseFilterKeys.value = [];
+  selectedFieldKey.value = "";
+  selectedConnectionResultId.value = "";
+});
+
+watch(databaseFilterOptions, (options) => {
+  if (databaseFilterKeys.value.length === 0) return;
+  const available = new Set(options.map((option) => option.key));
+  databaseFilterKeys.value = databaseFilterKeys.value.filter((key) => available.has(key));
+});
 
 watch(
   detailTabs,
@@ -958,16 +1075,7 @@ function persistTask(task: AuditTask) {
 function createTask() {
   error.value = "";
   wizardStep.value = 1;
-  draft.value = newTask(draft.value);
-  draft.value.id = `audit-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  draft.value.status = "draft";
-  draft.value.progress = 0;
-  draft.value.mask = false;
-  draft.value.job = undefined;
-  draft.value.jobId = undefined;
-  draft.value.logHistory = [];
-  draft.value.errorHistory = [];
-  draft.value.errors = [];
+  draft.value = newTask();
   view.value = "wizard";
 }
 
@@ -1549,6 +1657,7 @@ async function startConnectionBatchTask(task: AuditTask, connectionIds: string[]
     logs: [...task.logHistory],
     findings: [],
     tableResults: [],
+    targetSummaries: [],
     errors: [...task.errorHistory],
     startedAt,
   };
@@ -1604,6 +1713,7 @@ async function startConnectionBatchTask(task: AuditTask, connectionIds: string[]
       aggregate.tableResults.push(
         ...connectionJob.tableResults,
       );
+      aggregate.targetSummaries.push(auditTargetSummary(connectionId, label, connection, connectionJob));
       aggregate.logs.push(...(job.logs || []).map((entry) => ({ ...entry, message: `${label}: ${entry.message}` })));
       aggregate.errors.push(...(job.errors || []).map((entry) => `${label}: ${entry}`));
       if (job.status !== "failed") {
@@ -1614,6 +1724,7 @@ async function startConnectionBatchTask(task: AuditTask, connectionIds: string[]
         }
       }
     } catch (err) {
+      aggregate.targetSummaries.push(auditTargetSummary(connectionId, label, connection, undefined, String(err)));
       aggregate.errors.push(`${label}: ${String(err)}`);
       aggregate.logs.push({
         time: new Date().toLocaleTimeString(),
@@ -1641,6 +1752,41 @@ async function startConnectionBatchTask(task: AuditTask, connectionIds: string[]
   if (task.outputEnabled && completedTargets > 0) {
     await autoExportTask({ ...finalTask, outputs }, aggregate, { includeSplits: false, existingOutputs: outputs });
   }
+}
+
+function auditTargetSummary(
+  connectionId: string,
+  label: string,
+  connection: ConnectionConfig | undefined,
+  job?: AuditJobState,
+  error?: string,
+): AuditTargetSummary {
+  const findingCount = job?.findings?.length || 0;
+  const tableCount = job?.tableResults?.length || 0;
+  const jobError = error || (job?.errors || []).join("; ");
+  return {
+    connectionId,
+    connectionName: label,
+    dbType: connection?.db_type || job?.findings?.[0]?.dbType || job?.tableResults?.[0]?.dbType,
+    connectionHost: connection?.host,
+    connectionPort: connection?.port,
+    connectionUser: connection?.username,
+    database: taskDatabaseName(job, connection),
+    status: jobError ? "failed" : findingCount > 0 ? "hit" : "no-hit",
+    findingCount,
+    tableCount,
+    error: jobError || undefined,
+  };
+}
+
+function taskDatabaseName(job: AuditJobState | undefined, connection: ConnectionConfig | undefined) {
+  return (
+    job?.request?.database ||
+    job?.tableResults?.[0]?.database ||
+    job?.findings?.[0]?.database ||
+    connection?.database ||
+    undefined
+  );
 }
 
 async function waitForAuditJobSnapshot(
@@ -1689,7 +1835,8 @@ async function refreshTaskJob(taskId: string, jobId?: string) {
   try {
     const job = await api.auditGetJob(effectiveJobId);
     if (!job) return;
-    const mergedJob = mergeTaskLogHistory(task, job);
+    const mergedJob =
+      job.status === "running" ? mergeTaskLogHistory(task, job) : ensureJobTargetSummaries(task, mergeTaskLogHistory(task, job));
     const status = mapJobStatus(job.status);
     const next = persistTask({
       ...task,
@@ -1709,6 +1856,17 @@ async function refreshTaskJob(taskId: string, jobId?: string) {
     persistTask({ ...task, status: "failed", message: String(err), errors: [...(task.errorHistory || []), String(err)] });
     stopPolling(task.id);
   }
+}
+
+function ensureJobTargetSummaries(task: AuditTask, job: AuditJobState): AuditJobState {
+  if (job.targetSummaries?.length) return job;
+  const connectionId = job.request?.connectionId || task.connectionId || task.connectionIds?.[0] || "";
+  const connection = props.connections.find((item) => item.id === connectionId);
+  const label = connection?.name || connectionId || task.name;
+  return {
+    ...job,
+    targetSummaries: [auditTargetSummary(connectionId, label, connection, job)],
+  };
 }
 
 async function exportReport(task: AuditTask) {
@@ -2153,6 +2311,62 @@ function buildSampleGroups(findings: AuditFinding[]) {
 
 function databaseScopeText(item: Pick<TableHit | FieldHit | SampleGroup, "connectionName" | "dbType">) {
   return [item.dbType, item.connectionName].filter(Boolean).join(" · ");
+}
+
+function databaseFilterKey(item: DatabaseFilterItem) {
+  const database = item.database?.trim() || "-";
+  const source = item.connectionId || [item.dbType, item.connectionName].filter(Boolean).join(" · ") || "";
+  return [source, database].join("\u001f");
+}
+
+function databaseFilterLabel(item: DatabaseFilterItem) {
+  const scope = databaseScopeText(item);
+  const database = item.database?.trim() || "-";
+  return [scope, database].filter(Boolean).join(" / ");
+}
+
+function databaseFilterButtonText() {
+  if (databaseFilterKeys.value.length === 0) return ui.value.databaseFilterAll;
+  return ui.value.databaseFilterCount.replace("{count}", String(databaseFilterKeys.value.length));
+}
+
+function isDatabaseFilterSelected(key: string) {
+  return selectedDatabaseFilterSet.value.has(key);
+}
+
+function databaseFilterItemClass(selected: boolean) {
+  return selected ? "bg-primary/10 font-medium text-primary" : "";
+}
+
+function matchesDatabaseFilter(item: DatabaseFilterItem) {
+  return databaseFilterKeys.value.length === 0 || selectedDatabaseFilterSet.value.has(databaseFilterKey(item));
+}
+
+function toggleDatabaseFilter(key: string) {
+  databaseFilterKeys.value = databaseFilterKeys.value.includes(key)
+    ? databaseFilterKeys.value.filter((item) => item !== key)
+    : [...databaseFilterKeys.value, key];
+}
+
+function clearDatabaseFilter() {
+  databaseFilterKeys.value = [];
+}
+
+function toggleConnectionResult(id: string) {
+  selectedConnectionResultId.value = selectedConnectionResultId.value === id ? "" : id;
+}
+
+function connectionResultRowCount(
+  tables: NonNullable<AuditJobState["tableResults"]>,
+  findings: AuditFinding[],
+) {
+  const tableRows = tables.reduce((total, table) => total + Number(table.rowCount || 0), 0);
+  if (tableRows > 0) return tableRows;
+  return findings.reduce((total, finding) => total + Number(finding.count || 0), 0);
+}
+
+function sampleGroupRowCount(group: SampleGroup) {
+  return group.fields.reduce((max, field) => Math.max(max, Number(field.count || 0)), 0);
 }
 
 function highestRisk(a: "high" | "medium" | "low", b: "high" | "medium" | "low") {
@@ -2812,12 +3026,54 @@ onUnmounted(() => {
       <div class="mb-4 rounded-md border bg-background p-4">
         <div class="font-semibold">{{ ui.connectionResultOverview }}</div>
         <div class="mt-3 grid gap-2 md:grid-cols-2 xl:grid-cols-3">
-          <div v-for="row in connectionResultRows" :key="row.id" class="rounded-md border p-3 text-xs">
+          <div
+            v-for="row in connectionResultRows"
+            :key="row.id"
+            class="rounded-md border p-3 text-xs transition hover:border-primary"
+            :class="selectedConnectionResultId === row.id ? 'border-primary bg-primary/5 ring-1 ring-primary/30' : ''"
+            role="button"
+            tabindex="0"
+            @click="toggleConnectionResult(row.id)"
+            @keydown.enter="toggleConnectionResult(row.id)"
+          >
             <div class="flex items-center gap-2">
               <DatabaseIcon :db-type="row.dbType" class="h-3.5 w-3.5 shrink-0" />
               <span class="font-medium">{{ row.name }}</span>
             </div>
             <div class="mt-2 text-muted-foreground">{{ row.status }}</div>
+            <div v-if="selectedConnectionResultId === row.id" class="mt-3 rounded-md border bg-background/80 p-3">
+              <div v-if="row.database" class="mb-2 truncate font-mono text-[11px] text-muted-foreground">
+                {{ row.database }}
+              </div>
+              <div class="grid grid-cols-2 gap-2">
+                <div>
+                  <div class="text-muted-foreground">{{ ui.sensitiveFields }}</div>
+                  <div class="font-semibold">{{ row.findingCount }}</div>
+                </div>
+                <div>
+                  <div class="text-muted-foreground">{{ ui.hitTables }}</div>
+                  <div class="font-semibold">{{ row.tableCount }}</div>
+                </div>
+                <div>
+                  <div class="text-muted-foreground">{{ ui.rows }}</div>
+                  <div class="font-semibold">{{ row.rowCount }}</div>
+                </div>
+                <div>
+                  <div class="text-muted-foreground">{{ ui.risk }}</div>
+                  <div class="mt-1 flex flex-wrap gap-1">
+                    <span class="rounded-full border px-1.5 py-0.5" :class="riskClass('high')"
+                      >{{ ui.riskHighShort }} {{ row.high }}</span
+                    >
+                    <span class="rounded-full border px-1.5 py-0.5" :class="riskClass('medium')"
+                      >{{ ui.riskMediumShort }} {{ row.medium }}</span
+                    >
+                    <span class="rounded-full border px-1.5 py-0.5" :class="riskClass('low')"
+                      >{{ ui.riskLowShort }} {{ row.low }}</span
+                    >
+                  </div>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -2848,8 +3104,62 @@ onUnmounted(() => {
         </div>
 
         <div v-if="activeTab === 'hits'" class="p-4">
-          <div class="mb-3 grid gap-3 md:grid-cols-[1fr_180px]">
+          <div class="mb-3 grid gap-3 md:grid-cols-[1fr_220px_180px]">
             <Input v-model="fieldQuery" class="h-9" :placeholder="ui.fieldSearch" />
+            <DropdownMenu>
+              <DropdownMenuTrigger as-child>
+                <Button variant="outline" class="h-9 justify-start gap-2 px-3" :disabled="databaseFilterOptions.length === 0">
+                  <Database class="h-4 w-4 shrink-0" />
+                  <span class="truncate">{{ databaseFilterButtonText() }}</span>
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent class="max-h-64 min-w-64 overflow-y-auto">
+                <DropdownMenuCheckboxItem
+                  :checked="databaseFilterKeys.length === 0"
+                  :class="databaseFilterItemClass(databaseFilterKeys.length === 0)"
+                  @select.prevent
+                  @click="clearDatabaseFilter"
+                >
+                  <span
+                    class="mr-2 flex h-4 w-4 shrink-0 items-center justify-center rounded border"
+                    :class="
+                      databaseFilterKeys.length === 0
+                        ? 'border-primary bg-primary text-primary-foreground'
+                        : 'border-muted-foreground/40 text-transparent'
+                    "
+                  >
+                    <Check class="h-3 w-3" />
+                  </span>
+                  {{ ui.databaseFilterAll }}
+                </DropdownMenuCheckboxItem>
+                <DropdownMenuCheckboxItem
+                  v-for="option in databaseFilterOptions"
+                  :key="option.key"
+                  :checked="isDatabaseFilterSelected(option.key)"
+                  :class="databaseFilterItemClass(isDatabaseFilterSelected(option.key))"
+                  @select.prevent
+                  @click="toggleDatabaseFilter(option.key)"
+                >
+                  <span class="inline-flex min-w-0 items-center gap-1.5">
+                    <span
+                      class="mr-1 flex h-4 w-4 shrink-0 items-center justify-center rounded border"
+                      :class="
+                        isDatabaseFilterSelected(option.key)
+                          ? 'border-primary bg-primary text-primary-foreground'
+                          : 'border-muted-foreground/40 text-transparent'
+                      "
+                    >
+                      <Check class="h-3 w-3" />
+                    </span>
+                    <DatabaseIcon :db-type="option.dbType || ''" class="h-3.5 w-3.5 shrink-0" />
+                    <span class="truncate">{{ option.label }}</span>
+                  </span>
+                </DropdownMenuCheckboxItem>
+                <div v-if="databaseFilterOptions.length === 0" class="px-3 py-2 text-xs text-muted-foreground">
+                  {{ ui.databaseFilterEmpty }}
+                </div>
+              </DropdownMenuContent>
+            </DropdownMenu>
             <Select v-model="riskFilter">
               <SelectTrigger class="h-9"><SelectValue /></SelectTrigger>
               <SelectContent>
@@ -2860,30 +3170,31 @@ onUnmounted(() => {
               </SelectContent>
             </Select>
           </div>
-          <table class="w-full text-xs">
+          <div class="max-w-full overflow-x-auto">
+          <table class="min-w-[980px] w-full text-xs">
             <thead class="bg-muted/60 text-muted-foreground">
               <tr>
-                <th class="px-3 py-2 text-left">{{ ui.connectionSource }}</th>
-                <th class="px-3 py-2 text-left">{{ ui.database }}</th>
-                <th class="px-3 py-2 text-left">{{ ui.table }}</th>
-                <th class="px-3 py-2 text-left">{{ ui.sensitiveFields }}</th>
-                <th class="px-3 py-2 text-left">{{ ui.rows }}</th>
-                <th class="px-3 py-2 text-left">{{ ui.risk }}</th>
+                <th class="whitespace-nowrap px-3 py-2 text-left">{{ ui.connectionSource }}</th>
+                <th class="whitespace-nowrap px-3 py-2 text-left">{{ ui.database }}</th>
+                <th class="whitespace-nowrap px-3 py-2 text-left">{{ ui.table }}</th>
+                <th class="whitespace-nowrap px-3 py-2 text-left">{{ ui.sensitiveFields }}</th>
+                <th class="whitespace-nowrap px-3 py-2 text-left">{{ ui.rows }}</th>
+                <th class="whitespace-nowrap px-3 py-2 text-left">{{ ui.risk }}</th>
               </tr>
             </thead>
             <tbody>
               <tr v-for="hit in filteredTables" :key="hit.key" class="border-t">
-                <td class="px-3 py-2">
+                <td class="whitespace-nowrap px-3 py-2">
                   <span class="flex items-center gap-1.5">
                     <DatabaseIcon :db-type="hit.dbType || ''" class="h-3.5 w-3.5 shrink-0" />
                     <span class="truncate">{{ databaseScopeText(hit) || "-" }}</span>
                   </span>
                 </td>
-                <td class="px-3 py-2 font-mono">{{ hit.database }}</td>
-                <td class="px-3 py-2 font-mono">{{ hit.table }}</td>
-                <td class="px-3 py-2">{{ hit.columns.join(", ") }}</td>
-                <td class="px-3 py-2">{{ hit.rowCount }}</td>
-                <td class="px-3 py-2">
+                <td class="whitespace-nowrap px-3 py-2 font-mono">{{ hit.database }}</td>
+                <td class="whitespace-nowrap px-3 py-2 font-mono">{{ hit.table }}</td>
+                <td class="whitespace-nowrap px-3 py-2 font-mono">{{ hit.columns.join(", ") }}</td>
+                <td class="whitespace-nowrap px-3 py-2">{{ hit.rowCount }}</td>
+                <td class="whitespace-nowrap px-3 py-2">
                   <span class="rounded-full border px-2 py-0.5" :class="riskClass(hit.risk)">{{ hit.risk }}</span>
                 </td>
               </tr>
@@ -2892,19 +3203,80 @@ onUnmounted(() => {
               </tr>
             </tbody>
           </table>
+          </div>
         </div>
 
         <div v-else-if="activeTab === 'fields'" class="p-4">
           <div class="mb-3 flex items-center justify-between">
-            <Select v-model="riskFilter">
-              <SelectTrigger class="h-9 w-44"><SelectValue /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value="all">{{ ui.riskAll }}</SelectItem>
-                <SelectItem value="high">{{ ui.riskHigh }}</SelectItem>
-                <SelectItem value="medium">{{ ui.riskMedium }}</SelectItem>
-                <SelectItem value="low">{{ ui.riskLow }}</SelectItem>
-              </SelectContent>
-            </Select>
+            <div class="flex flex-wrap gap-3">
+              <DropdownMenu>
+                <DropdownMenuTrigger as-child>
+                  <Button
+                    variant="outline"
+                    class="h-9 w-56 justify-start gap-2 px-3"
+                    :disabled="databaseFilterOptions.length === 0"
+                  >
+                    <Database class="h-4 w-4 shrink-0" />
+                    <span class="truncate">{{ databaseFilterButtonText() }}</span>
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent class="max-h-64 min-w-64 overflow-y-auto">
+                  <DropdownMenuCheckboxItem
+                    :checked="databaseFilterKeys.length === 0"
+                    :class="databaseFilterItemClass(databaseFilterKeys.length === 0)"
+                    @select.prevent
+                    @click="clearDatabaseFilter"
+                  >
+                    <span
+                      class="mr-2 flex h-4 w-4 shrink-0 items-center justify-center rounded border"
+                      :class="
+                        databaseFilterKeys.length === 0
+                          ? 'border-primary bg-primary text-primary-foreground'
+                          : 'border-muted-foreground/40 text-transparent'
+                      "
+                    >
+                      <Check class="h-3 w-3" />
+                    </span>
+                    {{ ui.databaseFilterAll }}
+                  </DropdownMenuCheckboxItem>
+                  <DropdownMenuCheckboxItem
+                    v-for="option in databaseFilterOptions"
+                    :key="option.key"
+                    :checked="isDatabaseFilterSelected(option.key)"
+                    :class="databaseFilterItemClass(isDatabaseFilterSelected(option.key))"
+                    @select.prevent
+                    @click="toggleDatabaseFilter(option.key)"
+                  >
+                    <span class="inline-flex min-w-0 items-center gap-1.5">
+                      <span
+                        class="mr-1 flex h-4 w-4 shrink-0 items-center justify-center rounded border"
+                        :class="
+                          isDatabaseFilterSelected(option.key)
+                            ? 'border-primary bg-primary text-primary-foreground'
+                            : 'border-muted-foreground/40 text-transparent'
+                        "
+                      >
+                        <Check class="h-3 w-3" />
+                      </span>
+                      <DatabaseIcon :db-type="option.dbType || ''" class="h-3.5 w-3.5 shrink-0" />
+                      <span class="truncate">{{ option.label }}</span>
+                    </span>
+                  </DropdownMenuCheckboxItem>
+                  <div v-if="databaseFilterOptions.length === 0" class="px-3 py-2 text-xs text-muted-foreground">
+                    {{ ui.databaseFilterEmpty }}
+                  </div>
+                </DropdownMenuContent>
+              </DropdownMenu>
+              <Select v-model="riskFilter">
+                <SelectTrigger class="h-9 w-44"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">{{ ui.riskAll }}</SelectItem>
+                  <SelectItem value="high">{{ ui.riskHigh }}</SelectItem>
+                  <SelectItem value="medium">{{ ui.riskMedium }}</SelectItem>
+                  <SelectItem value="low">{{ ui.riskLow }}</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
             <span class="text-xs text-muted-foreground">{{
               ui.fieldCount.replace("{count}", String(filteredFields.length))
             }}</span>
@@ -2936,7 +3308,7 @@ onUnmounted(() => {
               </div>
               <div
                 v-if="selectedFieldKey === field.key"
-                class="absolute left-0 top-full z-30 mt-2 w-80 rounded-md border bg-background p-4 text-foreground shadow-xl md:left-full md:top-0 md:ml-3 md:mt-0"
+                class="mt-4 rounded-md border bg-background p-4 text-foreground shadow-sm"
                 @click.stop
               >
                 <div class="flex items-start justify-between gap-3">
@@ -2998,9 +3370,63 @@ onUnmounted(() => {
         </div>
 
         <div v-else-if="activeTab === 'samples'" class="space-y-4 p-4">
-          <div class="grid gap-3 md:grid-cols-[1fr_1fr_160px]">
+          <div class="grid gap-3 md:grid-cols-[1fr_1fr_220px_160px]">
             <Input v-model="sampleQuery" class="h-9" :placeholder="ui.contentSearch" />
             <Input v-model="matchQuery" class="h-9" :placeholder="ui.matchSearch" />
+            <DropdownMenu>
+              <DropdownMenuTrigger as-child>
+                <Button variant="outline" class="h-9 justify-start gap-2 px-3" :disabled="databaseFilterOptions.length === 0">
+                  <Database class="h-4 w-4 shrink-0" />
+                  <span class="truncate">{{ databaseFilterButtonText() }}</span>
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent class="max-h-64 min-w-64 overflow-y-auto">
+                <DropdownMenuCheckboxItem
+                  :checked="databaseFilterKeys.length === 0"
+                  :class="databaseFilterItemClass(databaseFilterKeys.length === 0)"
+                  @select.prevent
+                  @click="clearDatabaseFilter"
+                >
+                  <span
+                    class="mr-2 flex h-4 w-4 shrink-0 items-center justify-center rounded border"
+                    :class="
+                      databaseFilterKeys.length === 0
+                        ? 'border-primary bg-primary text-primary-foreground'
+                        : 'border-muted-foreground/40 text-transparent'
+                    "
+                  >
+                    <Check class="h-3 w-3" />
+                  </span>
+                  {{ ui.databaseFilterAll }}
+                </DropdownMenuCheckboxItem>
+                <DropdownMenuCheckboxItem
+                  v-for="option in databaseFilterOptions"
+                  :key="option.key"
+                  :checked="isDatabaseFilterSelected(option.key)"
+                  :class="databaseFilterItemClass(isDatabaseFilterSelected(option.key))"
+                  @select.prevent
+                  @click="toggleDatabaseFilter(option.key)"
+                >
+                  <span class="inline-flex min-w-0 items-center gap-1.5">
+                    <span
+                      class="mr-1 flex h-4 w-4 shrink-0 items-center justify-center rounded border"
+                      :class="
+                        isDatabaseFilterSelected(option.key)
+                          ? 'border-primary bg-primary text-primary-foreground'
+                          : 'border-muted-foreground/40 text-transparent'
+                      "
+                    >
+                      <Check class="h-3 w-3" />
+                    </span>
+                    <DatabaseIcon :db-type="option.dbType || ''" class="h-3.5 w-3.5 shrink-0" />
+                    <span class="truncate">{{ option.label }}</span>
+                  </span>
+                </DropdownMenuCheckboxItem>
+                <div v-if="databaseFilterOptions.length === 0" class="px-3 py-2 text-xs text-muted-foreground">
+                  {{ ui.databaseFilterEmpty }}
+                </div>
+              </DropdownMenuContent>
+            </DropdownMenu>
             <div class="text-xs text-muted-foreground">{{ filteredSampleSummary }}</div>
           </div>
           <div v-for="group in filteredSampleGroups" :key="group.key" class="overflow-hidden rounded-md border">
@@ -3020,6 +3446,10 @@ onUnmounted(() => {
                 ><span class="text-muted-foreground">{{ ui.fieldEvidence }}</span>
                 <b>{{ group.fields.length }}</b></span
               >
+              <span
+                ><span class="text-muted-foreground">{{ ui.rows }}</span>
+                <b>{{ sampleGroupRowCount(group) }}</b></span
+              >
               <span v-if="group.rows.length"
                 ><span class="text-muted-foreground">{{ ui.sampleRows }}</span> <b>{{ group.rows.length }}</b></span
               >
@@ -3034,8 +3464,8 @@ onUnmounted(() => {
                       class="w-48 min-w-[12rem] px-3 py-2 text-left align-top font-mono"
                       :class="riskTextClass(field.level)"
                     >
-                      <div class="whitespace-normal break-words">{{ field.column }}</div>
-                      <div class="whitespace-normal break-words font-sans text-[11px]">
+                      <div class="whitespace-nowrap">{{ field.column }}</div>
+                      <div class="whitespace-nowrap font-sans text-[11px]">
                         {{ ui.levelLabel[field.level] }} · {{ kindName(field.kind) }}
                       </div>
                     </th>
@@ -3049,7 +3479,7 @@ onUnmounted(() => {
                       class="w-48 min-w-[12rem] px-3 py-2 align-top font-mono"
                       :class="riskTextClass(field.level)"
                     >
-                      <div class="whitespace-normal break-words">{{ row[field.column] || "" }}</div>
+                      <div class="whitespace-nowrap">{{ row[field.column] || "" }}</div>
                     </td>
                   </tr>
                 </tbody>

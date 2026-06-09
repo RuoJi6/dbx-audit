@@ -4,6 +4,7 @@ use serde_json::Value;
 
 use super::types::{
     AuditFinding, AuditJobState, AuditKind, AuditLevel, AuditLogEntry, AuditMode, AuditTableEvidence, AuditTableField,
+    AuditTargetSummary,
 };
 use crate::xlsx_export::{build_xlsx_workbook_multi, XlsxCellData, XlsxWorksheetData};
 
@@ -20,6 +21,9 @@ pub fn audit_job_to_xlsx(job: &AuditJobState) -> Result<Vec<u8>, String> {
     let redis_findings = job.findings.iter().filter(|finding| is_redis_finding(finding)).cloned().collect::<Vec<_>>();
     let mut sheets = Vec::new();
 
+    if !job.target_summaries.is_empty() {
+        sheets.push(target_overview_sheet(&job.target_summaries));
+    }
     if sql_tables.is_empty() && redis_findings.is_empty() {
         sheets.push(no_findings_sheet());
     } else {
@@ -65,6 +69,7 @@ pub fn audit_findings_to_xlsx(findings: &[AuditFinding]) -> Result<Vec<u8>, Stri
         logs: Vec::new(),
         findings: findings.to_vec(),
         table_results: Vec::new(),
+        target_summaries: Vec::new(),
         errors: Vec::new(),
         started_at: String::new(),
         finished_at: None,
@@ -150,6 +155,26 @@ fn table_fields_from_findings(findings: &[&AuditFinding]) -> Vec<AuditTableField
 
 fn no_findings_sheet() -> XlsxWorksheetData {
     sheet("No Findings", vec![row(["结果"]), row(["未发现敏感信息命中"])])
+}
+
+fn target_overview_sheet(targets: &[AuditTargetSummary]) -> XlsxWorksheetData {
+    let mut rows = vec![row(["连接结果概览"]), Vec::new()];
+    rows.push(row(["数据库类型", "连接名称", "目标", "用户", "数据库", "状态", "命中数", "命中表数", "错误"]));
+    for target in targets {
+        let status = target_status_label(&target.status, target.finding_count, target.error.as_deref());
+        rows.push(vec![
+            cell(database_type_label(target.db_type.as_deref()), None),
+            cell(target.connection_name.clone().or_else(|| target.connection_id.clone()).unwrap_or_default(), None),
+            cell(target_summary_address(target), None),
+            cell(target.connection_user.clone().unwrap_or_default(), None),
+            cell(target.database.clone().unwrap_or_default(), None),
+            cell(status, target_status_style(target)),
+            cell(target.finding_count.to_string(), None),
+            cell(target.table_count.to_string(), None),
+            cell(target.error.clone().unwrap_or_default(), None),
+        ]);
+    }
+    sheet("连接结果概览", rows)
 }
 
 fn summary_sheet(tables: &[AuditTableEvidence]) -> XlsxWorksheetData {
@@ -355,16 +380,43 @@ fn table_label(table: &AuditTableEvidence) -> String {
 }
 
 fn table_sheet_name(table: &AuditTableEvidence) -> String {
-    [
-        table.db_type.as_deref().unwrap_or_default(),
-        table.database.as_str(),
-        table.schema.as_deref().unwrap_or_default(),
-        table.table.as_str(),
-    ]
-        .into_iter()
-        .filter(|part| !part.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join(".")
+    let source = table
+        .connection_name
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| table.db_type.as_deref())
+        .unwrap_or("db");
+    let table_name = table.table.as_str();
+    let schema = table.schema.as_deref().filter(|value| !value.trim().is_empty());
+    let name = match schema {
+        Some("document") | Some("index") | Some("redis-key") | None => format!("{source}.{table_name}"),
+        Some(schema) => format!("{source}.{schema}.{table_name}"),
+    };
+    compact_sheet_name(&name)
+}
+
+fn compact_sheet_name(value: &str) -> String {
+    let cleaned = value
+        .chars()
+        .map(|ch| match ch {
+            '[' | ']' | ':' | '*' | '?' | '/' | '\\' => '_',
+            _ => ch,
+        })
+        .collect::<String>();
+    if cleaned.chars().count() <= 31 {
+        return cleaned;
+    }
+    let parts = cleaned.split('.').filter(|part| !part.is_empty()).collect::<Vec<_>>();
+    if parts.len() >= 2 {
+        let head = parts[0];
+        let tail = parts[parts.len() - 1];
+        let tail_len = tail.chars().count();
+        let sep_len = 1;
+        let head_limit = 31usize.saturating_sub(tail_len + sep_len).max(8);
+        let head_short = head.chars().take(head_limit).collect::<String>();
+        return format!("{head_short}.{tail}").chars().take(31).collect();
+    }
+    cleaned.chars().take(31).collect()
 }
 
 fn audit_target_rows(table: &AuditTableEvidence) -> Vec<Vec<XlsxCellData>> {
@@ -384,8 +436,45 @@ fn target_address(table: &AuditTableEvidence) -> String {
     }
 }
 
+fn target_summary_address(target: &AuditTargetSummary) -> String {
+    match (target.connection_host.as_deref(), target.connection_port) {
+        (Some(host), Some(port)) if !host.trim().is_empty() => format!("{host}:{port}"),
+        (Some(host), _) => host.to_string(),
+        _ => String::new(),
+    }
+}
+
 fn database_type_label(value: Option<&str>) -> String {
     value.unwrap_or("").trim().to_ascii_lowercase()
+}
+
+fn target_status_label(status: &str, finding_count: usize, error: Option<&str>) -> String {
+    if error.is_some_and(|value| !value.trim().is_empty()) {
+        return "失败".to_string();
+    }
+    match status.trim().to_ascii_lowercase().as_str() {
+        "failed" | "error" => "失败".to_string(),
+        "no-hit" | "no_hits" | "no-hits" => "无命中".to_string(),
+        "hit" | "hits" => "有命中".to_string(),
+        "completed" | "success" | "ok" if finding_count > 0 => "有命中".to_string(),
+        "completed" | "success" | "ok" => "无命中".to_string(),
+        other if other.is_empty() && finding_count > 0 => "有命中".to_string(),
+        other if other.is_empty() => "无命中".to_string(),
+        _ if finding_count > 0 => "有命中".to_string(),
+        _ => status.to_string(),
+    }
+}
+
+fn target_status_style(target: &AuditTargetSummary) -> Option<usize> {
+    if target.error.as_deref().is_some_and(|value| !value.trim().is_empty()) {
+        return Some(STYLE_HIGH);
+    }
+    match target.status.trim().to_ascii_lowercase().as_str() {
+        "failed" | "error" => Some(STYLE_HIGH),
+        "hit" | "hits" => Some(STYLE_MEDIUM),
+        "completed" | "success" | "ok" if target.finding_count > 0 => Some(STYLE_MEDIUM),
+        _ => None,
+    }
 }
 
 fn table_field_styles(table: &AuditTableEvidence) -> BTreeMap<String, usize> {
@@ -417,6 +506,9 @@ fn kind_label(kind: AuditKind) -> &'static str {
         AuditKind::Address => "地址",
         AuditKind::Username => "用户名",
         AuditKind::Account => "账号",
+        AuditKind::IpAddress => "IP 地址",
+        AuditKind::BusinessIdentifier => "业务标识",
+        AuditKind::RiskEvidence => "风险/证据",
     }
 }
 
@@ -454,7 +546,7 @@ mod tests {
     use super::{audit_findings_to_xlsx, audit_job_to_json, audit_job_to_xlsx};
     use crate::audit::types::{
         AuditFinding, AuditJobState, AuditJobStatus, AuditKind, AuditLevel, AuditLevelFilter, AuditLogEntry, AuditMode,
-        AuditSample, AuditScanRequest, AuditTableEvidence, AuditTableField,
+        AuditSample, AuditScanRequest, AuditTableEvidence, AuditTableField, AuditTargetSummary,
     };
     use std::collections::BTreeMap;
 
@@ -555,6 +647,34 @@ mod tests {
             }],
             findings: vec![finding(), redis_finding()],
             table_results: vec![table_result()],
+            target_summaries: vec![
+                AuditTargetSummary {
+                    connection_id: Some("conn-1".to_string()),
+                    connection_name: Some("local".to_string()),
+                    db_type: Some("postgres".to_string()),
+                    connection_host: Some("127.0.0.1".to_string()),
+                    connection_port: Some(5432),
+                    connection_user: Some("audit".to_string()),
+                    database: Some("audit_demo".to_string()),
+                    status: "hit".to_string(),
+                    finding_count: 2,
+                    table_count: 1,
+                    error: None,
+                },
+                AuditTargetSummary {
+                    connection_id: Some("conn-2".to_string()),
+                    connection_name: Some("empty-clickhouse".to_string()),
+                    db_type: Some("clickhouse".to_string()),
+                    connection_host: Some("127.0.0.1".to_string()),
+                    connection_port: Some(8123),
+                    connection_user: Some("audit".to_string()),
+                    database: Some("audit_demo".to_string()),
+                    status: "no-hit".to_string(),
+                    finding_count: 0,
+                    table_count: 0,
+                    error: None,
+                },
+            ],
             errors: vec!["sample warning".to_string()],
             started_at: "2026-06-08T00:00:00Z".to_string(),
             finished_at: Some("2026-06-08T00:00:01Z".to_string()),
@@ -581,7 +701,10 @@ mod tests {
         let text = String::from_utf8_lossy(&bytes);
         for expected in [
             "敏感信息汇总",
-            "postgres.audit_demo.public.user",
+            "连接结果概览",
+            "empty-clickhouse",
+            "无命中",
+            "local.public.users",
             "Redis 汇总",
             "Redis Keys",
             "数据库类型",

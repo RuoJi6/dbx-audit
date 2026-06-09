@@ -275,9 +275,24 @@ export interface AuditJobState {
   logs: { time: string; level: string; message: string }[];
   findings: AuditFinding[];
   tableResults: AuditTableEvidence[];
+  targetSummaries: AuditTargetSummary[];
   errors: string[];
   startedAt: string;
   finishedAt?: string;
+}
+
+export interface AuditTargetSummary {
+  connectionId?: string;
+  connectionName?: string;
+  dbType?: string;
+  connectionHost?: string;
+  connectionPort?: number;
+  connectionUser?: string;
+  database?: string;
+  status: string;
+  findingCount: number;
+  tableCount: number;
+  error?: string;
 }
 
 export interface AuditExportResult {
