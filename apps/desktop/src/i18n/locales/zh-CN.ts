@@ -2030,7 +2030,7 @@ export default {
     start: "开始扫描",
     cancel: "停止扫描",
     exportPath: "导出路径",
-    exportPlaceholder: "/tmp/dbx-audit-report.xlsx",
+    exportPlaceholder: "dbx-audit-report.xlsx",
     fscanText: "fscan 内容",
     parse: "解析",
     parsedTargets: "已解析 {count} 个数据库目标。",

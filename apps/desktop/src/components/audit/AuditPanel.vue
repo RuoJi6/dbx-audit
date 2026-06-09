@@ -280,6 +280,7 @@ const zh = {
   output: "输出路径",
   outputEnabled: "输出表格",
   outputRequired: "请先勾选输出表格",
+  outputPathRequired: "请选择输出文件路径",
   mask: "报告中脱敏样例",
   includeSystem: "包含系统库",
   splitOutput: "按目标拆分输出",
@@ -526,6 +527,7 @@ const en = {
   output: "Output path",
   outputEnabled: "Output table",
   outputRequired: "Please enable output table first",
+  outputPathRequired: "Please choose an output file path",
   mask: "Mask samples in report",
   includeSystem: "Include system databases",
   splitOutput: "Split output by target",
@@ -1058,7 +1060,7 @@ function newTask(seed?: Partial<AuditTask>): AuditTask {
     outputEnabled: seed?.outputEnabled || false,
     splitOutput: seed?.splitOutput || false,
     textEncoding: seed?.textEncoding || "auto",
-    outputPath: seed?.outputPath || "/tmp/dbx-audit-report.xlsx",
+    outputPath: seed?.outputPath || "",
     outputs: seed?.outputs || [],
     fscanText: seed?.fscanText || "",
     targets: seed?.targets || [],
@@ -1541,6 +1543,7 @@ function validateTask(task: AuditTask) {
     return ui.value.targetRequired;
   }
   if (task.limit < 1) return ui.value.limitRequired;
+  if (task.outputEnabled && !task.outputPath.trim()) return ui.value.outputPathRequired;
   return "";
 }
 
@@ -2052,6 +2055,10 @@ async function exportReport(task: AuditTask) {
     error.value = ui.value.outputRequired;
     return;
   }
+  if (!task.outputPath.trim()) {
+    error.value = ui.value.outputPathRequired;
+    return;
+  }
   if (!task.job) {
     error.value = ui.value.runTaskFirst;
     return;
@@ -2152,14 +2159,15 @@ async function writeSplitOutput(
 }
 
 function ensureXlsxPath(path: string) {
-  const trimmed = path.trim() || "/tmp/dbx-audit-report.xlsx";
+  const trimmed = path.trim();
+  if (!trimmed) throw new Error(ui.value.outputPathRequired);
   return trimmed.replace(/\.json$/i, ".xlsx").match(/\.xlsx$/i)
     ? trimmed.replace(/\.json$/i, ".xlsx")
     : `${trimmed}.xlsx`;
 }
 
 function outputPathForTask(task: AuditTask) {
-  return ensureXlsxPath(task.outputPath.trim() || `/tmp/${task.name.replace(/\s+/g, "-")}.xlsx`);
+  return ensureXlsxPath(task.outputPath);
 }
 
 function lastOutputPath(outputs: string[]) {
@@ -2260,6 +2268,10 @@ function sanitizeFilePart(value: string) {
   return value.replace(/[^a-z0-9._-]+/gi, "_").replace(/^_+|_+$/g, "") || "target";
 }
 
+function suggestedOutputFileName(task: Pick<AuditTask, "name">) {
+  return `${sanitizeFilePart(task.name || "dbx-audit-report")}.xlsx`;
+}
+
 async function chooseOutputPath() {
   error.value = "";
   if (!isTauriRuntime()) {
@@ -2269,7 +2281,9 @@ async function chooseOutputPath() {
   try {
     const { save } = await import("@tauri-apps/plugin-dialog");
     const path = await save({
-      defaultPath: ensureXlsxPath(draft.value.outputPath.trim() || "/tmp/dbx-audit-report.xlsx"),
+      defaultPath: draft.value.outputPath.trim()
+        ? ensureXlsxPath(draft.value.outputPath)
+        : suggestedOutputFileName(draft.value),
       filters: [{ name: "Excel", extensions: ["xlsx"] }],
     });
     if (path) draft.value.outputPath = path;
@@ -2279,9 +2293,13 @@ async function chooseOutputPath() {
 }
 
 async function openOutputDirectory(task: AuditTask) {
-  const directory = outputDirectory(task.outputPath || "/tmp/dbx-audit-report.xlsx");
   exportMessage.value = "";
   error.value = "";
+  if (!task.outputPath.trim()) {
+    error.value = ui.value.outputPathRequired;
+    return;
+  }
+  const directory = outputDirectory(task.outputPath);
   if (!isTauriRuntime()) {
     exportMessage.value = ui.value.openFolderUnavailable.replace("{path}", directory);
     return;
@@ -2296,9 +2314,10 @@ async function openOutputDirectory(task: AuditTask) {
 
 function outputDirectory(path: string) {
   const normalized = path.trim().replace(/\\/g, "/");
-  if (!normalized) return "/tmp";
+  if (!normalized) return ".";
   if (normalized.endsWith("/")) return normalized;
   const index = normalized.lastIndexOf("/");
+  if (/^[A-Za-z]:\//.test(normalized) && index === 2) return normalized.slice(0, 3);
   return index <= 0 ? "." : normalized.slice(0, index);
 }
 

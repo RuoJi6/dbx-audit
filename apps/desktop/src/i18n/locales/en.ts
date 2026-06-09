@@ -2077,7 +2077,7 @@ export default {
     start: "Start scan",
     cancel: "Cancel scan",
     exportPath: "Export path",
-    exportPlaceholder: "/tmp/dbx-audit-report.xlsx",
+    exportPlaceholder: "dbx-audit-report.xlsx",
     fscanText: "fscan text",
     parse: "Parse",
     parsedTargets: "Parsed {count} database targets.",

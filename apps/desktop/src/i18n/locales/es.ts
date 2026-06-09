@@ -1909,7 +1909,7 @@ export default {
     start: "Iniciar escaneo",
     cancel: "Cancelar escaneo",
     exportPath: "Ruta de exportación",
-    exportPlaceholder: "/tmp/dbx-audit-report.xlsx",
+    exportPlaceholder: "dbx-audit-report.xlsx",
     fscanText: "Texto fscan",
     parse: "Analizar",
     parsedTargets: "{count} objetivos de base de datos analizados.",

@@ -2047,7 +2047,7 @@ export default {
     start: "Iniciar varredura",
     cancel: "Cancelar varredura",
     exportPath: "Caminho de exportação",
-    exportPlaceholder: "/tmp/dbx-audit-report.xlsx",
+    exportPlaceholder: "dbx-audit-report.xlsx",
     fscanText: "Texto fscan",
     parse: "Analisar",
     parsedTargets: "{count} alvos de banco de dados analisados.",

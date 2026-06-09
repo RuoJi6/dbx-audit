@@ -1917,7 +1917,7 @@ export default {
     start: "開始掃描",
     cancel: "停止掃描",
     exportPath: "匯出路徑",
-    exportPlaceholder: "/tmp/dbx-audit-report.xlsx",
+    exportPlaceholder: "dbx-audit-report.xlsx",
     fscanText: "fscan 內容",
     parse: "解析",
     parsedTargets: "已解析 {count} 個資料庫目標。",
