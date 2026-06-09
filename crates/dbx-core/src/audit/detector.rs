@@ -160,7 +160,7 @@ fn any_contains(haystack: &str, needles: &[&str]) -> bool {
 fn matches_exactish(haystack: &str, needles: &[&str]) -> bool {
     haystack.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_')).any(|part| {
         let part = part.trim_matches('_');
-        needles.iter().any(|needle| part == *needle)
+        needles.contains(&part)
     })
 }
 

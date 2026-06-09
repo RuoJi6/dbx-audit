@@ -89,7 +89,7 @@ fn sql_tables(job: &AuditJobState) -> Vec<AuditTableEvidence> {
     if tables.is_empty() {
         tables = fallback_tables_from_findings(&job.findings);
     }
-    tables.sort_by(|a, b| table_sort_key(a).cmp(&table_sort_key(b)));
+    tables.sort_by_key(table_sort_key);
     tables
 }
 
@@ -386,7 +386,7 @@ fn table_sheet_name(table: &AuditTableEvidence) -> String {
         .connection_name
         .as_deref()
         .filter(|value| !value.trim().is_empty())
-        .or_else(|| table.db_type.as_deref())
+        .or(table.db_type.as_deref())
         .unwrap_or("db");
     let table_name = table.table.as_str();
     let schema = table.schema.as_deref().filter(|value| !value.trim().is_empty());
@@ -460,8 +460,8 @@ fn target_status_label(status: &str, finding_count: usize, error: Option<&str>) 
         "hit" | "hits" => "有命中".to_string(),
         "completed" | "success" | "ok" if finding_count > 0 => "有命中".to_string(),
         "completed" | "success" | "ok" => "无命中".to_string(),
-        other if other.is_empty() && finding_count > 0 => "有命中".to_string(),
-        other if other.is_empty() => "无命中".to_string(),
+        "" if finding_count > 0 => "有命中".to_string(),
+        "" => "无命中".to_string(),
         _ if finding_count > 0 => "有命中".to_string(),
         _ => status.to_string(),
     }
@@ -640,6 +640,8 @@ mod tests {
                 mask: false,
                 include_system: false,
                 workers: 1,
+                table_workers: None,
+                field_workers: None,
                 timeout_secs: 15,
             },
             logs: vec![AuditLogEntry {

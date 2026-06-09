@@ -21,6 +21,7 @@ struct FindingKey {
     basis: String,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn audit_document_findings(
     database: &str,
     schema: Option<&str>,
@@ -149,9 +150,9 @@ fn upsert_document_finding(
         count: 0,
         samples: Vec::new(),
     });
-    if !counted.contains_key(&key) {
+    if let std::collections::btree_map::Entry::Vacant(entry) = counted.entry(key) {
         finding.count += 1;
-        counted.insert(key, true);
+        entry.insert(true);
     }
     if finding.samples.len() < limit.max(1) {
         finding.samples.push(AuditSample {

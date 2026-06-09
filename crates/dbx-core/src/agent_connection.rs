@@ -320,7 +320,7 @@ fn trino_agent_jdbc_params(config: &ConnectionConfig, base: &str) -> String {
     if !user_params.is_empty() {
         params.push(user_params.to_string());
     }
-    if config.ssl && !url_params_has_key(&user_params, "SSL") && !url_has_query_key(base, "SSL") {
+    if config.ssl && !url_params_has_key(user_params, "SSL") && !url_has_query_key(base, "SSL") {
         params.push("SSL=true".to_string());
     }
     params.join("&")
