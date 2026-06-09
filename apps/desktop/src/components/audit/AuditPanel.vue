@@ -66,6 +66,9 @@ type AuditTask = {
   level: AuditLevelFilter;
   limit: number;
   workers: number;
+  targetWorkers: number;
+  tableWorkers: number;
+  fieldWorkers: number;
   timeoutSecs: number;
   mask: boolean;
   includeSystem: boolean;
@@ -251,6 +254,17 @@ const zh = {
   level: "风险级别",
   limit: "样例数量",
   workers: "并发数",
+  targetWorkers: "目标并发",
+  tableWorkers: "表/集合并发",
+  fieldWorkers: "字段查询并发",
+  concurrencyModel: "并发模型",
+  concurrencyHint:
+    "目标并发 {targetWorkers}；表/集合并发 {tableWorkers}；字段查询并发 {fieldWorkers}",
+  targetWorkersHint: "多目标任务同时扫描的连接数",
+  tableWorkersHint: "单连接内同时扫描的 SQL 表、Mongo/Elasticsearch 集合或索引数",
+  fieldWorkersHint: "单表内敏感字段存在行数统计并发数，Redis 每页 Key 取值也使用此并发",
+  singleTargetConcurrency: "单目标",
+  multiTargetSequential: "{count} 个目标顺序执行",
   timeout: "超时秒数",
   encoding: "内容编码",
   output: "输出路径",
@@ -483,6 +497,17 @@ const en = {
   level: "Risk level",
   limit: "Sample limit",
   workers: "Workers",
+  targetWorkers: "Target workers",
+  tableWorkers: "Table/collection workers",
+  fieldWorkers: "Field query workers",
+  concurrencyModel: "Concurrency",
+  concurrencyHint:
+    "Target workers {targetWorkers}; table/collection workers {tableWorkers}; field query workers {fieldWorkers}",
+  targetWorkersHint: "Connections scanned at the same time in multi-target tasks",
+  tableWorkersHint: "SQL tables, Mongo/Elasticsearch collections or indices scanned at the same time per connection",
+  fieldWorkersHint: "Concurrent sensitive-field count queries inside one table; Redis key value reads per page also use this",
+  singleTargetConcurrency: "Single target",
+  multiTargetSequential: "{count} targets sequentially",
   timeout: "Timeout seconds",
   encoding: "Encoding",
   output: "Output path",
@@ -653,26 +678,9 @@ function overlayGlobalAuditMessages(base: AuditUi, messages: unknown): AuditUi {
     return base;
   }
   const next: AuditUi = { ...base };
-  const directKeys: Array<keyof AuditUi> = [
-    "title",
-    "subtitle",
-    "connection",
-    "database",
-    "schema",
-    "tables",
-    "fscanText",
-    "parse",
-    "start",
-    "table",
-    "column",
-    "logs",
-    "noFindings",
-  ];
-
-  for (const key of directKeys) {
-    const translated = textFrom(messages[key]);
-    if (translated) {
-      next[key] = translated as never;
+  for (const [key, value] of Object.entries(messages)) {
+    if (typeof value === "string" && key in next && typeof next[key as keyof AuditUi] === "string") {
+      next[key as keyof AuditUi] = value as never;
     }
   }
 
@@ -1029,7 +1037,10 @@ function newTask(seed?: Partial<AuditTask>): AuditTask {
     mode: seed?.mode || "field-content",
     level: seed?.level || "all",
     limit: seed?.limit || 15,
-    workers: seed?.workers || 1,
+    workers: seed?.workers || seed?.tableWorkers || 1,
+    targetWorkers: seed?.targetWorkers || 1,
+    tableWorkers: seed?.tableWorkers || seed?.workers || 1,
+    fieldWorkers: seed?.fieldWorkers || 1,
     timeoutSecs: seed?.timeoutSecs || 15,
     mask: seed?.mask ?? false,
     includeSystem: seed?.includeSystem || false,
@@ -1060,6 +1071,10 @@ function normalizeTask(task: AuditTask) {
     connectionId: task.connectionId || connectionIds[0] || "",
     connectionIds,
     job: task.job ? { ...task.job, tableResults: task.job.tableResults || [] } : undefined,
+    workers: Number(task.workers) || Number(task.tableWorkers) || 1,
+    targetWorkers: Number(task.targetWorkers) || 1,
+    tableWorkers: Number(task.tableWorkers) || Number(task.workers) || 1,
+    fieldWorkers: Number(task.fieldWorkers) || 1,
     outputEnabled: task.outputEnabled || false,
     outputs: task.outputs || [],
     logHistory: task.logHistory || [],
@@ -1101,6 +1116,10 @@ function saveDraft() {
   error.value = "";
   const saved = persistTask({
     ...draft.value,
+    workers: taskTableWorkerCount(draft.value),
+    targetWorkers: taskTargetWorkerCount(draft.value),
+    tableWorkers: taskTableWorkerCount(draft.value),
+    fieldWorkers: taskFieldWorkerCount(draft.value),
     status: draft.value.status === "running" ? "draft" : draft.value.status,
   });
   selectedTaskId.value = saved.id;
@@ -1588,6 +1607,10 @@ async function startTask(task: AuditTask) {
   const errorHistory = [...(task.errors || [])];
   const running = persistTask({
     ...task,
+    workers: taskTableWorkerCount(task),
+    targetWorkers: taskTargetWorkerCount(task),
+    tableWorkers: taskTableWorkerCount(task),
+    fieldWorkers: taskFieldWorkerCount(task),
     connectionId: connectionIds[0],
     connectionIds,
     status: "running",
@@ -1618,7 +1641,9 @@ async function startTask(task: AuditTask) {
       limit: Number(running.limit) || 15,
       mask: running.mask,
       includeSystem: running.includeSystem,
-      workers: Number(running.workers) || 1,
+      workers: taskTableWorkerCount(running),
+      tableWorkers: taskTableWorkerCount(running),
+      fieldWorkers: taskFieldWorkerCount(running),
       timeoutSecs: Number(running.timeoutSecs) || 15,
     });
     if (cancelledTaskIds.has(running.id)) {
@@ -1656,6 +1681,8 @@ async function startConnectionBatchTask(task: AuditTask, connectionIds: string[]
   const startedAt = new Date().toISOString();
   const outputs: string[] = [];
   let completedTargets = 0;
+  let nextTargetIndex = 0;
+  const targetProgress = new Map(connectionIds.map((connectionId) => [connectionId, 0]));
   const aggregate: AuditJobState = {
     jobId: `batch-${task.id}`,
     status: "running",
@@ -1670,7 +1697,9 @@ async function startConnectionBatchTask(task: AuditTask, connectionIds: string[]
       limit: Number(task.limit) || 15,
       mask: task.mask,
       includeSystem: task.includeSystem,
-      workers: Number(task.workers) || 1,
+      workers: taskTableWorkerCount(task),
+      tableWorkers: taskTableWorkerCount(task),
+      fieldWorkers: taskFieldWorkerCount(task),
       timeoutSecs: Number(task.timeoutSecs) || 15,
     },
     logs: [...task.logHistory],
@@ -1681,8 +1710,14 @@ async function startConnectionBatchTask(task: AuditTask, connectionIds: string[]
     startedAt,
   };
 
-  for (const [index, connectionId] of connectionIds.entries()) {
-    if (cancelledTaskIds.has(task.id)) break;
+  const aggregateProgress = () => {
+    const total = connectionIds.length || 1;
+    const sum = Array.from(targetProgress.values()).reduce((total, value) => total + value, 0);
+    return Math.min(99, Math.round(sum / total));
+  };
+
+  const runTarget = async (connectionId: string) => {
+    if (cancelledTaskIds.has(task.id)) return;
     const connection = props.connections.find((item) => item.id === connectionId);
     const label = connection?.name || connectionId;
     try {
@@ -1694,9 +1729,9 @@ async function startConnectionBatchTask(task: AuditTask, connectionIds: string[]
       persistTask({
         ...task,
         jobId: aggregate.jobId,
-        job: { ...aggregate, progress: Math.round((index / connectionIds.length) * 100) },
+        job: { ...aggregate, progress: aggregateProgress() },
         status: "running",
-        progress: Math.round((index / connectionIds.length) * 100),
+        progress: aggregateProgress(),
         message: ui.value.scanningConnection.replace("{name}", label),
       });
       const jobId = await api.auditStartScan({
@@ -1704,7 +1739,8 @@ async function startConnectionBatchTask(task: AuditTask, connectionIds: string[]
         connectionId,
         connection,
       });
-      const job = await waitForAuditJobSnapshot(jobId, task.id, label, index, connectionIds.length, aggregate);
+      const job = await waitForAuditJobSnapshot(jobId, task.id, label, connectionId, connectionIds.length, aggregate, targetProgress);
+      targetProgress.set(connectionId, job.status === "cancelled" ? job.progress || aggregateProgress() : 100);
       const connectionJob: AuditJobState = {
         ...job,
         request: { ...job.request, connectionId },
@@ -1737,7 +1773,7 @@ async function startConnectionBatchTask(task: AuditTask, connectionIds: string[]
       aggregate.logs.push(...(job.logs || []).map((entry) => ({ ...entry, message: `${label}: ${entry.message}` })));
       aggregate.errors.push(...(job.errors || []).map((entry) => `${label}: ${entry}`));
       if (job.status === "cancelled" || cancelledTaskIds.has(task.id)) {
-        break;
+        return;
       }
       if (job.status !== "failed") {
         completedTargets += 1;
@@ -1747,6 +1783,7 @@ async function startConnectionBatchTask(task: AuditTask, connectionIds: string[]
         }
       }
     } catch (err) {
+      targetProgress.set(connectionId, 100);
       aggregate.targetSummaries.push(auditTargetSummary(connectionId, label, connection, undefined, String(err)));
       aggregate.errors.push(`${label}: ${String(err)}`);
       aggregate.logs.push({
@@ -1755,7 +1792,18 @@ async function startConnectionBatchTask(task: AuditTask, connectionIds: string[]
         message: `${label}: ${String(err)}`,
       });
     }
-  }
+  };
+
+  const targetWorkers = Math.min(taskTargetWorkerCount(task), connectionIds.length);
+  await Promise.all(
+    Array.from({ length: targetWorkers }, async () => {
+      while (nextTargetIndex < connectionIds.length && !cancelledTaskIds.has(task.id)) {
+        const connectionId = connectionIds[nextTargetIndex];
+        nextTargetIndex += 1;
+        if (connectionId) await runTarget(connectionId);
+      }
+    }),
+  );
 
   const wasCancelled = cancelledTaskIds.has(task.id);
   if (wasCancelled) {
@@ -1825,15 +1873,21 @@ async function waitForAuditJobSnapshot(
   jobId: string,
   taskId: string,
   label: string,
-  index: number,
+  connectionId: string,
   total: number,
   aggregate: AuditJobState,
+  targetProgress?: Map<string, number>,
 ) {
   for (;;) {
     const job = await api.auditGetJob(jobId);
     if (!job) throw new Error(ui.value.jobNotFound.replace("{id}", jobId));
-    const baseProgress = (index / total) * 100;
-    const currentProgress = Math.min(99, Math.round(baseProgress + job.progress / total));
+    if (targetProgress) targetProgress.set(connectionId, job.progress || 0);
+    const currentProgress = targetProgress
+      ? Math.min(
+          99,
+          Math.round(Array.from(targetProgress.values()).reduce((total, value) => total + value, 0) / Math.max(1, total)),
+        )
+      : Math.min(99, job.progress || 0);
     aggregate.progress = currentProgress;
     if (cancelledTaskIds.has(taskId)) {
       await api.auditCancelScan(jobId).catch(() => false);
@@ -2173,6 +2227,36 @@ function outputDirectory(path: string) {
   if (normalized.endsWith("/")) return normalized;
   const index = normalized.lastIndexOf("/");
   return index <= 0 ? "." : normalized.slice(0, index);
+}
+
+function fileNameFromPath(path: string) {
+  const normalized = path.trim().replace(/\\/g, "/");
+  if (!normalized) return "-";
+  const index = normalized.lastIndexOf("/");
+  return index >= 0 ? normalized.slice(index + 1) || normalized : normalized;
+}
+
+function taskConcurrencyText(task: AuditTask) {
+  return ui.value.concurrencyHint
+    .replace("{targetWorkers}", String(taskTargetWorkerCount(task)))
+    .replace("{tableWorkers}", String(taskTableWorkerCount(task)))
+    .replace("{fieldWorkers}", String(taskFieldWorkerCount(task)));
+}
+
+function taskTargetWorkerCount(task: Pick<AuditTask, "targetWorkers">) {
+  return Math.max(1, Math.min(32, Number(task.targetWorkers) || 1));
+}
+
+function taskTableWorkerCount(task: Pick<AuditTask, "workers" | "tableWorkers">) {
+  return Math.max(1, Math.min(32, Number(task.tableWorkers) || Number(task.workers) || 1));
+}
+
+function taskFieldWorkerCount(task: Pick<AuditTask, "fieldWorkers">) {
+  return Math.max(1, Math.min(32, Number(task.fieldWorkers) || 1));
+}
+
+function taskWorkerSummary(task: AuditTask) {
+  return `${ui.value.targetWorkers} ${taskTargetWorkerCount(task)} / ${ui.value.tableWorkers} ${taskTableWorkerCount(task)} / ${ui.value.fieldWorkers} ${taskFieldWorkerCount(task)}`;
 }
 
 function stopPolling(taskId: string) {
@@ -2729,15 +2813,21 @@ onUnmounted(() => {
         <div
           v-for="task in filteredTasks"
           :key="task.id"
-          class="grid gap-3 border-b p-4 lg:grid-cols-[1fr_160px_1.4fr_auto]"
+          class="flex flex-wrap items-start gap-4 border-b p-4"
         >
-          <div>
-            <button class="text-left text-base font-semibold hover:text-primary" @click="viewTask(task)">
+          <div class="min-w-[220px] flex-[1_1_240px]">
+            <button
+              class="block max-w-full truncate text-left text-base font-semibold hover:text-primary"
+              :title="task.name"
+              @click="viewTask(task)"
+            >
               {{ task.name }}
             </button>
-            <div class="mt-1 text-xs text-muted-foreground">{{ task.description || ui.noDescription }}</div>
+            <div class="mt-1 max-w-full truncate text-xs text-muted-foreground" :title="task.description || ui.noDescription">
+              {{ task.description || ui.noDescription }}
+            </div>
           </div>
-          <div>
+          <div class="min-w-[96px] shrink-0">
             <span
               class="rounded-full px-3 py-1 text-xs"
               :class="
@@ -2753,10 +2843,18 @@ onUnmounted(() => {
               {{ ui.status[task.status] }}
             </span>
           </div>
-          <div class="space-y-1 text-xs text-muted-foreground">
-            <div class="flex items-center gap-1.5">
+          <div class="min-w-[320px] flex-[2_1_420px] space-y-1 text-xs text-muted-foreground">
+            <div class="flex min-w-0 items-center gap-1.5">
               <DatabaseIcon :db-type="taskConnectionIcon(task)" class="h-3.5 w-3.5 shrink-0" />
-              <span>{{ targetSummary(task) }}</span>
+              <span class="truncate" :title="targetSummary(task)">{{ targetSummary(task) }}</span>
+            </div>
+            <div class="flex min-w-0 flex-wrap items-center gap-2">
+              <span class="shrink-0 rounded-full border px-2 py-0.5" :title="taskConcurrencyText(task)">
+                {{ taskWorkerSummary(task) }}
+              </span>
+              <span class="min-w-[180px] flex-1 truncate" :title="taskConcurrencyText(task)">
+                {{ taskConcurrencyText(task) }}
+              </span>
             </div>
             <div class="flex flex-wrap items-center gap-2">
               <span class="rounded-full border px-2 py-0.5" :class="riskClass('high')"
@@ -2773,7 +2871,7 @@ onUnmounted(() => {
               <div class="h-full bg-primary" :style="{ width: `${task.progress}%` }" />
             </div>
           </div>
-          <div class="flex flex-wrap items-center gap-2">
+          <div class="flex min-w-[252px] max-w-[320px] shrink-0 flex-wrap items-center justify-end gap-2">
             <Button variant="outline" size="sm" @click="copyTask(task)">{{ ui.copy }}</Button>
             <Button variant="outline" size="sm" @click="configureTask(task)">{{ ui.config }}</Button>
             <Button variant="outline" size="sm" @click="viewTask(task)">{{ ui.detail }}</Button>
@@ -2965,9 +3063,17 @@ onUnmounted(() => {
               {{ ui.limit }}
               <Input v-model.number="draft.limit" class="h-9" min="1" type="number" />
             </label>
-            <label class="space-y-1 text-xs font-medium">
-              {{ ui.workers }}
-              <Input v-model.number="draft.workers" class="h-9" min="1" type="number" />
+            <label class="space-y-1 text-xs font-medium" :title="ui.targetWorkersHint">
+              {{ ui.targetWorkers }}
+              <Input v-model.number="draft.targetWorkers" class="h-9" max="32" min="1" type="number" />
+            </label>
+            <label class="space-y-1 text-xs font-medium" :title="ui.tableWorkersHint">
+              {{ ui.tableWorkers }}
+              <Input v-model.number="draft.tableWorkers" class="h-9" max="32" min="1" type="number" />
+            </label>
+            <label class="space-y-1 text-xs font-medium" :title="ui.fieldWorkersHint">
+              {{ ui.fieldWorkers }}
+              <Input v-model.number="draft.fieldWorkers" class="h-9" max="32" min="1" type="number" />
             </label>
             <label class="space-y-1 text-xs font-medium">
               {{ ui.timeout }}
@@ -3035,7 +3141,12 @@ onUnmounted(() => {
               {{ targetSummary(selectedTask) }} · {{ ui.status[selectedTask.status] }}
             </div>
             <h3 class="text-lg font-semibold">{{ selectedTask.name }}</h3>
-            <div class="text-xs text-muted-foreground">{{ selectedTask.description || ui.noDescription }}</div>
+            <div class="mt-1 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+              <span>{{ selectedTask.description || ui.noDescription }}</span>
+              <span class="rounded-full border px-2 py-0.5" :title="taskConcurrencyText(selectedTask)">
+                {{ taskWorkerSummary(selectedTask) }}
+              </span>
+            </div>
           </div>
           <div class="flex flex-wrap gap-2">
             <Button variant="outline" size="sm" class="gap-1" @click="copyTask(selectedTask)"
@@ -3060,7 +3171,7 @@ onUnmounted(() => {
 
       <div class="mb-4 grid gap-4 lg:grid-cols-[1fr_340px]">
         <div class="rounded-md border bg-background p-4">
-          <div class="grid gap-4 md:grid-cols-4">
+          <div class="grid gap-4 md:grid-cols-6">
             <div>
               <div class="text-xs text-muted-foreground">{{ ui.hitTables }}</div>
               <div class="mt-1 text-3xl font-semibold">{{ detailTables.length }}</div>
@@ -3072,6 +3183,18 @@ onUnmounted(() => {
             <div>
               <div class="text-xs text-muted-foreground">{{ ui.highRiskHits }}</div>
               <div class="mt-1 text-3xl font-semibold">{{ detailTotals.high }}</div>
+            </div>
+            <div>
+              <div class="text-xs text-muted-foreground">{{ ui.targetWorkers }}</div>
+              <div class="mt-1 text-3xl font-semibold">{{ taskTargetWorkerCount(selectedTask) }}</div>
+            </div>
+            <div>
+              <div class="text-xs text-muted-foreground">{{ ui.tableWorkers }}</div>
+              <div class="mt-1 text-3xl font-semibold">{{ taskTableWorkerCount(selectedTask) }}</div>
+            </div>
+            <div>
+              <div class="text-xs text-muted-foreground">{{ ui.fieldWorkers }}</div>
+              <div class="mt-1 text-3xl font-semibold">{{ taskFieldWorkerCount(selectedTask) }}</div>
             </div>
             <div>
               <div class="text-xs text-muted-foreground">{{ ui.currentProgress }}</div>
@@ -3120,9 +3243,27 @@ onUnmounted(() => {
               <div class="text-muted-foreground">{{ ui.encoding }}</div>
               <div class="font-medium">{{ selectedTask.textEncoding }}</div>
             </div>
+            <div>
+              <div class="text-muted-foreground">{{ ui.targetWorkers }}</div>
+              <div class="font-medium">{{ taskTargetWorkerCount(selectedTask) }}</div>
+            </div>
+            <div>
+              <div class="text-muted-foreground">{{ ui.tableWorkers }}</div>
+              <div class="font-medium">{{ taskTableWorkerCount(selectedTask) }}</div>
+            </div>
+            <div>
+              <div class="text-muted-foreground">{{ ui.fieldWorkers }}</div>
+              <div class="font-medium">{{ taskFieldWorkerCount(selectedTask) }}</div>
+            </div>
+            <div class="col-span-2">
+              <div class="text-muted-foreground">{{ ui.concurrencyModel }}</div>
+              <div class="font-medium leading-relaxed">{{ taskConcurrencyText(selectedTask) }}</div>
+            </div>
             <div v-if="selectedTask.outputEnabled">
               <div class="text-muted-foreground">{{ ui.output }}</div>
-              <div class="truncate font-medium">{{ selectedTask.outputPath }}</div>
+              <div class="break-all font-mono font-medium" :title="selectedTask.outputPath">
+                {{ selectedTask.outputPath }}
+              </div>
             </div>
           </div>
           <div v-if="selectedTask.outputEnabled" class="mt-4 flex flex-wrap gap-2">
@@ -3140,7 +3281,12 @@ onUnmounted(() => {
           </div>
           <div v-if="selectedTask.outputs.length" class="mt-3 text-xs">
             <div class="text-muted-foreground">{{ ui.outputFiles }}</div>
-            <div v-for="path in selectedTask.outputs" :key="path" class="truncate font-mono">{{ path }}</div>
+            <div class="mt-1 max-h-32 space-y-1 overflow-y-auto rounded-md border bg-muted/20 p-2">
+              <div v-for="path in selectedTask.outputs" :key="path" class="min-w-0" :title="path">
+                <div class="truncate font-mono font-medium">{{ fileNameFromPath(path) }}</div>
+                <div class="truncate font-mono text-[11px] text-muted-foreground">{{ outputDirectory(path) }}</div>
+              </div>
+            </div>
           </div>
         </div>
       </div>

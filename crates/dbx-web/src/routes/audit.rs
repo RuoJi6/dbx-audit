@@ -5,6 +5,7 @@ use std::sync::Arc;
 use axum::extract::{Path, State};
 use axum::Json;
 use chrono::Utc;
+use futures::stream::{self, StreamExt};
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -233,6 +234,51 @@ pub async fn save_task_store(
     Ok(Json(true))
 }
 
+struct AuditTableScanTarget {
+    database: String,
+    schema: String,
+    table: String,
+    database_index: usize,
+    schema_index: usize,
+    total_databases: usize,
+    total_schemas: usize,
+    total_tables: usize,
+}
+
+struct AuditTableScanResult {
+    database: String,
+    schema: String,
+    table: String,
+    database_index: usize,
+    schema_index: usize,
+    total_databases: usize,
+    total_schemas: usize,
+    total_tables: usize,
+    findings: Vec<AuditFinding>,
+    table_result: Option<AuditTableEvidence>,
+    logs: Vec<AuditLogEntry>,
+}
+
+struct AuditDocumentScanTarget {
+    database: String,
+    collection: String,
+    database_index: usize,
+    total_databases: usize,
+    total_collections: usize,
+}
+
+struct AuditDocumentScanResult {
+    database: String,
+    collection: String,
+    database_index: usize,
+    total_databases: usize,
+    total_collections: usize,
+    findings: Vec<AuditFinding>,
+    table_result: Option<AuditTableEvidence>,
+    logs: Vec<AuditLogEntry>,
+    errors: Vec<String>,
+}
+
 async fn run_field_name_scan(state: Arc<WebState>, request: AuditScanRequest, job_id: &str) -> Result<(), String> {
     prepare_audit_connection(&state, &request).await?;
     match connection_db_type(&state, &request.connection_id).await {
@@ -271,68 +317,49 @@ async fn run_field_name_scan(state: Arc<WebState>, request: AuditScanRequest, jo
             };
 
             let total_tables = tables.len().max(1);
-            for (table_index, table) in tables.iter().enumerate() {
+            let targets = tables.into_iter().map(|table| AuditTableScanTarget {
+                database: database.to_string(),
+                schema: schema.to_string(),
+                table,
+                database_index,
+                schema_index,
+                total_databases,
+                total_schemas,
+                total_tables,
+            });
+            let mut completed_tables = 0usize;
+            let mut scans = stream::iter(targets)
+                .map(|target| {
+                    let state = state.clone();
+                    let request = request.clone();
+                    let job_id = job_id.to_string();
+                    async move { scan_audit_table(state, request, job_id, target).await }
+                })
+                .buffer_unordered(request.table_worker_count());
+
+            while let Some(result) = scans.next().await {
                 if is_cancelled(&state, job_id).await {
                     return Ok(());
                 }
-
-                let schema_opt = schema_option(schema);
-                let columns =
-                    dbx_core::schema::get_columns_core(&state.app, &request.connection_id, database, schema, table)
-                        .await?;
-                let mut findings =
-                    audit_column_findings(database, schema_opt, table, &columns, request.mode, request.level);
-                apply_connection_meta(&state, &request.connection_id, &mut findings).await;
-
-                for finding in findings.iter_mut() {
-                    match count_non_empty_rows(&state, &request, database, schema_opt, table, &finding.column).await {
-                        Ok(count) => finding.count = count,
-                        Err(err) => {
-                            update_job(&state, job_id, |job| {
-                                job.logs.push(log_entry(
-                                    "warn",
-                                    format!(
-                                        "字段存在行数统计失败：{}.{table}.{}，{err}",
-                                        schema_label(schema),
-                                        finding.column
-                                    ),
-                                ));
-                            })
-                            .await;
-                        }
-                    }
-                }
-
-                if request.mode.includes_content() && !findings.is_empty() {
-                    match attach_sample_rows(&state, &request, database, schema_opt, table, &mut findings).await {
-                        Ok(()) => {}
-                        Err(err) => {
-                            update_job(&state, job_id, |job| {
-                                job.logs.push(log_entry("warn", format!("样例采集失败：{database}.{table}，{err}")));
-                            })
-                            .await;
-                        }
-                    }
-                }
-
-                let table_result =
-                    collect_table_evidence(&state, &request, database, schema_opt, table, &columns, &findings).await;
-
+                let result = result?;
+                completed_tables += 1;
                 update_job(&state, job_id, |job| {
-                    job.findings.extend(findings);
-                    match table_result {
-                        Ok(table_result) if !table_result.fields.is_empty() => job.table_results.push(table_result),
-                        Ok(_) => {}
-                        Err(err) => {
-                            job.logs.push(log_entry("warn", format!("表样例记录失败：{database}.{table}，{err}")));
-                        }
+                    job.findings.extend(result.findings);
+                    if let Some(table_result) = result.table_result {
+                        job.table_results.push(table_result);
                     }
-                    let database_progress = (database_index * 85) / total_databases;
-                    let schema_progress = (schema_index * 85) / (total_databases * total_schemas);
-                    let table_progress = ((table_index + 1) * 85) / (total_databases * total_schemas * total_tables);
+                    job.logs.extend(result.logs);
+                    let database_progress = (result.database_index * 85) / result.total_databases;
+                    let schema_progress = (result.schema_index * 85) / (result.total_databases * result.total_schemas);
+                    let table_progress =
+                        (completed_tables * 85) / (result.total_databases * result.total_schemas * result.total_tables);
                     job.progress = (10 + database_progress + schema_progress + table_progress).min(95) as u8;
-                    let qualified = if schema.is_empty() { table.to_string() } else { format!("{schema}.{table}") };
-                    job.logs.push(log_entry("info", format!("已扫描表：{database}.{qualified}")));
+                    let qualified = if result.schema.is_empty() {
+                        result.table.clone()
+                    } else {
+                        format!("{}.{}", result.schema, result.table)
+                    };
+                    job.logs.push(log_entry("info", format!("已扫描表：{}.{qualified}", result.database)));
                 })
                 .await;
             }
@@ -340,6 +367,91 @@ async fn run_field_name_scan(state: Arc<WebState>, request: AuditScanRequest, jo
     }
 
     Ok(())
+}
+
+async fn scan_audit_table(
+    state: Arc<WebState>,
+    request: AuditScanRequest,
+    job_id: String,
+    target: AuditTableScanTarget,
+) -> Result<AuditTableScanResult, String> {
+    if is_cancelled(&state, &job_id).await {
+        return Ok(AuditTableScanResult {
+            database: target.database,
+            schema: target.schema,
+            table: target.table,
+            database_index: target.database_index,
+            schema_index: target.schema_index,
+            total_databases: target.total_databases,
+            total_schemas: target.total_schemas,
+            total_tables: target.total_tables,
+            findings: Vec::new(),
+            table_result: None,
+            logs: Vec::new(),
+        });
+    }
+
+    let schema_opt = schema_option(&target.schema);
+    let columns = dbx_core::schema::get_columns_core(
+        &state.app,
+        &request.connection_id,
+        &target.database,
+        &target.schema,
+        &target.table,
+    )
+    .await?;
+    let mut findings =
+        audit_column_findings(&target.database, schema_opt, &target.table, &columns, request.mode, request.level);
+    apply_connection_meta(&state, &request.connection_id, &mut findings).await;
+
+    let mut logs = count_non_empty_rows_for_findings(
+        state.clone(),
+        request.clone(),
+        job_id.clone(),
+        &target.database,
+        schema_opt,
+        &target.table,
+        &target.schema,
+        &mut findings,
+    )
+    .await;
+
+    if request.mode.includes_content() && !findings.is_empty() && !is_cancelled(&state, &job_id).await {
+        if let Err(err) =
+            attach_sample_rows(&state, &request, &target.database, schema_opt, &target.table, &mut findings).await
+        {
+            logs.push(log_entry("warn", format!("样例采集失败：{}.{}，{err}", target.database, target.table)));
+        }
+    }
+
+    let table_result = if is_cancelled(&state, &job_id).await {
+        None
+    } else {
+        match collect_table_evidence(&state, &request, &target.database, schema_opt, &target.table, &columns, &findings)
+            .await
+        {
+            Ok(table_result) if !table_result.fields.is_empty() => Some(table_result),
+            Ok(_) => None,
+            Err(err) => {
+                logs.push(log_entry("warn", format!("表样例记录失败：{}.{}，{err}", target.database, target.table)));
+                None
+            }
+        }
+    };
+
+    Ok(AuditTableScanResult {
+        database: target.database,
+        schema: target.schema,
+        table: target.table,
+        database_index: target.database_index,
+        schema_index: target.schema_index,
+        total_databases: target.total_databases,
+        total_schemas: target.total_schemas,
+        total_tables: target.total_tables,
+        findings,
+        table_result,
+        logs,
+    })
 }
 
 async fn prepare_audit_connection(state: &WebState, request: &AuditScanRequest) -> Result<(), String> {
@@ -417,6 +529,60 @@ fn schema_label(schema: &str) -> String {
     } else {
         schema.to_string()
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn count_non_empty_rows_for_findings(
+    state: Arc<WebState>,
+    request: AuditScanRequest,
+    job_id: String,
+    database: &str,
+    schema: Option<&str>,
+    table: &str,
+    schema_label_value: &str,
+    findings: &mut [AuditFinding],
+) -> Vec<AuditLogEntry> {
+    let database = database.to_string();
+    let schema = schema.map(str::to_string);
+    let table = table.to_string();
+    let schema_label_value = schema_label_value.to_string();
+    let columns = findings.iter().map(|finding| finding.column.clone()).collect::<Vec<_>>();
+    let mut logs = Vec::new();
+    let mut counts = stream::iter(columns)
+        .map(|column| {
+            let state = state.clone();
+            let request = request.clone();
+            let job_id = job_id.clone();
+            let database = database.clone();
+            let schema = schema.clone();
+            let table = table.clone();
+            async move {
+                if is_cancelled(&state, &job_id).await {
+                    return (column, Ok(0));
+                }
+                let count = count_non_empty_rows(&state, &request, &database, schema.as_deref(), &table, &column).await;
+                (column, count)
+            }
+        })
+        .buffer_unordered(request.field_worker_count());
+
+    while let Some((column, result)) = counts.next().await {
+        if is_cancelled(&state, &job_id).await {
+            break;
+        }
+        match result {
+            Ok(count) => {
+                if let Some(finding) = findings.iter_mut().find(|finding| finding.column == column) {
+                    finding.count = count;
+                }
+            }
+            Err(err) => logs.push(log_entry(
+                "warn",
+                format!("字段存在行数统计失败：{}.{}.{}，{err}", schema_label(&schema_label_value), table, column),
+            )),
+        }
+    }
+    logs
 }
 
 async fn attach_sample_rows(
@@ -755,62 +921,127 @@ async fn run_document_scan(state: Arc<WebState>, request: AuditScanRequest, job_
                 .collect::<Vec<_>>()
         };
         let total_collections = collections.len().max(1);
-        for (collection_index, collection) in collections.iter().enumerate() {
+        let targets = collections.into_iter().map(|collection| AuditDocumentScanTarget {
+            database: database.to_string(),
+            collection,
+            database_index,
+            total_databases,
+            total_collections,
+        });
+        let mut completed_collections = 0usize;
+        let mut scans = stream::iter(targets)
+            .map(|target| {
+                let state = state.clone();
+                let request = request.clone();
+                let schema = schema.clone();
+                let job_id = job_id.to_string();
+                async move { scan_document_target(state, request, job_id, schema, target).await }
+            })
+            .buffer_unordered(request.table_worker_count());
+
+        while let Some(result) = scans.next().await {
             if is_cancelled(&state, job_id).await {
                 return Ok(());
             }
-            let result = match dbx_core::mongo_ops::mongo_find_documents_core(
-                &state.app,
-                &request.connection_id,
-                database,
-                collection,
-                0,
-                request.limit.max(1) as i64,
-                None,
-                None,
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(err) => {
-                    update_job(&state, job_id, |job| {
-                        job.logs.push(log_entry("warn", format!("文档集合扫描跳过：{database}.{collection}，{err}")));
-                        job.errors.push(format!("{database}.{collection}: {err}"));
-                    })
-                    .await;
-                    continue;
-                }
-            };
-            let (mut findings, table_result) = audit_document_findings(
-                database,
-                Some(&schema),
-                collection,
-                &result.documents,
-                request.mode,
-                request.level,
-                request.limit,
-                request.mask,
-            );
-            apply_connection_meta(&state, &request.connection_id, &mut findings).await;
-            let mut table_result = table_result;
-            if let Some(table) = table_result.as_mut() {
-                apply_table_connection_meta(&state, &request.connection_id, table).await;
-                table.row_count = result.total;
-            }
+            let result = result?;
+            completed_collections += 1;
             update_job(&state, job_id, |job| {
-                job.findings.extend(findings);
-                if let Some(table_result) = table_result {
+                job.findings.extend(result.findings);
+                if let Some(table_result) = result.table_result {
                     job.table_results.push(table_result);
                 }
-                let database_progress = (database_index * 90) / total_databases;
-                let collection_progress = ((collection_index + 1) * 90) / (total_databases * total_collections);
+                job.logs.extend(result.logs);
+                job.errors.extend(result.errors);
+                let database_progress = (result.database_index * 90) / result.total_databases;
+                let collection_progress =
+                    (completed_collections * 90) / (result.total_databases * result.total_collections);
                 job.progress = (5 + database_progress + collection_progress).min(95) as u8;
-                job.logs.push(log_entry("info", format!("已扫描文档目标：{database}.{collection}")));
+                job.logs.push(log_entry("info", format!("已扫描文档目标：{}.{}", result.database, result.collection)));
             })
             .await;
         }
     }
     Ok(())
+}
+
+async fn scan_document_target(
+    state: Arc<WebState>,
+    request: AuditScanRequest,
+    job_id: String,
+    schema: String,
+    target: AuditDocumentScanTarget,
+) -> Result<AuditDocumentScanResult, String> {
+    if is_cancelled(&state, &job_id).await {
+        return Ok(AuditDocumentScanResult {
+            database: target.database,
+            collection: target.collection,
+            database_index: target.database_index,
+            total_databases: target.total_databases,
+            total_collections: target.total_collections,
+            findings: Vec::new(),
+            table_result: None,
+            logs: Vec::new(),
+            errors: Vec::new(),
+        });
+    }
+
+    let result = match dbx_core::mongo_ops::mongo_find_documents_core(
+        &state.app,
+        &request.connection_id,
+        &target.database,
+        &target.collection,
+        0,
+        request.limit.max(1) as i64,
+        None,
+        None,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(err) => {
+            return Ok(AuditDocumentScanResult {
+                database: target.database.clone(),
+                collection: target.collection.clone(),
+                database_index: target.database_index,
+                total_databases: target.total_databases,
+                total_collections: target.total_collections,
+                findings: Vec::new(),
+                table_result: None,
+                logs: vec![log_entry(
+                    "warn",
+                    format!("文档集合扫描跳过：{}.{}，{err}", target.database, target.collection),
+                )],
+                errors: vec![format!("{}.{}: {err}", target.database, target.collection)],
+            });
+        }
+    };
+    let (mut findings, table_result) = audit_document_findings(
+        &target.database,
+        Some(&schema),
+        &target.collection,
+        &result.documents,
+        request.mode,
+        request.level,
+        request.limit,
+        request.mask,
+    );
+    apply_connection_meta(&state, &request.connection_id, &mut findings).await;
+    let mut table_result = table_result;
+    if let Some(table) = table_result.as_mut() {
+        apply_table_connection_meta(&state, &request.connection_id, table).await;
+        table.row_count = result.total;
+    }
+    Ok(AuditDocumentScanResult {
+        database: target.database,
+        collection: target.collection,
+        database_index: target.database_index,
+        total_databases: target.total_databases,
+        total_collections: target.total_collections,
+        findings,
+        table_result,
+        logs: Vec::new(),
+        errors: Vec::new(),
+    })
 }
 
 async fn run_redis_scan(state: Arc<WebState>, request: AuditScanRequest, job_id: &str) -> Result<(), String> {
@@ -839,25 +1070,39 @@ async fn run_redis_scan(state: Arc<WebState>, request: AuditScanRequest, job_id:
         if is_cancelled(&state, job_id).await {
             return Ok(());
         }
+        let db = *db;
         let mut cursor = 0u64;
         loop {
             let page =
-                dbx_core::redis_ops::redis_scan_keys_core(&state.app, &request.connection_id, *db, cursor, "*", 200)
+                dbx_core::redis_ops::redis_scan_keys_core(&state.app, &request.connection_id, db, cursor, "*", 200)
                     .await?;
             let mut findings = Vec::new();
-            for key in page.keys {
+            let mut key_scans = stream::iter(page.keys)
+                .map(|key| {
+                    let state = state.clone();
+                    let request = request.clone();
+                    let job_id = job_id.to_string();
+                    async move {
+                        if is_cancelled(&state, &job_id).await {
+                            return Vec::new();
+                        }
+                        let value = dbx_core::redis_ops::redis_get_value_in_db_core(
+                            &state.app,
+                            &request.connection_id,
+                            db,
+                            &key.key_raw,
+                        )
+                        .await
+                        .ok();
+                        redis_key_findings(&request, db, &key.key_display, value.as_ref())
+                    }
+                })
+                .buffer_unordered(request.field_worker_count());
+            while let Some(mut key_findings) = key_scans.next().await {
                 if is_cancelled(&state, job_id).await {
                     return Ok(());
                 }
-                let value = dbx_core::redis_ops::redis_get_value_in_db_core(
-                    &state.app,
-                    &request.connection_id,
-                    *db,
-                    &key.key_raw,
-                )
-                .await
-                .ok();
-                findings.extend(redis_key_findings(&request, *db, &key.key_display, value.as_ref()));
+                findings.append(&mut key_findings);
             }
             apply_connection_meta(&state, &request.connection_id, &mut findings).await;
             update_job(&state, job_id, |job| {
@@ -1037,7 +1282,14 @@ fn is_system_database(db_type: Option<DatabaseType>, name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     if matches!(
         lower.as_str(),
-        "information_schema" | "mysql" | "performance_schema" | "sys" | "system" | "template0" | "template1" | "postgres"
+        "information_schema"
+            | "mysql"
+            | "performance_schema"
+            | "sys"
+            | "system"
+            | "template0"
+            | "template1"
+            | "postgres"
     ) {
         return true;
     }
@@ -1092,38 +1344,38 @@ fn is_system_schema(db_type: Option<DatabaseType>, name: &str) -> bool {
         Some(DatabaseType::Oracle | DatabaseType::Dameng | DatabaseType::OceanbaseOracle | DatabaseType::Yashandb) => {
             upper.starts_with("APEX_")
                 || matches!(
-                upper.as_str(),
-                "SYS"
-                    | "SYSTEM"
-                    | "ANONYMOUS"
-                    | "OUTLN"
-                    | "DIP"
-                    | "DMSYS"
-                    | "DBSNMP"
-                    | "EXFSYS"
-                    | "FLOWS_FILES"
-                    | "XDB"
-                    | "MDDATA"
-                    | "MDSYS"
-                    | "ORDSYS"
-                    | "ORDDATA"
-                    | "ORDPLUGINS"
-                    | "CTXSYS"
-                    | "WMSYS"
-                    | "APPQOSSYS"
-                    | "AUDSYS"
-                    | "DVSYS"
-                    | "GSMADMIN_INTERNAL"
-                    | "LBACSYS"
-                    | "OJVMSYS"
-                    | "OLAPSYS"
-                    | "REMOTE_SCHEDULER_AGENT"
-                    | "SI_INFORMTN_SCHEMA"
-                    | "SPATIAL_CSW_ADMIN_USR"
-                    | "SYSBACKUP"
-                    | "SYSDG"
-                    | "SYSKM"
-                    | "SYSRAC"
+                    upper.as_str(),
+                    "SYS"
+                        | "SYSTEM"
+                        | "ANONYMOUS"
+                        | "OUTLN"
+                        | "DIP"
+                        | "DMSYS"
+                        | "DBSNMP"
+                        | "EXFSYS"
+                        | "FLOWS_FILES"
+                        | "XDB"
+                        | "MDDATA"
+                        | "MDSYS"
+                        | "ORDSYS"
+                        | "ORDDATA"
+                        | "ORDPLUGINS"
+                        | "CTXSYS"
+                        | "WMSYS"
+                        | "APPQOSSYS"
+                        | "AUDSYS"
+                        | "DVSYS"
+                        | "GSMADMIN_INTERNAL"
+                        | "LBACSYS"
+                        | "OJVMSYS"
+                        | "OLAPSYS"
+                        | "REMOTE_SCHEDULER_AGENT"
+                        | "SI_INFORMTN_SCHEMA"
+                        | "SPATIAL_CSW_ADMIN_USR"
+                        | "SYSBACKUP"
+                        | "SYSDG"
+                        | "SYSKM"
+                        | "SYSRAC"
                 )
         }
         Some(DatabaseType::Db2) => upper.starts_with("SYS") || matches!(upper.as_str(), "SQLJ" | "NULLID"),

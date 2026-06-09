@@ -103,8 +103,22 @@ pub struct AuditScanRequest {
     pub include_system: bool,
     #[serde(default = "default_workers")]
     pub workers: usize,
+    #[serde(default)]
+    pub table_workers: Option<usize>,
+    #[serde(default)]
+    pub field_workers: Option<usize>,
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
+}
+
+impl AuditScanRequest {
+    pub fn table_worker_count(&self) -> usize {
+        self.table_workers.unwrap_or(self.workers).clamp(1, 32)
+    }
+
+    pub fn field_worker_count(&self) -> usize {
+        self.field_workers.unwrap_or(1).clamp(1, 32)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

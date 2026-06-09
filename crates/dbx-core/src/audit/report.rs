@@ -64,6 +64,8 @@ pub fn audit_findings_to_xlsx(findings: &[AuditFinding]) -> Result<Vec<u8>, Stri
             mask: false,
             include_system: false,
             workers: 1,
+            table_workers: None,
+            field_workers: None,
             timeout_secs: 15,
         },
         logs: Vec::new(),

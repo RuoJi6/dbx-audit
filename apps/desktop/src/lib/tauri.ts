@@ -166,6 +166,8 @@ export interface AuditScanRequest {
   mask: boolean;
   includeSystem: boolean;
   workers: number;
+  tableWorkers?: number;
+  fieldWorkers?: number;
   timeoutSecs: number;
 }
 
