@@ -2966,9 +2966,6 @@ onUnmounted(() => {
               <span class="shrink-0 rounded-full border px-2 py-0.5" :title="taskConcurrencyText(task)">
                 {{ taskWorkerSummary(task) }}
               </span>
-              <span class="min-w-[180px] flex-1 truncate" :title="taskConcurrencyText(task)">
-                {{ taskConcurrencyText(task) }}
-              </span>
             </div>
             <div class="flex flex-wrap items-center gap-2">
               <span class="rounded-full border px-2 py-0.5" :class="riskClass('high')"
@@ -3257,9 +3254,6 @@ onUnmounted(() => {
             <h3 class="text-lg font-semibold">{{ selectedTask.name }}</h3>
             <div class="mt-1 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
               <span>{{ selectedTask.description || ui.noDescription }}</span>
-              <span class="rounded-full border px-2 py-0.5" :title="taskConcurrencyText(selectedTask)">
-                {{ taskWorkerSummary(selectedTask) }}
-              </span>
             </div>
           </div>
           <div class="flex flex-wrap gap-2">
@@ -3283,110 +3277,100 @@ onUnmounted(() => {
         </div>
       </div>
 
-      <div class="mb-4 grid gap-4 lg:grid-cols-[1fr_340px]">
-        <div class="rounded-md border bg-background p-4">
-          <div class="grid gap-4 md:grid-cols-4">
-            <div>
-              <div class="text-xs text-muted-foreground">{{ ui.hitTables }}</div>
-              <div class="mt-1 text-3xl font-semibold">{{ detailTables.length }}</div>
-            </div>
-            <div>
-              <div class="text-xs text-muted-foreground">{{ ui.sensitiveFields }}</div>
-              <div class="mt-1 text-3xl font-semibold">{{ detailFields.length }}</div>
-            </div>
-            <div>
-              <div class="text-xs text-muted-foreground">{{ ui.highRiskHits }}</div>
-              <div class="mt-1 text-3xl font-semibold">{{ detailTotals.high }}</div>
-            </div>
-            <div>
-              <div class="text-xs text-muted-foreground">{{ ui.currentProgress }}</div>
-              <div class="mt-1 text-3xl font-semibold">{{ selectedTask.progress }}%</div>
-            </div>
-          </div>
-          <div class="mt-4 flex flex-wrap gap-2">
-            <span class="rounded-full border px-2 py-0.5 text-xs" :class="riskClass('high')"
-              >{{ ui.riskHigh }} {{ detailTotals.high }}</span
-            >
-            <span class="rounded-full border px-2 py-0.5 text-xs" :class="riskClass('medium')"
-              >{{ ui.riskMedium }} {{ detailTotals.medium }}</span
-            >
-            <span class="rounded-full border px-2 py-0.5 text-xs" :class="riskClass('low')"
-              >{{ ui.riskLow }} {{ detailTotals.low }}</span
-            >
-          </div>
-          <div class="mt-4 h-2 overflow-hidden rounded bg-muted">
-            <div class="h-full bg-primary" :style="{ width: `${selectedTask.progress}%` }" />
-          </div>
-          <div class="mt-3 flex justify-between text-xs text-muted-foreground">
-            <span>{{ localizedTaskMessage(selectedTask) }}</span>
-            <span class="flex items-center gap-1.5">
-              <DatabaseIcon :db-type="taskConnectionIcon(selectedTask)" class="h-3.5 w-3.5 shrink-0" />
-              {{ connectionLabel(selectedTask) }}
-            </span>
-          </div>
-        </div>
-
-        <div class="rounded-md border bg-background p-4">
-          <div class="font-semibold">{{ ui.taskInfo }}</div>
-          <div class="mt-4 grid grid-cols-2 gap-3 text-xs">
-            <div>
-              <div class="text-muted-foreground">{{ ui.createdAt }}</div>
-              <div class="font-medium">{{ formatTime(selectedTask.createdAt) }}</div>
-            </div>
-            <div>
-              <div class="text-muted-foreground">{{ ui.updatedAt }}</div>
-              <div class="font-medium">{{ formatTime(selectedTask.updatedAt) }}</div>
-            </div>
-            <div>
-              <div class="text-muted-foreground">{{ ui.mode }}</div>
-              <div class="font-medium">{{ ui.modeLabel[selectedTask.mode] }}</div>
-            </div>
-            <div>
-              <div class="text-muted-foreground">{{ ui.encoding }}</div>
-              <div class="font-medium">{{ selectedTask.textEncoding }}</div>
-            </div>
-            <div>
-              <div class="text-muted-foreground">{{ ui.targetWorkers }}</div>
-              <div class="font-medium">{{ taskTargetWorkerCount(selectedTask) }}</div>
-            </div>
-            <div>
-              <div class="text-muted-foreground">{{ ui.tableWorkers }}</div>
-              <div class="font-medium">{{ taskTableWorkerCount(selectedTask) }}</div>
-            </div>
-            <div>
-              <div class="text-muted-foreground">{{ ui.fieldWorkers }}</div>
-              <div class="font-medium">{{ taskFieldWorkerCount(selectedTask) }}</div>
-            </div>
-            <div class="col-span-2">
-              <div class="text-muted-foreground">{{ ui.concurrencyModel }}</div>
-              <div class="font-medium leading-relaxed">{{ taskConcurrencyText(selectedTask) }}</div>
-            </div>
-            <div v-if="selectedTask.outputEnabled">
-              <div class="text-muted-foreground">{{ ui.output }}</div>
-              <div class="break-all font-mono font-medium" :title="selectedTask.outputPath">
-                {{ selectedTask.outputPath }}
+      <div class="mb-4 rounded-md border bg-background p-4">
+        <div class="grid gap-5 lg:grid-cols-[1fr_360px]">
+          <div>
+            <div class="grid gap-4 md:grid-cols-4">
+              <div>
+                <div class="text-xs text-muted-foreground">{{ ui.hitTables }}</div>
+                <div class="mt-1 text-3xl font-semibold">{{ detailTables.length }}</div>
+              </div>
+              <div>
+                <div class="text-xs text-muted-foreground">{{ ui.sensitiveFields }}</div>
+                <div class="mt-1 text-3xl font-semibold">{{ detailFields.length }}</div>
+              </div>
+              <div>
+                <div class="text-xs text-muted-foreground">{{ ui.highRiskHits }}</div>
+                <div class="mt-1 text-3xl font-semibold">{{ detailTotals.high }}</div>
+              </div>
+              <div>
+                <div class="text-xs text-muted-foreground">{{ ui.currentProgress }}</div>
+                <div class="mt-1 text-3xl font-semibold">{{ selectedTask.progress }}%</div>
               </div>
             </div>
+            <div class="mt-4 flex flex-wrap gap-2">
+              <span class="rounded-full border px-2 py-0.5 text-xs" :class="riskClass('high')"
+                >{{ ui.riskHigh }} {{ detailTotals.high }}</span
+              >
+              <span class="rounded-full border px-2 py-0.5 text-xs" :class="riskClass('medium')"
+                >{{ ui.riskMedium }} {{ detailTotals.medium }}</span
+              >
+              <span class="rounded-full border px-2 py-0.5 text-xs" :class="riskClass('low')"
+                >{{ ui.riskLow }} {{ detailTotals.low }}</span
+              >
+            </div>
+            <div class="mt-4 h-2 overflow-hidden rounded bg-muted">
+              <div class="h-full bg-primary" :style="{ width: `${selectedTask.progress}%` }" />
+            </div>
+            <div class="mt-3 flex justify-between gap-3 text-xs text-muted-foreground">
+              <span>{{ localizedTaskMessage(selectedTask) }}</span>
+              <span class="flex items-center gap-1.5 text-right">
+                <DatabaseIcon :db-type="taskConnectionIcon(selectedTask)" class="h-3.5 w-3.5 shrink-0" />
+                {{ connectionLabel(selectedTask) }}
+              </span>
+            </div>
           </div>
-          <div v-if="selectedTask.outputEnabled" class="mt-4 flex flex-wrap gap-2">
-            <Button
-              variant="outline"
-              size="sm"
-              class="gap-1"
-              :disabled="!selectedTask.job || !selectedTask.outputEnabled"
-              @click="exportReport(selectedTask)"
-              ><FileSpreadsheet class="h-3.5 w-3.5" />{{ ui.xlsx }}</Button
-            >
-            <Button variant="outline" size="sm" class="gap-1" @click="openOutputDirectory(selectedTask)"
-              ><FolderOpen class="h-3.5 w-3.5" />{{ ui.openFolder }}</Button
-            >
-          </div>
-          <div v-if="selectedTask.outputs.length" class="mt-3 text-xs">
-            <div class="text-muted-foreground">{{ ui.outputFiles }}</div>
-            <div class="mt-1 max-h-32 space-y-1 overflow-y-auto rounded-md border bg-muted/20 p-2">
-              <div v-for="path in selectedTask.outputs" :key="path" class="min-w-0" :title="path">
-                <div class="truncate font-mono font-medium">{{ fileNameFromPath(path) }}</div>
-                <div class="truncate font-mono text-[11px] text-muted-foreground">{{ outputDirectory(path) }}</div>
+
+          <div class="border-t pt-4 lg:border-l lg:border-t-0 lg:pl-5 lg:pt-0">
+            <div class="font-semibold">{{ ui.taskInfo }}</div>
+            <div class="mt-4 grid grid-cols-2 gap-3 text-xs">
+              <div>
+                <div class="text-muted-foreground">{{ ui.createdAt }}</div>
+                <div class="font-medium">{{ formatTime(selectedTask.createdAt) }}</div>
+              </div>
+              <div>
+                <div class="text-muted-foreground">{{ ui.updatedAt }}</div>
+                <div class="font-medium">{{ formatTime(selectedTask.updatedAt) }}</div>
+              </div>
+              <div>
+                <div class="text-muted-foreground">{{ ui.mode }}</div>
+                <div class="font-medium">{{ ui.modeLabel[selectedTask.mode] }}</div>
+              </div>
+              <div>
+                <div class="text-muted-foreground">{{ ui.encoding }}</div>
+                <div class="font-medium">{{ selectedTask.textEncoding }}</div>
+              </div>
+              <div class="col-span-2">
+                <div class="text-muted-foreground">{{ ui.concurrencyModel }}</div>
+                <div class="font-medium leading-relaxed">{{ taskWorkerSummary(selectedTask) }}</div>
+              </div>
+              <div v-if="selectedTask.outputEnabled" class="col-span-2">
+                <div class="text-muted-foreground">{{ ui.output }}</div>
+                <div class="truncate font-mono font-medium" :title="selectedTask.outputPath">
+                  {{ selectedTask.outputPath }}
+                </div>
+              </div>
+            </div>
+            <div v-if="selectedTask.outputEnabled" class="mt-4 flex flex-wrap gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                class="gap-1"
+                :disabled="!selectedTask.job || !selectedTask.outputEnabled"
+                @click="exportReport(selectedTask)"
+                ><FileSpreadsheet class="h-3.5 w-3.5" />{{ ui.xlsx }}</Button
+              >
+              <Button variant="outline" size="sm" class="gap-1" @click="openOutputDirectory(selectedTask)"
+                ><FolderOpen class="h-3.5 w-3.5" />{{ ui.openFolder }}</Button
+              >
+            </div>
+            <div v-if="selectedTask.outputs.length" class="mt-3 text-xs">
+              <div class="text-muted-foreground">{{ ui.outputFiles }}</div>
+              <div class="mt-1 max-h-28 space-y-1 overflow-y-auto rounded-md border bg-muted/20 p-2">
+                <div v-for="path in selectedTask.outputs" :key="path" class="min-w-0" :title="path">
+                  <div class="truncate font-mono font-medium">{{ fileNameFromPath(path) }}</div>
+                  <div class="truncate font-mono text-[11px] text-muted-foreground">{{ outputDirectory(path) }}</div>
+                </div>
               </div>
             </div>
           </div>
