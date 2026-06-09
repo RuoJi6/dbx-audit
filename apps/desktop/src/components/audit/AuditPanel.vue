@@ -3147,7 +3147,7 @@ onUnmounted(() => {
 
       <div class="mb-4 rounded-md border bg-background p-4">
         <div class="font-semibold">{{ ui.connectionResultOverview }}</div>
-        <div class="mt-3 grid gap-2 md:grid-cols-2 xl:grid-cols-3">
+        <div class="mt-3 grid items-start gap-2 md:grid-cols-2 xl:grid-cols-3">
           <div
             v-for="row in connectionResultRows"
             :key="row.id"
