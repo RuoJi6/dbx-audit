@@ -132,6 +132,11 @@ type SampleGroup = {
   rows: Record<string, string>[];
 };
 
+type SampleCellPair = {
+  key: string;
+  value: string;
+};
+
 type DatabaseFilterItem = {
   connectionId?: string;
   connectionName?: string;
@@ -156,6 +161,7 @@ const LEGACY_TASK_STORE_KEY = "dbx-audit-tasks-v1";
 const LEGACY_LAST_DRAFT_KEY = "dbx-audit-task-draft-v1";
 const pollTimers = new Map<string, ReturnType<typeof setInterval>>();
 const exportingTaskIds = new Set<string>();
+const cancelledTaskIds = new Set<string>();
 const wizardSteps: WizardStep[] = [1, 2, 3, 4];
 const taskKinds: AuditTaskKind[] = ["single", "fscan", "sql"];
 
@@ -1567,6 +1573,7 @@ async function startTask(task: AuditTask) {
     error.value = validation;
     return;
   }
+  cancelledTaskIds.delete(task.id);
   stopPolling(task.id);
   error.value = "";
   const missing = missingConnectionIds(task);
@@ -1614,6 +1621,18 @@ async function startTask(task: AuditTask) {
       workers: Number(running.workers) || 1,
       timeoutSecs: Number(running.timeoutSecs) || 15,
     });
+    if (cancelledTaskIds.has(running.id)) {
+      await api.auditCancelScan(jobId).catch(() => false);
+      const current = tasks.value.find((item) => item.id === running.id) || running;
+      persistTask({
+        ...current,
+        jobId,
+        status: "cancelled",
+        message: ui.value.status.cancelled,
+        finishedAt: new Date().toISOString(),
+      });
+      return;
+    }
     persistTask({ ...running, jobId, message: ui.value.scanning });
     await refreshTaskJob(running.id, jobId);
     const current = tasks.value.find((item) => item.id === running.id);
@@ -1663,6 +1682,7 @@ async function startConnectionBatchTask(task: AuditTask, connectionIds: string[]
   };
 
   for (const [index, connectionId] of connectionIds.entries()) {
+    if (cancelledTaskIds.has(task.id)) break;
     const connection = props.connections.find((item) => item.id === connectionId);
     const label = connection?.name || connectionId;
     try {
@@ -1716,6 +1736,9 @@ async function startConnectionBatchTask(task: AuditTask, connectionIds: string[]
       aggregate.targetSummaries.push(auditTargetSummary(connectionId, label, connection, connectionJob));
       aggregate.logs.push(...(job.logs || []).map((entry) => ({ ...entry, message: `${label}: ${entry.message}` })));
       aggregate.errors.push(...(job.errors || []).map((entry) => `${label}: ${entry}`));
+      if (job.status === "cancelled" || cancelledTaskIds.has(task.id)) {
+        break;
+      }
       if (job.status !== "failed") {
         completedTargets += 1;
         if (task.outputEnabled && task.splitOutput) {
@@ -1734,22 +1757,31 @@ async function startConnectionBatchTask(task: AuditTask, connectionIds: string[]
     }
   }
 
+  const wasCancelled = cancelledTaskIds.has(task.id);
+  if (wasCancelled) {
+    aggregate.logs.push({
+      time: new Date().toLocaleTimeString(),
+      level: "info",
+      message: ui.value.status.cancelled,
+    });
+  }
   const hasNewErrors = aggregate.errors.length > task.errorHistory.length;
-  aggregate.status = hasNewErrors ? "failed" : "completed";
-  aggregate.progress = 100;
+  aggregate.status = wasCancelled ? "cancelled" : hasNewErrors ? "failed" : "completed";
+  aggregate.progress = wasCancelled ? Math.max(task.progress || 0, aggregate.progress || 0) : 100;
   aggregate.finishedAt = new Date().toISOString();
   const finalTask = persistTask({
     ...task,
     jobId: aggregate.jobId,
     job: aggregate,
-    status: hasNewErrors ? "failed" : "completed",
-    progress: 100,
-    message: hasNewErrors ? ui.value.batchScanFailed : ui.value.batchScanCompleted,
+    status: wasCancelled ? "cancelled" : hasNewErrors ? "failed" : "completed",
+    progress: aggregate.progress,
+    message: wasCancelled ? ui.value.status.cancelled : hasNewErrors ? ui.value.batchScanFailed : ui.value.batchScanCompleted,
     errors: aggregate.errors,
     outputs,
     finishedAt: aggregate.finishedAt,
   });
-  if (task.outputEnabled && completedTargets > 0) {
+  cancelledTaskIds.delete(task.id);
+  if (!wasCancelled && task.outputEnabled && completedTargets > 0) {
     await autoExportTask({ ...finalTask, outputs }, aggregate, { includeSplits: false, existingOutputs: outputs });
   }
 }
@@ -1802,6 +1834,16 @@ async function waitForAuditJobSnapshot(
     if (!job) throw new Error(ui.value.jobNotFound.replace("{id}", jobId));
     const baseProgress = (index / total) * 100;
     const currentProgress = Math.min(99, Math.round(baseProgress + job.progress / total));
+    aggregate.progress = currentProgress;
+    if (cancelledTaskIds.has(taskId)) {
+      await api.auditCancelScan(jobId).catch(() => false);
+      return {
+        ...job,
+        status: "cancelled" as const,
+        progress: currentProgress,
+        finishedAt: new Date().toISOString(),
+      };
+    }
     const task = tasks.value.find((item) => item.id === taskId);
     if (task) {
       persistTask({
@@ -1819,15 +1861,46 @@ async function waitForAuditJobSnapshot(
 }
 
 async function stopTask(task: AuditTask) {
-  if (!task.jobId) return;
-  await api.auditCancelScan(task.jobId);
-  await refreshTaskJob(task.id, task.jobId);
+  if (task.status !== "running") return;
+  cancelledTaskIds.add(task.id);
+  stopPolling(task.id);
+  const now = new Date().toISOString();
+  const cancelLog = {
+    time: new Date().toLocaleTimeString(),
+    level: "info",
+    message: ui.value.status.cancelled,
+  };
+  const logs = [...(task.job?.logs || task.logHistory || []), cancelLog];
+  const cancelledJob = task.job
+    ? {
+        ...task.job,
+        status: "cancelled" as const,
+        progress: task.progress,
+        logs,
+        finishedAt: now,
+      }
+    : undefined;
+  persistTask({
+    ...task,
+    status: "cancelled",
+    progress: task.progress,
+    message: ui.value.status.cancelled,
+    job: cancelledJob,
+    finishedAt: now,
+  });
+  if (task.jobId && !task.jobId.startsWith("batch-")) {
+    await api.auditCancelScan(task.jobId).catch((err) => {
+      error.value = String(err);
+      return false;
+    });
+  }
 }
 
 async function refreshTaskJob(taskId: string, jobId?: string) {
   const task = tasks.value.find((item) => item.id === taskId);
   const effectiveJobId = jobId || task?.jobId;
   if (!task || !effectiveJobId) return;
+  if (cancelledTaskIds.has(taskId)) return;
   if (effectiveJobId.startsWith("batch-")) {
     exportMessage.value = ui.value.importedSnapshotRefreshHint;
     return;
@@ -1835,6 +1908,7 @@ async function refreshTaskJob(taskId: string, jobId?: string) {
   try {
     const job = await api.auditGetJob(effectiveJobId);
     if (!job) return;
+    if (cancelledTaskIds.has(taskId)) return;
     const mergedJob =
       job.status === "running" ? mergeTaskLogHistory(task, job) : ensureJobTargetSummaries(task, mergeTaskLogHistory(task, job));
     const status = mapJobStatus(job.status);
@@ -2307,6 +2381,54 @@ function buildSampleGroups(findings: AuditFinding[]) {
     groups.set(key, group);
   }
   return Array.from(groups.values());
+}
+
+function databaseNameText(database?: string, dbType?: string) {
+  const redisDb = dbType === "redis" ? database?.match(/^redis-db(\d+)$/) : undefined;
+  if (redisDb) return `DB ${redisDb[1]}`;
+  return database || "-";
+}
+
+function sampleCellPairs(value: unknown): SampleCellPair[] {
+  if (typeof value !== "string") return [];
+  const text = value.trim();
+  if (!text || (!text.startsWith("{") && !text.startsWith("["))) return [];
+  try {
+    return samplePairsFromParsed(JSON.parse(text)).slice(0, 30);
+  } catch {
+    return [];
+  }
+}
+
+function samplePairsFromParsed(value: unknown, prefix = ""): SampleCellPair[] {
+  if (Array.isArray(value)) {
+    if (value.every((item) => isRecord(item) && "field" in item && "value" in item)) {
+      return value.map((item) => ({
+        key: String(item.field || "-"),
+        value: stringifySampleValue(item.value),
+      }));
+    }
+    return value.flatMap((item, index) => samplePairsFromParsed(item, prefix ? `${prefix}.${index}` : String(index)));
+  }
+  if (isRecord(value)) {
+    return Object.entries(value).flatMap(([key, entry]) => {
+      const nextKey = prefix ? `${prefix}.${key}` : key;
+      if (isRecord(entry) || Array.isArray(entry)) return samplePairsFromParsed(entry, nextKey);
+      return [{ key: nextKey, value: stringifySampleValue(entry) }];
+    });
+  }
+  return prefix ? [{ key: prefix, value: stringifySampleValue(value) }] : [];
+}
+
+function stringifySampleValue(value: unknown) {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
 }
 
 function databaseScopeText(item: Pick<TableHit | FieldHit | SampleGroup, "connectionName" | "dbType">) {
@@ -3439,7 +3561,8 @@ onUnmounted(() => {
                 <b>{{ databaseScopeText(group) || "-" }}</b>
               </span>
               <span
-                ><span class="text-muted-foreground">{{ ui.databaseName }}</span> <b>{{ group.database }}</b></span
+                ><span class="text-muted-foreground">{{ ui.databaseName }}</span>
+                <b>{{ databaseNameText(group.database, group.dbType) }}</b></span
               >
               <span
                 ><span class="text-muted-foreground">{{ ui.tableName }}</span> <b>{{ group.table }}</b></span
@@ -3481,7 +3604,17 @@ onUnmounted(() => {
                       class="w-48 min-w-[12rem] px-3 py-2 align-top font-mono"
                       :class="riskTextClass(field.level)"
                     >
-                      <div class="whitespace-nowrap">{{ row[field.column] || "" }}</div>
+                      <div v-if="sampleCellPairs(row[field.column]).length" class="min-w-72 space-y-1 font-sans">
+                        <div
+                          v-for="pair in sampleCellPairs(row[field.column])"
+                          :key="`${pair.key}-${pair.value}`"
+                          class="grid grid-cols-[7rem_minmax(0,1fr)] gap-2 rounded bg-background/60 px-2 py-1"
+                        >
+                          <span class="truncate text-muted-foreground">{{ pair.key }}</span>
+                          <span class="min-w-0 overflow-x-auto whitespace-nowrap font-mono">{{ pair.value }}</span>
+                        </div>
+                      </div>
+                      <div v-else class="whitespace-nowrap">{{ row[field.column] || "" }}</div>
                     </td>
                   </tr>
                 </tbody>
