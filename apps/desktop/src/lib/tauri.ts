@@ -190,6 +190,7 @@ export interface AuditFinding {
   connectionId?: string;
   connectionName?: string;
   dbType?: string;
+  sourceType?: string;
   connectionHost?: string;
   connectionPort?: number;
   connectionUser?: string;

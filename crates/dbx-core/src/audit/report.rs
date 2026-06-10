@@ -232,6 +232,14 @@ fn table_detail_sheet(table: &AuditTableEvidence, findings: Vec<&AuditFinding>) 
             cell(field.total.to_string(), None),
         ]);
     }
+    if !findings.is_empty() {
+        rows.push(Vec::new());
+        rows.push(row(["命中规则明细"]));
+        rows.push(finding_detail_header());
+        for finding in &findings {
+            rows.push(finding_detail_row(finding));
+        }
+    }
     rows.push(Vec::new());
     rows.push(row(["真实样例数据"]));
     if table.rows.is_empty() {
@@ -310,9 +318,32 @@ fn redis_header(with_value: bool) -> Vec<XlsxCellData> {
             "命中类型",
             "敏感级别",
             "判断依据",
+            "规则名称",
+            "规则ID",
+            "规则级别",
+            "规则标签",
+            "Target Key",
+            "置信度",
         ])
     } else {
-        row(["数据库类型", "Target", "DB", "Key", "Redis类型", "TTL", "Path/Field", "命中类型", "敏感级别", "判断依据"])
+        row([
+            "数据库类型",
+            "Target",
+            "DB",
+            "Key",
+            "Redis类型",
+            "TTL",
+            "Path/Field",
+            "命中类型",
+            "敏感级别",
+            "判断依据",
+            "规则名称",
+            "规则ID",
+            "规则级别",
+            "规则标签",
+            "Target Key",
+            "置信度",
+        ])
     }
 }
 
@@ -333,8 +364,50 @@ fn redis_row(finding: &AuditFinding, with_value: bool) -> Vec<XlsxCellData> {
         cell(kind_label(finding.kind), Some(style_for_level(finding.level))),
         cell(level_label(finding.level), None),
         cell(finding.basis.clone(), None),
+        cell(rule_name_label(finding), None),
+        cell(finding.rule_id.clone().unwrap_or_default(), None),
+        cell(rule_severity_label(finding), None),
+        cell(rule_tags_label(finding), None),
+        cell(finding.target_key.clone().unwrap_or_default(), None),
+        cell(finding.confidence.clone().unwrap_or_default(), None),
     ]);
     values
+}
+
+fn finding_detail_header() -> Vec<XlsxCellData> {
+    row([
+        "字段名",
+        "命中模式",
+        "疑似类型",
+        "DBX级别",
+        "判断依据",
+        "规则名称",
+        "规则ID",
+        "规则级别",
+        "规则标签",
+        "Target Key",
+        "置信度",
+        "命中数",
+        "样例值",
+    ])
+}
+
+fn finding_detail_row(finding: &AuditFinding) -> Vec<XlsxCellData> {
+    vec![
+        cell(finding.column.clone(), Some(style_for_level(finding.level))),
+        cell(mode_label(finding.mode), None),
+        cell(kind_label(finding.kind), None),
+        cell(level_label(finding.level), None),
+        cell(finding.basis.clone(), None),
+        cell(rule_name_label(finding), None),
+        cell(finding.rule_id.clone().unwrap_or_default(), None),
+        cell(rule_severity_label(finding), None),
+        cell(rule_tags_label(finding), None),
+        cell(finding.target_key.clone().unwrap_or_default(), None),
+        cell(finding.confidence.clone().unwrap_or_default(), None),
+        cell(finding.count.to_string(), None),
+        cell(sample_text(finding), None),
+    ]
 }
 
 fn sheet(name: &str, cells: Vec<Vec<XlsxCellData>>) -> XlsxWorksheetData {
@@ -549,6 +622,18 @@ fn style_for_level(level: AuditLevel) -> usize {
 
 fn sample_text(finding: &AuditFinding) -> String {
     finding.samples.iter().map(|sample| sample.value.clone()).collect::<Vec<_>>().join("\n")
+}
+
+fn rule_name_label(finding: &AuditFinding) -> String {
+    finding.rule_name.clone().unwrap_or_else(|| kind_label(finding.kind).to_string())
+}
+
+fn rule_severity_label(finding: &AuditFinding) -> String {
+    finding.rule_severity.clone().unwrap_or_else(|| level_label(finding.level).to_string())
+}
+
+fn rule_tags_label(finding: &AuditFinding) -> String {
+    finding.rule_tags.join(",")
 }
 
 #[cfg(test)]

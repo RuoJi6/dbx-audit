@@ -1,49 +1,17 @@
 <script setup lang="ts">
 import { computed, onUnmounted, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
-import {
-  ArrowLeft,
-  Check,
-  ChevronDown,
-  ChevronRight,
-  Clipboard,
-  Database,
-  Download,
-  FileSpreadsheet,
-  FolderOpen,
-  ListChecks,
-  Play,
-  Plus,
-  RefreshCw,
-  Search,
-  ShieldCheck,
-  Square,
-  Table2,
-  Trash2,
-  Upload,
-} from "@lucide/vue";
+import { ArrowLeft, Check, ChevronDown, ChevronRight, Clipboard, Database, Download, FileSpreadsheet, FolderOpen, ListChecks, Play, Plus, RefreshCw, Search, ShieldCheck, Square, Table2, Trash2, Upload } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import DatabaseIcon from "@/components/icons/DatabaseIcon.vue";
-import {
-  DropdownMenu,
-  DropdownMenuCheckboxItem,
-  DropdownMenuContent,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
+import { DropdownMenu, DropdownMenuCheckboxItem, DropdownMenuContent, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import * as api from "@/lib/api";
 import { connectionIconType } from "@/lib/connectionPresentation";
 import { safeLocalStorageGet, safeLocalStorageRemove } from "@/lib/safeStorage";
 import { isTauriRuntime } from "@/lib/tauriRuntime";
-import type {
-  AuditFinding,
-  AuditJobState,
-  AuditLevelFilter,
-  AuditMode,
-  AuditTargetSummary,
-  ParsedFscanTarget,
-} from "@/lib/tauri";
+import type { AuditFinding, AuditJobState, AuditLevelFilter, AuditMode, AuditTargetSummary, ParsedFscanTarget } from "@/lib/tauri";
 import type { ConnectionConfig } from "@/types/database";
 
 type AuditTaskKind = "single" | "fscan" | "sql";
@@ -107,6 +75,7 @@ type TableHit = {
   connectionId?: string;
   connectionName?: string;
   dbType?: string;
+  sourceType?: string;
   database: string;
   schema?: string;
   table: string;
@@ -120,6 +89,7 @@ type FieldHit = {
   connectionId?: string;
   connectionName?: string;
   dbType?: string;
+  sourceType?: string;
   database: string;
   schema?: string;
   table: string;
@@ -137,6 +107,7 @@ type SampleGroup = {
   connectionId?: string;
   connectionName?: string;
   dbType?: string;
+  sourceType?: string;
   database: string;
   schema?: string;
   table: string;
@@ -155,6 +126,7 @@ type DatabaseFilterItem = {
   connectionId?: string;
   connectionName?: string;
   dbType?: string;
+  sourceType?: string;
   database?: string;
 };
 
@@ -171,9 +143,7 @@ const props = defineProps<{
 }>();
 
 const emit = defineEmits<{
-  openSampleTarget: [
-    target: { connectionId: string; dbType?: string; database: string; schema?: string; tableName: string },
-  ];
+  openSampleTarget: [target: { connectionId: string; dbType?: string; database: string; schema?: string; tableName: string }];
 }>();
 
 const { locale, tm } = useI18n();
@@ -457,8 +427,7 @@ const en = {
   newTaskName: "New audit task",
   dataManager: "Data Manager",
   dataManagerTitle: "Audit Data Manager",
-  dataManagerHint:
-    "Tasks, configuration, and scan results are saved in DBX's official dbx.db. Export or import ZIP backups here.",
+  dataManagerHint: "Tasks, configuration, and scan results are saved in DBX's official dbx.db. Export or import ZIP backups here.",
   storageKey: "Storage key",
   backupData: "Backup data",
   exportBackup: "Export backup",
@@ -494,8 +463,7 @@ const en = {
   exportFailed: "Export failed: {error}",
   importFailed: "Import failed: {error}",
   invalidBackup: "Backup content does not include a tasks array",
-  importedSnapshotRefreshHint:
-    "This imported task is a snapshot. It cannot refresh runtime state; restart it or export the saved table.",
+  importedSnapshotRefreshHint: "This imported task is a snapshot. It cannot refresh runtime state; restart it or export the saved table.",
   missingConnections: "Skipped missing connections: {ids}",
   nameRequired: "{name} is required",
   connectionRequired: "Please select a connection",
@@ -542,12 +510,10 @@ const en = {
   tableWorkers: "Table/collection workers",
   fieldWorkers: "Field query workers",
   concurrencyModel: "Concurrency",
-  concurrencyHint:
-    "Target workers {targetWorkers}; table/collection workers {tableWorkers}; field query workers {fieldWorkers}",
+  concurrencyHint: "Target workers {targetWorkers}; table/collection workers {tableWorkers}; field query workers {fieldWorkers}",
   targetWorkersHint: "Connections scanned at the same time in multi-target tasks",
   tableWorkersHint: "SQL tables, Mongo/Elasticsearch collections or indices scanned at the same time per connection",
-  fieldWorkersHint:
-    "Concurrent sensitive-field count queries inside one table; Redis key value reads per page also use this",
+  fieldWorkersHint: "Concurrent sensitive-field count queries inside one table; Redis key value reads per page also use this",
   singleTargetConcurrency: "Single target",
   multiTargetSequential: "{count} targets sequentially",
   timeout: "Timeout seconds",
@@ -612,8 +578,7 @@ const en = {
   failedConnections: "Failed {count}",
   cancelledConnections: "Cancelled {count}",
   chooseOutput: "Choose output file",
-  chooseOutputUnavailable:
-    "Web dev mode cannot choose local output paths. Use the desktop app or enter a path manually.",
+  chooseOutputUnavailable: "Web dev mode cannot choose local output paths. Use the desktop app or enter a path manually.",
   fieldSearch: "phone / id_card / token",
   contentSearch: "phone / email / token value",
   databaseFilter: "Database filter",
@@ -648,8 +613,7 @@ const en = {
   fieldCount: "{count} fields",
   fieldDetail: "Field detail",
   sampleValues: "Sample values",
-  noFieldSamplesHint:
-    "This scan result did not return sample values. Masked samples will appear here after content scanning is connected.",
+  noFieldSamplesHint: "This scan result did not return sample values. Masked samples will appear here after content scanning is connected.",
   rowHits: "{count} row hits",
   type: "Type",
   address: "Address",
@@ -664,11 +628,9 @@ const en = {
   databaseName: "Database",
   tableName: "Table",
   sampleRows: "Sample rows",
-  noSampleRowsHint:
-    "This task only has field findings and did not return content sample rows. Real samples will appear here after backend content scanning is connected.",
+  noSampleRowsHint: "This task only has field findings and did not return content sample rows. Real samples will appear here after backend content scanning is connected.",
   fieldEvidence: "Field evidence",
-  openFolderUnavailable:
-    "Web dev mode cannot open local folders directly. Use the desktop app or open manually: {path}",
+  openFolderUnavailable: "Web dev mode cannot open local folders directly. Use the desktop app or open manually: {path}",
   openedFolder: "Opened folder: {path}",
   status: {
     draft: "Draft",
@@ -808,27 +770,13 @@ const backupPassword = ref("");
 let auditStoreSaveTimer: ReturnType<typeof setTimeout> | undefined;
 
 const selectedTask = computed(() => tasks.value.find((task) => task.id === selectedTaskId.value) || null);
-const selectedTaskExportMessage = computed(() =>
-  selectedTask.value && exportMessageTaskId.value === selectedTask.value.id ? exportMessage.value : "",
-);
-const selectedConnection = computed(() =>
-  props.connections.find((connection) => connection.id === draft.value.connectionId),
-);
+const selectedTaskExportMessage = computed(() => (selectedTask.value && exportMessageTaskId.value === selectedTask.value.id ? exportMessage.value : ""));
+const selectedConnection = computed(() => props.connections.find((connection) => connection.id === draft.value.connectionId));
 const filteredTasks = computed(() => {
   const query = searchQuery.value.trim().toLowerCase();
   if (!query) return tasks.value;
   return tasks.value.filter((task) => {
-    const haystack = [
-      task.name,
-      task.description,
-      task.database,
-      task.tables,
-      task.kind,
-      task.message,
-      connectionLabel(task),
-    ]
-      .join(" ")
-      .toLowerCase();
+    const haystack = [task.name, task.description, task.database, task.tables, task.kind, task.message, connectionLabel(task)].join(" ").toLowerCase();
     return haystack.includes(query);
   });
 });
@@ -865,7 +813,8 @@ const databaseFilterOptions = computed<DatabaseFilterOption[]>(() => {
       const item: DatabaseFilterItem = {
         connectionId: id,
         connectionName: connection?.name || id,
-        dbType: connectionIconType(connection),
+        dbType: connection ? connectionIconType(connection) : undefined,
+        sourceType: connection?.db_type,
         database: task.database.trim(),
       };
       const key = databaseFilterKey(item);
@@ -889,16 +838,11 @@ const filteredTables = computed(() => {
     if (!matchesDatabaseFilter(item)) return false;
     if (riskFilter.value !== "all" && item.risk !== riskFilter.value) return false;
     if (!query) return true;
-    return [item.dbType, item.connectionName, item.database, item.table, item.columns.join(" ")]
-      .join(" ")
-      .toLowerCase()
-      .includes(query);
+    return [item.sourceType, item.dbType, item.connectionName, item.database, item.table, item.columns.join(" ")].join(" ").toLowerCase().includes(query);
   });
 });
 const filteredFields = computed(() => {
-  return detailFields.value.filter(
-    (field) => matchesDatabaseFilter(field) && (riskFilter.value === "all" || field.level === riskFilter.value),
-  );
+  return detailFields.value.filter((field) => matchesDatabaseFilter(field) && (riskFilter.value === "all" || field.level === riskFilter.value));
 });
 const sampleGroups = computed(() => buildSampleGroups(detailFindings.value));
 const filteredSampleGroups = computed(() => {
@@ -906,20 +850,11 @@ const filteredSampleGroups = computed(() => {
   const sensitiveQuery = matchQuery.value.trim().toLowerCase();
   return sampleGroups.value.filter((group) => {
     if (!matchesDatabaseFilter(group)) return false;
-    return (
-      (!valueQuery || group.valueSearchText.includes(valueQuery)) &&
-      (!sensitiveQuery || group.sensitiveSearchText.includes(sensitiveQuery))
-    );
+    return (!valueQuery || group.valueSearchText.includes(valueQuery)) && (!sensitiveQuery || group.sensitiveSearchText.includes(sensitiveQuery));
   });
 });
-const filteredSampleRowCount = computed(() =>
-  filteredSampleGroups.value.reduce((total, group) => total + group.rows.length, 0),
-);
-const filteredSampleSummary = computed(() =>
-  ui.value.sampleSummary
-    .replace("{groups}", String(filteredSampleGroups.value.length))
-    .replace("{rows}", String(filteredSampleRowCount.value)),
-);
+const filteredSampleRowCount = computed(() => filteredSampleGroups.value.reduce((total, group) => total + group.rows.length, 0));
+const filteredSampleSummary = computed(() => ui.value.sampleSummary.replace("{groups}", String(filteredSampleGroups.value.length)).replace("{rows}", String(filteredSampleRowCount.value)));
 const connectionResultRows = computed(() => {
   const task = selectedTask.value;
   if (!task) return [];
@@ -929,23 +864,12 @@ const connectionResultRows = computed(() => {
   return ids.map((id) => {
     const connection = props.connections.find((item) => item.id === id);
     const name = connection?.name || id;
-    const relatedFindings = findings.filter(
-      (finding) => finding.connectionId === id || finding.connectionName === name,
-    );
+    const relatedFindings = findings.filter((finding) => finding.connectionId === id || finding.connectionName === name);
     const relatedTables = tables.filter((table) => table.connectionId === id || table.connectionName === name);
     const relatedErrors = (task.errors || []).filter((entry) => entry.includes(id) || entry.includes(name));
-    const targetSummary = task.job?.targetSummaries?.find(
-      (target) => target.connectionId === id || target.connectionName === name,
-    );
+    const targetSummary = task.job?.targetSummaries?.find((target) => target.connectionId === id || target.connectionName === name);
     const errorText = stripConnectionErrorLabel(targetSummary?.error || relatedErrors.join("; "), name);
-    const outcome =
-      targetSummary?.status === "failed" || errorText
-        ? "failed"
-        : targetSummary?.status === "cancelled"
-          ? "cancelled"
-          : relatedFindings.length
-            ? "hit"
-            : "no-hit";
+    const outcome = targetSummary?.status === "failed" || errorText ? "failed" : targetSummary?.status === "cancelled" ? "cancelled" : relatedFindings.length ? "hit" : "no-hit";
     const totals = riskTotals(relatedFindings);
     const rowCount = connectionResultRowCount(relatedTables, relatedFindings);
     return {
@@ -954,20 +878,8 @@ const connectionResultRows = computed(() => {
       dbType: connectionIconType(connection) || targetSummary?.dbType || relatedFindings[0]?.dbType || "",
       outcome,
       error: errorText,
-      status:
-        outcome === "failed"
-          ? errorText
-          : outcome === "cancelled"
-            ? ui.value.status.cancelled
-            : relatedFindings.length
-              ? `${ui.value.hasHits} ${relatedFindings.length}`
-              : ui.value.noHits,
-      database:
-        targetSummary?.database ||
-        relatedTables[0]?.database ||
-        relatedFindings[0]?.database ||
-        connection?.database ||
-        "",
+      status: outcome === "failed" ? errorText : outcome === "cancelled" ? ui.value.status.cancelled : relatedFindings.length ? `${ui.value.hasHits} ${relatedFindings.length}` : ui.value.noHits,
+      database: targetSummary?.database || relatedTables[0]?.database || relatedFindings[0]?.database || connection?.database || "",
       tableCount: targetSummary?.tableCount ?? relatedTables.length,
       findingCount: targetSummary?.findingCount ?? relatedFindings.length,
       rowCount,
@@ -978,16 +890,7 @@ const connectionResultRows = computed(() => {
   });
 });
 const connectionResultSummary = computed(() =>
-  [
-    ui.value.connectionResultSummary
-      .replace("{connections}", String(connectionResultRows.value.length))
-      .replace(
-        "{findings}",
-        String(connectionResultRows.value.reduce((total, row) => total + Number(row.findingCount || 0), 0)),
-      ),
-    connectionResultFailureSummary(),
-    connectionResultCancelledSummary(),
-  ]
+  [ui.value.connectionResultSummary.replace("{connections}", String(connectionResultRows.value.length)).replace("{findings}", String(connectionResultRows.value.reduce((total, row) => total + Number(row.findingCount || 0), 0))), connectionResultFailureSummary(), connectionResultCancelledSummary()]
     .filter(Boolean)
     .join(" / "),
 );
@@ -1084,9 +987,7 @@ function loadLegacyAuditTaskStore(): { tasks: AuditTask[]; draft?: Partial<Audit
 }
 
 function normalizeTasks(value: AuditTask[]) {
-  return value.map((task) =>
-    normalizeTask({ ...newTask(), ...task, targets: task.targets || [], errors: task.errors || [] }),
-  );
+  return value.map((task) => normalizeTask({ ...newTask(), ...task, targets: task.targets || [], errors: task.errors || [] }));
 }
 
 function scheduleAuditTaskStoreSave() {
@@ -1124,11 +1025,7 @@ function newTask(seed?: Partial<AuditTask>): AuditTask {
     progress: seed?.progress || 0,
     message: seed?.message || ui.value.notStarted,
     connectionId: fallbackConnectionId,
-    connectionIds: seed?.connectionIds?.length
-      ? seed.connectionIds
-      : fallbackConnectionId
-        ? [fallbackConnectionId]
-        : [],
+    connectionIds: seed?.connectionIds?.length ? seed.connectionIds : fallbackConnectionId ? [fallbackConnectionId] : [],
     database: seed?.database || "",
     schema: seed?.schema || "",
     tables: seed?.tables || "",
@@ -1166,9 +1063,7 @@ function newTask(seed?: Partial<AuditTask>): AuditTask {
 }
 
 function normalizeTask(task: AuditTask) {
-  const connectionIds = (
-    task.connectionIds?.length ? task.connectionIds : task.connectionId ? [task.connectionId] : []
-  ).filter((connectionId, index, ids) => ids.indexOf(connectionId) === index);
+  const connectionIds = (task.connectionIds?.length ? task.connectionIds : task.connectionId ? [task.connectionId] : []).filter((connectionId, index, ids) => ids.indexOf(connectionId) === index);
   return {
     ...task,
     connectionId: task.connectionId || connectionIds[0] || "",
@@ -1266,10 +1161,7 @@ async function exportTaskBackup() {
     const backupBytes = await buildBackupZip();
     const fileName = `dbx-audit-backup-${new Date().toISOString().slice(0, 10)}.zip`;
     if (isTauriRuntime()) {
-      const [{ save }, { writeFile }] = await Promise.all([
-        import("@tauri-apps/plugin-dialog"),
-        import("@tauri-apps/plugin-fs"),
-      ]);
+      const [{ save }, { writeFile }] = await Promise.all([import("@tauri-apps/plugin-dialog"), import("@tauri-apps/plugin-fs")]);
       const path = await save({
         defaultPath: fileName,
         filters: [{ name: "ZIP", extensions: ["zip"] }],
@@ -1279,9 +1171,7 @@ async function exportTaskBackup() {
         return;
       }
       await writeFile(path, backupBytes);
-      dataManagerMessage.value = ui.value.exportedTasks
-        .replace("{count}", String(tasks.value.length))
-        .replace("{path}", path);
+      dataManagerMessage.value = ui.value.exportedTasks.replace("{count}", String(tasks.value.length)).replace("{path}", path);
       return;
     }
     downloadBackupFile(fileName, backupBytes);
@@ -1333,10 +1223,7 @@ function downloadBackupFile(fileName: string, content: Uint8Array) {
 
 async function readBackupFile() {
   if (isTauriRuntime()) {
-    const [{ open }, { readFile }] = await Promise.all([
-      import("@tauri-apps/plugin-dialog"),
-      import("@tauri-apps/plugin-fs"),
-    ]);
+    const [{ open }, { readFile }] = await Promise.all([import("@tauri-apps/plugin-dialog"), import("@tauri-apps/plugin-fs")]);
     const selected = await open({
       multiple: false,
       filters: [{ name: "Audit backup", extensions: ["zip", "json"] }],
@@ -1389,10 +1276,7 @@ async function buildBackupZip() {
   files["manifest.json"] = encodeText(JSON.stringify(manifest, null, 2));
   if (backupIncludeLogs.value) {
     for (const task of tasks.value) {
-      const logs = [
-        ...(task.job?.logs || []).map((entry) => JSON.stringify(entry)),
-        ...(task.errors || []).map((entry) => JSON.stringify({ level: "error", message: entry })),
-      ].join("\n");
+      const logs = [...(task.job?.logs || []).map((entry) => JSON.stringify(entry)), ...(task.errors || []).map((entry) => JSON.stringify({ level: "error", message: entry }))].join("\n");
       if (logs) files[`logs/${sanitizeFilePart(task.id)}.jsonl`] = encodeText(logs);
     }
   }
@@ -1432,9 +1316,7 @@ async function encryptBackupPayload(data: Uint8Array, password: string) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const iterations = 120_000;
   const key = await deriveBackupKey(password, salt, iterations);
-  const encrypted = new Uint8Array(
-    await crypto.subtle.encrypt({ name: "AES-GCM", iv: toArrayBuffer(iv) }, key, toArrayBuffer(data)),
-  );
+  const encrypted = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv: toArrayBuffer(iv) }, key, toArrayBuffer(data)));
   return {
     data: encrypted,
     manifest: {
@@ -1449,26 +1331,12 @@ async function encryptBackupPayload(data: Uint8Array, password: string) {
 
 async function decryptBackupPayload(data: Uint8Array, password: string, manifest: BackupCryptoManifest) {
   const key = await deriveBackupKey(password, base64ToBytes(manifest.salt), manifest.iterations);
-  return new Uint8Array(
-    await crypto.subtle.decrypt(
-      { name: "AES-GCM", iv: toArrayBuffer(base64ToBytes(manifest.iv)) },
-      key,
-      toArrayBuffer(data),
-    ),
-  );
+  return new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv: toArrayBuffer(base64ToBytes(manifest.iv)) }, key, toArrayBuffer(data)));
 }
 
 async function deriveBackupKey(password: string, salt: Uint8Array, iterations: number) {
-  const material = await crypto.subtle.importKey("raw", toArrayBuffer(encodeText(password)), "PBKDF2", false, [
-    "deriveKey",
-  ]);
-  return crypto.subtle.deriveKey(
-    { name: "PBKDF2", hash: "SHA-256", salt: toArrayBuffer(salt), iterations },
-    material,
-    { name: "AES-GCM", length: 256 },
-    false,
-    ["encrypt", "decrypt"],
-  );
+  const material = await crypto.subtle.importKey("raw", toArrayBuffer(encodeText(password)), "PBKDF2", false, ["deriveKey"]);
+  return crypto.subtle.deriveKey({ name: "PBKDF2", hash: "SHA-256", salt: toArrayBuffer(salt), iterations }, material, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
 }
 
 function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
@@ -1482,57 +1350,13 @@ function createStoredZip(files: Record<string, Uint8Array>) {
   for (const [name, data] of Object.entries(files)) {
     const nameBytes = encodeText(name);
     const crc = crc32(data);
-    const local = concatBytes([
-      u32(0x04034b50),
-      u16(20),
-      u16(0),
-      u16(0),
-      u16(0),
-      u16(0),
-      u32(crc),
-      u32(data.length),
-      u32(data.length),
-      u16(nameBytes.length),
-      u16(0),
-      nameBytes,
-      data,
-    ]);
+    const local = concatBytes([u32(0x04034b50), u16(20), u16(0), u16(0), u16(0), u16(0), u32(crc), u32(data.length), u32(data.length), u16(nameBytes.length), u16(0), nameBytes, data]);
     localParts.push(local);
-    centralParts.push(
-      concatBytes([
-        u32(0x02014b50),
-        u16(20),
-        u16(20),
-        u16(0),
-        u16(0),
-        u16(0),
-        u16(0),
-        u32(crc),
-        u32(data.length),
-        u32(data.length),
-        u16(nameBytes.length),
-        u16(0),
-        u16(0),
-        u16(0),
-        u16(0),
-        u32(0),
-        u32(offset),
-        nameBytes,
-      ]),
-    );
+    centralParts.push(concatBytes([u32(0x02014b50), u16(20), u16(20), u16(0), u16(0), u16(0), u16(0), u32(crc), u32(data.length), u32(data.length), u16(nameBytes.length), u16(0), u16(0), u16(0), u16(0), u32(0), u32(offset), nameBytes]));
     offset += local.length;
   }
   const central = concatBytes(centralParts);
-  const end = concatBytes([
-    u32(0x06054b50),
-    u16(0),
-    u16(0),
-    u16(centralParts.length),
-    u16(centralParts.length),
-    u32(central.length),
-    u32(offset),
-    u16(0),
-  ]);
+  const end = concatBytes([u32(0x06054b50), u16(0), u16(0), u16(centralParts.length), u16(centralParts.length), u32(central.length), u32(offset), u16(0)]);
   return concatBytes([...localParts, central, end]);
 }
 
@@ -1629,12 +1453,7 @@ function validateTask(task: AuditTask) {
   if (!task.name.trim()) return ui.value.nameRequired.replace("{name}", ui.value.name);
   if (activeConnectionIds(task).length === 0) return ui.value.connectionRequired;
   if (task.kind === "sql" && !task.sql.trim()) return ui.value.sqlRequired;
-  if (
-    task.kind === "fscan" &&
-    activeConnectionIds(task).length === 0 &&
-    !task.fscanText.trim() &&
-    task.targets.length === 0
-  ) {
+  if (task.kind === "fscan" && activeConnectionIds(task).length === 0 && !task.fscanText.trim() && task.targets.length === 0) {
     return ui.value.targetRequired;
   }
   if (task.limit < 1) return ui.value.limitRequired;
@@ -1681,29 +1500,16 @@ function selectField(field: FieldHit) {
 }
 
 function activeConnectionIds(task: Pick<AuditTask, "kind" | "connectionId" | "connectionIds">) {
-  return rawConnectionIds(task).filter((connectionId) =>
-    props.connections.some((connection) => connection.id === connectionId),
-  );
+  return rawConnectionIds(task).filter((connectionId) => props.connections.some((connection) => connection.id === connectionId));
 }
 
 function rawConnectionIds(task: Pick<AuditTask, "kind" | "connectionId" | "connectionIds">) {
-  const ids =
-    task.kind === "fscan"
-      ? task.connectionIds?.length
-        ? task.connectionIds
-        : task.connectionId
-          ? [task.connectionId]
-          : []
-      : task.connectionId
-        ? [task.connectionId]
-        : [];
+  const ids = task.kind === "fscan" ? (task.connectionIds?.length ? task.connectionIds : task.connectionId ? [task.connectionId] : []) : task.connectionId ? [task.connectionId] : [];
   return ids.filter((connectionId, index) => !!connectionId && ids.indexOf(connectionId) === index);
 }
 
 function missingConnectionIds(task: Pick<AuditTask, "kind" | "connectionId" | "connectionIds">) {
-  return rawConnectionIds(task).filter(
-    (connectionId) => !props.connections.some((connection) => connection.id === connectionId),
-  );
+  return rawConnectionIds(task).filter((connectionId) => !props.connections.some((connection) => connection.id === connectionId));
 }
 
 function isDraftConnectionSelected(connectionId: string) {
@@ -1731,9 +1537,7 @@ async function startTask(task: AuditTask) {
   const missing = missingConnectionIds(task);
   const connectionIds = activeConnectionIds(task);
   if (connectionIds.length === 0) {
-    error.value = missing.length
-      ? ui.value.missingConnections.replace("{ids}", missing.join(", "))
-      : ui.value.connectionRequired;
+    error.value = missing.length ? ui.value.missingConnections.replace("{ids}", missing.join(", ")) : ui.value.connectionRequired;
     return;
   }
   const logHistory = nextRunLogHistory(task);
@@ -1878,15 +1682,7 @@ async function startConnectionBatchTask(task: AuditTask, connectionIds: string[]
         connectionId,
         connection,
       });
-      const job = await waitForAuditJobSnapshot(
-        jobId,
-        task.id,
-        label,
-        connectionId,
-        connectionIds.length,
-        aggregate,
-        targetProgress,
-      );
+      const job = await waitForAuditJobSnapshot(jobId, task.id, label, connectionId, connectionIds.length, aggregate, targetProgress);
       targetProgress.set(connectionId, job.status === "cancelled" ? job.progress || aggregateProgress() : 100);
       const connectionJob: AuditJobState = {
         ...job,
@@ -1966,11 +1762,7 @@ async function startConnectionBatchTask(task: AuditTask, connectionIds: string[]
     job: aggregate,
     status: wasCancelled ? "cancelled" : hasNewErrors ? "failed" : "completed",
     progress: aggregate.progress,
-    message: wasCancelled
-      ? ui.value.status.cancelled
-      : hasNewErrors
-        ? ui.value.batchScanFailed
-        : ui.value.batchScanCompleted,
+    message: wasCancelled ? ui.value.status.cancelled : hasNewErrors ? ui.value.batchScanFailed : ui.value.batchScanCompleted,
     errors: aggregate.errors,
     outputs,
     finishedAt: aggregate.finishedAt,
@@ -1981,13 +1773,7 @@ async function startConnectionBatchTask(task: AuditTask, connectionIds: string[]
   }
 }
 
-function auditTargetSummary(
-  connectionId: string,
-  label: string,
-  connection: ConnectionConfig | undefined,
-  job?: AuditJobState,
-  error?: string,
-): AuditTargetSummary {
+function auditTargetSummary(connectionId: string, label: string, connection: ConnectionConfig | undefined, job?: AuditJobState, error?: string): AuditTargetSummary {
   const findingCount = job?.findings?.length || 0;
   const tableCount = job?.tableResults?.length || 0;
   const jobError = error || (job?.errors || []).join("; ");
@@ -2028,36 +1814,15 @@ function connectionResultCancelledSummary() {
 }
 
 function taskDatabaseName(job: AuditJobState | undefined, connection: ConnectionConfig | undefined) {
-  return (
-    job?.request?.database ||
-    job?.tableResults?.[0]?.database ||
-    job?.findings?.[0]?.database ||
-    connection?.database ||
-    undefined
-  );
+  return job?.request?.database || job?.tableResults?.[0]?.database || job?.findings?.[0]?.database || connection?.database || undefined;
 }
 
-async function waitForAuditJobSnapshot(
-  jobId: string,
-  taskId: string,
-  label: string,
-  connectionId: string,
-  total: number,
-  aggregate: AuditJobState,
-  targetProgress?: Map<string, number>,
-) {
+async function waitForAuditJobSnapshot(jobId: string, taskId: string, label: string, connectionId: string, total: number, aggregate: AuditJobState, targetProgress?: Map<string, number>) {
   for (;;) {
     const job = await api.auditGetJob(jobId);
     if (!job) throw new Error(ui.value.jobNotFound.replace("{id}", jobId));
     if (targetProgress) targetProgress.set(connectionId, job.progress || 0);
-    const currentProgress = targetProgress
-      ? Math.min(
-          99,
-          Math.round(
-            Array.from(targetProgress.values()).reduce((total, value) => total + value, 0) / Math.max(1, total),
-          ),
-        )
-      : Math.min(99, job.progress || 0);
+    const currentProgress = targetProgress ? Math.min(99, Math.round(Array.from(targetProgress.values()).reduce((total, value) => total + value, 0) / Math.max(1, total))) : Math.min(99, job.progress || 0);
     aggregate.progress = currentProgress;
     if (cancelledTaskIds.has(taskId)) {
       await api.auditCancelScan(jobId).catch(() => false);
@@ -2133,10 +1898,7 @@ async function refreshTaskJob(taskId: string, jobId?: string) {
     const job = await api.auditGetJob(effectiveJobId);
     if (!job) return;
     if (cancelledTaskIds.has(taskId)) return;
-    const mergedJob =
-      job.status === "running"
-        ? mergeTaskLogHistory(task, job)
-        : ensureJobTargetSummaries(task, mergeTaskLogHistory(task, job));
+    const mergedJob = job.status === "running" ? mergeTaskLogHistory(task, job) : ensureJobTargetSummaries(task, mergeTaskLogHistory(task, job));
     const status = mapJobStatus(job.status);
     const next = persistTask({
       ...task,
@@ -2198,11 +1960,7 @@ async function exportReport(task: AuditTask) {
   }
 }
 
-async function autoExportTask(
-  task: AuditTask,
-  job: AuditJobState,
-  options: { includeSplits?: boolean; existingOutputs?: string[] } = {},
-) {
+async function autoExportTask(task: AuditTask, job: AuditJobState, options: { includeSplits?: boolean; existingOutputs?: string[] } = {}) {
   if (!task.outputEnabled || !shouldAutoExportJob(job) || exportingTaskIds.has(task.id)) return;
   exportingTaskIds.add(task.id);
   try {
@@ -2241,11 +1999,7 @@ function clearExportMessage() {
   exportMessage.value = "";
 }
 
-async function writeAuditOutputs(
-  task: AuditTask,
-  job: AuditJobState,
-  options: { includeSplits?: boolean; includeMerged?: boolean; existingOutputs?: string[] } = {},
-) {
+async function writeAuditOutputs(task: AuditTask, job: AuditJobState, options: { includeSplits?: boolean; includeMerged?: boolean; existingOutputs?: string[] } = {}) {
   const includeSplits = options.includeSplits ?? (task.splitOutput && rawConnectionIds(task).length > 1);
   const includeMerged = options.includeMerged ?? true;
   const path = outputPathForTask(task);
@@ -2253,13 +2007,7 @@ async function writeAuditOutputs(
   let mergedPath = "";
   if (includeSplits) {
     for (const context of splitContextsForTask(task, job)) {
-      const splitResult = await writeSplitOutput(
-        task,
-        filterJobForConnection(job, context),
-        context.connectionId,
-        context.label,
-        context.connection,
-      );
+      const splitResult = await writeSplitOutput(task, filterJobForConnection(job, context), context.connectionId, context.label, context.connection);
       if (splitResult) outputs.push(splitResult);
     }
   }
@@ -2271,13 +2019,7 @@ async function writeAuditOutputs(
   return { outputs, mergedPath };
 }
 
-async function writeSplitOutput(
-  task: AuditTask,
-  job: AuditJobState,
-  connectionId: string,
-  label: string,
-  connection?: ConnectionConfig,
-) {
+async function writeSplitOutput(task: AuditTask, job: AuditJobState, connectionId: string, label: string, connection?: ConnectionConfig) {
   const path = outputPathForTask(task);
   const splitPath = splitOutputPath(path, connectionId, job.findings || [], connection, label);
   const splitJob: AuditJobState = {
@@ -2295,9 +2037,7 @@ async function writeSplitOutput(
 function ensureXlsxPath(path: string) {
   const trimmed = path.trim();
   if (!trimmed) throw new Error(ui.value.outputPathRequired);
-  return trimmed.replace(/\.json$/i, ".xlsx").match(/\.xlsx$/i)
-    ? trimmed.replace(/\.json$/i, ".xlsx")
-    : `${trimmed}.xlsx`;
+  return trimmed.replace(/\.json$/i, ".xlsx").match(/\.xlsx$/i) ? trimmed.replace(/\.json$/i, ".xlsx") : `${trimmed}.xlsx`;
 }
 
 function outputPathForTask(task: AuditTask) {
@@ -2326,9 +2066,7 @@ function splitContextsForTask(task: AuditTask, job: AuditJobState) {
       contexts.set(key, {
         connectionId: finding.connectionId || key,
         label: finding.connectionName || key,
-        connection: finding.connectionId
-          ? props.connections.find((item) => item.id === finding.connectionId)
-          : undefined,
+        connection: finding.connectionId ? props.connections.find((item) => item.id === finding.connectionId) : undefined,
       });
     }
   }
@@ -2343,12 +2081,8 @@ function splitContextsForTask(task: AuditTask, job: AuditJobState) {
     }
   }
   return Array.from(contexts.values()).filter((context) => {
-    const hasError = (job.errors || []).some(
-      (entry) => entry.startsWith(`${context.label}:`) || entry.startsWith(`${context.connectionId}:`),
-    );
-    const hasResult =
-      (job.findings || []).some((finding) => matchesConnection(finding, context)) ||
-      (job.tableResults || []).some((table) => matchesConnection(table, context));
+    const hasError = (job.errors || []).some((entry) => entry.startsWith(`${context.label}:`) || entry.startsWith(`${context.connectionId}:`));
+    const hasResult = (job.findings || []).some((finding) => matchesConnection(finding, context)) || (job.tableResults || []).some((table) => matchesConnection(table, context));
     return hasResult || !hasError;
   });
 }
@@ -2358,43 +2092,19 @@ function filterJobForConnection(job: AuditJobState, context: SplitContext): Audi
     ...job,
     findings: (job.findings || []).filter((finding) => matchesConnection(finding, context)),
     tableResults: (job.tableResults || []).filter((table) => matchesConnection(table, context)),
-    logs: (job.logs || []).filter(
-      (entry) =>
-        entry.message.startsWith(`${context.label}:`) ||
-        entry.message.startsWith(`${context.connectionId}:`) ||
-        !entry.message.includes(":"),
-    ),
-    errors: (job.errors || []).filter(
-      (entry) => entry.startsWith(`${context.label}:`) || entry.startsWith(`${context.connectionId}:`),
-    ),
+    logs: (job.logs || []).filter((entry) => entry.message.startsWith(`${context.label}:`) || entry.message.startsWith(`${context.connectionId}:`) || !entry.message.includes(":")),
+    errors: (job.errors || []).filter((entry) => entry.startsWith(`${context.label}:`) || entry.startsWith(`${context.connectionId}:`)),
   };
 }
 
-function matchesConnection(
-  item: Pick<AuditFinding, "connectionId" | "connectionName" | "dbType">,
-  context: SplitContext,
-) {
-  return (
-    item.connectionId === context.connectionId ||
-    item.connectionName === context.label ||
-    (!!context.connection && item.dbType === context.connection.db_type) ||
-    (!item.connectionId && !item.connectionName && !context.connectionId)
-  );
+function matchesConnection(item: Pick<AuditFinding, "connectionId" | "connectionName" | "dbType">, context: SplitContext) {
+  return item.connectionId === context.connectionId || item.connectionName === context.label || (!!context.connection && item.dbType === context.connection.db_type) || (!item.connectionId && !item.connectionName && !context.connectionId);
 }
 
-function splitOutputPath(
-  path: string,
-  connectionId: string,
-  findings: AuditFinding[],
-  connection?: ConnectionConfig,
-  label?: string,
-) {
+function splitOutputPath(path: string, connectionId: string, findings: AuditFinding[], connection?: ConnectionConfig, label?: string) {
   const index = path.toLowerCase().lastIndexOf(".xlsx");
   const stem = index >= 0 ? path.slice(0, index) : path;
-  const suffixSource = [
-    connection?.db_type || findings[0]?.dbType || "db",
-    label || connection?.name || findings[0]?.connectionName || connectionId,
-  ].join("_");
+  const suffixSource = [connection?.db_type || findings[0]?.dbType || "db", label || connection?.name || findings[0]?.connectionName || connectionId].join("_");
   return `${stem}-${sanitizeFilePart(suffixSource)}.xlsx`;
 }
 
@@ -2415,9 +2125,7 @@ async function chooseOutputPath() {
   try {
     const { save } = await import("@tauri-apps/plugin-dialog");
     const path = await save({
-      defaultPath: draft.value.outputPath.trim()
-        ? ensureXlsxPath(draft.value.outputPath)
-        : suggestedOutputFileName(draft.value),
+      defaultPath: draft.value.outputPath.trim() ? ensureXlsxPath(draft.value.outputPath) : suggestedOutputFileName(draft.value),
       filters: [{ name: "Excel", extensions: ["xlsx"] }],
     });
     if (path) draft.value.outputPath = path;
@@ -2597,9 +2305,7 @@ function connectionLabel(task: AuditTask) {
 function targetSummary(task: AuditTask) {
   if (task.kind === "fscan") {
     const parsedTargets = task.targets.length || splitList(task.fscanText).length;
-    return `${ui.value.targetMultiPrefix} · ${connectionLabel(task)}${
-      parsedTargets ? ` · ${ui.value.importedTargetCount.replace("{count}", String(parsedTargets))}` : ""
-    }`;
+    return `${ui.value.targetMultiPrefix} · ${connectionLabel(task)}${parsedTargets ? ` · ${ui.value.importedTargetCount.replace("{count}", String(parsedTargets))}` : ""}`;
   }
   if (task.kind === "sql") return `${ui.value.targetSqlPrefix} · ${connectionLabel(task)}`;
   return `${ui.value.targetSinglePrefix} · ${connectionLabel(task)}`;
@@ -2645,21 +2351,16 @@ function taskTotals(task: AuditTask) {
 
 function findingsWithConnectionMeta(task: AuditTask): AuditFinding[] {
   const fallbackConnection = connectionFor(task);
-  return (task.job?.findings || []).map((finding) => ({
-    ...finding,
-    connectionId: finding.connectionId || fallbackConnection?.id,
-    connectionName: finding.connectionName || fallbackConnection?.name,
-    dbType:
-      connectionIconType(
-        props.connections.find(
-          (connection) =>
-            (!!finding.connectionId && connection.id === finding.connectionId) ||
-            (!!finding.connectionName && connection.name === finding.connectionName),
-        ) || fallbackConnection,
-      ) ||
-      finding.dbType ||
-      fallbackConnection?.db_type,
-  }));
+  return (task.job?.findings || []).map((finding) => {
+    const matchedConnection: ConnectionConfig | undefined = props.connections.find((connection) => (!!finding.connectionId && connection.id === finding.connectionId) || (!!finding.connectionName && connection.name === finding.connectionName)) || fallbackConnection;
+    return {
+      ...finding,
+      connectionId: finding.connectionId || fallbackConnection?.id,
+      connectionName: finding.connectionName || fallbackConnection?.name,
+      dbType: matchedConnection ? connectionIconType(matchedConnection) : finding.dbType || fallbackConnection?.db_type,
+      sourceType: matchedConnection?.db_type || finding.sourceType || finding.dbType || fallbackConnection?.db_type,
+    };
+  });
 }
 
 function tableHits(findings: AuditFinding[]): TableHit[] {
@@ -2673,6 +2374,7 @@ function tableHits(findings: AuditFinding[]): TableHit[] {
         connectionId: finding.connectionId,
         connectionName: finding.connectionName,
         dbType: finding.dbType,
+        sourceType: finding.sourceType,
         database: finding.database,
         schema: finding.schema,
         table: finding.table,
@@ -2694,6 +2396,7 @@ function fieldHits(findings: AuditFinding[]): FieldHit[] {
     connectionId: finding.connectionId,
     connectionName: finding.connectionName,
     dbType: finding.dbType,
+    sourceType: finding.sourceType,
     database: finding.database,
     schema: finding.schema,
     table: finding.table,
@@ -2718,6 +2421,7 @@ function buildSampleGroups(findings: AuditFinding[]) {
         connectionId: field.connectionId,
         connectionName: field.connectionName,
         dbType: field.dbType,
+        sourceType: field.sourceType,
         database: field.database,
         schema: field.schema,
         table: field.table,
@@ -2787,13 +2491,13 @@ function stringifySampleValue(value: unknown) {
   }
 }
 
-function databaseScopeText(item: Pick<TableHit | FieldHit | SampleGroup, "connectionName" | "dbType">) {
-  return [item.dbType, item.connectionName].filter(Boolean).join(" · ");
+function databaseScopeText(item: Pick<TableHit | FieldHit | SampleGroup, "connectionName" | "dbType" | "sourceType">) {
+  return [item.sourceType || item.dbType, item.connectionName].filter(Boolean).join(" · ");
 }
 
 function databaseFilterKey(item: DatabaseFilterItem) {
   const database = item.database?.trim() || "-";
-  const source = item.connectionId || [item.dbType, item.connectionName].filter(Boolean).join(" · ") || "";
+  const source = item.connectionId || [item.sourceType || item.dbType, item.connectionName].filter(Boolean).join(" · ") || "";
   return [source, database].join("\u001f");
 }
 
@@ -2833,9 +2537,7 @@ function matchesDatabaseFilter(item: DatabaseFilterItem) {
 }
 
 function toggleDatabaseFilter(key: string) {
-  databaseFilterKeys.value = databaseFilterKeys.value.includes(key)
-    ? databaseFilterKeys.value.filter((item) => item !== key)
-    : [...databaseFilterKeys.value, key];
+  databaseFilterKeys.value = databaseFilterKeys.value.includes(key) ? databaseFilterKeys.value.filter((item) => item !== key) : [...databaseFilterKeys.value, key];
 }
 
 function clearDatabaseFilter() {
@@ -2865,9 +2567,7 @@ function visibleSampleRows(group: SampleGroup) {
 }
 
 function toggleSampleGroup(group: SampleGroup) {
-  expandedSampleGroupKeys.value = isSampleGroupExpanded(group)
-    ? expandedSampleGroupKeys.value.filter((key) => key !== group.key)
-    : [...expandedSampleGroupKeys.value, group.key];
+  expandedSampleGroupKeys.value = isSampleGroupExpanded(group) ? expandedSampleGroupKeys.value.filter((key) => key !== group.key) : [...expandedSampleGroupKeys.value, group.key];
 }
 
 function sampleGroupToggleText(group: SampleGroup) {
@@ -2935,33 +2635,17 @@ function searchText(parts: Array<unknown>) {
 }
 
 function sampleGroupValueSearchText(group: SampleGroup) {
-  return searchText([
-    group.database,
-    group.table,
-    ...group.fields.map((field) => field.column),
-    ...group.rows.flatMap((row) => Object.values(row)),
-  ]);
+  return searchText([group.database, group.table, ...group.fields.map((field) => field.column), ...group.rows.flatMap((row) => Object.values(row))]);
 }
 
 function sampleGroupSensitiveSearchText(group: SampleGroup) {
   return searchText([
     group.dbType,
+    group.sourceType,
     group.connectionName,
     group.database,
     group.table,
-    ...group.fields.flatMap((field) => [
-      field.column,
-      field.kind,
-      field.ruleName,
-      findingDisplayName(field),
-      field.ruleSeverity,
-      findingSeverityLabel(field),
-      kindName(field.kind),
-      field.level,
-      ui.value.levelLabel[field.level],
-      field.count,
-      ...field.samples,
-    ]),
+    ...group.fields.flatMap((field) => [field.column, field.kind, field.ruleName, findingDisplayName(field), field.ruleSeverity, findingSeverityLabel(field), kindName(field.kind), field.level, ui.value.levelLabel[field.level], field.count, ...field.samples]),
   ]);
 }
 
@@ -2990,9 +2674,7 @@ function formatConnectionInfo(connection: ConnectionConfig, task: AuditTask) {
   const fields: Array<[string, string] | undefined> = [
     [ui.value.connectionName, connection.name],
     [ui.value.type, connection.db_type],
-    connection.driver_label || connection.driver_profile
-      ? [ui.value.driver, connection.driver_label || connection.driver_profile || ""]
-      : undefined,
+    connection.driver_label || connection.driver_profile ? [ui.value.driver, connection.driver_label || connection.driver_profile || ""] : undefined,
     [ui.value.hostIp, connection.host],
     [ui.value.port, String(connection.port || "")],
     [ui.value.usernameLabel, connection.username],
@@ -3089,12 +2771,7 @@ onUnmounted(() => {
             <h3 class="mt-1 text-xl font-semibold">{{ ui.overviewHeadline }}</h3>
           </div>
           <div class="flex gap-2">
-            <Button
-              variant="outline"
-              class="gap-1"
-              :class="showDataManager ? 'border-primary text-primary' : ''"
-              @click="toggleDataManager"
-            >
+            <Button variant="outline" class="gap-1" :class="showDataManager ? 'border-primary text-primary' : ''" @click="toggleDataManager">
               <Database class="h-4 w-4" />
               {{ ui.dataManager }}
             </Button>
@@ -3179,33 +2856,15 @@ onUnmounted(() => {
         </div>
         <div v-for="task in filteredTasks" :key="task.id" class="flex flex-wrap items-start gap-4 border-b p-4">
           <div class="min-w-[220px] flex-[1_1_240px]">
-            <button
-              class="block max-w-full truncate text-left text-base font-semibold hover:text-primary"
-              :title="task.name"
-              @click="viewTask(task)"
-            >
+            <button class="block max-w-full truncate text-left text-base font-semibold hover:text-primary" :title="task.name" @click="viewTask(task)">
               {{ task.name }}
             </button>
-            <div
-              class="mt-1 max-w-full truncate text-xs text-muted-foreground"
-              :title="task.description || ui.noDescription"
-            >
+            <div class="mt-1 max-w-full truncate text-xs text-muted-foreground" :title="task.description || ui.noDescription">
               {{ task.description || ui.noDescription }}
             </div>
           </div>
           <div class="min-w-[96px] shrink-0">
-            <span
-              class="rounded-full px-3 py-1 text-xs"
-              :class="
-                task.status === 'completed'
-                  ? 'bg-emerald-50 text-emerald-700'
-                  : task.status === 'running'
-                    ? 'bg-blue-50 text-blue-700'
-                    : task.status === 'failed'
-                      ? 'bg-red-50 text-red-700'
-                      : 'bg-muted text-muted-foreground'
-              "
-            >
+            <span class="rounded-full px-3 py-1 text-xs" :class="task.status === 'completed' ? 'bg-emerald-50 text-emerald-700' : task.status === 'running' ? 'bg-blue-50 text-blue-700' : task.status === 'failed' ? 'bg-red-50 text-red-700' : 'bg-muted text-muted-foreground'">
               {{ ui.status[task.status] }}
             </span>
           </div>
@@ -3220,15 +2879,9 @@ onUnmounted(() => {
               </span>
             </div>
             <div class="flex flex-wrap items-center gap-2">
-              <span class="rounded-full border px-2 py-0.5" :class="riskClass('high')"
-                >{{ ui.riskHighShort }} {{ taskTotals(task).high }}</span
-              >
-              <span class="rounded-full border px-2 py-0.5" :class="riskClass('medium')"
-                >{{ ui.riskMediumShort }} {{ taskTotals(task).medium }}</span
-              >
-              <span class="rounded-full border px-2 py-0.5" :class="riskClass('low')"
-                >{{ ui.riskLowShort }} {{ taskTotals(task).low }}</span
-              >
+              <span class="rounded-full border px-2 py-0.5" :class="riskClass('high')">{{ ui.riskHighShort }} {{ taskTotals(task).high }}</span>
+              <span class="rounded-full border px-2 py-0.5" :class="riskClass('medium')">{{ ui.riskMediumShort }} {{ taskTotals(task).medium }}</span>
+              <span class="rounded-full border px-2 py-0.5" :class="riskClass('low')">{{ ui.riskLowShort }} {{ taskTotals(task).low }}</span>
             </div>
             <div class="h-1.5 overflow-hidden rounded bg-muted">
               <div class="h-full bg-primary" :style="{ width: `${task.progress}%` }" />
@@ -3257,13 +2910,7 @@ onUnmounted(() => {
             {{ ui.newTask }}
           </div>
           <div class="mt-3 grid gap-2 sm:grid-cols-4">
-            <button
-              v-for="step in wizardSteps"
-              :key="step"
-              class="rounded-md border px-3 py-2 text-left text-xs"
-              :class="wizardStep === step ? 'border-primary bg-primary/5 text-primary' : 'text-muted-foreground'"
-              @click="setWizardStep(step)"
-            >
+            <button v-for="step in wizardSteps" :key="step" class="rounded-md border px-3 py-2 text-left text-xs" :class="wizardStep === step ? 'border-primary bg-primary/5 text-primary' : 'text-muted-foreground'" @click="setWizardStep(step)">
               {{ step }}. {{ [ui.taskInfo, ui.taskType, ui.target, ui.params][step - 1] }}
             </button>
           </div>
@@ -3282,24 +2929,12 @@ onUnmounted(() => {
           </div>
 
           <div v-else-if="wizardStep === 2" class="grid gap-3 md:grid-cols-3">
-            <button
-              v-for="kind in taskKinds"
-              :key="kind"
-              class="rounded-md border p-4 text-left"
-              :class="draft.kind === kind ? 'border-primary bg-primary/5' : ''"
-              @click="setTaskKind(kind)"
-            >
+            <button v-for="kind in taskKinds" :key="kind" class="rounded-md border p-4 text-left" :class="draft.kind === kind ? 'border-primary bg-primary/5' : ''" @click="setTaskKind(kind)">
               <div class="font-semibold">
                 {{ kind === "single" ? ui.single : kind === "fscan" ? ui.fscan : ui.sql }}
               </div>
               <div class="mt-2 text-xs text-muted-foreground">
-                {{
-                  kind === "single"
-                    ? ui.kindDescription.single
-                    : kind === "fscan"
-                      ? ui.kindDescription.fscan
-                      : ui.kindDescription.sql
-                }}
+                {{ kind === "single" ? ui.kindDescription.single : kind === "fscan" ? ui.kindDescription.fscan : ui.kindDescription.sql }}
               </div>
             </button>
           </div>
@@ -3315,18 +2950,11 @@ onUnmounted(() => {
                   :class="isDraftConnectionSelected(connection.id) ? 'border-primary bg-primary/5' : 'bg-background'"
                   @click="toggleDraftConnection(connection.id)"
                 >
-                  <input
-                    class="pointer-events-none"
-                    type="checkbox"
-                    :checked="isDraftConnectionSelected(connection.id)"
-                    tabindex="-1"
-                  />
+                  <input class="pointer-events-none" type="checkbox" :checked="isDraftConnectionSelected(connection.id)" tabindex="-1" />
                   <DatabaseIcon :db-type="connectionIconType(connection)" class="h-4 w-4 shrink-0" />
                   <span class="min-w-0">
                     <span class="block truncate font-medium">{{ connection.name }}</span>
-                    <span class="block truncate text-muted-foreground"
-                      >{{ connection.db_type }} · {{ connection.host }}:{{ connection.port }}</span
-                    >
+                    <span class="block truncate text-muted-foreground">{{ connection.db_type }} · {{ connection.host }}:{{ connection.port }}</span>
                   </span>
                 </button>
               </div>
@@ -3339,11 +2967,7 @@ onUnmounted(() => {
               <Select v-model="draft.connectionId">
                 <SelectTrigger class="h-9">
                   <div class="flex min-w-0 items-center gap-2">
-                    <DatabaseIcon
-                      v-if="draft.connectionId"
-                      :db-type="draftConnectionIcon()"
-                      class="h-3.5 w-3.5 shrink-0"
-                    />
+                    <DatabaseIcon v-if="draft.connectionId" :db-type="draftConnectionIcon()" class="h-3.5 w-3.5 shrink-0" />
                     <SelectValue />
                   </div>
                 </SelectTrigger>
@@ -3371,28 +2995,19 @@ onUnmounted(() => {
             </label>
             <label v-if="draft.kind === 'sql'" class="space-y-1 text-xs font-medium md:col-span-2">
               {{ ui.sqlText }}
-              <textarea
-                v-model="draft.sql"
-                class="h-32 w-full resize-none rounded-md border bg-background p-2 font-mono text-xs"
-                placeholder="select * from users limit 100"
-              />
+              <textarea v-model="draft.sql" class="h-32 w-full resize-none rounded-md border bg-background p-2 font-mono text-xs" placeholder="select * from users limit 100" />
             </label>
             <div v-if="draft.kind === 'fscan'" class="space-y-2 md:col-span-2">
               <label class="block space-y-1 text-xs font-medium">
                 {{ ui.fscanText }}
-                <textarea
-                  v-model="draft.fscanText"
-                  class="h-32 w-full resize-none rounded-md border bg-background p-2 font-mono text-xs"
-                />
+                <textarea v-model="draft.fscanText" class="h-32 w-full resize-none rounded-md border bg-background p-2 font-mono text-xs" />
               </label>
               <div class="flex items-center gap-2">
                 <Button variant="outline" size="sm" class="gap-1" @click="parseFscanForDraft">
                   <Search class="h-3.5 w-3.5" />
                   {{ ui.parse }}
                 </Button>
-                <span class="text-xs text-muted-foreground">{{
-                  ui.parsed.replace("{count}", String(draft.targets.length))
-                }}</span>
+                <span class="text-xs text-muted-foreground">{{ ui.parsed.replace("{count}", String(draft.targets.length)) }}</span>
               </div>
             </div>
           </div>
@@ -3448,22 +3063,11 @@ onUnmounted(() => {
             </label>
             <label class="space-y-1 text-xs font-medium" :title="ui.contentMaxRowsHint">
               {{ ui.contentMaxRows }}
-              <Input
-                :model-value="draft.contentMaxRows ?? undefined"
-                class="h-9"
-                min="1"
-                type="number"
-                @update:model-value="setDraftContentMaxRows"
-              />
+              <Input :model-value="draft.contentMaxRows ?? undefined" class="h-9" min="1" type="number" @update:model-value="setDraftContentMaxRows" />
             </label>
             <label class="space-y-1 text-xs font-medium md:col-span-3" :title="ui.ruleTemplatePathsHint">
               {{ ui.ruleTemplatePaths }}
-              <Input
-                :model-value="draft.ruleTemplatePaths.join(', ')"
-                class="h-9"
-                :placeholder="ui.ruleTemplatePathsHint"
-                @update:model-value="setDraftRuleTemplatePaths"
-              />
+              <Input :model-value="draft.ruleTemplatePaths.join(', ')" class="h-9" :placeholder="ui.ruleTemplatePathsHint" @update:model-value="setDraftRuleTemplatePaths" />
             </label>
             <label class="space-y-1 text-xs font-medium">
               {{ ui.encoding }}
@@ -3476,34 +3080,19 @@ onUnmounted(() => {
                 </SelectContent>
               </Select>
             </label>
-            <label class="flex items-center gap-2 text-xs md:col-span-3"
-              ><input v-model="draft.outputEnabled" type="checkbox" />{{ ui.outputEnabled }}</label
-            >
+            <label class="flex items-center gap-2 text-xs md:col-span-3"><input v-model="draft.outputEnabled" type="checkbox" />{{ ui.outputEnabled }}</label>
             <label v-if="draft.outputEnabled" class="space-y-1 text-xs font-medium md:col-span-3">
               {{ ui.output }}
               <div class="flex gap-2">
                 <Input v-model="draft.outputPath" class="h-9 min-w-0" />
-                <Button
-                  type="button"
-                  variant="outline"
-                  class="h-9 w-9 shrink-0 p-0"
-                  :title="ui.chooseOutput"
-                  :aria-label="ui.chooseOutput"
-                  @click="chooseOutputPath"
-                >
+                <Button type="button" variant="outline" class="h-9 w-9 shrink-0 p-0" :title="ui.chooseOutput" :aria-label="ui.chooseOutput" @click="chooseOutputPath">
                   <FolderOpen class="h-4 w-4" />
                 </Button>
               </div>
             </label>
-            <label class="flex items-center gap-2 text-xs"
-              ><input v-model="draft.mask" type="checkbox" />{{ ui.mask }}</label
-            >
-            <label class="flex items-center gap-2 text-xs"
-              ><input v-model="draft.includeSystem" type="checkbox" />{{ ui.includeSystem }}</label
-            >
-            <label v-if="draft.outputEnabled" class="flex items-center gap-2 text-xs"
-              ><input v-model="draft.splitOutput" type="checkbox" />{{ ui.splitOutput }}</label
-            >
+            <label class="flex items-center gap-2 text-xs"><input v-model="draft.mask" type="checkbox" />{{ ui.mask }}</label>
+            <label class="flex items-center gap-2 text-xs"><input v-model="draft.includeSystem" type="checkbox" />{{ ui.includeSystem }}</label>
+            <label v-if="draft.outputEnabled" class="flex items-center gap-2 text-xs"><input v-model="draft.splitOutput" type="checkbox" />{{ ui.splitOutput }}</label>
           </div>
 
           <p v-if="error" class="text-xs text-destructive">{{ error }}</p>
@@ -3523,31 +3112,19 @@ onUnmounted(() => {
       <div class="mb-4 rounded-md border bg-background p-4">
         <div class="flex flex-wrap items-center justify-between gap-3">
           <div>
-            <div class="text-xs text-muted-foreground">
-              {{ targetSummary(selectedTask) }} · {{ ui.status[selectedTask.status] }}
-            </div>
+            <div class="text-xs text-muted-foreground">{{ targetSummary(selectedTask) }} · {{ ui.status[selectedTask.status] }}</div>
             <h3 class="text-lg font-semibold">{{ selectedTask.name }}</h3>
             <div class="mt-1 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
               <span>{{ selectedTask.description || ui.noDescription }}</span>
             </div>
           </div>
           <div class="flex flex-wrap gap-2">
-            <Button variant="outline" size="sm" class="gap-1" @click="copyTask(selectedTask)"
-              ><Clipboard class="h-3.5 w-3.5" />{{ ui.copy }}</Button
-            >
+            <Button variant="outline" size="sm" class="gap-1" @click="copyTask(selectedTask)"><Clipboard class="h-3.5 w-3.5" />{{ ui.copy }}</Button>
             <Button variant="outline" size="sm" @click="configureTask(selectedTask)">{{ ui.config }}</Button>
-            <Button v-if="selectedTask.status !== 'running'" size="sm" class="gap-1" @click="startTask(selectedTask)"
-              ><Play class="h-3.5 w-3.5" />{{ ui.start }}</Button
-            >
-            <Button v-else variant="outline" size="sm" class="gap-1" @click="stopTask(selectedTask)"
-              ><Square class="h-3.5 w-3.5" />{{ ui.stop }}</Button
-            >
-            <Button variant="outline" size="sm" class="gap-1" @click="refreshTaskJob(selectedTask.id)"
-              ><RefreshCw class="h-3.5 w-3.5" />{{ ui.refresh }}</Button
-            >
-            <Button variant="outline" size="sm" class="gap-1 text-destructive" @click="removeTask(selectedTask)"
-              ><Trash2 class="h-3.5 w-3.5" />{{ ui.delete }}</Button
-            >
+            <Button v-if="selectedTask.status !== 'running'" size="sm" class="gap-1" @click="startTask(selectedTask)"><Play class="h-3.5 w-3.5" />{{ ui.start }}</Button>
+            <Button v-else variant="outline" size="sm" class="gap-1" @click="stopTask(selectedTask)"><Square class="h-3.5 w-3.5" />{{ ui.stop }}</Button>
+            <Button variant="outline" size="sm" class="gap-1" @click="refreshTaskJob(selectedTask.id)"><RefreshCw class="h-3.5 w-3.5" />{{ ui.refresh }}</Button>
+            <Button variant="outline" size="sm" class="gap-1 text-destructive" @click="removeTask(selectedTask)"><Trash2 class="h-3.5 w-3.5" />{{ ui.delete }}</Button>
           </div>
         </div>
       </div>
@@ -3574,15 +3151,9 @@ onUnmounted(() => {
               </div>
             </div>
             <div class="mt-4 flex flex-wrap gap-2">
-              <span class="rounded-full border px-2 py-0.5 text-xs" :class="riskClass('high')"
-                >{{ ui.riskHigh }} {{ detailTotals.high }}</span
-              >
-              <span class="rounded-full border px-2 py-0.5 text-xs" :class="riskClass('medium')"
-                >{{ ui.riskMedium }} {{ detailTotals.medium }}</span
-              >
-              <span class="rounded-full border px-2 py-0.5 text-xs" :class="riskClass('low')"
-                >{{ ui.riskLow }} {{ detailTotals.low }}</span
-              >
+              <span class="rounded-full border px-2 py-0.5 text-xs" :class="riskClass('high')">{{ ui.riskHigh }} {{ detailTotals.high }}</span>
+              <span class="rounded-full border px-2 py-0.5 text-xs" :class="riskClass('medium')">{{ ui.riskMedium }} {{ detailTotals.medium }}</span>
+              <span class="rounded-full border px-2 py-0.5 text-xs" :class="riskClass('low')">{{ ui.riskLow }} {{ detailTotals.low }}</span>
             </div>
             <div class="mt-4 h-2 overflow-hidden rounded bg-muted">
               <div class="h-full bg-primary" :style="{ width: `${selectedTask.progress}%` }" />
@@ -3595,11 +3166,7 @@ onUnmounted(() => {
               </span>
             </div>
             <div class="mt-6 rounded-md border bg-muted/20 p-3">
-              <button
-                type="button"
-                class="flex w-full items-center gap-2 text-left"
-                @click="connectionResultsExpanded = !connectionResultsExpanded"
-              >
+              <button type="button" class="flex w-full items-center gap-2 text-left" @click="connectionResultsExpanded = !connectionResultsExpanded">
                 <ChevronDown v-if="connectionResultsExpanded" class="h-4 w-4 shrink-0 text-muted-foreground" />
                 <ChevronRight v-else class="h-4 w-4 shrink-0 text-muted-foreground" />
                 <span class="font-semibold">{{ ui.connectionResultOverview }}</span>
@@ -3610,16 +3177,7 @@ onUnmounted(() => {
                   v-for="row in connectionResultRows"
                   :key="row.id"
                   class="rounded-md border bg-background p-3 text-xs transition hover:border-primary"
-                  :class="
-                    [
-                      row.outcome === 'failed'
-                        ? 'border-destructive/40 bg-destructive/5'
-                        : row.outcome === 'cancelled'
-                          ? 'border-muted-foreground/30 bg-muted/40'
-                          : '',
-                      selectedConnectionResultId === row.id ? 'border-primary bg-primary/5 ring-1 ring-primary/30' : '',
-                    ]
-                  "
+                  :class="[row.outcome === 'failed' ? 'border-destructive/40 bg-destructive/5' : row.outcome === 'cancelled' ? 'border-muted-foreground/30 bg-muted/40' : '', selectedConnectionResultId === row.id ? 'border-primary bg-primary/5 ring-1 ring-primary/30' : '']"
                   role="button"
                   tabindex="0"
                   @click="toggleConnectionResult(row.id)"
@@ -3628,23 +3186,11 @@ onUnmounted(() => {
                   <div class="flex items-center gap-2">
                     <DatabaseIcon :db-type="row.dbType" class="h-3.5 w-3.5 shrink-0" />
                     <span class="min-w-0 flex-1 truncate font-medium">{{ row.name }}</span>
-                    <span
-                      v-if="row.outcome === 'failed' || row.outcome === 'cancelled'"
-                      class="shrink-0 rounded-full border px-1.5 py-0.5 text-[11px]"
-                      :class="
-                        row.outcome === 'failed'
-                          ? 'border-destructive/40 bg-destructive/10 text-destructive'
-                          : 'border-muted-foreground/30 text-muted-foreground'
-                      "
-                    >
+                    <span v-if="row.outcome === 'failed' || row.outcome === 'cancelled'" class="shrink-0 rounded-full border px-1.5 py-0.5 text-[11px]" :class="row.outcome === 'failed' ? 'border-destructive/40 bg-destructive/10 text-destructive' : 'border-muted-foreground/30 text-muted-foreground'">
                       {{ row.outcome === "failed" ? ui.status.failed : ui.status.cancelled }}
                     </span>
                   </div>
-                  <div
-                    class="mt-2 line-clamp-3"
-                    :class="row.outcome === 'failed' ? 'text-destructive' : 'text-muted-foreground'"
-                    :title="row.status"
-                  >
+                  <div class="mt-2 line-clamp-3" :class="row.outcome === 'failed' ? 'text-destructive' : 'text-muted-foreground'" :title="row.status">
                     {{ row.status }}
                   </div>
                   <div v-if="selectedConnectionResultId === row.id" class="mt-3 rounded-md border bg-background/80 p-3">
@@ -3667,15 +3213,9 @@ onUnmounted(() => {
                       <div>
                         <div class="text-muted-foreground">{{ ui.risk }}</div>
                         <div class="mt-1 flex flex-wrap gap-1">
-                          <span class="rounded-full border px-1.5 py-0.5" :class="riskClass('high')"
-                            >{{ ui.riskHighShort }} {{ row.high }}</span
-                          >
-                          <span class="rounded-full border px-1.5 py-0.5" :class="riskClass('medium')"
-                            >{{ ui.riskMediumShort }} {{ row.medium }}</span
-                          >
-                          <span class="rounded-full border px-1.5 py-0.5" :class="riskClass('low')"
-                            >{{ ui.riskLowShort }} {{ row.low }}</span
-                          >
+                          <span class="rounded-full border px-1.5 py-0.5" :class="riskClass('high')">{{ ui.riskHighShort }} {{ row.high }}</span>
+                          <span class="rounded-full border px-1.5 py-0.5" :class="riskClass('medium')">{{ ui.riskMediumShort }} {{ row.medium }}</span>
+                          <span class="rounded-full border px-1.5 py-0.5" :class="riskClass('low')">{{ ui.riskLowShort }} {{ row.low }}</span>
                         </div>
                       </div>
                     </div>
@@ -3716,17 +3256,8 @@ onUnmounted(() => {
               </div>
             </div>
             <div v-if="selectedTask.outputEnabled" class="mt-4 flex flex-wrap gap-2">
-              <Button
-                variant="outline"
-                size="sm"
-                class="gap-1"
-                :disabled="!selectedTask.job || !selectedTask.outputEnabled"
-                @click="exportReport(selectedTask)"
-                ><FileSpreadsheet class="h-3.5 w-3.5" />{{ ui.xlsx }}</Button
-              >
-              <Button variant="outline" size="sm" class="gap-1" @click="openOutputDirectory(selectedTask)"
-                ><FolderOpen class="h-3.5 w-3.5" />{{ ui.openFolder }}</Button
-              >
+              <Button variant="outline" size="sm" class="gap-1" :disabled="!selectedTask.job || !selectedTask.outputEnabled" @click="exportReport(selectedTask)"><FileSpreadsheet class="h-3.5 w-3.5" />{{ ui.xlsx }}</Button>
+              <Button variant="outline" size="sm" class="gap-1" @click="openOutputDirectory(selectedTask)"><FolderOpen class="h-3.5 w-3.5" />{{ ui.openFolder }}</Button>
             </div>
             <div v-if="selectedTask.outputs.length" class="mt-3 text-xs">
               <div class="text-muted-foreground">{{ ui.outputFiles }}</div>
@@ -3743,26 +3274,8 @@ onUnmounted(() => {
 
       <div class="rounded-md border bg-background">
         <div class="flex flex-wrap gap-1 border-b px-3 pt-3">
-          <button
-            v-for="tab in detailTabs"
-            :key="tab"
-            class="rounded-t-md px-4 py-2 text-sm"
-            :class="
-              activeTab === tab ? 'border border-b-background bg-background text-primary' : 'text-muted-foreground'
-            "
-            @click="activeTab = tab"
-          >
-            {{
-              tab === "hits"
-                ? ui.hits
-                : tab === "fields"
-                  ? ui.fields
-                  : tab === "sql"
-                    ? ui.sqlResult
-                    : tab === "samples"
-                      ? ui.samples
-                      : ui.logs
-            }}
+          <button v-for="tab in detailTabs" :key="tab" class="rounded-t-md px-4 py-2 text-sm" :class="activeTab === tab ? 'border border-b-background bg-background text-primary' : 'text-muted-foreground'" @click="activeTab = tab">
+            {{ tab === "hits" ? ui.hits : tab === "fields" ? ui.fields : tab === "sql" ? ui.sqlResult : tab === "samples" ? ui.samples : ui.logs }}
           </button>
         </div>
 
@@ -3771,51 +3284,21 @@ onUnmounted(() => {
             <Input v-model="fieldQuery" class="h-9" :placeholder="ui.fieldSearch" />
             <DropdownMenu>
               <DropdownMenuTrigger as-child>
-                <Button
-                  variant="outline"
-                  class="h-9 justify-start gap-2 px-3"
-                  :disabled="databaseFilterOptions.length === 0"
-                >
+                <Button variant="outline" class="h-9 justify-start gap-2 px-3" :disabled="databaseFilterOptions.length === 0">
                   <Database class="h-4 w-4 shrink-0" />
                   <span class="truncate">{{ databaseFilterButtonText() }}</span>
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent class="max-h-80 w-[min(420px,calc(100vw-3rem))] overflow-y-auto p-1">
-                <DropdownMenuCheckboxItem
-                  :checked="databaseFilterKeys.length === 0"
-                  :class="databaseFilterItemClass(databaseFilterKeys.length === 0)"
-                  @select.prevent
-                  @click="clearDatabaseFilter"
-                >
-                  <span
-                    class="mr-2 flex h-4 w-4 shrink-0 items-center justify-center rounded border"
-                    :class="
-                      databaseFilterKeys.length === 0
-                        ? 'border-primary bg-primary text-primary-foreground'
-                        : 'border-muted-foreground/40 text-transparent'
-                    "
-                  >
+                <DropdownMenuCheckboxItem :checked="databaseFilterKeys.length === 0" :class="databaseFilterItemClass(databaseFilterKeys.length === 0)" @select.prevent @click="clearDatabaseFilter">
+                  <span class="mr-2 flex h-4 w-4 shrink-0 items-center justify-center rounded border" :class="databaseFilterKeys.length === 0 ? 'border-primary bg-primary text-primary-foreground' : 'border-muted-foreground/40 text-transparent'">
                     <Check class="h-3 w-3" />
                   </span>
                   {{ ui.databaseFilterAll }}
                 </DropdownMenuCheckboxItem>
-                <DropdownMenuCheckboxItem
-                  v-for="option in databaseFilterOptions"
-                  :key="option.key"
-                  :checked="isDatabaseFilterSelected(option.key)"
-                  :class="databaseFilterItemClass(isDatabaseFilterSelected(option.key))"
-                  @select.prevent
-                  @click="toggleDatabaseFilter(option.key)"
-                >
+                <DropdownMenuCheckboxItem v-for="option in databaseFilterOptions" :key="option.key" :checked="isDatabaseFilterSelected(option.key)" :class="databaseFilterItemClass(isDatabaseFilterSelected(option.key))" @select.prevent @click="toggleDatabaseFilter(option.key)">
                   <span class="flex min-w-0 flex-1 items-start gap-2">
-                    <span
-                      class="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded border"
-                      :class="
-                        isDatabaseFilterSelected(option.key)
-                          ? 'border-primary bg-primary text-primary-foreground'
-                          : 'border-muted-foreground/40 text-transparent'
-                      "
-                    >
+                    <span class="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded border" :class="isDatabaseFilterSelected(option.key) ? 'border-primary bg-primary text-primary-foreground' : 'border-muted-foreground/40 text-transparent'">
                       <Check class="h-3 w-3" />
                     </span>
                     <DatabaseIcon :db-type="option.dbType || ''" class="mt-0.5 h-4 w-4 shrink-0" />
@@ -3868,9 +3351,7 @@ onUnmounted(() => {
                   <td class="whitespace-nowrap px-3 py-2 font-mono">{{ hit.table }}</td>
                   <td class="whitespace-nowrap px-3 py-2">{{ hit.rowCount }}</td>
                   <td class="whitespace-nowrap px-3 py-2">
-                    <span class="rounded-full border px-2 py-0.5" :class="riskClass(hit.risk)">{{
-                      ui.levelLabel[hit.risk]
-                    }}</span>
+                    <span class="rounded-full border px-2 py-0.5" :class="riskClass(hit.risk)">{{ ui.levelLabel[hit.risk] }}</span>
                   </td>
                   <td class="whitespace-nowrap px-3 py-2 font-mono">{{ hit.columns.join(", ") }}</td>
                 </tr>
@@ -3887,51 +3368,21 @@ onUnmounted(() => {
             <div class="flex flex-wrap gap-3">
               <DropdownMenu>
                 <DropdownMenuTrigger as-child>
-                  <Button
-                    variant="outline"
-                    class="h-9 w-56 justify-start gap-2 px-3"
-                    :disabled="databaseFilterOptions.length === 0"
-                  >
+                  <Button variant="outline" class="h-9 w-56 justify-start gap-2 px-3" :disabled="databaseFilterOptions.length === 0">
                     <Database class="h-4 w-4 shrink-0" />
                     <span class="truncate">{{ databaseFilterButtonText() }}</span>
                   </Button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent class="max-h-80 w-[min(420px,calc(100vw-3rem))] overflow-y-auto p-1">
-                  <DropdownMenuCheckboxItem
-                    :checked="databaseFilterKeys.length === 0"
-                    :class="databaseFilterItemClass(databaseFilterKeys.length === 0)"
-                    @select.prevent
-                    @click="clearDatabaseFilter"
-                  >
-                    <span
-                      class="mr-2 flex h-4 w-4 shrink-0 items-center justify-center rounded border"
-                      :class="
-                        databaseFilterKeys.length === 0
-                          ? 'border-primary bg-primary text-primary-foreground'
-                          : 'border-muted-foreground/40 text-transparent'
-                      "
-                    >
+                  <DropdownMenuCheckboxItem :checked="databaseFilterKeys.length === 0" :class="databaseFilterItemClass(databaseFilterKeys.length === 0)" @select.prevent @click="clearDatabaseFilter">
+                    <span class="mr-2 flex h-4 w-4 shrink-0 items-center justify-center rounded border" :class="databaseFilterKeys.length === 0 ? 'border-primary bg-primary text-primary-foreground' : 'border-muted-foreground/40 text-transparent'">
                       <Check class="h-3 w-3" />
                     </span>
                     {{ ui.databaseFilterAll }}
                   </DropdownMenuCheckboxItem>
-                  <DropdownMenuCheckboxItem
-                    v-for="option in databaseFilterOptions"
-                    :key="option.key"
-                    :checked="isDatabaseFilterSelected(option.key)"
-                    :class="databaseFilterItemClass(isDatabaseFilterSelected(option.key))"
-                    @select.prevent
-                    @click="toggleDatabaseFilter(option.key)"
-                  >
+                  <DropdownMenuCheckboxItem v-for="option in databaseFilterOptions" :key="option.key" :checked="isDatabaseFilterSelected(option.key)" :class="databaseFilterItemClass(isDatabaseFilterSelected(option.key))" @select.prevent @click="toggleDatabaseFilter(option.key)">
                     <span class="flex min-w-0 flex-1 items-start gap-2">
-                      <span
-                        class="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded border"
-                        :class="
-                          isDatabaseFilterSelected(option.key)
-                            ? 'border-primary bg-primary text-primary-foreground'
-                            : 'border-muted-foreground/40 text-transparent'
-                        "
-                      >
+                      <span class="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded border" :class="isDatabaseFilterSelected(option.key) ? 'border-primary bg-primary text-primary-foreground' : 'border-muted-foreground/40 text-transparent'">
                         <Check class="h-3 w-3" />
                       </span>
                       <DatabaseIcon :db-type="option.dbType || ''" class="mt-0.5 h-4 w-4 shrink-0" />
@@ -3960,9 +3411,7 @@ onUnmounted(() => {
                 </SelectContent>
               </Select>
             </div>
-            <span class="text-xs text-muted-foreground">{{
-              ui.fieldCount.replace("{count}", String(filteredFields.length))
-            }}</span>
+            <span class="text-xs text-muted-foreground">{{ ui.fieldCount.replace("{count}", String(filteredFields.length)) }}</span>
           </div>
           <div class="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
             <div
@@ -3983,17 +3432,10 @@ onUnmounted(() => {
               <div class="mt-2 text-xs">{{ field.database }} / {{ field.table }}</div>
               <div class="mt-2 text-xs">{{ findingDisplayName(field) }} · {{ findingSeverityLabel(field) }}</div>
               <div class="mt-2 text-xs font-semibold">{{ ui.rowHits.replace("{count}", String(field.count)) }}</div>
-              <div
-                v-if="field.samples.length"
-                class="mt-3 max-h-20 overflow-auto rounded bg-background/70 p-2 font-mono text-xs"
-              >
+              <div v-if="field.samples.length" class="mt-3 max-h-20 overflow-auto rounded bg-background/70 p-2 font-mono text-xs">
                 <div v-for="sample in field.samples" :key="sample">{{ sample }}</div>
               </div>
-              <div
-                v-if="selectedFieldKey === field.key"
-                class="mt-4 rounded-md border bg-background p-4 text-foreground shadow-sm"
-                @click.stop
-              >
+              <div v-if="selectedFieldKey === field.key" class="mt-4 rounded-md border bg-background p-4 text-foreground shadow-sm" @click.stop>
                 <div class="flex items-start justify-between gap-3">
                   <div>
                     <div class="text-xs text-muted-foreground">{{ ui.fieldDetail }}</div>
@@ -4007,21 +3449,16 @@ onUnmounted(() => {
                     <span>{{ databaseScopeText(field) || "-" }}</span>
                   </div>
                   <div>
-                    <span class="text-muted-foreground">{{ ui.database }}：</span
-                    ><span class="font-mono">{{ field.database }}</span>
+                    <span class="text-muted-foreground">{{ ui.database }}：</span><span class="font-mono">{{ field.database }}</span>
                   </div>
                   <div>
-                    <span class="text-muted-foreground">{{ ui.table }}：</span
-                    ><span class="font-mono">{{ field.table }}</span>
+                    <span class="text-muted-foreground">{{ ui.table }}：</span><span class="font-mono">{{ field.table }}</span>
                   </div>
                   <div>
                     <span class="text-muted-foreground">{{ ui.kind }}：</span>{{ findingDisplayName(field) }}
                   </div>
                   <div>
-                    <span class="text-muted-foreground">{{ ui.risk }}：</span
-                    ><span class="rounded-full border px-2 py-0.5" :class="riskClass(field.level)">{{
-                      findingSeverityLabel(field)
-                    }}</span>
+                    <span class="text-muted-foreground">{{ ui.risk }}：</span><span class="rounded-full border px-2 py-0.5" :class="riskClass(field.level)">{{ findingSeverityLabel(field) }}</span>
                   </div>
                   <div>
                     <span class="text-muted-foreground">{{ ui.rows }}：</span><b>{{ field.count }}</b>
@@ -4029,10 +3466,7 @@ onUnmounted(() => {
                 </div>
                 <div class="mt-3">
                   <div class="text-xs text-muted-foreground">{{ ui.sampleValues }}</div>
-                  <div
-                    v-if="field.samples.length"
-                    class="mt-2 max-h-32 overflow-auto rounded-md border bg-muted/20 p-3 font-mono text-xs"
-                  >
+                  <div v-if="field.samples.length" class="mt-2 max-h-32 overflow-auto rounded-md border bg-muted/20 p-3 font-mono text-xs">
                     <div v-for="sample in field.samples" :key="sample">{{ sample }}</div>
                   </div>
                   <div v-else class="mt-2 rounded-md border bg-muted/20 p-3 text-xs text-muted-foreground">
@@ -4045,11 +3479,7 @@ onUnmounted(() => {
         </div>
 
         <div v-else-if="activeTab === 'sql'" class="p-4">
-          <textarea
-            class="h-44 w-full resize-none rounded-md border bg-muted/30 p-3 font-mono text-xs"
-            readonly
-            :value="selectedTask.sql || ui.sqlPlaceholder"
-          />
+          <textarea class="h-44 w-full resize-none rounded-md border bg-muted/30 p-3 font-mono text-xs" readonly :value="selectedTask.sql || ui.sqlPlaceholder" />
         </div>
 
         <div v-else-if="activeTab === 'samples'" class="space-y-4 p-4">
@@ -4058,51 +3488,21 @@ onUnmounted(() => {
             <Input v-model="matchQuery" class="h-9" :placeholder="ui.matchSearch" />
             <DropdownMenu>
               <DropdownMenuTrigger as-child>
-                <Button
-                  variant="outline"
-                  class="h-9 justify-start gap-2 px-3"
-                  :disabled="databaseFilterOptions.length === 0"
-                >
+                <Button variant="outline" class="h-9 justify-start gap-2 px-3" :disabled="databaseFilterOptions.length === 0">
                   <Database class="h-4 w-4 shrink-0" />
                   <span class="truncate">{{ databaseFilterButtonText() }}</span>
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent class="max-h-80 w-[min(420px,calc(100vw-3rem))] overflow-y-auto p-1">
-                <DropdownMenuCheckboxItem
-                  :checked="databaseFilterKeys.length === 0"
-                  :class="databaseFilterItemClass(databaseFilterKeys.length === 0)"
-                  @select.prevent
-                  @click="clearDatabaseFilter"
-                >
-                  <span
-                    class="mr-2 flex h-4 w-4 shrink-0 items-center justify-center rounded border"
-                    :class="
-                      databaseFilterKeys.length === 0
-                        ? 'border-primary bg-primary text-primary-foreground'
-                        : 'border-muted-foreground/40 text-transparent'
-                    "
-                  >
+                <DropdownMenuCheckboxItem :checked="databaseFilterKeys.length === 0" :class="databaseFilterItemClass(databaseFilterKeys.length === 0)" @select.prevent @click="clearDatabaseFilter">
+                  <span class="mr-2 flex h-4 w-4 shrink-0 items-center justify-center rounded border" :class="databaseFilterKeys.length === 0 ? 'border-primary bg-primary text-primary-foreground' : 'border-muted-foreground/40 text-transparent'">
                     <Check class="h-3 w-3" />
                   </span>
                   {{ ui.databaseFilterAll }}
                 </DropdownMenuCheckboxItem>
-                <DropdownMenuCheckboxItem
-                  v-for="option in databaseFilterOptions"
-                  :key="option.key"
-                  :checked="isDatabaseFilterSelected(option.key)"
-                  :class="databaseFilterItemClass(isDatabaseFilterSelected(option.key))"
-                  @select.prevent
-                  @click="toggleDatabaseFilter(option.key)"
-                >
+                <DropdownMenuCheckboxItem v-for="option in databaseFilterOptions" :key="option.key" :checked="isDatabaseFilterSelected(option.key)" :class="databaseFilterItemClass(isDatabaseFilterSelected(option.key))" @select.prevent @click="toggleDatabaseFilter(option.key)">
                   <span class="flex min-w-0 flex-1 items-start gap-2">
-                    <span
-                      class="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded border"
-                      :class="
-                        isDatabaseFilterSelected(option.key)
-                          ? 'border-primary bg-primary text-primary-foreground'
-                          : 'border-muted-foreground/40 text-transparent'
-                      "
-                    >
+                    <span class="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded border" :class="isDatabaseFilterSelected(option.key) ? 'border-primary bg-primary text-primary-foreground' : 'border-muted-foreground/40 text-transparent'">
                       <Check class="h-3 w-3" />
                     </span>
                     <DatabaseIcon :db-type="option.dbType || ''" class="mt-0.5 h-4 w-4 shrink-0" />
@@ -4131,15 +3531,13 @@ onUnmounted(() => {
                 <b>{{ databaseScopeText(group) || "-" }}</b>
               </span>
               <span
-                ><span class="text-muted-foreground">{{ ui.databaseName }}</span>
-                <b>{{ databaseNameText(group.database, group.dbType) }}</b></span
+                ><span class="text-muted-foreground">{{ ui.databaseName }}</span> <b>{{ databaseNameText(group.database, group.dbType) }}</b></span
               >
               <span
                 ><span class="text-muted-foreground">{{ ui.tableName }}</span> <b>{{ group.table }}</b></span
               >
               <span
-                ><span class="text-muted-foreground">{{ ui.fieldEvidence }}</span>
-                <b>{{ group.fields.length }}</b></span
+                ><span class="text-muted-foreground">{{ ui.fieldEvidence }}</span> <b>{{ group.fields.length }}</b></span
               >
               <span
                 ><span class="text-muted-foreground">{{ ui.rows }}</span> <b>{{ sampleGroupRowCount(group) }}</b></span
@@ -4147,25 +3545,12 @@ onUnmounted(() => {
               <span v-if="group.rows.length"
                 ><span class="text-muted-foreground">{{ ui.sampleRows }}</span> <b>{{ group.rows.length }}</b></span
               >
-              <Button
-                v-if="group.rows.length > 1"
-                variant="outline"
-                size="sm"
-                class="ml-auto h-7 gap-1.5 px-2 text-xs"
-                @click="toggleSampleGroup(group)"
-              >
+              <Button v-if="group.rows.length > 1" variant="outline" size="sm" class="ml-auto h-7 gap-1.5 px-2 text-xs" @click="toggleSampleGroup(group)">
                 <ChevronDown v-if="isSampleGroupExpanded(group)" class="h-3.5 w-3.5" />
                 <ChevronRight v-else class="h-3.5 w-3.5" />
                 {{ sampleGroupToggleText(group) }}
               </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                class="h-7 gap-1.5 px-2 text-xs"
-                :class="group.rows.length > 1 ? '' : 'ml-auto'"
-                :disabled="!canOpenSampleGroup(group)"
-                @click="openSampleGroup(group)"
-              >
+              <Button variant="outline" size="sm" class="h-7 gap-1.5 px-2 text-xs" :class="group.rows.length > 1 ? '' : 'ml-auto'" :disabled="!canOpenSampleGroup(group)" @click="openSampleGroup(group)">
                 <Table2 class="h-3.5 w-3.5" />
                 {{ ui.openData }}
               </Button>
@@ -4174,33 +3559,17 @@ onUnmounted(() => {
               <table class="min-w-max table-fixed text-xs">
                 <thead>
                   <tr>
-                    <th
-                      v-for="field in group.fields"
-                      :key="field.key"
-                      class="w-48 min-w-[12rem] px-3 py-2 text-left align-top font-mono"
-                      :class="riskTextClass(field.level)"
-                    >
+                    <th v-for="field in group.fields" :key="field.key" class="w-48 min-w-[12rem] px-3 py-2 text-left align-top font-mono" :class="riskTextClass(field.level)">
                       <div class="whitespace-nowrap">{{ field.column }}</div>
-                      <div class="whitespace-nowrap font-sans text-[11px]">
-                        {{ findingSeverityLabel(field) }} · {{ findingDisplayName(field) }}
-                      </div>
+                      <div class="whitespace-nowrap font-sans text-[11px]">{{ findingSeverityLabel(field) }} · {{ findingDisplayName(field) }}</div>
                     </th>
                   </tr>
                 </thead>
                 <tbody>
                   <tr v-for="(row, index) in visibleSampleRows(group)" :key="index" class="border-t">
-                    <td
-                      v-for="field in group.fields"
-                      :key="field.key"
-                      class="w-48 min-w-[12rem] px-3 py-2 align-top font-mono"
-                      :class="riskTextClass(field.level)"
-                    >
+                    <td v-for="field in group.fields" :key="field.key" class="w-48 min-w-[12rem] px-3 py-2 align-top font-mono" :class="riskTextClass(field.level)">
                       <div v-if="sampleCellPairs(row[field.column]).length" class="min-w-72 space-y-1 font-sans">
-                        <div
-                          v-for="pair in sampleCellPairs(row[field.column])"
-                          :key="`${pair.key}-${pair.value}`"
-                          class="grid grid-cols-[7rem_minmax(0,1fr)] gap-2 rounded bg-background/60 px-2 py-1"
-                        >
+                        <div v-for="pair in sampleCellPairs(row[field.column])" :key="`${pair.key}-${pair.value}`" class="grid grid-cols-[7rem_minmax(0,1fr)] gap-2 rounded bg-background/60 px-2 py-1">
                           <span class="truncate text-muted-foreground">{{ pair.key }}</span>
                           <span class="min-w-0 overflow-x-auto whitespace-nowrap font-mono">{{ pair.value }}</span>
                         </div>
@@ -4213,22 +3582,12 @@ onUnmounted(() => {
             </div>
             <div v-else class="border-t p-4">
               <div class="flex flex-wrap gap-2">
-                <span
-                  v-for="field in group.fields"
-                  :key="field.key"
-                  class="rounded-full border px-2 py-1 font-mono text-xs"
-                  :class="riskClass(field.level)"
-                >
-                  {{ field.column }} · {{ findingSeverityLabel(field) }} · {{ findingDisplayName(field) }}
-                </span>
+                <span v-for="field in group.fields" :key="field.key" class="rounded-full border px-2 py-1 font-mono text-xs" :class="riskClass(field.level)"> {{ field.column }} · {{ findingSeverityLabel(field) }} · {{ findingDisplayName(field) }} </span>
               </div>
               <div class="mt-3 text-xs text-muted-foreground">{{ ui.noSampleRowsHint }}</div>
             </div>
           </div>
-          <div
-            v-if="filteredSampleGroups.length === 0"
-            class="rounded-md border bg-muted/20 p-8 text-center text-sm text-muted-foreground"
-          >
+          <div v-if="filteredSampleGroups.length === 0" class="rounded-md border bg-muted/20 p-8 text-center text-sm text-muted-foreground">
             <div>{{ ui.noSamples }}</div>
             <div class="mt-2 text-xs">
               {{ ui.noSampleRowsHint }}
@@ -4237,16 +3596,9 @@ onUnmounted(() => {
         </div>
 
         <div v-else class="max-h-96 overflow-auto p-4 font-mono text-xs">
-          <div v-for="(entry, index) in selectedTask.job?.logs || []" :key="index">
-            {{ entry.time }} [{{ entry.level }}] {{ entry.message }}
-          </div>
-          <div v-for="(entry, index) in selectedTask.errors" :key="`error-${index}`" class="text-destructive">
-            error {{ entry }}
-          </div>
-          <div
-            v-if="!selectedTask.job?.logs?.length && !selectedTask.errors.length"
-            class="font-sans text-sm text-muted-foreground"
-          >
+          <div v-for="(entry, index) in selectedTask.job?.logs || []" :key="index">{{ entry.time }} [{{ entry.level }}] {{ entry.message }}</div>
+          <div v-for="(entry, index) in selectedTask.errors" :key="`error-${index}`" class="text-destructive">error {{ entry }}</div>
+          <div v-if="!selectedTask.job?.logs?.length && !selectedTask.errors.length" class="font-sans text-sm text-muted-foreground">
             {{ ui.logs }}
           </div>
         </div>
