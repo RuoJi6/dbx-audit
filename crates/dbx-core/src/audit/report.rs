@@ -67,6 +67,9 @@ pub fn audit_findings_to_xlsx(findings: &[AuditFinding]) -> Result<Vec<u8>, Stri
             table_workers: None,
             field_workers: None,
             timeout_secs: 15,
+            content_page_size: 1000,
+            content_max_rows: None,
+            rule_template_paths: Vec::new(),
         },
         logs: Vec::new(),
         findings: findings.to_vec(),
@@ -511,6 +514,11 @@ fn kind_label(kind: AuditKind) -> &'static str {
         AuditKind::IpAddress => "IP 地址",
         AuditKind::BusinessIdentifier => "业务标识",
         AuditKind::RiskEvidence => "风险/证据",
+        AuditKind::Secret => "敏感密钥",
+        AuditKind::PrivateKey => "私钥",
+        AuditKind::CloudCredential => "云凭证",
+        AuditKind::Webhook => "Webhook",
+        AuditKind::ConnectionString => "连接串",
     }
 }
 
@@ -571,6 +579,12 @@ mod tests {
             basis: "field-name".to_string(),
             count: 2,
             samples: vec![AuditSample { column: "email".to_string(), value: "a@example.com".to_string() }],
+            rule_id: Some("dbx-field-email".to_string()),
+            rule_name: Some("Email field".to_string()),
+            rule_severity: Some("medium".to_string()),
+            rule_tags: vec!["pii".to_string()],
+            target_key: Some("conn-1/audit_demo/public/users/email".to_string()),
+            confidence: Some("suspected".to_string()),
         }
     }
 
@@ -593,6 +607,12 @@ mod tests {
             basis: "key+value".to_string(),
             count: 1,
             samples: vec![AuditSample { column: "value".to_string(), value: "sk_live_redis".to_string() }],
+            rule_id: Some("dbx-generic-token".to_string()),
+            rule_name: Some("Generic token".to_string()),
+            rule_severity: Some("high".to_string()),
+            rule_tags: vec!["secret".to_string()],
+            target_key: Some("redis-1/redis-db0/session:token/value".to_string()),
+            confidence: Some("confirmed".to_string()),
         }
     }
 
@@ -643,6 +663,9 @@ mod tests {
                 table_workers: None,
                 field_workers: None,
                 timeout_secs: 15,
+                content_page_size: 1000,
+                content_max_rows: None,
+                rule_template_paths: Vec::new(),
             },
             logs: vec![AuditLogEntry {
                 time: "12:00:00".to_string(),

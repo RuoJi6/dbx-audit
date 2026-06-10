@@ -63,14 +63,25 @@ pub enum AuditKind {
     IpAddress,
     BusinessIdentifier,
     RiskEvidence,
+    Secret,
+    PrivateKey,
+    CloudCredential,
+    Webhook,
+    ConnectionString,
 }
 
 impl AuditKind {
     pub fn level(self) -> AuditLevel {
         match self {
-            AuditKind::IdCard | AuditKind::BankCard | AuditKind::PasswordSecret | AuditKind::TokenSecret => {
-                AuditLevel::High
-            }
+            AuditKind::IdCard
+            | AuditKind::BankCard
+            | AuditKind::PasswordSecret
+            | AuditKind::TokenSecret
+            | AuditKind::Secret
+            | AuditKind::PrivateKey
+            | AuditKind::CloudCredential
+            | AuditKind::Webhook
+            | AuditKind::ConnectionString => AuditLevel::High,
             AuditKind::Phone | AuditKind::Email | AuditKind::IpAddress | AuditKind::RiskEvidence => AuditLevel::Medium,
             AuditKind::Address | AuditKind::Username | AuditKind::Account | AuditKind::BusinessIdentifier => {
                 AuditLevel::Low
@@ -109,6 +120,12 @@ pub struct AuditScanRequest {
     pub field_workers: Option<usize>,
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
+    #[serde(default = "default_content_page_size")]
+    pub content_page_size: usize,
+    #[serde(default)]
+    pub content_max_rows: Option<usize>,
+    #[serde(default)]
+    pub rule_template_paths: Vec<String>,
 }
 
 impl AuditScanRequest {
@@ -118,6 +135,10 @@ impl AuditScanRequest {
 
     pub fn field_worker_count(&self) -> usize {
         self.field_workers.unwrap_or(1).clamp(1, 32)
+    }
+
+    pub fn content_page_size(&self) -> usize {
+        self.content_page_size.clamp(1, 10_000)
     }
 }
 
@@ -197,6 +218,10 @@ fn default_timeout_secs() -> u64 {
     15
 }
 
+fn default_content_page_size() -> usize {
+    1000
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AuditSample {
@@ -272,6 +297,18 @@ pub struct AuditFinding {
     pub count: u64,
     #[serde(default)]
     pub samples: Vec<AuditSample>,
+    #[serde(default)]
+    pub rule_id: Option<String>,
+    #[serde(default)]
+    pub rule_name: Option<String>,
+    #[serde(default)]
+    pub rule_severity: Option<String>,
+    #[serde(default)]
+    pub rule_tags: Vec<String>,
+    #[serde(default)]
+    pub target_key: Option<String>,
+    #[serde(default)]
+    pub confidence: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

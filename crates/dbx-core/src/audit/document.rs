@@ -2,7 +2,9 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-use super::detector::{detect_field, detect_value, mask_sensitive_value};
+use super::detector::mask_sensitive_value;
+use super::rules::AuditRuleEngine;
+use super::scanner::audit_target_key;
 use super::types::{
     AuditFinding, AuditKind, AuditLevel, AuditLevelFilter, AuditMode, AuditSample, AuditTableEvidence, AuditTableField,
 };
@@ -32,6 +34,31 @@ pub fn audit_document_findings(
     limit: usize,
     mask: bool,
 ) -> (Vec<AuditFinding>, Option<AuditTableEvidence>) {
+    audit_document_findings_with_engine(
+        AuditRuleEngine::builtin(),
+        database,
+        schema,
+        collection,
+        documents,
+        mode,
+        level,
+        limit,
+        mask,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn audit_document_findings_with_engine(
+    engine: &AuditRuleEngine,
+    database: &str,
+    schema: Option<&str>,
+    collection: &str,
+    documents: &[Value],
+    mode: AuditMode,
+    level: AuditLevelFilter,
+    limit: usize,
+    mask: bool,
+) -> (Vec<AuditFinding>, Option<AuditTableEvidence>) {
     let mut rows = documents.iter().map(flatten_document_row).collect::<Vec<_>>();
     let mut columns = rows.iter().flat_map(|row| row.keys().cloned()).collect::<Vec<_>>();
     columns.sort();
@@ -46,10 +73,10 @@ pub fn audit_document_findings(
                 continue;
             }
             if mode.includes_field_name() {
-                for kind in detect_field(collection, &field.path, level) {
+                for matched in engine.scan_field(&format!("column={}", field.path), level) {
                     let key = FindingKey {
                         path: field.path.clone(),
-                        kind,
+                        kind: matched.kind,
                         mode: AuditMode::FieldName,
                         basis: "field-name".to_string(),
                     };
@@ -61,16 +88,20 @@ pub fn audit_document_findings(
                         schema,
                         collection,
                         &field.value,
+                        Some(matched.rule_id),
+                        Some(matched.rule_name),
+                        Some(matched.rule_severity),
+                        matched.rule_tags,
                         limit,
                         mask,
                     );
                 }
             }
             if mode.includes_content() {
-                for kind in detect_value(&field.value, level) {
+                for matched in engine.scan_content(&field.value, level) {
                     let key = FindingKey {
                         path: field.path.clone(),
-                        kind,
+                        kind: matched.kind,
                         mode: AuditMode::Content,
                         basis: "content".to_string(),
                     };
@@ -82,6 +113,10 @@ pub fn audit_document_findings(
                         schema,
                         collection,
                         &field.value,
+                        Some(matched.rule_id),
+                        Some(matched.rule_name),
+                        Some(matched.rule_severity),
+                        matched.rule_tags,
                         limit,
                         mask,
                     );
@@ -128,6 +163,10 @@ fn upsert_document_finding(
     schema: Option<&str>,
     collection: &str,
     value: &str,
+    rule_id: Option<String>,
+    rule_name: Option<String>,
+    rule_severity: Option<String>,
+    rule_tags: Vec<String>,
     limit: usize,
     mask: bool,
 ) {
@@ -149,6 +188,12 @@ fn upsert_document_finding(
         basis: key.basis.clone(),
         count: 0,
         samples: Vec::new(),
+        rule_id,
+        rule_name,
+        rule_severity,
+        rule_tags,
+        target_key: Some(audit_target_key(database, schema, collection, &key.path)),
+        confidence: Some(if key.mode == AuditMode::Content { "confirmed" } else { "suspected" }.to_string()),
     });
     if let std::collections::btree_map::Entry::Vacant(entry) = counted.entry(key) {
         finding.count += 1;

@@ -169,6 +169,9 @@ export interface AuditScanRequest {
   tableWorkers?: number;
   fieldWorkers?: number;
   timeoutSecs: number;
+  contentPageSize?: number;
+  contentMaxRows?: number | null;
+  ruleTemplatePaths?: string[];
 }
 
 export interface AuditTarget {
@@ -215,6 +218,12 @@ export interface AuditFinding {
   basis: string;
   count: number;
   samples: { column: string; value: string }[];
+  ruleId?: string;
+  ruleName?: string;
+  ruleSeverity?: string;
+  ruleTags?: string[];
+  targetKey?: string;
+  confidence?: string;
 }
 
 export interface AuditTableResult {

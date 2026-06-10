@@ -11,11 +11,13 @@ use uuid::Uuid;
 
 use crate::error::AppError;
 use crate::state::WebState;
+use dbx_core::audit::rules::AuditRuleEngine;
 use dbx_core::audit::{
-    audit_column_findings, audit_document_findings, audit_job_to_json, audit_job_to_xlsx, build_non_empty_count_sql,
-    build_sample_rows_sql, build_table_count_sql, detect_field, detect_value, mask_sensitive_value, parse_fscan_text,
-    AuditExportFormat, AuditExportResult, AuditFinding, AuditJobState, AuditJobStatus, AuditLogEntry, AuditSample,
-    AuditScanRequest, AuditTableEvidence, AuditTableField, ParsedFscanTargets,
+    audit_column_findings_with_engine, audit_content_findings_with_engine, audit_document_findings_with_engine,
+    audit_job_to_json, audit_job_to_xlsx, build_non_empty_count_sql, build_paged_rows_sql, build_sample_rows_sql,
+    build_table_count_sql, is_textual_audit_type, mask_sensitive_value, parse_fscan_text, AuditExportFormat,
+    AuditExportResult, AuditFinding, AuditJobState, AuditJobStatus, AuditLogEntry, AuditSample, AuditScanRequest,
+    AuditTableEvidence, AuditTableField, ParsedFscanTargets,
 };
 use dbx_core::models::connection::{ConnectionConfig, DatabaseType};
 use dbx_core::query::QueryExecutionOptions;
@@ -281,10 +283,11 @@ struct AuditDocumentScanResult {
 
 async fn run_field_name_scan(state: Arc<WebState>, request: AuditScanRequest, job_id: &str) -> Result<(), String> {
     prepare_audit_connection(&state, &request).await?;
+    let engine = Arc::new(AuditRuleEngine::from_template_paths(&request.rule_template_paths)?);
     match connection_db_type(&state, &request.connection_id).await {
-        Some(DatabaseType::Redis) => return run_redis_scan(state, request, job_id).await,
+        Some(DatabaseType::Redis) => return run_redis_scan(state, request, job_id, engine).await,
         Some(DatabaseType::MongoDb | DatabaseType::Elasticsearch) => {
-            return run_document_scan(state, request, job_id).await;
+            return run_document_scan(state, request, job_id, engine).await;
         }
         _ => {}
     }
@@ -332,8 +335,9 @@ async fn run_field_name_scan(state: Arc<WebState>, request: AuditScanRequest, jo
                 .map(|target| {
                     let state = state.clone();
                     let request = request.clone();
+                    let engine = engine.clone();
                     let job_id = job_id.to_string();
-                    async move { scan_audit_table(state, request, job_id, target).await }
+                    async move { scan_audit_table(state, request, engine, job_id, target).await }
                 })
                 .buffer_unordered(request.table_worker_count());
 
@@ -372,6 +376,7 @@ async fn run_field_name_scan(state: Arc<WebState>, request: AuditScanRequest, jo
 async fn scan_audit_table(
     state: Arc<WebState>,
     request: AuditScanRequest,
+    engine: Arc<AuditRuleEngine>,
     job_id: String,
     target: AuditTableScanTarget,
 ) -> Result<AuditTableScanResult, String> {
@@ -400,9 +405,15 @@ async fn scan_audit_table(
         &target.table,
     )
     .await?;
-    let mut findings =
-        audit_column_findings(&target.database, schema_opt, &target.table, &columns, request.mode, request.level);
-    apply_connection_meta(&state, &request.connection_id, &mut findings).await;
+    let mut findings = audit_column_findings_with_engine(
+        &engine,
+        &target.database,
+        schema_opt,
+        &target.table,
+        &columns,
+        request.mode,
+        request.level,
+    );
 
     let mut logs = count_non_empty_rows_for_findings(
         state.clone(),
@@ -415,6 +426,28 @@ async fn scan_audit_table(
         &mut findings,
     )
     .await;
+
+    if request.mode.includes_content() && !is_cancelled(&state, &job_id).await {
+        match scan_table_content_findings(
+            state.clone(),
+            &request,
+            &engine,
+            &job_id,
+            &target.database,
+            schema_opt,
+            &target.table,
+            &columns,
+        )
+        .await
+        {
+            Ok(content_findings) => merge_findings(&mut findings, content_findings, request.limit.max(1)),
+            Err(err) => {
+                logs.push(log_entry("warn", format!("内容扫描失败：{}.{}，{err}", target.database, target.table)))
+            }
+        }
+    }
+
+    apply_connection_meta(&state, &request.connection_id, &mut findings).await;
 
     if request.mode.includes_content() && !findings.is_empty() && !is_cancelled(&state, &job_id).await {
         if let Err(err) =
@@ -452,6 +485,120 @@ async fn scan_audit_table(
         table_result,
         logs,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn scan_table_content_findings(
+    state: Arc<WebState>,
+    request: &AuditScanRequest,
+    engine: &AuditRuleEngine,
+    job_id: &str,
+    database: &str,
+    schema: Option<&str>,
+    table: &str,
+    columns: &[ColumnInfo],
+) -> Result<Vec<AuditFinding>, String> {
+    let dialect = audit_sql_dialect(&state, &request.connection_id).await.ok_or("当前数据库暂不支持内容扫描")?;
+    let text_columns = columns.iter().filter(|column| is_textual_audit_type(&column.data_type)).collect::<Vec<_>>();
+    if text_columns.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let column_names = text_columns.iter().map(|column| column.name.clone()).collect::<Vec<_>>();
+    let page_size = request.content_page_size();
+    let max_rows = request.content_max_rows;
+    let mut offset = 0usize;
+    let mut scanned = 0usize;
+    let mut findings = Vec::new();
+
+    loop {
+        if is_cancelled(&state, job_id).await || max_rows.is_some_and(|max| scanned >= max) {
+            break;
+        }
+        let remaining = max_rows.map(|max| max.saturating_sub(scanned)).unwrap_or(page_size);
+        let limit = page_size.min(remaining).max(1);
+        let sql = build_paged_rows_sql(dialect, schema, table, &column_names, limit, offset);
+        let result = dbx_core::query::execute_sql_statement_with_options(
+            &state.app,
+            &request.connection_id,
+            database,
+            &sql,
+            schema,
+            None,
+            QueryExecutionOptions {
+                max_rows: Some(limit),
+                timeout_secs: Some(request.timeout_secs),
+                ..Default::default()
+            },
+        )
+        .await?;
+        if result.rows.is_empty() {
+            break;
+        }
+        for row in &result.rows {
+            for (index, column) in text_columns.iter().enumerate() {
+                let Some(value) = row.get(index).and_then(sample_value) else {
+                    continue;
+                };
+                let value = truncate_scan_value(&value);
+                let content_findings = audit_content_findings_with_engine(
+                    engine,
+                    database,
+                    schema,
+                    table,
+                    &column.name,
+                    Some(&column.data_type),
+                    &value,
+                    request.level,
+                    request.mask,
+                );
+                merge_findings(&mut findings, content_findings, request.limit.max(1));
+            }
+        }
+        let row_count = result.rows.len();
+        scanned += row_count;
+        offset += row_count;
+        if row_count < limit {
+            break;
+        }
+    }
+
+    Ok(findings)
+}
+
+fn truncate_scan_value(value: &str) -> String {
+    const MAX_SCAN_VALUE_CHARS: usize = 65_536;
+    if value.chars().count() <= MAX_SCAN_VALUE_CHARS {
+        value.to_string()
+    } else {
+        value.chars().take(MAX_SCAN_VALUE_CHARS).collect()
+    }
+}
+
+fn merge_findings(findings: &mut Vec<AuditFinding>, incoming: Vec<AuditFinding>, sample_limit: usize) {
+    for finding in incoming {
+        if let Some(existing) = findings.iter_mut().find(|existing| same_finding_bucket(existing, &finding)) {
+            existing.count = existing.count.saturating_add(finding.count.max(1));
+            for sample in finding.samples {
+                if existing.samples.len() < sample_limit && !existing.samples.contains(&sample) {
+                    existing.samples.push(sample);
+                }
+            }
+            if finding.confidence.as_deref() == Some("confirmed") {
+                existing.confidence = finding.confidence;
+            }
+        } else {
+            findings.push(finding);
+        }
+    }
+}
+
+fn same_finding_bucket(left: &AuditFinding, right: &AuditFinding) -> bool {
+    left.target_key == right.target_key
+        && left.rule_id == right.rule_id
+        && left.kind == right.kind
+        && left.mode == right.mode
+        && left.column == right.column
 }
 
 async fn prepare_audit_connection(state: &WebState, request: &AuditScanRequest) -> Result<(), String> {
@@ -886,7 +1033,12 @@ async fn audit_target_databases(
     Ok(databases)
 }
 
-async fn run_document_scan(state: Arc<WebState>, request: AuditScanRequest, job_id: &str) -> Result<(), String> {
+async fn run_document_scan(
+    state: Arc<WebState>,
+    request: AuditScanRequest,
+    job_id: &str,
+    engine: Arc<AuditRuleEngine>,
+) -> Result<(), String> {
     update_job(&state, job_id, |job| {
         job.progress = 5;
         job.logs.push(log_entry("info", "正在扫描文档集合/索引"));
@@ -941,9 +1093,10 @@ async fn run_document_scan(state: Arc<WebState>, request: AuditScanRequest, job_
             .map(|target| {
                 let state = state.clone();
                 let request = request.clone();
+                let engine = engine.clone();
                 let schema = schema.clone();
                 let job_id = job_id.to_string();
-                async move { scan_document_target(state, request, job_id, schema, target).await }
+                async move { scan_document_target(state, request, engine, job_id, schema, target).await }
             })
             .buffer_unordered(request.table_worker_count());
 
@@ -975,6 +1128,7 @@ async fn run_document_scan(state: Arc<WebState>, request: AuditScanRequest, job_
 async fn scan_document_target(
     state: Arc<WebState>,
     request: AuditScanRequest,
+    engine: Arc<AuditRuleEngine>,
     job_id: String,
     schema: String,
     target: AuditDocumentScanTarget,
@@ -1023,7 +1177,8 @@ async fn scan_document_target(
             });
         }
     };
-    let (mut findings, table_result) = audit_document_findings(
+    let (mut findings, table_result) = audit_document_findings_with_engine(
+        &engine,
         &target.database,
         Some(&schema),
         &target.collection,
@@ -1052,7 +1207,12 @@ async fn scan_document_target(
     })
 }
 
-async fn run_redis_scan(state: Arc<WebState>, request: AuditScanRequest, job_id: &str) -> Result<(), String> {
+async fn run_redis_scan(
+    state: Arc<WebState>,
+    request: AuditScanRequest,
+    job_id: &str,
+    engine: Arc<AuditRuleEngine>,
+) -> Result<(), String> {
     update_job(&state, job_id, |job| {
         job.progress = 5;
         job.logs.push(log_entry("info", "正在扫描 Redis keys"));
@@ -1089,6 +1249,7 @@ async fn run_redis_scan(state: Arc<WebState>, request: AuditScanRequest, job_id:
                 .map(|key| {
                     let state = state.clone();
                     let request = request.clone();
+                    let engine = engine.clone();
                     let job_id = job_id.to_string();
                     async move {
                         if is_cancelled(&state, &job_id).await {
@@ -1102,7 +1263,7 @@ async fn run_redis_scan(state: Arc<WebState>, request: AuditScanRequest, job_id:
                         )
                         .await
                         .ok();
-                        redis_key_findings(&request, db, &key.key_display, value.as_ref())
+                        redis_key_findings(&request, &engine, db, &key.key_display, value.as_ref())
                     }
                 })
                 .buffer_unordered(request.field_worker_count());
@@ -1130,21 +1291,44 @@ async fn run_redis_scan(state: Arc<WebState>, request: AuditScanRequest, job_id:
 
 fn redis_key_findings(
     request: &AuditScanRequest,
+    engine: &AuditRuleEngine,
     db: u32,
     key: &str,
     value: Option<&dbx_core::db::redis_driver::RedisValue>,
 ) -> Vec<AuditFinding> {
     let mut findings = Vec::new();
     if request.mode.includes_field_name() {
-        for kind in detect_field(key, key, request.level) {
-            findings.push(redis_finding(db, key, "key", kind, "field-name", key.to_string()));
+        for matched in engine.scan_field(&format!("column={key}"), request.level) {
+            findings.push(redis_finding(
+                db,
+                key,
+                "key",
+                matched.kind,
+                "field-name",
+                key.to_string(),
+                Some(matched.rule_id),
+                Some(matched.rule_name),
+                Some(matched.rule_severity),
+                matched.rule_tags,
+            ));
         }
     }
     if request.mode.includes_content() {
         let value_text = value.map(|value| redis_value_text(&value.value)).unwrap_or_default();
-        for kind in detect_value(&value_text, request.level) {
-            let sample = if request.mask { mask_sensitive_value(&value_text) } else { value_text.clone() };
-            findings.push(redis_finding(db, key, "value", kind, "content", sample));
+        for matched in engine.scan_content(&value_text, request.level) {
+            let sample = if request.mask { mask_sensitive_value(&matched.value) } else { matched.value };
+            findings.push(redis_finding(
+                db,
+                key,
+                "value",
+                matched.kind,
+                "content",
+                sample,
+                Some(matched.rule_id),
+                Some(matched.rule_name),
+                Some(matched.rule_severity),
+                matched.rule_tags,
+            ));
         }
     }
     findings
@@ -1157,6 +1341,10 @@ fn redis_finding(
     kind: dbx_core::audit::AuditKind,
     basis: &str,
     sample: String,
+    rule_id: Option<String>,
+    rule_name: Option<String>,
+    rule_severity: Option<String>,
+    rule_tags: Vec<String>,
 ) -> AuditFinding {
     AuditFinding {
         connection_id: None,
@@ -1180,6 +1368,12 @@ fn redis_finding(
         basis: basis.to_string(),
         count: 1,
         samples: vec![AuditSample { column: column.to_string(), value: sample }],
+        rule_id,
+        rule_name,
+        rule_severity,
+        rule_tags,
+        target_key: Some(format!("redis-db{db}/{key}/{column}")),
+        confidence: Some(if basis == "content" { "confirmed" } else { "suspected" }.to_string()),
     }
 }
 
@@ -1203,6 +1397,11 @@ async fn apply_connection_meta(state: &WebState, connection_id: &str, findings: 
         finding.connection_host = Some(config.host.clone());
         finding.connection_port = Some(config.port);
         finding.connection_user = Some(config.username.clone());
+        if let Some(target_key) = finding.target_key.as_mut() {
+            if !target_key.starts_with(&format!("{connection_id}/")) {
+                *target_key = format!("{connection_id}/{target_key}");
+            }
+        }
     }
 }
 

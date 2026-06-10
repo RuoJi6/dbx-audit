@@ -73,6 +73,9 @@ type AuditTask = {
   tableWorkers: number;
   fieldWorkers: number;
   timeoutSecs: number;
+  contentPageSize: number;
+  contentMaxRows: number | null;
+  ruleTemplatePaths: string[];
   mask: boolean;
   includeSystem: boolean;
   outputEnabled: boolean;
@@ -234,6 +237,7 @@ const zh = {
   sqlRequired: "请填写 SQL 内容",
   targetRequired: "请选择至少一个连接或填写目标",
   limitRequired: "样例数量必须大于 0",
+  contentPageSizeRequired: "内容分页大小必须大于 0",
   runTaskFirst: "请先运行任务",
   jobNotFound: "未找到扫描任务：{id}",
   copiedDatabaseInfo: "已复制数据库信息",
@@ -280,6 +284,11 @@ const zh = {
   singleTargetConcurrency: "单目标",
   multiTargetSequential: "{count} 个目标顺序执行",
   timeout: "超时秒数",
+  contentPageSize: "内容分页大小",
+  contentMaxRows: "内容最大行数",
+  contentMaxRowsHint: "留空表示分页扫描完整表",
+  ruleTemplatePaths: "外部规则目录",
+  ruleTemplatePathsHint: "多个路径用逗号分隔",
   encoding: "内容编码",
   output: "输出路径",
   outputEnabled: "输出表格",
@@ -334,6 +343,8 @@ const zh = {
   connectionResultOverview: "连接结果概览",
   noHits: "无命中",
   hasHits: "有命中",
+  failedConnections: "失败 {count}",
+  cancelledConnections: "已取消 {count}",
   chooseOutput: "选择输出文件",
   chooseOutputUnavailable: "Web 开发模式无法选择本地输出路径，请在桌面 App 中使用或手动填写路径。",
   exportReport: "报告导出",
@@ -426,6 +437,11 @@ const zh = {
     "ip-address": "IP 地址",
     "business-identifier": "业务标识",
     "risk-evidence": "风险/证据",
+    secret: "敏感密钥",
+    "private-key": "私钥",
+    "cloud-credential": "云凭证",
+    webhook: "Webhook",
+    "connection-string": "连接串",
   },
 };
 
@@ -484,6 +500,7 @@ const en = {
   sqlRequired: "Please enter SQL",
   targetRequired: "Please select at least one connection or enter targets",
   limitRequired: "Sample limit must be greater than 0",
+  contentPageSizeRequired: "Content page size must be greater than 0",
   runTaskFirst: "Run the task first",
   jobNotFound: "Scan job not found: {id}",
   copiedDatabaseInfo: "Database info copied",
@@ -532,6 +549,11 @@ const en = {
   singleTargetConcurrency: "Single target",
   multiTargetSequential: "{count} targets sequentially",
   timeout: "Timeout seconds",
+  contentPageSize: "Content page size",
+  contentMaxRows: "Content max rows",
+  contentMaxRowsHint: "Empty means paged full-table scan",
+  ruleTemplatePaths: "External rule directories",
+  ruleTemplatePathsHint: "Separate multiple paths with commas",
   encoding: "Encoding",
   output: "Output path",
   outputEnabled: "Output table",
@@ -585,6 +607,8 @@ const en = {
   connectionResultOverview: "Connection results",
   noHits: "No hits",
   hasHits: "Has hits",
+  failedConnections: "Failed {count}",
+  cancelledConnections: "Cancelled {count}",
   chooseOutput: "Choose output file",
   chooseOutputUnavailable:
     "Web dev mode cannot choose local output paths. Use the desktop app or enter a path manually.",
@@ -676,6 +700,11 @@ const en = {
     "ip-address": "IP address",
     "business-identifier": "Business ID",
     "risk-evidence": "Risk/evidence",
+    secret: "Secret",
+    "private-key": "Private key",
+    "cloud-credential": "Cloud credential",
+    webhook: "Webhook",
+    "connection-string": "Connection string",
   },
 };
 
@@ -763,6 +792,7 @@ const selectedTaskId = ref("");
 const draft = ref<AuditTask>(newTask());
 const tasks = ref<AuditTask[]>([]);
 const exportMessage = ref("");
+const exportMessageTaskId = ref("");
 const error = ref("");
 const showDataManager = ref(false);
 const dataManagerMessage = ref("");
@@ -776,6 +806,9 @@ const backupPassword = ref("");
 let auditStoreSaveTimer: ReturnType<typeof setTimeout> | undefined;
 
 const selectedTask = computed(() => tasks.value.find((task) => task.id === selectedTaskId.value) || null);
+const selectedTaskExportMessage = computed(() =>
+  selectedTask.value && exportMessageTaskId.value === selectedTask.value.id ? exportMessage.value : "",
+);
 const selectedConnection = computed(() =>
   props.connections.find((connection) => connection.id === draft.value.connectionId),
 );
@@ -902,17 +935,31 @@ const connectionResultRows = computed(() => {
     const targetSummary = task.job?.targetSummaries?.find(
       (target) => target.connectionId === id || target.connectionName === name,
     );
+    const errorText = stripConnectionErrorLabel(targetSummary?.error || relatedErrors.join("; "), name);
+    const outcome =
+      targetSummary?.status === "failed" || errorText
+        ? "failed"
+        : targetSummary?.status === "cancelled"
+          ? "cancelled"
+          : relatedFindings.length
+            ? "hit"
+            : "no-hit";
     const totals = riskTotals(relatedFindings);
     const rowCount = connectionResultRowCount(relatedTables, relatedFindings);
     return {
       id,
       name,
       dbType: connectionIconType(connection) || targetSummary?.dbType || relatedFindings[0]?.dbType || "",
-      status: relatedErrors.length
-        ? relatedErrors.join("; ")
-        : relatedFindings.length
-          ? `${ui.value.hasHits} ${relatedFindings.length}`
-          : ui.value.noHits,
+      outcome,
+      error: errorText,
+      status:
+        outcome === "failed"
+          ? errorText
+          : outcome === "cancelled"
+            ? ui.value.status.cancelled
+            : relatedFindings.length
+              ? `${ui.value.hasHits} ${relatedFindings.length}`
+              : ui.value.noHits,
       database:
         targetSummary?.database ||
         relatedTables[0]?.database ||
@@ -929,12 +976,18 @@ const connectionResultRows = computed(() => {
   });
 });
 const connectionResultSummary = computed(() =>
-  ui.value.connectionResultSummary
-    .replace("{connections}", String(connectionResultRows.value.length))
-    .replace(
-      "{findings}",
-      String(connectionResultRows.value.reduce((total, row) => total + Number(row.findingCount || 0), 0)),
-    ),
+  [
+    ui.value.connectionResultSummary
+      .replace("{connections}", String(connectionResultRows.value.length))
+      .replace(
+        "{findings}",
+        String(connectionResultRows.value.reduce((total, row) => total + Number(row.findingCount || 0), 0)),
+      ),
+    connectionResultFailureSummary(),
+    connectionResultCancelledSummary(),
+  ]
+    .filter(Boolean)
+    .join(" / "),
 );
 
 watch(
@@ -1086,6 +1139,9 @@ function newTask(seed?: Partial<AuditTask>): AuditTask {
     tableWorkers: seed?.tableWorkers || seed?.workers || 5,
     fieldWorkers: seed?.fieldWorkers || 5,
     timeoutSecs: seed?.timeoutSecs || 15,
+    contentPageSize: seed?.contentPageSize || 1000,
+    contentMaxRows: seed?.contentMaxRows ?? null,
+    ruleTemplatePaths: coerceRuleTemplatePaths(seed?.ruleTemplatePaths),
     mask: seed?.mask ?? false,
     includeSystem: seed?.includeSystem || false,
     outputEnabled: seed?.outputEnabled || false,
@@ -1120,6 +1176,9 @@ function normalizeTask(task: AuditTask) {
     targetWorkers: Number(task.targetWorkers) || 10,
     tableWorkers: Number(task.tableWorkers) || Number(task.workers) || 5,
     fieldWorkers: Number(task.fieldWorkers) || 5,
+    contentPageSize: Number(task.contentPageSize) || 1000,
+    contentMaxRows: Number(task.contentMaxRows) > 0 ? Number(task.contentMaxRows) : null,
+    ruleTemplatePaths: coerceRuleTemplatePaths(task.ruleTemplatePaths),
     outputEnabled: task.outputEnabled || false,
     outputs: task.outputs || [],
     logHistory: task.logHistory || [],
@@ -1140,6 +1199,7 @@ function persistTask(task: AuditTask) {
 
 function createTask() {
   error.value = "";
+  clearExportMessage();
   wizardStep.value = 1;
   draft.value = newTask();
   view.value = "wizard";
@@ -1147,6 +1207,7 @@ function createTask() {
 
 function configureTask(task: AuditTask) {
   error.value = "";
+  clearExportMessage();
   draft.value = newTask(task);
   wizardStep.value = 1;
   view.value = "wizard";
@@ -1557,6 +1618,7 @@ function clearAuditTasks() {
 
 function viewTask(task: AuditTask, tab: DetailTab = "hits") {
   selectedTaskId.value = task.id;
+  error.value = "";
   activeTab.value = tab;
   view.value = "detail";
 }
@@ -1574,6 +1636,7 @@ function validateTask(task: AuditTask) {
     return ui.value.targetRequired;
   }
   if (task.limit < 1) return ui.value.limitRequired;
+  if (task.contentPageSize < 1) return ui.value.contentPageSizeRequired;
   if (task.outputEnabled && !task.outputPath.trim()) return ui.value.outputPathRequired;
   return "";
 }
@@ -1662,6 +1725,7 @@ async function startTask(task: AuditTask) {
   cancelledTaskIds.delete(task.id);
   stopPolling(task.id);
   error.value = "";
+  clearExportMessage();
   const missing = missingConnectionIds(task);
   const connectionIds = activeConnectionIds(task);
   if (connectionIds.length === 0) {
@@ -1712,6 +1776,9 @@ async function startTask(task: AuditTask) {
       tableWorkers: taskTableWorkerCount(running),
       fieldWorkers: taskFieldWorkerCount(running),
       timeoutSecs: Number(running.timeoutSecs) || 15,
+      contentPageSize: Number(running.contentPageSize) || 1000,
+      contentMaxRows: contentMaxRowsForTask(running),
+      ruleTemplatePaths: ruleTemplatePathsForTask(running),
     });
     if (cancelledTaskIds.has(running.id)) {
       await api.auditCancelScan(jobId).catch(() => false);
@@ -1768,6 +1835,9 @@ async function startConnectionBatchTask(task: AuditTask, connectionIds: string[]
       tableWorkers: taskTableWorkerCount(task),
       fieldWorkers: taskFieldWorkerCount(task),
       timeoutSecs: Number(task.timeoutSecs) || 15,
+      contentPageSize: Number(task.contentPageSize) || 1000,
+      contentMaxRows: contentMaxRowsForTask(task),
+      ruleTemplatePaths: ruleTemplatePathsForTask(task),
     },
     logs: [...task.logHistory],
     findings: [],
@@ -1927,11 +1997,32 @@ function auditTargetSummary(
     connectionPort: connection?.port,
     connectionUser: connection?.username,
     database: taskDatabaseName(job, connection),
-    status: jobError ? "failed" : findingCount > 0 ? "hit" : "no-hit",
+    status: job?.status === "cancelled" ? "cancelled" : jobError ? "failed" : findingCount > 0 ? "hit" : "no-hit",
     findingCount,
     tableCount,
     error: jobError || undefined,
   };
+}
+
+function stripConnectionErrorLabel(error: string | undefined, label: string) {
+  if (!error) return "";
+  const prefix = `${label}:`;
+  return error
+    .split(";")
+    .map((item) => item.trim())
+    .map((item) => (item.startsWith(prefix) ? item.slice(prefix.length).trim() : item))
+    .filter(Boolean)
+    .join("; ");
+}
+
+function connectionResultFailureSummary() {
+  const count = connectionResultRows.value.filter((row) => row.outcome === "failed").length;
+  return count ? ui.value.failedConnections.replace("{count}", String(count)) : "";
+}
+
+function connectionResultCancelledSummary() {
+  const count = connectionResultRows.value.filter((row) => row.outcome === "cancelled").length;
+  return count ? ui.value.cancelledConnections.replace("{count}", String(count)) : "";
 }
 
 function taskDatabaseName(job: AuditJobState | undefined, connection: ConnectionConfig | undefined) {
@@ -2033,7 +2124,7 @@ async function refreshTaskJob(taskId: string, jobId?: string) {
   if (!task || !effectiveJobId) return;
   if (cancelledTaskIds.has(taskId)) return;
   if (effectiveJobId.startsWith("batch-")) {
-    exportMessage.value = ui.value.importedSnapshotRefreshHint;
+    setExportMessage(task.id, ui.value.importedSnapshotRefreshHint);
     return;
   }
   try {
@@ -2095,11 +2186,11 @@ async function exportReport(task: AuditTask) {
     return;
   }
   error.value = "";
-  exportMessage.value = "";
+  clearExportMessage();
   try {
     const result = await writeAuditOutputs(task, task.job);
     persistTask({ ...task, outputs: result.outputs });
-    exportMessage.value = `${ui.value.exportReport}: ${result.mergedPath || lastOutputPath(result.outputs)}`;
+    setExportMessage(task.id, `${ui.value.exportReport}: ${result.mergedPath || lastOutputPath(result.outputs)}`);
   } catch (err) {
     error.value = String(err);
   }
@@ -2116,7 +2207,7 @@ async function autoExportTask(
     const current = tasks.value.find((item) => item.id === task.id) || task;
     const result = await writeAuditOutputs(current, job, options);
     persistTask({ ...current, job, outputs: result.outputs });
-    exportMessage.value = `${ui.value.exportReport}: ${result.mergedPath || lastOutputPath(result.outputs)}`;
+    setExportMessage(current.id, `${ui.value.exportReport}: ${result.mergedPath || lastOutputPath(result.outputs)}`);
   } catch (err) {
     const current = tasks.value.find((item) => item.id === task.id) || task;
     const message = `${ui.value.exportReport}: ${String(err)}`;
@@ -2126,7 +2217,7 @@ async function autoExportTask(
       message,
       errors: [...(current.errors || []), message],
     });
-    exportMessage.value = message;
+    setExportMessage(current.id, message);
   } finally {
     exportingTaskIds.delete(task.id);
   }
@@ -2136,6 +2227,16 @@ function shouldAutoExportJob(job: AuditJobState) {
   if (job.status === "cancelled") return false;
   if (job.status !== "failed") return true;
   return (job.findings?.length || 0) > 0 || (job.tableResults?.length || 0) > 0;
+}
+
+function setExportMessage(taskId: string, message: string) {
+  exportMessageTaskId.value = taskId;
+  exportMessage.value = message;
+}
+
+function clearExportMessage() {
+  exportMessageTaskId.value = "";
+  exportMessage.value = "";
 }
 
 async function writeAuditOutputs(
@@ -2324,7 +2425,7 @@ async function chooseOutputPath() {
 }
 
 async function openOutputDirectory(task: AuditTask) {
-  exportMessage.value = "";
+  clearExportMessage();
   error.value = "";
   if (!task.outputPath.trim()) {
     error.value = ui.value.outputPathRequired;
@@ -2332,12 +2433,12 @@ async function openOutputDirectory(task: AuditTask) {
   }
   const directory = outputDirectory(task.outputPath);
   if (!isTauriRuntime()) {
-    exportMessage.value = ui.value.openFolderUnavailable.replace("{path}", directory);
+    setExportMessage(task.id, ui.value.openFolderUnavailable.replace("{path}", directory));
     return;
   }
   try {
     await api.auditOpenOutputDirectory(directory);
-    exportMessage.value = ui.value.openedFolder.replace("{path}", directory);
+    setExportMessage(task.id, ui.value.openedFolder.replace("{path}", directory));
   } catch (err) {
     error.value = String(err);
   }
@@ -2393,6 +2494,34 @@ function splitList(text: string) {
     .split(/[,;\n]/)
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function contentMaxRowsForTask(task: Pick<AuditTask, "contentMaxRows">) {
+  const value = Number(task.contentMaxRows);
+  return value > 0 ? value : null;
+}
+
+function ruleTemplatePathsForTask(task: Pick<AuditTask, "ruleTemplatePaths">) {
+  return coerceRuleTemplatePaths(task.ruleTemplatePaths);
+}
+
+function setDraftRuleTemplatePaths(value: string | number) {
+  draft.value.ruleTemplatePaths = splitList(String(value));
+}
+
+function setDraftContentMaxRows(value: string | number) {
+  const next = Number(value);
+  draft.value.contentMaxRows = next > 0 ? next : null;
+}
+
+function coerceRuleTemplatePaths(value: unknown) {
+  if (Array.isArray(value)) {
+    return value.map((path) => String(path).trim()).filter(Boolean);
+  }
+  if (typeof value === "string") {
+    return splitList(value);
+  }
+  return [];
 }
 
 function mapJobStatus(status: AuditJobState["status"]): AuditTaskStatus {
@@ -2825,7 +2954,7 @@ async function copyTask(task: AuditTask) {
   try {
     await writeClipboardText(text);
     dataManagerMessage.value = ui.value.copiedDatabaseInfo;
-    exportMessage.value = ui.value.copiedDatabaseInfo;
+    setExportMessage(task.id, ui.value.copiedDatabaseInfo);
     error.value = "";
   } catch (err) {
     error.value = ui.value.copyFailed.replace("{error}", String(err));
@@ -3298,6 +3427,29 @@ onUnmounted(() => {
               <Input v-model.number="draft.timeoutSecs" class="h-9" min="1" type="number" />
             </label>
             <label class="space-y-1 text-xs font-medium">
+              {{ ui.contentPageSize }}
+              <Input v-model.number="draft.contentPageSize" class="h-9" min="1" type="number" />
+            </label>
+            <label class="space-y-1 text-xs font-medium" :title="ui.contentMaxRowsHint">
+              {{ ui.contentMaxRows }}
+              <Input
+                :model-value="draft.contentMaxRows ?? undefined"
+                class="h-9"
+                min="1"
+                type="number"
+                @update:model-value="setDraftContentMaxRows"
+              />
+            </label>
+            <label class="space-y-1 text-xs font-medium md:col-span-3" :title="ui.ruleTemplatePathsHint">
+              {{ ui.ruleTemplatePaths }}
+              <Input
+                :model-value="draft.ruleTemplatePaths.join(', ')"
+                class="h-9"
+                :placeholder="ui.ruleTemplatePathsHint"
+                @update:model-value="setDraftRuleTemplatePaths"
+              />
+            </label>
+            <label class="space-y-1 text-xs font-medium">
               {{ ui.encoding }}
               <Select v-model="draft.textEncoding">
                 <SelectTrigger class="h-9"><SelectValue /></SelectTrigger>
@@ -3443,7 +3595,14 @@ onUnmounted(() => {
                   :key="row.id"
                   class="rounded-md border bg-background p-3 text-xs transition hover:border-primary"
                   :class="
-                    selectedConnectionResultId === row.id ? 'border-primary bg-primary/5 ring-1 ring-primary/30' : ''
+                    [
+                      row.outcome === 'failed'
+                        ? 'border-destructive/40 bg-destructive/5'
+                        : row.outcome === 'cancelled'
+                          ? 'border-muted-foreground/30 bg-muted/40'
+                          : '',
+                      selectedConnectionResultId === row.id ? 'border-primary bg-primary/5 ring-1 ring-primary/30' : '',
+                    ]
                   "
                   role="button"
                   tabindex="0"
@@ -3452,9 +3611,26 @@ onUnmounted(() => {
                 >
                   <div class="flex items-center gap-2">
                     <DatabaseIcon :db-type="row.dbType" class="h-3.5 w-3.5 shrink-0" />
-                    <span class="font-medium">{{ row.name }}</span>
+                    <span class="min-w-0 flex-1 truncate font-medium">{{ row.name }}</span>
+                    <span
+                      v-if="row.outcome === 'failed' || row.outcome === 'cancelled'"
+                      class="shrink-0 rounded-full border px-1.5 py-0.5 text-[11px]"
+                      :class="
+                        row.outcome === 'failed'
+                          ? 'border-destructive/40 bg-destructive/10 text-destructive'
+                          : 'border-muted-foreground/30 text-muted-foreground'
+                      "
+                    >
+                      {{ row.outcome === "failed" ? ui.status.failed : ui.status.cancelled }}
+                    </span>
                   </div>
-                  <div class="mt-2 text-muted-foreground">{{ row.status }}</div>
+                  <div
+                    class="mt-2 line-clamp-3"
+                    :class="row.outcome === 'failed' ? 'text-destructive' : 'text-muted-foreground'"
+                    :title="row.status"
+                  >
+                    {{ row.status }}
+                  </div>
                   <div v-if="selectedConnectionResultId === row.id" class="mt-3 rounded-md border bg-background/80 p-3">
                     <div v-if="row.database" class="mb-2 truncate font-mono text-[11px] text-muted-foreground">
                       {{ row.database }}
@@ -4061,7 +4237,7 @@ onUnmounted(() => {
       </div>
 
       <p v-if="error" class="mt-3 text-xs text-destructive">{{ error }}</p>
-      <p v-if="exportMessage" class="mt-3 text-xs text-muted-foreground">{{ exportMessage }}</p>
+      <p v-if="selectedTaskExportMessage" class="mt-3 text-xs text-muted-foreground">{{ selectedTaskExportMessage }}</p>
     </main>
   </section>
 </template>
