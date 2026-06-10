@@ -1541,7 +1541,8 @@ async function startTask(task: AuditTask) {
     return;
   }
   const logHistory = nextRunLogHistory(task);
-  const errorHistory = [...(task.errors || [])];
+  const errorHistory: string[] = [];
+  const missingErrors = missing.map((id) => ui.value.missingConnections.replace("{ids}", id));
   const running = persistTask({
     ...task,
     workers: taskTableWorkerCount(task),
@@ -1558,7 +1559,7 @@ async function startTask(task: AuditTask) {
     outputs: [],
     logHistory,
     errorHistory,
-    errors: [...errorHistory, ...missing.map((id) => ui.value.missingConnections.replace("{ids}", id))],
+    errors: missingErrors,
     startedAt: new Date().toISOString(),
     finishedAt: undefined,
   });
@@ -2247,7 +2248,7 @@ function lastLog(job?: AuditJobState) {
 }
 
 function nextRunLogHistory(task: AuditTask) {
-  const previous = task.job?.logs?.length ? task.job.logs : task.logHistory || [];
+  const previous = (task.job?.logs?.length ? task.job.logs : task.logHistory || []).filter((entry) => entry.level !== "error");
   if (!previous.length) return [];
   return [
     ...previous,
