@@ -125,6 +125,8 @@ type FieldHit = {
   table: string;
   column: string;
   kind: string;
+  ruleName?: string;
+  ruleSeverity?: string;
   level: "high" | "medium" | "low";
   count: number;
   samples: string[];
@@ -2697,6 +2699,8 @@ function fieldHits(findings: AuditFinding[]): FieldHit[] {
     table: finding.table,
     column: finding.column,
     kind: finding.kind,
+    ruleName: finding.ruleName,
+    ruleSeverity: finding.ruleSeverity,
     level: finding.level as "high" | "medium" | "low",
     count: Number(finding.count || finding.samples?.length || 1),
     samples: (finding.samples || []).map((sample) => sample.value),
@@ -2915,6 +2919,14 @@ function kindName(kind: string) {
   return labels[kind] || kind;
 }
 
+function findingDisplayName(field: Pick<FieldHit, "kind" | "ruleName">) {
+  return field.ruleName || kindName(field.kind);
+}
+
+function findingSeverityLabel(field: Pick<FieldHit, "level" | "ruleSeverity">) {
+  return field.ruleSeverity || ui.value.levelLabel[field.level];
+}
+
 function searchText(parts: Array<unknown>) {
   return parts
     .filter((part) => part !== undefined && part !== null && part !== "")
@@ -2940,6 +2952,10 @@ function sampleGroupSensitiveSearchText(group: SampleGroup) {
     ...group.fields.flatMap((field) => [
       field.column,
       field.kind,
+      field.ruleName,
+      findingDisplayName(field),
+      field.ruleSeverity,
+      findingSeverityLabel(field),
       kindName(field.kind),
       field.level,
       ui.value.levelLabel[field.level],
@@ -3965,7 +3981,7 @@ onUnmounted(() => {
                 <span>{{ databaseScopeText(field) || "-" }}</span>
               </div>
               <div class="mt-2 text-xs">{{ field.database }} / {{ field.table }}</div>
-              <div class="mt-2 text-xs">{{ kindName(field.kind) }} · {{ ui.levelLabel[field.level] }}</div>
+              <div class="mt-2 text-xs">{{ findingDisplayName(field) }} · {{ findingSeverityLabel(field) }}</div>
               <div class="mt-2 text-xs font-semibold">{{ ui.rowHits.replace("{count}", String(field.count)) }}</div>
               <div
                 v-if="field.samples.length"
@@ -3999,12 +4015,12 @@ onUnmounted(() => {
                     ><span class="font-mono">{{ field.table }}</span>
                   </div>
                   <div>
-                    <span class="text-muted-foreground">{{ ui.kind }}：</span>{{ kindName(field.kind) }}
+                    <span class="text-muted-foreground">{{ ui.kind }}：</span>{{ findingDisplayName(field) }}
                   </div>
                   <div>
                     <span class="text-muted-foreground">{{ ui.risk }}：</span
                     ><span class="rounded-full border px-2 py-0.5" :class="riskClass(field.level)">{{
-                      ui.levelLabel[field.level]
+                      findingSeverityLabel(field)
                     }}</span>
                   </div>
                   <div>
@@ -4166,7 +4182,7 @@ onUnmounted(() => {
                     >
                       <div class="whitespace-nowrap">{{ field.column }}</div>
                       <div class="whitespace-nowrap font-sans text-[11px]">
-                        {{ ui.levelLabel[field.level] }} · {{ kindName(field.kind) }}
+                        {{ findingSeverityLabel(field) }} · {{ findingDisplayName(field) }}
                       </div>
                     </th>
                   </tr>
@@ -4203,7 +4219,7 @@ onUnmounted(() => {
                   class="rounded-full border px-2 py-1 font-mono text-xs"
                   :class="riskClass(field.level)"
                 >
-                  {{ field.column }} · {{ ui.levelLabel[field.level] }} · {{ kindName(field.kind) }}
+                  {{ field.column }} · {{ findingSeverityLabel(field) }} · {{ findingDisplayName(field) }}
                 </span>
               </div>
               <div class="mt-3 text-xs text-muted-foreground">{{ ui.noSampleRowsHint }}</div>

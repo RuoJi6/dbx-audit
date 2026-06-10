@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use aho_corasick::{AhoCorasick, MatchKind};
 use regex::Regex;
@@ -10,8 +10,9 @@ use serde::Deserialize;
 use super::types::{AuditKind, AuditLevel, AuditLevelFilter};
 
 const BUILTIN_FIELD_RULES: &[&str] = &[include_str!("rules/fields/dbx-fields.yaml")];
-const BUILTIN_CONTENT_RULES: &[&str] =
+const DBX_CONTENT_RULES: &[&str] =
     &[include_str!("rules/content/dbx-pii.yaml"), include_str!("rules/content/dbx-secrets.yaml")];
+const FOUND_KEY_RULES: &[&str] = include!("rules/content/found_keys.rs");
 
 static BUILTIN_ENGINE: OnceLock<AuditRuleEngine> = OnceLock::new();
 
@@ -54,8 +55,24 @@ struct CompiledRule {
     tags: Vec<String>,
     kind: AuditKind,
     level: AuditLevel,
-    regexes: Vec<Regex>,
+    regexes: Vec<LazyRegex>,
     literals: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct LazyRegex {
+    pattern: String,
+    compiled: Arc<OnceLock<Option<Regex>>>,
+}
+
+impl LazyRegex {
+    fn new(pattern: String) -> Self {
+        Self { pattern, compiled: Arc::new(OnceLock::new()) }
+    }
+
+    fn get(&self) -> Option<&Regex> {
+        self.compiled.get_or_init(|| Regex::new(&self.pattern).ok()).as_ref()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -103,7 +120,7 @@ impl AuditRuleEngine {
             for source in BUILTIN_FIELD_RULES {
                 rules.extend(parse_rule_documents(source, Some(AuditRuleTarget::Field)));
             }
-            for source in BUILTIN_CONTENT_RULES {
+            for source in DBX_CONTENT_RULES.iter().chain(FOUND_KEY_RULES.iter()) {
                 rules.extend(parse_rule_documents(source, Some(AuditRuleTarget::Content)));
             }
             Self::from_rules(rules)
@@ -149,6 +166,11 @@ impl AuditRuleEngine {
             .map(|rule| (AuditRuleTarget::Field, rule))
             .chain(self.content.rules.iter().cloned().map(|rule| (AuditRuleTarget::Content, rule)))
             .collect()
+    }
+
+    #[cfg(test)]
+    fn content_rule_count(&self) -> usize {
+        self.content.rules.len()
     }
 }
 
@@ -206,7 +228,7 @@ impl RuleGroup {
             if !level.allows(rule.level) {
                 continue;
             }
-            for regex in &rule.regexes {
+            for regex in rule.regexes.iter().filter_map(LazyRegex::get) {
                 for capture in regex.captures_iter(text) {
                     let value = capture
                         .get(1)
@@ -298,15 +320,31 @@ fn compile_template_rule(
     let mut regexes = Vec::new();
     let mut literals = BTreeSet::<String>::new();
     for pattern in patterns {
-        if let Ok(regex) = Regex::new(&pattern) {
-            for literal in extract_literals(&pattern) {
-                literals.insert(literal);
-            }
-            regexes.push(regex);
+        for literal in extract_literals(&pattern) {
+            literals.insert(literal);
         }
+        regexes.push(LazyRegex::new(pattern));
     }
     if regexes.is_empty() {
         return None;
+    }
+    let is_dbx_rule = rule.dbx.is_some() || tags.iter().any(|tag| tag.eq_ignore_ascii_case("dbx"));
+    if !is_dbx_rule {
+        prune_generic_literals(&mut literals);
+        let metadata = metadata_literals(&rule.id, &name, &tags);
+        if (literals.is_empty() || literals.len() > 32) && !metadata.is_empty() {
+            literals = metadata.into_iter().collect();
+        } else {
+            for literal in metadata {
+                literals.insert(literal);
+            }
+            prune_generic_literals(&mut literals);
+        }
+    }
+    if literals.is_empty() && !is_dbx_rule {
+        for literal in metadata_literals(&rule.id, &name, &tags) {
+            literals.insert(literal);
+        }
     }
 
     Some((
@@ -433,6 +471,60 @@ fn level_from_severity(value: &str) -> Option<AuditLevel> {
 
 fn normalize_key(value: &str) -> String {
     value.chars().filter(|ch| ch.is_alphanumeric()).flat_map(char::to_lowercase).collect()
+}
+
+fn metadata_literals(id: &str, name: &str, tags: &[String]) -> Vec<String> {
+    let parts = id
+        .split(|ch: char| !ch.is_alphanumeric())
+        .chain(name.split(|ch: char| !ch.is_alphanumeric()))
+        .chain(tags.iter().flat_map(|tag| tag.split(|ch: char| !ch.is_alphanumeric())))
+        .map(|part| part.trim().to_ascii_lowercase())
+        .filter(|part| part.chars().count() >= 3)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let filtered = parts.iter().filter(|part| !is_generic_literal(part)).cloned().collect::<Vec<_>>();
+    if filtered.is_empty() {
+        parts
+    } else {
+        filtered
+    }
+}
+
+fn prune_generic_literals(literals: &mut BTreeSet<String>) {
+    if literals.iter().any(|literal| !is_generic_literal(literal)) {
+        literals.retain(|literal| !is_generic_literal(literal));
+    }
+}
+
+fn is_generic_literal(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    let parts = value.split(|ch: char| !ch.is_alphanumeric()).filter(|part| !part.is_empty()).collect::<Vec<_>>();
+    !parts.is_empty()
+        && parts.iter().all(|part| {
+            matches!(
+                *part,
+                "api"
+                    | "app"
+                    | "application"
+                    | "auth"
+                    | "client"
+                    | "consumer"
+                    | "customer"
+                    | "detect"
+                    | "file"
+                    | "key"
+                    | "keys"
+                    | "oauth"
+                    | "pass"
+                    | "password"
+                    | "sec"
+                    | "secret"
+                    | "token"
+                    | "true"
+                    | "verified"
+            )
+        })
 }
 
 fn extract_literals(pattern: &str) -> Vec<String> {
@@ -578,6 +670,21 @@ file:
             .scan_content("BEGIN RSA PRIVATE KEY", AuditLevelFilter::All)
             .iter()
             .any(|item| item.kind == AuditKind::PrivateKey));
+        assert!(engine.content_rule_count() >= 156);
+    }
+
+    #[test]
+    fn builtins_include_found_keys_bitbucket_rules() {
+        let engine = AuditRuleEngine::builtin();
+        let matches = engine.scan_content(
+            "bitbucket_client_secret = \"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_=\"",
+            AuditLevelFilter::All,
+        );
+        let item = matches.iter().find(|item| item.rule_id == "bitbucket-client-secret").expect("bitbucket rule");
+        assert_eq!(item.rule_name, "BitBucket Client Secret");
+        assert_eq!(item.rule_severity, "info");
+        assert_eq!(item.level, AuditLevel::Low);
+        assert_eq!(item.kind, AuditKind::TokenSecret);
     }
 
     #[test]
