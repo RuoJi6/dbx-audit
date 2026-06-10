@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use chrono::Utc;
+use chrono::{Local, Utc};
 use futures::stream::{self, StreamExt};
 use tauri::State;
 use uuid::Uuid;
@@ -34,7 +34,11 @@ fn now_rfc3339() -> String {
 }
 
 fn log_entry(level: &str, message: impl Into<String>) -> AuditLogEntry {
-    AuditLogEntry { time: Utc::now().format("%H:%M:%S").to_string(), level: level.to_string(), message: message.into() }
+    AuditLogEntry {
+        time: Local::now().format("%H:%M:%S").to_string(),
+        level: level.to_string(),
+        message: message.into(),
+    }
 }
 
 fn update_job(job_id: &str, update: impl FnOnce(&mut AuditJobState)) {

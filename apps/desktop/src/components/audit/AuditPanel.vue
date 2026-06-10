@@ -868,8 +868,8 @@ const connectionResultRows = computed(() => {
     const relatedTables = tables.filter((table) => table.connectionId === id || table.connectionName === name);
     const relatedErrors = (task.errors || []).filter((entry) => entry.includes(id) || entry.includes(name));
     const targetSummary = task.job?.targetSummaries?.find((target) => target.connectionId === id || target.connectionName === name);
-    const errorText = stripConnectionErrorLabel(targetSummary?.error || relatedErrors.join("; "), name);
-    const outcome = targetSummary?.status === "failed" || errorText ? "failed" : targetSummary?.status === "cancelled" ? "cancelled" : relatedFindings.length ? "hit" : "no-hit";
+    const errorText = stripConnectionErrorLabel(targetSummary?.error || (!targetSummary ? relatedErrors.join("; ") : ""), name);
+    const outcome = targetSummary?.status === "failed" ? "failed" : targetSummary?.status === "cancelled" ? "cancelled" : targetSummary?.status === "hit" ? "hit" : targetSummary?.status === "no-hit" ? "no-hit" : errorText ? "failed" : relatedFindings.length ? "hit" : "no-hit";
     const totals = riskTotals(relatedFindings);
     const rowCount = connectionResultRowCount(relatedTables, relatedFindings);
     return {
@@ -1752,17 +1752,17 @@ async function startConnectionBatchTask(task: AuditTask, connectionIds: string[]
       message: ui.value.status.cancelled,
     });
   }
-  const hasNewErrors = aggregate.errors.length > task.errorHistory.length;
-  aggregate.status = wasCancelled ? "cancelled" : hasNewErrors ? "failed" : "completed";
+  const hasFailedTargets = aggregate.targetSummaries.some((target) => target.status === "failed");
+  aggregate.status = wasCancelled ? "cancelled" : hasFailedTargets ? "failed" : "completed";
   aggregate.progress = wasCancelled ? Math.max(task.progress || 0, aggregate.progress || 0) : 100;
   aggregate.finishedAt = new Date().toISOString();
   const finalTask = persistTask({
     ...task,
     jobId: aggregate.jobId,
     job: aggregate,
-    status: wasCancelled ? "cancelled" : hasNewErrors ? "failed" : "completed",
+    status: wasCancelled ? "cancelled" : hasFailedTargets ? "failed" : "completed",
     progress: aggregate.progress,
-    message: wasCancelled ? ui.value.status.cancelled : hasNewErrors ? ui.value.batchScanFailed : ui.value.batchScanCompleted,
+    message: wasCancelled ? ui.value.status.cancelled : hasFailedTargets ? ui.value.batchScanFailed : ui.value.batchScanCompleted,
     errors: aggregate.errors,
     outputs,
     finishedAt: aggregate.finishedAt,
@@ -1777,6 +1777,7 @@ function auditTargetSummary(connectionId: string, label: string, connection: Con
   const findingCount = job?.findings?.length || 0;
   const tableCount = job?.tableResults?.length || 0;
   const jobError = error || (job?.errors || []).join("; ");
+  const status = error || job?.status === "failed" ? "failed" : job?.status === "cancelled" ? "cancelled" : findingCount > 0 ? "hit" : "no-hit";
   return {
     connectionId,
     connectionName: label,
@@ -1785,10 +1786,10 @@ function auditTargetSummary(connectionId: string, label: string, connection: Con
     connectionPort: connection?.port,
     connectionUser: connection?.username,
     database: taskDatabaseName(job, connection),
-    status: job?.status === "cancelled" ? "cancelled" : jobError ? "failed" : findingCount > 0 ? "hit" : "no-hit",
+    status,
     findingCount,
     tableCount,
-    error: jobError || undefined,
+    error: status === "failed" ? jobError || undefined : undefined,
   };
 }
 
