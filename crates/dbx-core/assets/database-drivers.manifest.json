@@ -339,9 +339,7 @@
       "metadataConnectionScoped": false,
       "skipTcpProbe": true,
       "defaultPort": 5258,
-      "driverProfiles": [
-        { "profile": "gbase8s", "label": "GBase 8s", "agentKey": "gbase8s" }
-      ]
+      "driverProfiles": [{ "profile": "gbase8s", "label": "GBase 8s", "agentKey": "gbase8s" }]
     },
     {
       "dbType": "access",
@@ -494,6 +492,17 @@
       "metadataConnectionScoped": false,
       "skipTcpProbe": true,
       "defaultPort": 5138
+    },
+    {
+      "dbType": "etcd",
+      "label": "etcd",
+      "runtimeMode": "agent",
+      "mcpMode": "bridge",
+      "agentKey": "etcd",
+      "singleConnectionPool": false,
+      "metadataConnectionScoped": false,
+      "skipTcpProbe": true,
+      "defaultPort": 2379
     },
     {
       "dbType": "iotdb",

@@ -8,7 +8,8 @@ use mysql_async::Row as MysqlRow;
 
 use crate::agent_connection::{
     agent_connect_params, h2_file_path_from_jdbc_url, is_h2_file_connection, mongo_legacy_error_with_auth_hint,
-    oracle_alternate_connect_config, oracle_auth_fallback_profiles, should_retry_oracle_with_10g_driver,
+    oracle_alternate_connect_config, oracle_auth_fallback_profiles, oracle_error_with_driver_hint,
+    should_retry_oracle_with_10g_driver,
 };
 use crate::agent_manager::{JavaRuntimeMode, DEFAULT_JRE_KEY};
 use crate::database_capabilities;
@@ -40,6 +41,7 @@ pub enum PoolKind {
     Postgres(deadpool_postgres::Pool),
     Sqlite(db::sqlite::SqliteHandle),
     Rqlite(db::rqlite_driver::RqliteClient),
+    Turso(db::turso_driver::TursoClient),
     Redis(db::redis_driver::RedisConnection),
     DuckDb(Arc<std::sync::Mutex<duckdb::Connection>>),
     MongoDb(mongodb::Client),
@@ -324,6 +326,7 @@ impl AppState {
         probe_connection_endpoint(&db_config, &host, port).await?;
         let url = connection_url_for_endpoint(&db_config, &host, port);
         let connect_timeout = std::time::Duration::from_secs(db_config.effective_connect_timeout_secs());
+        let idle_timeout = std::time::Duration::from_secs(db_config.idle_timeout_secs);
         let mysql_pool_max_connections = if normalize_client_session_id(client_session_id).is_some() { 1 } else { 3 };
         let pool = match db_config.db_type {
             DatabaseType::Mysql => {
@@ -376,6 +379,16 @@ impl AppState {
                 db::rqlite_driver::test_connection(&client, connect_timeout).await?;
                 PoolKind::Rqlite(client)
             }
+            DatabaseType::Turso => {
+                let auth_token = if !db_config.password.is_empty() {
+                    db_config.password.clone()
+                } else {
+                    db_config.url_params.as_deref().and_then(extract_auth_token_from_params).unwrap_or_default()
+                };
+                let client = db::turso_driver::TursoClient::new(&url, &auth_token, db_config.ssl, connect_timeout)?;
+                db::turso_driver::test_connection(&client, connect_timeout).await?;
+                PoolKind::Turso(client)
+            }
             DatabaseType::Redis => {
                 let con = if db_config.uses_redis_cluster() {
                     db::redis_driver::RedisConnection::Cluster(db::redis_driver::connect_cluster(&db_config).await?)
@@ -401,7 +414,7 @@ impl AppState {
                 PoolKind::DuckDb(con)
             }
             DatabaseType::MongoDb => {
-                let native_err = match db::mongo_driver::connect(&url, connect_timeout).await {
+                let native_err = match db::mongo_driver::connect(&url, connect_timeout, idle_timeout).await {
                     Ok(client) => match db::mongo_driver::test_connection(
                         &client,
                         connect_timeout,
@@ -410,7 +423,12 @@ impl AppState {
                     .await
                     {
                         Ok(()) => {
-                            self.connections.write().await.insert(pool_key.clone(), PoolKind::MongoDb(client));
+                            let mut conns = self.connections.write().await;
+                            // Re-check: another task may have created the pool while we were connecting.
+                            if conns.contains_key(&pool_key) {
+                                return Ok(pool_key);
+                            }
+                            conns.insert(pool_key.clone(), PoolKind::MongoDb(client));
                             return Ok(pool_key);
                         }
                         Err(e) => e,
@@ -560,7 +578,7 @@ impl AppState {
                             )
                         })?;
                     } else {
-                        return Err(err);
+                        return Err(oracle_error_with_driver_hint(&db_config, &err));
                     }
                 }
                 PoolKind::Agent(Arc::new(tokio::sync::Mutex::new(client)))
@@ -933,6 +951,7 @@ pub async fn close_pool_kind(pool: PoolKind) {
         PoolKind::Postgres(p) => p.close(),
         PoolKind::Sqlite(_) => {}
         PoolKind::Rqlite(_) => {}
+        PoolKind::Turso(_) => {}
         PoolKind::Redis(_) => {}
         PoolKind::DuckDb(con) => {
             crate::db::duckdb_driver::close_connection(con);
@@ -948,6 +967,19 @@ pub async fn close_pool_kind(pool: PoolKind) {
         PoolKind::ExternalTabular(_) => {}
         PoolKind::ExternalDriver { .. } => {}
     }
+}
+
+fn extract_auth_token_from_params(params: &str) -> Option<String> {
+    params
+        .trim()
+        .trim_start_matches('?')
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(key, _)| {
+            let k = key.trim().to_ascii_lowercase();
+            k == "auth_token" || k == "authtoken" || k == "auth-token"
+        })
+        .map(|(_, value)| value.trim().to_string())
 }
 
 fn base_pool_key_for(
@@ -1184,6 +1216,7 @@ mod tests {
             transport_layers: Vec::new(),
             connect_timeout_secs: default_connect_timeout_secs(),
             query_timeout_secs: crate::models::connection::default_query_timeout_secs(),
+            idle_timeout_secs: crate::models::connection::default_idle_timeout_secs(),
             ssl: false,
             ca_cert_path: String::new(),
             client_cert_path: String::new(),
@@ -1203,6 +1236,7 @@ mod tests {
             jdbc_driver_class: None,
             jdbc_driver_paths: Vec::new(),
             one_time: false,
+            read_only: false,
         }
     }
 

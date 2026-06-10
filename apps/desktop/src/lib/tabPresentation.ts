@@ -39,10 +39,7 @@ export function tabDisplayTitle(tab: QueryTab, t: Translate): string {
   if (isPreviewTab(tab)) return tab.title;
   if (tab.mode === "data" && tab.tableMeta?.tableName) {
     if (compact) return tab.tableMeta.tableName;
-    const suffix =
-      tab.tableMeta.schema && tab.tableMeta.schema !== tab.database
-        ? `@${database}.${tab.tableMeta.schema}`
-        : `@${database}`;
+    const suffix = tab.tableMeta.schema && tab.tableMeta.schema !== tab.database ? `@${database}.${tab.tableMeta.schema}` : `@${database}`;
     return `${tab.tableMeta.tableName}${suffix}`;
   }
   if (tab.mode === "query") {
@@ -103,18 +100,7 @@ export function tabTooltipLines(tab: QueryTab, t: Translate): { label: string; v
   return lines;
 }
 
-export function shouldShowTabOverflowControls(
-  tabCount: number,
-  hasTabOverflow: boolean,
-  canScrollLeft: boolean,
-  canScrollRight: boolean,
-): boolean {
-  return tabCount > 0 && (hasTabOverflow || canScrollLeft || canScrollRight);
-}
-
-export function tabularResultItems(
-  results: QueryResult[] | undefined,
-): { result: QueryResult; index: number; n: number }[] {
+export function tabularResultItems(results: QueryResult[] | undefined): { result: QueryResult; index: number; n: number }[] {
   if (!results) return [];
   return results
     .map((result, index) => ({ result, index }))

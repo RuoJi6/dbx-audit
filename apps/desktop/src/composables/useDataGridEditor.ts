@@ -1,16 +1,4 @@
-import {
-  ref,
-  computed,
-  nextTick,
-  watch,
-  getCurrentInstance,
-  onActivated,
-  onBeforeUnmount,
-  onDeactivated,
-  onMounted,
-  type ComputedRef,
-  type Ref,
-} from "vue";
+import { ref, computed, nextTick, watch, getCurrentInstance, onActivated, onBeforeUnmount, onDeactivated, onMounted, type ComputedRef, type Ref } from "vue";
 import * as api from "@/lib/api";
 import type { CellValue } from "@/lib/cellValue";
 import { coerceDataGridCellValue, dataGridCellEditorText } from "@/lib/dataGridCellCoercion";
@@ -60,16 +48,7 @@ export interface UseDataGridEditorOptions {
   sourceColumns?: ComputedRef<Array<string | undefined> | undefined>;
   canEditExistingRows?: ComputedRef<boolean>;
   onExecuteSql: ComputedRef<((sql: string) => Promise<void>) | undefined>;
-  customSave?: ComputedRef<
-    | ((changes: {
-        dirtyRows: Map<number, Map<number, CellValue>>;
-        newRows: CellValue[][];
-        deletedRows: Set<number>;
-        columns: string[];
-        rows: CellValue[][];
-      }) => Promise<void>)
-    | undefined
-  >;
+  customSave?: ComputedRef<((changes: { dirtyRows: Map<number, Map<number, CellValue>>; newRows: CellValue[][]; deletedRows: Set<number>; columns: string[]; rows: CellValue[][] }) => Promise<void>) | undefined>;
   sql: ComputedRef<string | undefined>;
   searchText: Ref<string>;
   whereFilterInput: Ref<string>;
@@ -82,15 +61,7 @@ export interface UseDataGridEditorOptions {
   currentPage: Ref<number>;
   cacheKey?: ComputedRef<string | undefined>;
   emit: {
-    (
-      event: "reload",
-      sql?: string,
-      searchText?: string,
-      whereInput?: string,
-      orderBy?: string,
-      limit?: number,
-      offset?: number,
-    ): void;
+    (event: "reload", sql?: string, searchText?: string, whereInput?: string, orderBy?: string, limit?: number, offset?: number): void;
   };
 }
 
@@ -203,12 +174,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
   const isSaving = ref(false);
   const saveError = ref("");
 
-  const useTransaction = computed(
-    () =>
-      editable.value &&
-      supportsDataGridTransaction(databaseType.value) &&
-      (!!customSave?.value || (!!connectionId.value && !!database.value && !!tableMeta.value)),
-  );
+  const useTransaction = computed(() => editable.value && supportsDataGridTransaction(databaseType.value) && (!!customSave?.value || (!!connectionId.value && !!database.value && !!tableMeta.value)));
 
   if (hasPendingChanges.value && useTransaction.value) {
     transactionActive.value = true;
@@ -466,6 +432,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
       rowChanges?.delete(col);
       if (rowChanges?.size === 0) dirtyRows.value.delete(item.sourceIndex);
     }
+    dirtyRows.value = new Map(dirtyRows.value);
     editingCell.value = null;
   }
 
@@ -543,9 +510,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
   }
 
   function clonedRowData(item: RowItem): CellValue[] {
-    const columnInfoByName = new Map(
-      (tableMeta.value?.columns ?? []).map((column) => [column.name.toLowerCase(), column]),
-    );
+    const columnInfoByName = new Map((tableMeta.value?.columns ?? []).map((column) => [column.name.toLowerCase(), column]));
     return item.data.map((val, i) => {
       const columnName = result.value.columns[i];
       const columnInfo = columnInfoByName.get(columnName.toLowerCase());
@@ -558,9 +523,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     if (databaseType.value === "neo4j" && columnName === DBX_NEO4J_ELEMENT_ID_COLUMN) return true;
     const extra = columnInfo?.extra ?? "";
     const columnDefault = columnInfo?.column_default ?? "";
-    return (
-      /\b(auto_increment|autoincrement|identity|generated)\b/i.test(extra) || /\bnextval\s*\(/i.test(columnDefault)
-    );
+    return /\b(auto_increment|autoincrement|identity|generated)\b/i.test(extra) || /\bnextval\s*\(/i.test(columnDefault);
   }
 
   function cloneRow(rowId: number) {
@@ -663,9 +626,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
       columns: result.value.columns,
       sourceColumns: sourceColumns.value,
       rows: result.value.rows,
-      dirtyRows: [...dirtyRows.value.entries()].map(
-        ([rowIndex, changes]) => [rowIndex, [...changes.entries()]] as [number, Array<[number, CellValue]>],
-      ),
+      dirtyRows: [...dirtyRows.value.entries()].map(([rowIndex, changes]) => [rowIndex, [...changes.entries()]] as [number, Array<[number, CellValue]>]),
       deletedRows: [...deletedRows.value],
       newRows: newRows.value,
     };
@@ -677,20 +638,11 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
   }
 
   function dataChangeOperation() {
-    const operations = [
-      newRows.value.length > 0 ? "INSERT" : "",
-      dirtyRows.value.size > 0 ? "UPDATE" : "",
-      deletedRows.value.size > 0 ? "DELETE" : "",
-    ].filter(Boolean);
+    const operations = [newRows.value.length > 0 ? "INSERT" : "", dirtyRows.value.size > 0 ? "UPDATE" : "", deletedRows.value.size > 0 ? "DELETE" : ""].filter(Boolean);
     return operations.length === 1 ? operations[0] : "DATA CHANGE";
   }
 
-  async function recordDataGridHistory(
-    statements: string[],
-    rollbackStatements: string[],
-    elapsed: number,
-    historyResult?: { affected_rows?: number; success?: boolean; error?: string },
-  ) {
+  async function recordDataGridHistory(statements: string[], rollbackStatements: string[], elapsed: number, historyResult?: { affected_rows?: number; success?: boolean; error?: string }) {
     if (!connectionId.value || !database.value || !tableMeta.value) return;
     const connName = connectionStore.getConfig(connectionId.value)?.name || "";
     const success = historyResult?.success ?? true;
@@ -721,12 +673,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     });
   }
 
-  async function recordFailedDataGridHistory(
-    statements: string[],
-    rollbackStatements: string[],
-    start: number,
-    error: unknown,
-  ) {
+  async function recordFailedDataGridHistory(statements: string[], rollbackStatements: string[], start: number, error: unknown) {
     const message = normalizeDataGridSaveError(databaseType.value, error);
     try {
       await recordDataGridHistory(statements, rollbackStatements, Date.now() - start, {
@@ -740,15 +687,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
   }
 
   function reloadCurrentData() {
-    options.emit(
-      "reload",
-      sql.value,
-      searchText.value,
-      options.currentWhereInput.value,
-      orderByInput.value.trim() || undefined,
-      pageSize.value,
-      (currentPage.value - 1) * pageSize.value,
-    );
+    options.emit("reload", sql.value, searchText.value, options.currentWhereInput.value, orderByInput.value.trim() || undefined, pageSize.value, (currentPage.value - 1) * pageSize.value);
   }
 
   async function saveChanges() {
@@ -808,21 +747,14 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     let apiResult: { affected_rows?: number } | undefined;
     console.info("[DBX][dataGrid:save-statements]", {
       databaseType: databaseType.value,
-      table: tableMeta.value
-        ? [tableMeta.value.schema, tableMeta.value.tableName].filter(Boolean).join(".")
-        : undefined,
+      table: tableMeta.value ? [tableMeta.value.schema, tableMeta.value.tableName].filter(Boolean).join(".") : undefined,
       statements: stmts,
       rollbackStatements: rollbackStmts,
     });
 
     if (useTransaction.value && connectionId.value && database.value) {
       try {
-        apiResult = await api.executeInTransaction(
-          connectionId.value,
-          database.value,
-          stmts,
-          preparedSave?.executionSchema,
-        );
+        apiResult = await api.executeInTransaction(connectionId.value, database.value, stmts, preparedSave?.executionSchema);
       } catch (e: any) {
         saveError.value = await recordFailedDataGridHistory(stmts, rollbackStmts, start, e);
         isSaving.value = false;
@@ -956,6 +888,36 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     });
   }
 
+  // --- SQL Preview for pending changes ---
+  const previewStatements = ref<string[]>([]);
+  const isPreviewLoading = ref(false);
+
+  async function previewChanges(): Promise<string[]> {
+    isPreviewLoading.value = true;
+    previewStatements.value = [];
+    try {
+      if (customSave?.value) {
+        // customSave doesn't expose SQL — return empty
+        return [];
+      }
+      const stmtOptions = saveStatementOptions();
+      if (!stmtOptions) return [];
+      const prepared = await api.prepareDataGridSave(stmtOptions);
+      if (prepared?.validationError) {
+        saveError.value = prepared.validationError;
+        return [];
+      }
+      const stmts = prepared?.statements ?? [];
+      previewStatements.value = stmts;
+      return stmts;
+    } catch (e: any) {
+      saveError.value = normalizeDataGridSaveError(databaseType.value, e);
+      return [];
+    } finally {
+      isPreviewLoading.value = false;
+    }
+  }
+
   return {
     editingCell,
     editValue,
@@ -1003,6 +965,9 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     clearResetScrollAfterResult,
     cleanupFrames,
     recordScrollPosition,
+    previewStatements,
+    isPreviewLoading,
+    previewChanges,
     syncHeaderScroll: (headerRef: Ref<HTMLDivElement | undefined>) => (e: Event) => {
       if (headerRef.value) {
         headerRef.value.scrollLeft = (e.target as HTMLElement).scrollLeft;

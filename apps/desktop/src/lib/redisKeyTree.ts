@@ -64,12 +64,7 @@ export function buildRedisKeyTree(keys: RedisKeyInfo[], db: number): RedisKeyTre
   return sortRedisTreeNodes(root);
 }
 
-function insertKeyIntoTree(
-  root: RedisKeyTreeNode[],
-  groupMap: Map<string, RedisKeyTreeGroupNode>,
-  key: RedisKeyInfo,
-  db: number,
-): void {
+function insertKeyIntoTree(root: RedisKeyTreeNode[], groupMap: Map<string, RedisKeyTreeGroupNode>, key: RedisKeyInfo, db: number): void {
   const pathSegments = key.key_display.split(":");
   if (pathSegments.length === 1) {
     root.push({
@@ -139,11 +134,7 @@ function rebuildGroupMap(tree: RedisKeyTreeNode[]): Map<string, RedisKeyTreeGrou
   return groupMap;
 }
 
-export function mergeKeysIntoRedisKeyTree(
-  existingTree: RedisKeyTreeNode[],
-  newKeys: RedisKeyInfo[],
-  db: number,
-): RedisKeyTreeNode[] {
+export function mergeKeysIntoRedisKeyTree(existingTree: RedisKeyTreeNode[], newKeys: RedisKeyInfo[], db: number): RedisKeyTreeNode[] {
   if (existingTree.length === 0) return buildRedisKeyTree(newKeys, db);
 
   const groupMap = rebuildGroupMap(existingTree);
@@ -199,11 +190,7 @@ export function collectRedisGroupKeyRaws(group: RedisKeyTreeGroupNode): string[]
   return keyRaws;
 }
 
-export function flattenVisibleRedisKeyTree(
-  nodes: RedisKeyTreeNode[],
-  expandedGroupIds: ReadonlySet<string>,
-  depth = 0,
-): RedisKeyTreeRow[] {
+export function flattenVisibleRedisKeyTree(nodes: RedisKeyTreeNode[], expandedGroupIds: ReadonlySet<string>, depth = 0): RedisKeyTreeRow[] {
   const rows: RedisKeyTreeRow[] = [];
 
   for (const node of nodes) {

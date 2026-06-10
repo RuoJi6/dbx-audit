@@ -25,9 +25,7 @@ const backend: Backend = {
   addConnection: async () => connection,
   removeConnection: async () => true,
   listTables: async () => [{ name: "users", type: "BASE TABLE" }],
-  describeTable: async () => [
-    { name: "id", data_type: "integer", is_nullable: false, column_default: null, is_primary_key: true, comment: null },
-  ],
+  describeTable: async () => [{ name: "id", data_type: "integer", is_nullable: false, column_default: null, is_primary_key: true, comment: null }],
   executeQuery: async () => ({ columns: ["total"], rows: [{ total: 1 }], row_count: 1 }),
 };
 

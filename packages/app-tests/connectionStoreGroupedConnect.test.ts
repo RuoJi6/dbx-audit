@@ -89,7 +89,10 @@ test("connecting a grouped connection updates it in place instead of adding a ro
 
     assert.equal(store.treeNodes.length, 1);
     assert.equal(store.treeNodes[0].type, "connection-group");
-    assert.deepEqual(store.treeNodes[0].children?.map((node) => node.id), ["conn-1"]);
+    assert.deepEqual(
+      store.treeNodes[0].children?.map((node) => node.id),
+      ["conn-1"],
+    );
     assert.equal(countConnectionNodes(store.treeNodes, "conn-1"), 1);
   } finally {
     globalThis.fetch = originalFetch;

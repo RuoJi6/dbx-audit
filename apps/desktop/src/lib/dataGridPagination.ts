@@ -15,10 +15,7 @@ export function canGoNextDataGridPage(options: CanGoNextDataGridPageOptions): bo
   if (options.hasMore === true) return true;
 
   const pageSize = Math.max(1, options.pageSize);
-  const currentOffset =
-    typeof options.pageOffset === "number" && options.pageOffset >= 0
-      ? options.pageOffset
-      : Math.max(0, (options.currentPage ?? 1) - 1) * pageSize;
+  const currentOffset = typeof options.pageOffset === "number" && options.pageOffset >= 0 ? options.pageOffset : Math.max(0, (options.currentPage ?? 1) - 1) * pageSize;
 
   const totalRowCount = options.totalRowCount;
   if (typeof totalRowCount === "number" && Number.isFinite(totalRowCount) && totalRowCount >= 0) {

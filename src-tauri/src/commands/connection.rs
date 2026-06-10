@@ -3,7 +3,7 @@ use tauri::State;
 
 pub use dbx_core::agent_connection::{
     agent_connect_params, mongo_legacy_error_with_auth_hint, oracle_alternate_connect_config,
-    oracle_auth_fallback_profiles, should_retry_oracle_with_10g_driver,
+    oracle_auth_fallback_profiles, oracle_error_with_driver_hint, should_retry_oracle_with_10g_driver,
 };
 pub use dbx_core::connection::{
     connect_bare_metadata_pool, connect_mysql_metadata_pool, connection_url_for_endpoint, metadata_connection_config,
@@ -85,7 +85,7 @@ async fn test_agent_connection(
                 ));
             }
         } else {
-            return Err(err);
+            return Err(oracle_error_with_driver_hint(config, &err));
         }
     }
 
@@ -142,7 +142,7 @@ async fn connect_agent_pool(
                 format!("{err}\n\nFallback with legacy Oracle drivers failed: {}", fallback_errors.join("\n"))
             })?;
         } else {
-            return Err(err);
+            return Err(oracle_error_with_driver_hint(config, &err));
         }
     }
 
@@ -173,6 +173,7 @@ mod tests {
             transport_layers: Vec::new(),
             connect_timeout_secs: dbx_core::models::connection::default_connect_timeout_secs(),
             query_timeout_secs: dbx_core::models::connection::default_query_timeout_secs(),
+            idle_timeout_secs: dbx_core::models::connection::default_idle_timeout_secs(),
             ssl: false,
             ca_cert_path: String::new(),
             client_cert_path: String::new(),
@@ -194,6 +195,7 @@ mod tests {
             jdbc_driver_class: None,
             jdbc_driver_paths: Vec::new(),
             one_time: false,
+            read_only: false,
         }
     }
 
@@ -247,6 +249,7 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
     let url = connection_url_for_endpoint(&config, &host, port);
     let target = redacted_connection_url_for_endpoint(&config, &host, port);
     let connect_timeout = std::time::Duration::from_secs(config.effective_connect_timeout_secs());
+    let idle_timeout = std::time::Duration::from_secs(config.idle_timeout_secs);
     log::info!("[test_connection] db_type={:?} target={}", config.db_type, target);
     let result = match probe_result {
         Err(e) => Err(e),
@@ -324,7 +327,7 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
                 }
             }
             DatabaseType::MongoDb => {
-                let native_err = match db::mongo_driver::connect(&url, connect_timeout).await {
+                let native_err = match db::mongo_driver::connect(&url, connect_timeout, idle_timeout).await {
                     Ok(client) => {
                         match db::mongo_driver::test_connection(&client, connect_timeout, config.effective_database())
                             .await
@@ -398,6 +401,31 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
                     .await
                     .map(|_| "Connection successful".to_string())
             }
+            DatabaseType::Turso => {
+                let auth_token = if !config.password.is_empty() {
+                    config.password.clone()
+                } else {
+                    config
+                        .url_params
+                        .as_deref()
+                        .and_then(|p| {
+                            p.trim()
+                                .trim_start_matches('?')
+                                .split('&')
+                                .filter_map(|pair| pair.split_once('='))
+                                .find(|(key, _)| {
+                                    let k = key.trim().to_ascii_lowercase();
+                                    k == "auth_token" || k == "authtoken" || k == "auth-token"
+                                })
+                                .map(|(_, value)| value.trim().to_string())
+                        })
+                        .unwrap_or_default()
+                };
+                let client = db::turso_driver::TursoClient::new(&url, &auth_token, config.ssl, connect_timeout)?;
+                db::turso_driver::test_connection(&client, connect_timeout)
+                    .await
+                    .map(|_| "Connection successful".to_string())
+            }
             db_type if database_capabilities::is_agent_type(&db_type) => {
                 test_agent_connection(state.inner(), &config, &host, port).await
             }
@@ -434,6 +462,7 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
     probe_connection_endpoint(&db_config, &host, port).await?;
     let url = connection_url_for_endpoint(&db_config, &host, port);
     let connect_timeout = std::time::Duration::from_secs(db_config.effective_connect_timeout_secs());
+    let idle_timeout = std::time::Duration::from_secs(db_config.idle_timeout_secs);
 
     let pool = match db_config.db_type {
         DatabaseType::Mysql => {
@@ -489,7 +518,7 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
             PoolKind::DuckDb(con)
         }
         DatabaseType::MongoDb => {
-            let native_err = match db::mongo_driver::connect(&url, connect_timeout).await {
+            let native_err = match db::mongo_driver::connect(&url, connect_timeout, idle_timeout).await {
                 Ok(client) => {
                     match db::mongo_driver::test_connection(&client, connect_timeout, db_config.effective_database())
                         .await
@@ -564,6 +593,30 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
             db::rqlite_driver::test_connection(&client, connect_timeout).await?;
             PoolKind::Rqlite(client)
         }
+        DatabaseType::Turso => {
+            let auth_token = if !db_config.password.is_empty() {
+                db_config.password.clone()
+            } else {
+                db_config
+                    .url_params
+                    .as_deref()
+                    .and_then(|p| {
+                        p.trim()
+                            .trim_start_matches('?')
+                            .split('&')
+                            .filter_map(|pair| pair.split_once('='))
+                            .find(|(key, _)| {
+                                let k = key.trim().to_ascii_lowercase();
+                                k == "auth_token" || k == "authtoken" || k == "auth-token"
+                            })
+                            .map(|(_, value)| value.trim().to_string())
+                    })
+                    .unwrap_or_default()
+            };
+            let client = db::turso_driver::TursoClient::new(&url, &auth_token, db_config.ssl, connect_timeout)?;
+            db::turso_driver::test_connection(&client, connect_timeout).await?;
+            PoolKind::Turso(client)
+        }
         db_type if database_capabilities::is_agent_type(&db_type) => {
             connect_agent_pool(state.inner(), &db_config, &host, port).await?
         }
@@ -607,6 +660,9 @@ pub async fn disconnect_db(state: State<'_, Arc<AppState>>, connection_id: Strin
     }
     drop(conns);
     state.reset_connection_transport(&connection_id).await;
+    if connection_id.starts_with("__visible_draft_") {
+        state.configs.write().await.remove(&connection_id);
+    }
     Ok(())
 }
 
@@ -624,5 +680,21 @@ pub async fn close_database_connection(
 #[tauri::command]
 pub async fn refresh_connections(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     state.refresh_connections().await;
+    Ok(())
+}
+
+/// Check whether a connection has read-only protection enabled.
+/// Returns an error if the connection is read-only, preventing write operations.
+pub async fn ensure_connection_writable(
+    state: &Arc<AppState>,
+    connection_id: &str,
+    action: &str,
+) -> Result<(), String> {
+    if let Some(name) = dbx_core::query::connection_readonly_name(state, connection_id).await {
+        return Err(format!(
+            "Read-only mode: connection '{}' has read-only protection enabled. {} blocked.",
+            name, action
+        ));
+    }
     Ok(())
 }

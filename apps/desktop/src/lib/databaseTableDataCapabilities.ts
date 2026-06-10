@@ -50,6 +50,7 @@ const NAVICAT_STYLE_TABLE_DATA_TYPES = new Set<DatabaseType>([
   "postgres",
   "sqlite",
   "rqlite",
+  "turso",
   "duckdb",
   "sqlserver",
   "oracle",

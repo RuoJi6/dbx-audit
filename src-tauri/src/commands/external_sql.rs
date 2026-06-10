@@ -12,8 +12,8 @@ pub fn pending_open_sql_files(state: tauri::State<'_, ExternalSqlOpenState>) -> 
 }
 
 #[tauri::command]
-pub fn read_external_sql_file(path: String) -> Result<String, String> {
-    read_external_sql_file_content(Path::new(&path))
+pub async fn read_external_sql_file(path: String) -> Result<String, String> {
+    read_external_sql_file_content_async(PathBuf::from(path)).await
 }
 
 #[derive(Default)]
@@ -62,11 +62,20 @@ pub fn is_sql_file_path(path: &Path) -> bool {
     path.extension().and_then(|ext| ext.to_str()).map(|ext| ext.eq_ignore_ascii_case("sql")).unwrap_or(false)
 }
 
-pub fn read_external_sql_file_content(path: &Path) -> Result<String, String> {
+#[cfg(test)]
+fn read_external_sql_file_content(path: &Path) -> Result<String, String> {
     if !is_sql_file_path(path) {
         return Err("Only .sql files can be opened this way".to_string());
     }
     let bytes = std::fs::read(path).map_err(|e| format!("Failed to read SQL file: {e}"))?;
+    decode_sql_file_bytes(&bytes)
+}
+
+async fn read_external_sql_file_content_async(path: PathBuf) -> Result<String, String> {
+    if !is_sql_file_path(&path) {
+        return Err("Only .sql files can be opened this way".to_string());
+    }
+    let bytes = tokio::fs::read(&path).await.map_err(|e| format!("Failed to read SQL file: {e}"))?;
     decode_sql_file_bytes(&bytes)
 }
 

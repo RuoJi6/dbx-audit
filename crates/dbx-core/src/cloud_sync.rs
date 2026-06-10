@@ -576,6 +576,7 @@ mod tests {
             })],
             connect_timeout_secs: 5,
             query_timeout_secs: 30,
+            idle_timeout_secs: 60,
             ssl: false,
             ca_cert_path: String::new(),
             client_cert_path: String::new(),
@@ -595,6 +596,7 @@ mod tests {
             jdbc_driver_class: None,
             jdbc_driver_paths: Vec::new(),
             one_time: false,
+            read_only: false,
         };
         scrub_connection_secrets(&mut config);
         assert!(config.password.is_empty());

@@ -415,7 +415,7 @@ public final class DbxJdbcPlugin {
             try {
                 try (Statement stmt = conn.createStatement()) {
                     if (timeoutSecs >= 0) {
-                        try { stmt.setQueryTimeout(timeoutSecs); } catch (SQLFeatureNotSupportedException ignored) {}
+                        try { stmt.setQueryTimeout(timeoutSecs); } catch (SQLFeatureNotSupportedException | UnsupportedOperationException ignored) {}
                     }
                     boolean hasResultSet = stmt.execute(trimStatementSql(sql));
                     if (hasResultSet) {
@@ -492,13 +492,13 @@ public final class DbxJdbcPlugin {
         if (fetchSize > 0) {
             try {
                 statement.setFetchSize(fetchSize);
-            } catch (SQLFeatureNotSupportedException ignored) {
+            } catch (SQLFeatureNotSupportedException | UnsupportedOperationException ignored) {
             }
         }
         if (timeoutSecs >= 0) {
             try {
                 statement.setQueryTimeout(timeoutSecs);
-            } catch (SQLFeatureNotSupportedException ignored) {
+            } catch (SQLFeatureNotSupportedException | UnsupportedOperationException ignored) {
             }
         }
     }
@@ -642,7 +642,7 @@ public final class DbxJdbcPlugin {
         if (catalog != null) {
             try {
                 conn.setCatalog(catalog);
-            } catch (SQLFeatureNotSupportedException | AbstractMethodError ignored) {
+            } catch (SQLFeatureNotSupportedException | AbstractMethodError | UnsupportedOperationException ignored) {
             }
             if (driverQuirks(connection).useCatalogFallbackSql()) {
                 applyUseCatalogFallback(conn, catalog);
@@ -651,7 +651,7 @@ public final class DbxJdbcPlugin {
         if (schema != null) {
             try {
                 conn.setSchema(schema);
-            } catch (SQLFeatureNotSupportedException | AbstractMethodError ignored) {
+            } catch (SQLFeatureNotSupportedException | AbstractMethodError | UnsupportedOperationException ignored) {
             }
         }
     }
@@ -659,7 +659,7 @@ public final class DbxJdbcPlugin {
     private static void applyUseCatalogFallback(Connection conn, String catalog) {
         try (Statement statement = conn.createStatement()) {
             statement.execute("USE " + quoteJdbcIdentifier(catalog));
-        } catch (SQLException | AbstractMethodError ignored) {
+        } catch (SQLException | AbstractMethodError | UnsupportedOperationException ignored) {
         }
     }
 
@@ -719,7 +719,7 @@ public final class DbxJdbcPlugin {
         addDatabase(result, optionalText(connection, "database"));
         try {
             addDatabase(result, conn.getCatalog());
-        } catch (SQLFeatureNotSupportedException | AbstractMethodError ignored) {
+        } catch (SQLFeatureNotSupportedException | AbstractMethodError | UnsupportedOperationException ignored) {
         }
         return result;
     }
@@ -762,7 +762,7 @@ public final class DbxJdbcPlugin {
         } else {
             try (ResultSet rs = meta.getSchemas(catalog, null)) {
                 appendSchemas(result, rs, false);
-            } catch (SQLFeatureNotSupportedException ignored) {
+            } catch (SQLFeatureNotSupportedException | UnsupportedOperationException ignored) {
                 try (ResultSet rs = meta.getSchemas()) {
                     appendSchemas(result, rs, false);
                 }
@@ -770,7 +770,7 @@ public final class DbxJdbcPlugin {
             if (result.isEmpty() && catalog != null) {
                 try (ResultSet rs = meta.getSchemas(null, null)) {
                     appendSchemas(result, rs, false);
-                } catch (SQLFeatureNotSupportedException ignored) {
+                } catch (SQLFeatureNotSupportedException | UnsupportedOperationException ignored) {
                 }
             }
         }
@@ -780,7 +780,7 @@ public final class DbxJdbcPlugin {
                 if (schema != null) {
                     addSchema(result, schema, quirks.caseInsensitiveSchemaMetadata());
                 }
-            } catch (SQLFeatureNotSupportedException | AbstractMethodError ignored) {
+            } catch (SQLFeatureNotSupportedException | AbstractMethodError | UnsupportedOperationException ignored) {
             }
         }
         return result;
@@ -960,7 +960,7 @@ public final class DbxJdbcPlugin {
                 }
             }
             return fallback;
-        } catch (SQLFeatureNotSupportedException ignored) {
+        } catch (SQLFeatureNotSupportedException | UnsupportedOperationException ignored) {
             return null;
         }
     }
@@ -1043,7 +1043,7 @@ public final class DbxJdbcPlugin {
                     putNullablePreferValue(columnNode(result, name), "comment", comment);
                 }
             }
-        } catch (SQLException | AbstractMethodError ignored) {
+        } catch (SQLException | AbstractMethodError | UnsupportedOperationException ignored) {
         }
     }
 

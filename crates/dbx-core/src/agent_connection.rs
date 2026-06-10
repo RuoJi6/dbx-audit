@@ -185,6 +185,24 @@ pub fn mongo_legacy_error_with_auth_hint(err: &str) -> String {
     )
 }
 
+pub fn oracle_error_with_driver_hint(config: &ConnectionConfig, err: &str) -> String {
+    if config.db_type != DatabaseType::Oracle {
+        return err.to_string();
+    }
+    if matches!(config.driver_profile.as_deref(), Some("oracle-legacy" | "oracle-10g")) {
+        return err.to_string();
+    }
+
+    let normalized = err.to_lowercase();
+    if !normalized.contains("ora-12541") && !err.contains("没有监听程序") {
+        return err.to_string();
+    }
+
+    format!(
+        "{err}\n\nOracle listener was not reachable with the current driver. If the host and port are correct, try switching Version to Oracle 11g-19c or Oracle 10g."
+    )
+}
+
 fn oracle_jdbc_connection_string(config: &ConnectionConfig, host: &str, port: u16, database: &str) -> String {
     if let Some(connection_string) = config.connection_string.as_deref().filter(|value| !value.trim().is_empty()) {
         let connection_string = connection_string.trim();
@@ -372,7 +390,9 @@ fn append_agent_url_params(base: String, params: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::connection::{default_connect_timeout_secs, default_query_timeout_secs};
+    use crate::models::connection::{
+        default_connect_timeout_secs, default_idle_timeout_secs, default_query_timeout_secs,
+    };
 
     fn config(db_type: DatabaseType, database: Option<&str>) -> ConnectionConfig {
         ConnectionConfig {
@@ -393,6 +413,7 @@ mod tests {
             transport_layers: Vec::new(),
             connect_timeout_secs: default_connect_timeout_secs(),
             query_timeout_secs: default_query_timeout_secs(),
+            idle_timeout_secs: default_idle_timeout_secs(),
             ssl: false,
             ca_cert_path: String::new(),
             client_cert_path: String::new(),
@@ -412,6 +433,7 @@ mod tests {
             jdbc_driver_class: None,
             jdbc_driver_paths: Vec::new(),
             one_time: false,
+            read_only: false,
         }
     }
 
@@ -482,6 +504,32 @@ mod tests {
 
         assert!(hinted.starts_with(err));
         assert!(hinted.contains("Current authentication database: admin"));
+    }
+
+    #[test]
+    fn oracle_listener_error_adds_driver_version_hint_for_default_profile() {
+        let mut cfg = config(DatabaseType::Oracle, Some("ORCL"));
+        cfg.driver_profile = Some("oracle".to_string());
+        let err = "Agent RPC error (-1): ORA-12541: TNS:no listener";
+
+        let hinted = oracle_error_with_driver_hint(&cfg, err);
+
+        assert!(hinted.starts_with(err));
+        assert!(hinted.contains("Oracle 11g-19c"));
+        assert!(hinted.contains("Oracle 10g"));
+    }
+
+    #[test]
+    fn oracle_listener_error_hint_skips_legacy_profiles_and_other_databases() {
+        let err = "Agent RPC error (-1): ORA-12541: TNS:no listener";
+        let mut cfg = config(DatabaseType::Oracle, Some("ORCL"));
+        cfg.driver_profile = Some("oracle-legacy".to_string());
+
+        assert_eq!(oracle_error_with_driver_hint(&cfg, err), err);
+
+        cfg.db_type = DatabaseType::OceanbaseOracle;
+        cfg.driver_profile = None;
+        assert_eq!(oracle_error_with_driver_hint(&cfg, err), err);
     }
 
     #[test]

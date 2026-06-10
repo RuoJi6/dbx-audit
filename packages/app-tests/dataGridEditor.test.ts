@@ -27,8 +27,7 @@ function installBrowserTestGlobals() {
       JSON.stringify({
         statements: mockPreparedSaveStatements(options),
         rollbackStatements: [],
-        executionSchema:
-          options.databaseType === "oracle" || options.databaseType === "neo4j" ? undefined : options.tableMeta.schema,
+        executionSchema: options.databaseType === "oracle" || options.databaseType === "neo4j" ? undefined : options.tableMeta.schema,
       }),
       { status: 200, headers: { "Content-Type": "application/json" } },
     );
@@ -36,9 +35,7 @@ function installBrowserTestGlobals() {
 }
 
 function mockPreparedSaveStatements(options: DataGridSaveStatementOptions): string[] {
-  const table = options.tableMeta.schema
-    ? `${quotePgIdentifier(options.tableMeta.schema)}.${quotePgIdentifier(options.tableMeta.tableName)}`
-    : quotePgIdentifier(options.tableMeta.tableName);
+  const table = options.tableMeta.schema ? `${quotePgIdentifier(options.tableMeta.schema)}.${quotePgIdentifier(options.tableMeta.tableName)}` : quotePgIdentifier(options.tableMeta.tableName);
   const statements: string[] = [];
   for (const rowIndex of options.deletedRows) {
     const row = options.rows[rowIndex];
@@ -48,12 +45,7 @@ function mockPreparedSaveStatements(options: DataGridSaveStatementOptions): stri
   for (const [rowIndex, changes] of options.dirtyRows) {
     const row = options.rows[rowIndex];
     if (!row) continue;
-    const sets = changes
-      .map(
-        ([columnIndex, value]) =>
-          `${quotePgIdentifier(options.columns[columnIndex])} = ${formatGridSqlLiteral(value, options.databaseType)}`,
-      )
-      .join(", ");
+    const sets = changes.map(([columnIndex, value]) => `${quotePgIdentifier(options.columns[columnIndex])} = ${formatGridSqlLiteral(value, options.databaseType)}`).join(", ");
     statements.push(`UPDATE ${table} SET ${sets} WHERE ${primaryKeyWhere(options, row)};`);
   }
   for (const row of options.newRows) {
@@ -387,9 +379,7 @@ test("saving inserted rows reloads current table data", async () => {
   await editor.saveChanges();
 
   assert.deepEqual(executedSql, [`INSERT INTO "public"."people" ("id", "name") VALUES (2, 'Linus');`]);
-  assert.deepEqual(emitted, [
-    ["reload", "SELECT id, name FROM people", "linus", "name ILIKE '%l%'", "id DESC", 50, 50],
-  ]);
+  assert.deepEqual(emitted, [["reload", "SELECT id, name FROM people", "linus", "name ILIKE '%l%'", "id DESC", 50, 50]]);
 });
 
 test("saving edited rows without deletes does not reload table data", async () => {
@@ -500,9 +490,7 @@ test("saving manually typed JSON from a MySQL grid normalizes smart quotes", asy
   editor.applyCellValue(0, 1, "{“2:3”:“3:4”,“3:2”:“4:3”,“21:9”:“16:9”}");
   await editor.saveChanges();
 
-  assert.deepEqual(executedSql, [
-    `UPDATE "settings" SET "payload" = '{"2:3":"3:4","3:2":"4:3","21:9":"16:9"}' WHERE "id" = 1;`,
-  ]);
+  assert.deepEqual(executedSql, [`UPDATE "settings" SET "payload" = '{"2:3":"3:4","3:2":"4:3","21:9":"16:9"}' WHERE "id" = 1;`]);
 });
 
 test("saving manually typed JSON arrays from a Postgres array column uses array values", async () => {

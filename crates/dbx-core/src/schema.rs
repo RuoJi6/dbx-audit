@@ -303,6 +303,7 @@ async fn list_databases_once(state: &AppState, connection_id: &str) -> Result<Ve
         PoolKind::Postgres(p) => db::postgres::list_databases(p).await,
         PoolKind::Sqlite(p) => db::sqlite::list_databases(p).await,
         PoolKind::Rqlite(client) => db::rqlite_driver::list_databases(client).await,
+        PoolKind::Turso(client) => db::turso_driver::list_databases(client).await,
         PoolKind::DuckDb(con) => {
             let con = con.lock().map_err(|e| e.to_string())?;
             duckdb_list_databases_with_attached(&con, &duckdb_attached_names)
@@ -523,6 +524,9 @@ async fn list_tables_once(
         PoolKind::Rqlite(client) => db::rqlite_driver::list_tables(client, schema)
             .await
             .map(|tables| filter_table_infos_for_config(tables, filter, limit, db_config.as_ref())),
+        PoolKind::Turso(client) => db::turso_driver::list_tables(client, schema)
+            .await
+            .map(|tables| filter_table_infos_for_config(tables, filter, limit, db_config.as_ref())),
         PoolKind::MongoDb(client) => db::mongo_driver::list_collections(client, database)
             .await
             .map(|names| collection_names_to_tables(names, "COLLECTION"))
@@ -638,6 +642,7 @@ mod tests {
             transport_layers: Vec::new(),
             connect_timeout_secs: 5,
             query_timeout_secs: 30,
+            idle_timeout_secs: 60,
             ssl: false,
             ca_cert_path: String::new(),
             client_cert_path: String::new(),
@@ -657,6 +662,7 @@ mod tests {
             jdbc_driver_class: None,
             jdbc_driver_paths: Vec::new(),
             one_time: false,
+            read_only: false,
         }
     }
 
@@ -1297,6 +1303,9 @@ pub async fn get_columns_core(
         PoolKind::Rqlite(client) => {
             db::rqlite_driver::get_columns(client, schema, table).await.map(deduplicate_column_infos)
         }
+        PoolKind::Turso(client) => {
+            db::turso_driver::get_columns(client, schema, table).await.map(deduplicate_column_infos)
+        }
         PoolKind::Elasticsearch(client) => {
             db::elasticsearch_driver::get_columns(client, table).await.map(deduplicate_column_infos)
         }
@@ -1372,6 +1381,7 @@ pub async fn list_indexes_core(
         PoolKind::Postgres(p) => db::postgres::list_indexes(p, schema, table).await,
         PoolKind::Sqlite(p) => db::sqlite::list_indexes(p, schema, table).await,
         PoolKind::Rqlite(client) => db::rqlite_driver::list_indexes(client, schema, table).await,
+        PoolKind::Turso(client) => db::turso_driver::list_indexes(client, schema, table).await,
         PoolKind::MongoDb(client) => db::mongo_driver::list_indexes(client, database, table).await,
         _ => Ok(vec![]),
     }
@@ -1402,6 +1412,7 @@ pub async fn list_foreign_keys_core(
         PoolKind::Postgres(p) => db::postgres::list_foreign_keys(p, schema, table).await,
         PoolKind::Sqlite(p) => db::sqlite::list_foreign_keys(p, schema, table).await,
         PoolKind::Rqlite(client) => db::rqlite_driver::list_foreign_keys(client, schema, table).await,
+        PoolKind::Turso(client) => db::turso_driver::list_foreign_keys(client, schema, table).await,
         _ => Ok(vec![]),
     }
 }
@@ -1431,6 +1442,7 @@ pub async fn list_triggers_core(
         PoolKind::Postgres(p) => db::postgres::list_triggers(p, schema, table).await,
         PoolKind::Sqlite(p) => db::sqlite::list_triggers(p, schema, table).await,
         PoolKind::Rqlite(client) => db::rqlite_driver::list_triggers(client, schema, table).await,
+        PoolKind::Turso(client) => db::turso_driver::list_triggers(client, schema, table).await,
         _ => Ok(vec![]),
     }
 }
@@ -1499,6 +1511,7 @@ pub async fn get_table_ddl_core(
         PoolKind::Postgres(p) => pg_ddl(p, schema, table).await,
         PoolKind::Sqlite(p) => sqlite_ddl(p, table).await,
         PoolKind::Rqlite(client) => db::rqlite_driver::table_ddl(client, table).await,
+        PoolKind::Turso(client) => db::turso_driver::table_ddl(client, table).await,
         _ => Err("DDL not supported for this database type".to_string()),
     }
 }
@@ -1534,6 +1547,7 @@ fn sqlite_object_type(kind: &db::ObjectSourceKind) -> &'static str {
         db::ObjectSourceKind::View => "view",
         db::ObjectSourceKind::Procedure
         | db::ObjectSourceKind::Function
+        | db::ObjectSourceKind::Sequence
         | db::ObjectSourceKind::Package
         | db::ObjectSourceKind::PackageBody => "routine",
     }
@@ -1544,7 +1558,7 @@ fn sqlserver_object_type_filter(kind: &db::ObjectSourceKind) -> &'static str {
         db::ObjectSourceKind::View => "'V'",
         db::ObjectSourceKind::Procedure => "'P'",
         db::ObjectSourceKind::Function => "'FN','IF','TF','FS','FT'",
-        db::ObjectSourceKind::Package | db::ObjectSourceKind::PackageBody => "''",
+        db::ObjectSourceKind::Sequence | db::ObjectSourceKind::Package | db::ObjectSourceKind::PackageBody => "''",
     }
 }
 
@@ -1586,6 +1600,30 @@ pub fn postgres_object_source_sql(schema: &str, name: &str, kind: &db::ObjectSou
                 prokind
             )
         }
+        db::ObjectSourceKind::Sequence => {
+            format!(
+                "SELECT concat_ws(E'\\n\\n', \
+                   '-- auto-generated definition' || E'\\n' || \
+                   'create sequence ' || quote_ident(c.relname) || E'\\n' || \
+                   '    as ' || pg_catalog.format_type(s.seqtypid, NULL) || ';', \
+                   'alter sequence ' || quote_ident(c.relname) || ' owner to ' || quote_ident(pg_get_userbyid(c.relowner)) || ';', \
+                   CASE WHEN owned.relname IS NOT NULL AND a.attname IS NOT NULL \
+                     THEN 'alter sequence ' || quote_ident(c.relname) || ' owned by ' || quote_ident(owned.relname) || '.' || quote_ident(a.attname) || ';' \
+                   END \
+                 ) \
+                 FROM pg_catalog.pg_class c \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                 JOIN pg_catalog.pg_sequence s ON s.seqrelid = c.oid \
+                 LEFT JOIN pg_catalog.pg_depend d \
+                   ON d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'a' \
+                 LEFT JOIN pg_catalog.pg_class owned ON owned.oid = d.refobjid \
+                 LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid \
+                 WHERE n.nspname = {} AND c.relname = {} AND c.relkind = 'S' \
+                 ORDER BY c.oid LIMIT 1",
+                sql_string(schema),
+                sql_string(name)
+            )
+        }
         db::ObjectSourceKind::Package | db::ObjectSourceKind::PackageBody => "SELECT NULL WHERE FALSE".to_string(),
     }
 }
@@ -1595,6 +1633,7 @@ pub fn oracle_object_source_sql(schema: &str, name: &str, kind: &db::ObjectSourc
         db::ObjectSourceKind::View => "VIEW",
         db::ObjectSourceKind::Procedure => "PROCEDURE",
         db::ObjectSourceKind::Function => "FUNCTION",
+        db::ObjectSourceKind::Sequence => "SEQUENCE",
         db::ObjectSourceKind::Package => "PACKAGE",
         db::ObjectSourceKind::PackageBody => "PACKAGE_BODY",
     };
@@ -1623,7 +1662,9 @@ pub fn mysql_object_source_sql(name: &str, kind: &db::ObjectSourceKind) -> Strin
         db::ObjectSourceKind::View => format!("SHOW CREATE VIEW {}", mysql_ident(name)),
         db::ObjectSourceKind::Procedure => format!("SHOW CREATE PROCEDURE {}", mysql_ident(name)),
         db::ObjectSourceKind::Function => format!("SHOW CREATE FUNCTION {}", mysql_ident(name)),
-        db::ObjectSourceKind::Package | db::ObjectSourceKind::PackageBody => String::new(),
+        db::ObjectSourceKind::Sequence | db::ObjectSourceKind::Package | db::ObjectSourceKind::PackageBody => {
+            String::new()
+        }
     }
 }
 
@@ -1726,6 +1767,9 @@ pub async fn get_object_source_core(
                 )?,
                 PoolKind::Rqlite(client) => {
                     return db::rqlite_driver::object_source(client, name, &object_type).await;
+                }
+                PoolKind::Turso(client) => {
+                    return db::turso_driver::object_source(client, name, &object_type).await;
                 }
                 PoolKind::ClickHouse(client) if matches!(object_type, db::ObjectSourceKind::View) => {
                     let result = db::clickhouse_driver::execute_query(
@@ -1881,6 +1925,25 @@ mod object_source_tests {
             postgres_object_source_sql("public", "recalc_score", &ObjectSourceKind::Function),
             "SELECT pg_get_functiondef(p.oid) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public' AND p.proname = 'recalc_score' AND p.prokind = 'f' ORDER BY p.oid LIMIT 1"
         );
+    }
+
+    #[test]
+    fn builds_postgres_object_source_sql_for_sequences() {
+        let sql = postgres_object_source_sql("tenant's schema", "order id seq", &ObjectSourceKind::Sequence);
+
+        assert!(sql.contains("-- auto-generated definition"));
+        assert!(sql.contains("create sequence"));
+        assert!(sql.contains("alter sequence"));
+        assert!(sql.contains("owner to"));
+        assert!(sql.contains("owned by"));
+        assert!(sql.contains("pg_catalog.pg_sequence"));
+        assert!(sql.contains("n.nspname = 'tenant''s schema'"));
+        assert!(sql.contains("c.relname = 'order id seq'"));
+        assert!(sql.contains("c.relkind = 'S'"));
+        assert!(!sql.contains("MINVALUE"));
+        assert!(!sql.contains("START WITH"));
+        assert!(!sql.contains("CACHE"));
+        assert!(!sql.contains("NO CYCLE"));
     }
 
     #[test]

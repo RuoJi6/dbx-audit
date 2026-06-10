@@ -46,7 +46,7 @@ function formatQueryToolResult(result: QueryResult, title?: string) {
 }
 
 export const DBX_CONNECTION_TYPE_DESCRIPTION =
-  "Database type: postgres, mysql, sqlite, rqlite, redis, duckdb, clickhouse, sqlserver, mongodb, oracle, elasticsearch, doris, starrocks, redshift, dameng, kingbase, highgo, vastbase, goldendb, databend, gaussdb, kwdb, yashandb, databricks, saphana, teradata, vertica, firebird, exasol, opengauss, oceanbase-oracle, gbase, h2, snowflake, trino, hive, db2, informix, iris, neo4j, cassandra, bigquery, kylin, sundb, tdengine, iotdb, xugu, jdbc, access";
+  "Database type: postgres, mysql, sqlite, rqlite, redis, duckdb, clickhouse, sqlserver, mongodb, oracle, elasticsearch, etcd, doris, starrocks, redshift, dameng, kingbase, highgo, vastbase, goldendb, databend, gaussdb, kwdb, yashandb, databricks, saphana, teradata, vertica, firebird, exasol, opengauss, oceanbase-oracle, gbase, h2, snowflake, trino, hive, db2, informix, iris, neo4j, cassandra, bigquery, kylin, sundb, tdengine, iotdb, xugu, jdbc, access";
 const FILE_CAPABLE_CONNECTION_TYPES = new Set(["sqlite", "duckdb", "access", "h2"]);
 
 export function createDbxMcpServer(backend: Backend, options: { isWebMode?: boolean } = {}): McpServer {
@@ -95,13 +95,7 @@ export function createDbxMcpServer(backend: Backend, options: { isWebMode?: bool
       if (!config) return toolError("CONNECTION_NOT_FOUND", `Connection "${connection_name}" not found.`);
       const columns = await backend.describeTable(withDatabase(config, database), table, schema);
       if (columns.length === 0) return text("No columns found.");
-      const rows = columns.map((c) => [
-        c.is_primary_key ? `${c.name} (PK)` : c.name,
-        c.data_type,
-        c.is_nullable ? "YES" : "NO",
-        c.column_default ?? "",
-        c.comment ?? "",
-      ]);
+      const rows = columns.map((c) => [c.is_primary_key ? `${c.name} (PK)` : c.name, c.data_type, c.is_nullable ? "YES" : "NO", c.column_default ?? "", c.comment ?? ""]);
       return text(mdTable(["Column", "Type", "Nullable", "Default", "Comment"], rows));
     },
   );
@@ -130,11 +124,7 @@ export function createDbxMcpServer(backend: Backend, options: { isWebMode?: bool
           results.push(await backend.executeQuery(withDatabase(config, database), statement));
         }
         if (results.length === 1) return formatQueryToolResult(results[0]);
-        return text(
-          results
-            .map((result, index) => formatQueryToolResult(result, `Statement ${index + 1}`).content[0].text)
-            .join("\n\n"),
-        );
+        return text(results.map((result, index) => formatQueryToolResult(result, `Statement ${index + 1}`).content[0].text).join("\n\n"));
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
         return toolError("QUERY_ERROR", msg);
@@ -172,10 +162,7 @@ export function createDbxMcpServer(backend: Backend, options: { isWebMode?: bool
       name: z.string().describe("Connection name"),
       db_type: z.string().describe(DBX_CONNECTION_TYPE_DESCRIPTION),
       host: z.string().describe("Database host"),
-      port: z
-        .number()
-        .optional()
-        .describe("Database port (TDengine defaults to 6041, IoTDB defaults to 6667, XuguDB defaults to 5138)"),
+      port: z.number().optional().describe("Database port (TDengine defaults to 6041, IoTDB defaults to 6667, XuguDB defaults to 5138)"),
       username: z.string().default("").describe("Username"),
       password: z.string().default("").describe("Password"),
       database: z.string().optional().describe("Default database name"),
@@ -191,8 +178,7 @@ export function createDbxMcpServer(backend: Backend, options: { isWebMode?: bool
         iotdb: 6667,
         xugu: 5138,
       };
-      const resolvedPort =
-        port ?? DEFAULT_PORTS[db_type] ?? (FILE_CAPABLE_CONNECTION_TYPES.has(db_type) ? 0 : undefined);
+      const resolvedPort = port ?? DEFAULT_PORTS[db_type] ?? (FILE_CAPABLE_CONNECTION_TYPES.has(db_type) ? 0 : undefined);
       if (resolvedPort === undefined) return text("Port is required for this database type.");
       const config = await backend.addConnection({
         name,

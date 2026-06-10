@@ -31,11 +31,17 @@ struct NpmLatestPackage {
 
 #[tauri::command]
 pub async fn check_mcp_server_status() -> Result<McpServerStatus, String> {
-    let npm_available = command_success("npm", &["--version"]);
-    let node_version = command_stdout("node", &["--version"]).ok().and_then(first_non_empty_line);
-    let current_version = if npm_available { installed_mcp_version() } else { None };
-    let bin_path = locate_mcp_bin();
-    let latest_version = fetch_latest_mcp_version().await.ok();
+    let local_status = tauri::async_runtime::spawn_blocking(|| {
+        let npm_available = command_success("npm", &["--version"]);
+        let node_version = command_stdout("node", &["--version"]).ok().and_then(first_non_empty_line);
+        let current_version = if npm_available { installed_mcp_version() } else { None };
+        let bin_path = locate_mcp_bin();
+        (npm_available, node_version, current_version, bin_path)
+    });
+    let latest_version = fetch_latest_mcp_version();
+    let (local_status, latest_version) = tokio::join!(local_status, latest_version);
+    let (npm_available, node_version, current_version, bin_path) = local_status.map_err(|err| err.to_string())?;
+    let latest_version = latest_version.ok();
     let update_available = current_version
         .as_deref()
         .zip(latest_version.as_deref())
@@ -58,7 +64,9 @@ pub async fn check_mcp_server_status() -> Result<McpServerStatus, String> {
 
 async fn fetch_latest_mcp_version() -> Result<String, String> {
     let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(10)).user_agent("dbx-mcp-status-checker");
-    if let Some(proxy_url) = dbx_core::update::system_proxy_url() {
+    let proxy_url =
+        tauri::async_runtime::spawn_blocking(dbx_core::update::system_proxy_url).await.map_err(|e| e.to_string())?;
+    if let Some(proxy_url) = proxy_url {
         let proxy = reqwest::Proxy::all(&proxy_url).map_err(|e| format!("Invalid system proxy URL: {e}"))?;
         builder = builder.proxy(proxy);
     }

@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::error::Error;
 use std::time::Duration;
 
-use super::with_connection_timeout;
+use super::{http_client_builder, with_connection_timeout};
 use crate::db::mongo_driver::MongoDocumentResult;
 
 pub struct EsClient {
@@ -28,11 +28,7 @@ impl EsClient {
             (Some(u), Some(p)) if !u.is_empty() => Some((u.to_string(), p.to_string())),
             _ => None,
         };
-        let mut builder =
-            HttpClient::builder().connect_timeout(timeout).danger_accept_invalid_certs(accept_invalid_certs);
-        if elasticsearch_should_bypass_system_proxy(&base_url) {
-            builder = builder.no_proxy();
-        }
+        let builder = http_client_builder(timeout).danger_accept_invalid_certs(accept_invalid_certs);
         let http = builder.build().unwrap_or_else(|_| HttpClient::new());
         let fallback_base_urls = elasticsearch_base_url_fallbacks(&base_url);
         Self { http, base_url, fallback_base_urls, auth }
@@ -164,17 +160,6 @@ fn elasticsearch_base_url_fallbacks(base_url: &str) -> Vec<String> {
     } else {
         Vec::new()
     }
-}
-
-fn elasticsearch_should_bypass_system_proxy(base_url: &str) -> bool {
-    let Ok(parsed) = reqwest::Url::parse(base_url) else {
-        return false;
-    };
-    let Some(host) = parsed.host_str() else {
-        return false;
-    };
-    let host = host.trim_matches(['[', ']']);
-    host.eq_ignore_ascii_case("localhost") || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 fn redact_elasticsearch_url(url: &str) -> String {
@@ -420,6 +405,24 @@ pub async fn execute_rest_query(client: &EsClient, input: &str) -> Result<crate:
         return execute_search_query(client, search_query, start).await;
     }
 
+    // `SELECT *` with clauses our simple parser doesn't cover (WHERE, IN,
+    // BETWEEN, LIKE, ...). Translate the SQL to an ES `_search` body
+    // ourselves rather than going through ES's `_sql` endpoint — `_sql`
+    // refuses several common shapes (LIKE on a `text` field with no
+    // `.keyword`, `SELECT *` returning an array field like `host.ip`, ...)
+    // that translate cleanly to raw DSL. Adapt first so that hyphenated
+    // index names (`aifanfan-python-bot-logs-*`) and `@timestamp`-style
+    // identifiers come out as double-quoted identifiers sqlparser will
+    // accept.
+    let adapted_for_translator = adapt_elasticsearch_sql_query(input);
+    match crate::db::elasticsearch_sql::translate_select_star(&adapted_for_translator) {
+        Ok(Some(translated)) => {
+            return execute_translated_select_star(client, translated, start).await;
+        }
+        Ok(None) => {}
+        Err(message) => return Err(format!("Elasticsearch SQL error: {message}")),
+    }
+
     if is_elasticsearch_sql_query(input) {
         return execute_sql_query(client, input, start).await;
     }
@@ -524,7 +527,10 @@ fn parse_elasticsearch_response(
 ) -> Result<crate::types::QueryResult, String> {
     if let Some(result) = parse_sql_response(&body, start) {
         Ok(result)
-    } else if let Some(hits) = body.pointer("/hits/hits").and_then(|v| v.as_array()).filter(|h| !h.is_empty()) {
+    } else if let Some(hits) = body.pointer("/hits/hits").and_then(|v| v.as_array()) {
+        // Treat any `_search`-shaped body as the hits result, even when empty —
+        // a 0-row match is a valid empty result, not a reason to fall back to
+        // the raw-JSON status/response view.
         let mut all_keys = Vec::<String>::new();
         let docs: Vec<serde_json::Map<String, serde_json::Value>> = hits
             .iter()
@@ -544,6 +550,11 @@ fn parse_elasticsearch_response(
                 row
             })
             .collect();
+        if all_keys.is_empty() {
+            // 0 hits → there's no doc to derive columns from; surface `_id`
+            // so the grid at least shows a column header for the empty set.
+            all_keys.push("_id".to_string());
+        }
 
         let rows: Vec<Vec<serde_json::Value>> = docs
             .iter()
@@ -567,6 +578,7 @@ fn parse_elasticsearch_response(
         Ok(crate::types::QueryResult {
             columns: all_keys,
             column_types: Vec::new(),
+            column_sortables: vec![],
             rows,
             affected_rows: row_count,
             execution_time_ms: start.elapsed().as_millis(),
@@ -581,6 +593,7 @@ fn parse_elasticsearch_response(
             Ok(crate::types::QueryResult {
                 columns,
                 column_types: Vec::new(),
+                column_sortables: vec![],
                 rows,
                 affected_rows: row_count,
                 execution_time_ms: start.elapsed().as_millis(),
@@ -593,6 +606,7 @@ fn parse_elasticsearch_response(
             Ok(crate::types::QueryResult {
                 columns: vec!["status".to_string(), "response".to_string()],
                 column_types: Vec::new(),
+                column_sortables: vec![],
                 rows: vec![vec![serde_json::Value::Number(status.into()), serde_json::Value::String(pretty)]],
                 affected_rows: 0,
                 execution_time_ms: start.elapsed().as_millis(),
@@ -606,6 +620,7 @@ fn parse_elasticsearch_response(
         Ok(crate::types::QueryResult {
             columns: vec!["status".to_string(), "response".to_string()],
             column_types: Vec::new(),
+            column_sortables: vec![],
             rows: vec![vec![serde_json::Value::Number(status.into()), serde_json::Value::String(pretty)]],
             affected_rows: 0,
             execution_time_ms: start.elapsed().as_millis(),
@@ -711,6 +726,32 @@ fn is_elasticsearch_sql_query(input: &str) -> bool {
         .split_once(char::is_whitespace)
         .map(|(keyword, _)| keyword.eq_ignore_ascii_case("select"))
         .unwrap_or_else(|| input.trim_start().eq_ignore_ascii_case("select"))
+}
+
+async fn execute_translated_select_star(
+    client: &EsClient,
+    translated: crate::db::elasticsearch_sql::TranslatedSelectStar,
+    start: std::time::Instant,
+) -> Result<crate::types::QueryResult, String> {
+    let report_index_total = !translated.user_limited;
+    let path = format!("/{}/_search", translated.index);
+    let resp = client
+        .post(&path)
+        .json(&translated.body)
+        .send()
+        .await
+        .map_err(|e| format!("Elasticsearch request failed: {e}"))?;
+    let status = resp.status().as_u16();
+    let body: serde_json::Value = resp.json().await.unwrap_or_else(|_| serde_json::Value::Null);
+    let index_total = body.pointer("/hits/total/value").and_then(|v| v.as_u64());
+
+    let mut result = parse_elasticsearch_response(status, body, start)?;
+    if report_index_total {
+        if let Some(total) = index_total {
+            result.affected_rows = total;
+        }
+    }
+    Ok(result)
 }
 
 async fn execute_sql_query(
@@ -998,6 +1039,7 @@ fn parse_sql_response(body: &serde_json::Value, start: std::time::Instant) -> Op
     Some(crate::types::QueryResult {
         columns: column_names,
         column_types: Vec::new(),
+        column_sortables: vec![],
         rows: result_rows,
         affected_rows: rows.len() as u64,
         execution_time_ms: start.elapsed().as_millis(),
@@ -1097,8 +1139,7 @@ fn parse_aggregations(aggs: &serde_json::Map<String, serde_json::Value>) -> (Vec
 #[cfg(test)]
 mod tests {
     use super::{
-        elasticsearch_accept_invalid_certs, elasticsearch_base_url_fallbacks, elasticsearch_should_bypass_system_proxy,
-        redact_elasticsearch_url, EsClient,
+        elasticsearch_accept_invalid_certs, elasticsearch_base_url_fallbacks, redact_elasticsearch_url, EsClient,
     };
     use std::time::Duration;
 
@@ -1147,13 +1188,5 @@ mod tests {
             redact_elasticsearch_url("https://elastic:secret@localhost:9200"),
             "https://user:password@localhost:9200"
         );
-    }
-
-    #[test]
-    fn elasticsearch_only_bypasses_system_proxy_for_loopback_hosts() {
-        assert!(elasticsearch_should_bypass_system_proxy("https://localhost:9200"));
-        assert!(elasticsearch_should_bypass_system_proxy("https://127.0.0.1:9200"));
-        assert!(elasticsearch_should_bypass_system_proxy("https://[::1]:9200"));
-        assert!(!elasticsearch_should_bypass_system_proxy("https://search.example.com:9200"));
     }
 }

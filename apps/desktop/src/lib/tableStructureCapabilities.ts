@@ -1,15 +1,6 @@
 import type { DatabaseType } from "@/types/database";
 
-export type TableStructureDialect =
-  | "mysql"
-  | "postgres"
-  | "sqlite"
-  | "duckdb"
-  | "sqlserver"
-  | "oracle"
-  | "h2"
-  | "clickhouse"
-  | "unsupported";
+export type TableStructureDialect = "mysql" | "postgres" | "sqlite" | "duckdb" | "sqlserver" | "oracle" | "h2" | "clickhouse" | "unsupported";
 
 export interface TableStructureCapabilities {
   dialect: TableStructureDialect;
@@ -224,6 +215,7 @@ const capabilityByType: Partial<Record<DatabaseType, TableStructureCapabilities>
   kingbase: postgresCapabilities,
   sqlite: sqliteCapabilities,
   rqlite: sqliteCapabilities,
+  turso: sqliteCapabilities,
   duckdb: duckdbCapabilities,
   sqlserver: sqlserverCapabilities,
   oracle: oracleCapabilities,
