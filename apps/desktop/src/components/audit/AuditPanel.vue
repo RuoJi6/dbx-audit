@@ -2890,10 +2890,15 @@ onUnmounted(() => {
               {{ task.description || ui.noDescription }}
             </div>
           </div>
-          <div class="min-w-[96px] shrink-0">
+          <div class="min-w-[140px] shrink-0 space-y-1">
             <span class="rounded-full px-3 py-1 text-xs" :class="task.status === 'completed' ? 'bg-emerald-50 text-emerald-700' : task.status === 'running' ? 'bg-blue-50 text-blue-700' : task.status === 'failed' ? 'bg-red-50 text-red-700' : 'bg-muted text-muted-foreground'">
               {{ ui.status[task.status] }}
             </span>
+            <div class="inline-flex whitespace-nowrap rounded-full border px-2 py-0.5 text-xs" :class="taskOutcomeClass(task)">
+              <span class="font-medium text-emerald-700">{{ ui.outcomeSuccess }} {{ taskOutcomeTotals(task).success }}</span>
+              <span class="mx-1 text-muted-foreground">/</span>
+              <span class="font-medium" :class="taskOutcomeTotals(task).failed > 0 ? 'text-destructive' : 'text-muted-foreground'">{{ ui.outcomeFailed }} {{ taskOutcomeTotals(task).failed }}</span>
+            </div>
           </div>
           <div class="min-w-[320px] flex-[2_1_420px] space-y-1 text-xs text-muted-foreground">
             <div class="flex min-w-0 items-center gap-1.5">
@@ -2909,11 +2914,6 @@ onUnmounted(() => {
               <span class="rounded-full border px-2 py-0.5" :class="riskClass('high')">{{ ui.riskHighShort }} {{ taskTotals(task).high }}</span>
               <span class="rounded-full border px-2 py-0.5" :class="riskClass('medium')">{{ ui.riskMediumShort }} {{ taskTotals(task).medium }}</span>
               <span class="rounded-full border px-2 py-0.5" :class="riskClass('low')">{{ ui.riskLowShort }} {{ taskTotals(task).low }}</span>
-              <span class="rounded-full border px-2 py-0.5" :class="taskOutcomeClass(task)">
-                <span class="font-medium text-emerald-700">{{ ui.outcomeSuccess }} {{ taskOutcomeTotals(task).success }}</span>
-                <span class="mx-1 text-muted-foreground">/</span>
-                <span class="font-medium" :class="taskOutcomeTotals(task).failed > 0 ? 'text-destructive' : 'text-muted-foreground'">{{ ui.outcomeFailed }} {{ taskOutcomeTotals(task).failed }}</span>
-              </span>
             </div>
             <div class="h-1.5 overflow-hidden rounded bg-muted">
               <div class="h-full bg-primary" :style="{ width: `${task.progress}%` }" />
