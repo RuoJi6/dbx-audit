@@ -333,6 +333,8 @@ const zh = {
   riskHighShort: "高",
   riskMediumShort: "中",
   riskLowShort: "低",
+  outcomeSuccess: "正确",
+  outcomeFailed: "错误",
   targetSinglePrefix: "单目标扫描",
   targetMultiPrefix: "多目标加载",
   targetSqlPrefix: "SQL 结果扫描",
@@ -588,6 +590,8 @@ const en = {
   riskHighShort: "High",
   riskMediumShort: "Med",
   riskLowShort: "Low",
+  outcomeSuccess: "OK",
+  outcomeFailed: "Error",
   targetSinglePrefix: "Single target scan",
   targetMultiPrefix: "Multi-target load",
   targetSqlPrefix: "SQL result scan",
@@ -2351,6 +2355,27 @@ function taskTotals(task: AuditTask) {
   return riskTotals(task.job?.findings || []);
 }
 
+function taskOutcomeTotals(task: AuditTask) {
+  const summaries = task.job?.targetSummaries || [];
+  if (summaries.length > 0) {
+    return summaries.reduce(
+      (totals, target) => {
+        if (target.status === "hit" || target.status === "no-hit") totals.success += 1;
+        else if (target.status === "failed") totals.failed += 1;
+        return totals;
+      },
+      { success: 0, failed: 0 },
+    );
+  }
+  if (task.status === "completed") return { success: 1, failed: 0 };
+  if (task.status === "failed") return { success: 0, failed: 1 };
+  return { success: 0, failed: 0 };
+}
+
+function taskOutcomeClass(task: AuditTask) {
+  return taskOutcomeTotals(task).failed > 0 ? "border-destructive/30 bg-destructive/5" : "border-emerald-200 bg-emerald-50";
+}
+
 function findingsWithConnectionMeta(task: AuditTask): AuditFinding[] {
   const fallbackConnection = connectionFor(task);
   return (task.job?.findings || []).map((finding) => {
@@ -2884,6 +2909,11 @@ onUnmounted(() => {
               <span class="rounded-full border px-2 py-0.5" :class="riskClass('high')">{{ ui.riskHighShort }} {{ taskTotals(task).high }}</span>
               <span class="rounded-full border px-2 py-0.5" :class="riskClass('medium')">{{ ui.riskMediumShort }} {{ taskTotals(task).medium }}</span>
               <span class="rounded-full border px-2 py-0.5" :class="riskClass('low')">{{ ui.riskLowShort }} {{ taskTotals(task).low }}</span>
+              <span class="rounded-full border px-2 py-0.5" :class="taskOutcomeClass(task)">
+                <span class="font-medium text-emerald-700">{{ ui.outcomeSuccess }} {{ taskOutcomeTotals(task).success }}</span>
+                <span class="mx-1 text-muted-foreground">/</span>
+                <span class="font-medium" :class="taskOutcomeTotals(task).failed > 0 ? 'text-destructive' : 'text-muted-foreground'">{{ ui.outcomeFailed }} {{ taskOutcomeTotals(task).failed }}</span>
+              </span>
             </div>
             <div class="h-1.5 overflow-hidden rounded bg-muted">
               <div class="h-full bg-primary" :style="{ width: `${task.progress}%` }" />
