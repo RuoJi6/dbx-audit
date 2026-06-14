@@ -101,6 +101,11 @@ jobs:
         run: |
           node -e "const fs=require('fs'); const p='src-tauri/tauri.conf.json'; const c=JSON.parse(fs.readFileSync(p,'utf8')); c.bundle.createUpdaterArtifacts=false; fs.writeFileSync(p, JSON.stringify(c, null, 2) + '\n');"
 
+      - name: Limit Windows Rust build parallelism
+        if: runner.os == 'Windows'
+        shell: bash
+        run: echo "CARGO_BUILD_JOBS=1" >> "$GITHUB_ENV"
+
       - name: Build Tauri app
         run: pnpm tauri build --target ${{ matrix.target }}
 
