@@ -1,6 +1,6 @@
 import type { DatabaseType } from "@/types/database";
 
-export type TableStructureDialect = "mysql" | "postgres" | "sqlite" | "duckdb" | "sqlserver" | "oracle" | "h2" | "clickhouse" | "unsupported";
+export type TableStructureDialect = "mysql" | "postgres" | "sqlite" | "duckdb" | "sqlserver" | "oracle" | "h2" | "clickhouse" | "influxdb" | "unsupported";
 
 export interface TableStructureCapabilities {
   dialect: TableStructureDialect;
@@ -66,6 +66,7 @@ const mysqlCapabilities = capabilities({
   dropIndex: true,
   rebuildIndex: true,
   indexType: true,
+  indexComment: true,
   alterPrimaryKey: true,
 });
 
@@ -199,20 +200,38 @@ const accessCapabilities = capabilities({
   createIndex: true,
 });
 
+const influxdbCapabilities = capabilities({
+  dialect: "influxdb",
+  createTable: false,
+  addColumn: false,
+  dropColumn: false,
+  renameColumn: false,
+  alterExistingColumn: false,
+  alterType: false,
+  alterNullability: false,
+  alterDefault: false,
+  reorderColumn: false,
+  comment: false,
+});
+
 const capabilityByType: Partial<Record<DatabaseType, TableStructureCapabilities>> = {
   mysql: mysqlCapabilities,
   doris: mysqlCapabilities,
   starrocks: mysqlCapabilities,
   goldendb: mysqlCapabilities,
   sundb: mysqlCapabilities,
+  databend: mysqlCapabilities,
+  gbase: mysqlCapabilities,
   postgres: postgresCapabilities,
   gaussdb: postgresCapabilities,
   kwdb: postgresCapabilities,
   opengauss: postgresCapabilities,
   redshift: redshiftCapabilities,
+  vertica: redshiftCapabilities,
   highgo: postgresCapabilities,
   vastbase: postgresCapabilities,
   kingbase: postgresCapabilities,
+  firebird: postgresCapabilities,
   sqlite: sqliteCapabilities,
   rqlite: sqliteCapabilities,
   turso: sqliteCapabilities,
@@ -222,9 +241,12 @@ const capabilityByType: Partial<Record<DatabaseType, TableStructureCapabilities>
   dameng: oracleCapabilities,
   "oceanbase-oracle": oracleCapabilities,
   iris: oracleCapabilities,
+  yashandb: oracleCapabilities,
+  xugu: oracleCapabilities,
   h2: h2Capabilities,
   access: accessCapabilities,
   clickhouse: clickhouseCapabilities,
+  influxdb: influxdbCapabilities,
 };
 
 export function getTableStructureCapabilities(dbType?: DatabaseType): TableStructureCapabilities {

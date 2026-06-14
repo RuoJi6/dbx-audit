@@ -237,6 +237,8 @@ pub async fn list_foreign_keys(
             ref_schema: None,
             ref_table: value_by_column(&result.columns, &row, "table").unwrap_or_default(),
             ref_column: value_by_column(&result.columns, &row, "to").unwrap_or_default(),
+            on_update: None,
+            on_delete: None,
         })
         .collect())
 }
@@ -273,6 +275,7 @@ pub async fn list_triggers(client: &TursoClient, _schema: &str, table: &str) -> 
                 name: value_as_string(row.first()).unwrap_or_default(),
                 event: event.to_string(),
                 timing: timing.to_string(),
+                statement: value_as_string(row.get(1)),
             }
         })
         .collect())
@@ -633,7 +636,6 @@ mod tests {
         assert_eq!(value_by_column(&columns, &row, "notnull").as_deref(), Some("1"));
     }
 
-    #[test]
     #[test]
     fn split_sql_statements_splits_on_semicolons() {
         assert_eq!(split_sql_statements("SELECT 1"), vec!["SELECT 1"]);

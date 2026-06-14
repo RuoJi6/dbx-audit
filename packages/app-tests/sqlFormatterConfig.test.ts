@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "vitest";
-import { DEFAULT_SQL_FORMATTER_SETTINGS, parseSqlFormatterConfig, serializeSqlFormatterConfig, normalizeSqlFormatterSettings, syncSqlFormatterConfigDraft, sqlFormatterOptions } from "../../apps/desktop/src/lib/sqlFormatterConfig.ts";
+import { DEFAULT_SQL_FORMATTER_SETTINGS, normalizeSqlFormatterSettings, parseSqlFormatterConfig, serializeSqlFormatterConfig, sqlFormatterOptions, syncSqlFormatterConfigDraft } from "../../apps/desktop/src/lib/sqlFormatterConfig.ts";
+
+const defaultOptionSettings = DEFAULT_SQL_FORMATTER_SETTINGS;
 
 test("normalizes empty formatter settings to defaults", () => {
   assert.deepEqual(normalizeSqlFormatterSettings({}), DEFAULT_SQL_FORMATTER_SETTINGS);
@@ -11,6 +13,8 @@ test("keeps valid formatter settings and clamps invalid values", () => {
     keywordCase: "lower",
     dataTypeCase: "upper",
     functionCase: "lower",
+    identifierCase: "upper",
+    indentStyle: "tabularLeft",
     useTabs: true,
     tabWidth: 4,
     logicalOperatorNewline: "after",
@@ -18,12 +22,16 @@ test("keeps valid formatter settings and clamps invalid values", () => {
     linesBetweenQueries: 2,
     denseOperators: true,
     newlineBeforeSemicolon: true,
+    paramTypes: { named: [":"], custom: [{ regex: "\\{\\w+\\}" }] },
   });
 
   assert.deepEqual(settings, {
+    ...DEFAULT_SQL_FORMATTER_SETTINGS,
     keywordCase: "lower",
     dataTypeCase: "upper",
     functionCase: "lower",
+    identifierCase: "upper",
+    indentStyle: "tabularLeft",
     useTabs: true,
     tabWidth: 4,
     logicalOperatorNewline: "after",
@@ -31,6 +39,7 @@ test("keeps valid formatter settings and clamps invalid values", () => {
     linesBetweenQueries: 2,
     denseOperators: true,
     newlineBeforeSemicolon: true,
+    paramTypes: { named: [":"], custom: [{ regex: "\\{\\w+\\}" }] },
   });
 
   assert.deepEqual(
@@ -38,6 +47,8 @@ test("keeps valid formatter settings and clamps invalid values", () => {
       keywordCase: "camel",
       dataTypeCase: "invalid",
       functionCase: "invalid",
+      identifierCase: "invalid",
+      indentStyle: "wide",
       useTabs: "yes",
       tabWidth: 99,
       logicalOperatorNewline: "middle",
@@ -45,6 +56,8 @@ test("keeps valid formatter settings and clamps invalid values", () => {
       linesBetweenQueries: 9,
       denseOperators: "true",
       newlineBeforeSemicolon: "false",
+      paramTypes: { named: ["#"] },
+      editor: { shortcuts: [{ id: "duplicateLine", keys: { windows: "Ctrl+W", linux: "Ctrl+W", macos: "Cmd+W" }, enabled: false }] },
     }),
     DEFAULT_SQL_FORMATTER_SETTINGS,
   );
@@ -62,7 +75,7 @@ test("serializes formatter config as a stable versioned envelope", () => {
         version: 1,
         formatter: "sql-formatter",
         options: {
-          ...DEFAULT_SQL_FORMATTER_SETTINGS,
+          ...defaultOptionSettings,
           keywordCase: "lower",
         },
       },
@@ -82,6 +95,8 @@ test("parses valid formatter config files", () => {
         keywordCase: "lower",
         functionCase: "upper",
         dataTypeCase: "preserve",
+        identifierCase: "lower",
+        indentStyle: "tabularRight",
         useTabs: false,
         tabWidth: 4,
         logicalOperatorNewline: "after",
@@ -89,15 +104,24 @@ test("parses valid formatter config files", () => {
         linesBetweenQueries: 0,
         denseOperators: false,
         newlineBeforeSemicolon: true,
+        paramTypes: { named: [":"], quoted: ["@"], positional: true },
+      },
+      editor: {
+        scope: "legacyJsonEditorScope",
+        platforms: ["windows", "macos"],
+        shortcuts: [{ id: "unknownLegacyShortcut", action: "copyLineDown", keys: { windows: "", linux: "Ctrl+W", macos: "Cmd+W" }, enabled: "yes" }],
       },
     }),
   );
 
   assert.equal(result.ok, true);
   assert.deepEqual(result.settings, {
+    ...DEFAULT_SQL_FORMATTER_SETTINGS,
     keywordCase: "lower",
     functionCase: "upper",
     dataTypeCase: "preserve",
+    identifierCase: "lower",
+    indentStyle: "tabularRight",
     useTabs: false,
     tabWidth: 4,
     logicalOperatorNewline: "after",
@@ -105,7 +129,26 @@ test("parses valid formatter config files", () => {
     linesBetweenQueries: 0,
     denseOperators: false,
     newlineBeforeSemicolon: true,
+    paramTypes: { named: [":"], quoted: ["@"], positional: true },
   });
+});
+
+test("ignores legacy editor shortcut fields in formatter config files", () => {
+  const result = parseSqlFormatterConfig(
+    JSON.stringify({
+      version: 1,
+      formatter: "sql-formatter",
+      options: {},
+      editor: {
+        shortcuts: [{ id: "unknown", keys: { windows: "" }, enabled: "not-a-boolean" }],
+      },
+    }),
+  );
+
+  assert.equal(result.ok, true);
+  if (result.ok) {
+    assert.deepEqual(result.settings, DEFAULT_SQL_FORMATTER_SETTINGS);
+  }
 });
 
 test("rejects malformed formatter config files", () => {
@@ -127,6 +170,17 @@ test("rejects invalid known formatter option values when parsing config files", 
   const invalidNumericChoice = parseSqlFormatterConfig(JSON.stringify({ version: 1, formatter: "sql-formatter", options: { tabWidth: 3 } }));
   assert.equal(invalidNumericChoice.ok, false);
   if (!invalidNumericChoice.ok) assert.match(invalidNumericChoice.message, /tabWidth/);
+
+  const invalidParams = parseSqlFormatterConfig(JSON.stringify({ version: 1, formatter: "sql-formatter", options: { params: ["42"] } }));
+  assert.equal(invalidParams.ok, false);
+  if (!invalidParams.ok) assert.match(invalidParams.message, /params/);
+
+  const legacyNullParams = parseSqlFormatterConfig(JSON.stringify({ version: 1, formatter: "sql-formatter", options: { params: null } }));
+  assert.equal(legacyNullParams.ok, true);
+
+  const invalidParamTypes = parseSqlFormatterConfig(JSON.stringify({ version: 1, formatter: "sql-formatter", options: { paramTypes: { custom: [{ regex: "" }] } } }));
+  assert.equal(invalidParamTypes.ok, false);
+  if (!invalidParamTypes.ok) assert.match(invalidParamTypes.message, /paramTypes/);
 });
 
 test("syncs valid JSON drafts so outer settings apply can persist them", () => {
@@ -136,7 +190,7 @@ test("syncs valid JSON drafts so outer settings apply can persist them", () => {
       version: 1,
       formatter: "sql-formatter",
       options: {
-        ...DEFAULT_SQL_FORMATTER_SETTINGS,
+        ...defaultOptionSettings,
         keywordCase: "lower",
         tabWidth: 4,
       },
@@ -161,7 +215,7 @@ test("does not sync invalid JSON drafts", () => {
       version: 1,
       formatter: "sql-formatter",
       options: {
-        ...DEFAULT_SQL_FORMATTER_SETTINGS,
+        ...defaultOptionSettings,
         keywordCase: "camel",
       },
     }),
@@ -186,6 +240,8 @@ test("maps DBX formatter settings to sql-formatter options", () => {
       keywordCase: "lower",
       dataTypeCase: "preserve",
       functionCase: "preserve",
+      identifierCase: "preserve",
+      indentStyle: "standard",
       useTabs: true,
       tabWidth: 2,
       logicalOperatorNewline: "before",
@@ -193,6 +249,28 @@ test("maps DBX formatter settings to sql-formatter options", () => {
       linesBetweenQueries: 1,
       denseOperators: false,
       newlineBeforeSemicolon: true,
+    },
+  );
+
+  assert.deepEqual(
+    sqlFormatterOptions({
+      ...DEFAULT_SQL_FORMATTER_SETTINGS,
+      paramTypes: { positional: true },
+    }),
+    {
+      keywordCase: "upper",
+      dataTypeCase: "preserve",
+      functionCase: "preserve",
+      identifierCase: "preserve",
+      indentStyle: "standard",
+      useTabs: false,
+      tabWidth: 2,
+      logicalOperatorNewline: "before",
+      expressionWidth: 50,
+      linesBetweenQueries: 1,
+      denseOperators: false,
+      newlineBeforeSemicolon: false,
+      paramTypes: { positional: true },
     },
   );
 });

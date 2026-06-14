@@ -30,6 +30,7 @@ import { useVisibilityChange } from "@/composables/useVisibilityChange";
 import "@/i18n";
 import { translateBackendError } from "@/i18n/backend-errors";
 import * as api from "@/lib/api";
+import { connectionRedactedNameLabel } from "@/lib/connectionPresentation";
 import { resolveDefaultDatabase } from "@/lib/defaultDatabase";
 import { findTreeNodeById, resolveNewQueryTarget } from "@/lib/newQueryContext";
 import { buildExecutableObjectSourceStatements, objectSourceSaveExecutionMode } from "@/lib/objectSourceEditor";
@@ -61,6 +62,7 @@ import { classifyAiSqlExecution } from "@/lib/aiSqlExecutionPolicy";
 import { buildHistoryAiAnalysisPrompt } from "@/lib/historyAiAnalysis";
 import { countAvailableAgentDriverUpdates, type AgentDriverUpdateBadgeState } from "@/lib/agentDriverUpdateBadge";
 import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/safeStorage";
+import { rankSavedSqlHistory } from "@/lib/savedSqlHistory";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -127,6 +129,8 @@ const newQueryContextSource = ref<"tab" | "sidebar">("tab");
 const showSaveSqlDialog = ref(false);
 const saveSqlName = ref("");
 const saveSqlFolderId = ref("");
+const pendingSaveAndCloseTabId = ref<string | null>(null);
+const pendingPrevActiveTabId = ref<string | null>(null);
 const ROOT_SAVED_SQL_FOLDER = "__root__";
 
 const activeTab = computed(() => queryStore.tabs.find((t) => t.id === queryStore.activeTabId));
@@ -191,25 +195,20 @@ async function resolveActiveExecutableSql() {
     : "";
 }
 
+const blockDangerousRedisCommands = ref(true);
+
 const { dangerSql, pendingDangerSql, showDangerDialog, suppressDangerConfirm, tryExecute, doExecute, cancelActiveExecution, tryExplain, onDangerConfirm, explainMode } = useSqlExecution({
   activeTab,
   activeConnection,
   executableSql,
   resolveExecutableSql: resolveActiveExecutableSql,
   activeOutputView,
+  blockDangerousRedisCommands,
 });
 
 const dialogs = useDialogSources();
 const { getDatabaseOptions } = useDatabaseOptions();
 const { openLineageTarget, openDatabaseSearchTarget, onStructureEditorSaved, openTableTarget } = useNavigationTargets(dialogs);
-const { onExecuteSql, onReloadData, onPaginate, onSort } = useDataGridActions(activeTab);
-const { setupTauriListeners, cleanupTauriListeners } = useTauriEvents({
-  openTableTarget,
-  openSqlFilePath,
-  openDbFilePath,
-  openConnectionDeepLink,
-});
-useVisibilityChange();
 
 function auditSampleDatabaseType(target: AuditSampleTarget): DatabaseType | string | undefined {
   return connectionStore.getConfig(target.connectionId)?.db_type || target.dbType?.toLowerCase();
@@ -264,6 +263,15 @@ async function openAuditSampleTarget(target: AuditSampleTarget) {
   }
 }
 
+const { onExecuteSql, onReloadData, onPaginate, onSort } = useDataGridActions(activeTab);
+const { setupTauriListeners, cleanupTauriListeners } = useTauriEvents({
+  openTableTarget,
+  openSqlFilePath,
+  openDbFilePath,
+  openConnectionDeepLink,
+});
+useVisibilityChange();
+
 const appVersion = ref("");
 const isClassicLayout = computed(() => settingsStore.editorSettings.appLayout === "classic");
 const updateNotificationsEnabled = computed(() => settingsStore.editorSettings.updateNotificationsEnabled);
@@ -276,8 +284,46 @@ const connectionStats = computed(() => ({
   types: new Set(connectionStore.connections.map((c) => c.driver_profile || c.db_type)).size,
 }));
 const recentConnections = computed(() => connectionStore.connections.slice(0, 5));
+const savedSqlHistoryItems = computed(() => {
+  const folderById = new Map(savedSqlStore.allFolders.map((folder) => [folder.id, folder]));
+  const folderPath = (folderId?: string): string | undefined => {
+    if (!folderId) return undefined;
+    const parts: string[] = [];
+    const seen = new Set<string>();
+    let folder = folderById.get(folderId);
+    while (folder && !seen.has(folder.id)) {
+      seen.add(folder.id);
+      parts.unshift(folder.name);
+      folder = folder.parentFolderId ? folderById.get(folder.parentFolderId) : undefined;
+    }
+    return parts.join("/");
+  };
+  return rankSavedSqlHistory(savedSqlStore.allFiles, { limit: 6 }).map((file) => {
+    const connection = connectionStore.getConfig(file.connectionId);
+    return {
+      id: file.id,
+      name: file.name,
+      connectionName: connection ? connectionRedactedNameLabel(connection) : t("welcome.unknownConnection"),
+      database: file.database,
+      folderName: folderPath(file.folderId),
+      openCount: file.openCount ?? 0,
+    };
+  });
+});
 const saveSqlFolders = computed(() => {
-  return savedSqlStore.allFolders;
+  const folderById = new Map(savedSqlStore.allFolders.map((folder) => [folder.id, folder]));
+  const pathForFolder = (folderId: string) => {
+    const parts: string[] = [];
+    const seen = new Set<string>();
+    let folder = folderById.get(folderId);
+    while (folder && !seen.has(folder.id)) {
+      seen.add(folder.id);
+      parts.unshift(folder.name);
+      folder = folder.parentFolderId ? folderById.get(folder.parentFolderId) : undefined;
+    }
+    return parts.join(" / ");
+  };
+  return savedSqlStore.allFoldersTreeOrder.map((folder) => ({ ...folder, displayName: pathForFolder(folder.id) || folder.name }));
 });
 
 async function applyUiScale(scale: number) {
@@ -408,6 +454,36 @@ function defaultSavedSqlName(title: string) {
   return normalized.endsWith(".sql") ? normalized : `${normalized}.sql`;
 }
 
+async function handleSaveTab(tabId: string) {
+  const tab = queryStore.tabs.find((t) => t.id === tabId);
+  if (!tab || !tab.sql.trim()) return;
+  const existing = tab.savedSqlId ? savedSqlStore.getFile(tab.savedSqlId) : undefined;
+  if (existing) {
+    const updated = await savedSqlStore.saveFile({
+      id: existing.id,
+      connectionId: tab.connectionId,
+      folderId: existing.folderId,
+      name: existing.name,
+      database: tab.database,
+      schema: tab.schema,
+      sql: tab.sql,
+    });
+    queryStore.linkSavedSql(tab.id, updated.id, updated.name);
+    queryStore.markTabClean(tab);
+    toast(t("savedSql.saved"), 2000);
+    queryStore.closeTab(tabId, { force: true });
+    return;
+  }
+  // No existing saved SQL — open save dialog, then close after save
+  const prevActive = queryStore.activeTabId;
+  queryStore.activeTabId = tabId;
+  saveSqlName.value = defaultSavedSqlName(tab.title);
+  saveSqlFolderId.value = ROOT_SAVED_SQL_FOLDER;
+  pendingSaveAndCloseTabId.value = tabId;
+  pendingPrevActiveTabId.value = prevActive;
+  showSaveSqlDialog.value = true;
+}
+
 async function openSaveSqlDialog() {
   const tab = activeTab.value;
   if (!tab || !tab.sql.trim()) return;
@@ -477,7 +553,15 @@ async function confirmSaveSqlToLibrary() {
       sql: tab.sql,
     });
     queryStore.linkSavedSql(tab.id, saved.id, saved.name);
+    queryStore.markTabClean(tab);
     showSaveSqlDialog.value = false;
+    if (pendingSaveAndCloseTabId.value) {
+      const closeId = pendingSaveAndCloseTabId.value;
+      pendingSaveAndCloseTabId.value = null;
+      if (pendingPrevActiveTabId.value) queryStore.activeTabId = pendingPrevActiveTabId.value;
+      pendingPrevActiveTabId.value = null;
+      queryStore.closeTab(closeId, { force: true });
+    }
     toast(t("savedSql.saved"), 2000);
   } catch (e: any) {
     toast(t("savedSql.saveFailed", { message: e?.message || String(e) }), 5000);
@@ -485,7 +569,6 @@ async function confirmSaveSqlToLibrary() {
 }
 
 async function openSqlFile() {
-  closePrimaryWorkspacePanels();
   const tab = activeTab.value;
   if (!tab) return;
   try {
@@ -520,7 +603,6 @@ async function openSqlFile() {
 
 async function openSqlFilePath(path: string) {
   if (!isTauriRuntime()) return;
-  closePrimaryWorkspacePanels();
   try {
     const content = await api.readExternalSqlFile(path);
     const connectionId = connectionStore.activeConnectionId || activeTab.value?.connectionId || connectionStore.connections[0]?.id || "";
@@ -556,7 +638,6 @@ function getDbTypeFromPath(path: string): "sqlite" | "duckdb" | null {
 
 async function openDbFilePath(path: string) {
   if (!isTauriRuntime()) return;
-  closePrimaryWorkspacePanels();
   await connectionStore.initFromDisk();
   try {
     const name = path.split("/").pop()?.split("\\").pop() || path;
@@ -617,7 +698,6 @@ async function openPendingDbFiles() {
 async function openConnectionDeepLink(url: string) {
   await connectionStore.initFromDisk();
   try {
-    closePrimaryWorkspacePanels();
     const draft = parseConnectionDeepLink(url);
     if (!draft) return;
     connectionStore.stopEditing();
@@ -647,7 +727,6 @@ function setConnectionDialogOpen(value: boolean) {
 }
 
 async function newQuery() {
-  closePrimaryWorkspacePanels();
   const target = resolveNewQueryTarget({
     activeTab: activeTab.value,
     selectedTreeNode: findTreeNodeById(connectionStore.treeNodes, connectionStore.selectedTreeNodeId),
@@ -672,7 +751,6 @@ async function newQuery() {
 }
 
 async function openConnectionQuery(connectionId: string) {
-  closePrimaryWorkspacePanels();
   const connection = connectionStore.getConfig(connectionId);
   if (!connection) return;
   connectionStore.activeConnectionId = connectionId;
@@ -686,8 +764,16 @@ async function openConnectionQuery(connectionId: string) {
   }
 }
 
+function openSavedSqlFromWelcome(fileId: string) {
+  const file = savedSqlStore.getFile(fileId);
+  if (!file) return;
+  queryStore.openSavedSql(file);
+  connectionStore.activeConnectionId = file.connectionId;
+  void savedSqlStore.recordFileUsage(file.id);
+  toast(t("welcome.fileOpened", { name: file.name }), 2000);
+}
+
 async function onClickTable(tableName: string) {
-  closePrimaryWorkspacePanels();
   const tab = activeTab.value;
   if (!tab) return;
   const connectionId = tab.connectionId;
@@ -709,7 +795,6 @@ async function onClickTable(tableName: string) {
 }
 
 async function changeActiveConnection(connectionId: string) {
-  closePrimaryWorkspacePanels();
   const tab = activeTab.value;
   if (!tab) return;
   const connection = connectionStore.getConfig(connectionId);
@@ -747,7 +832,7 @@ function changeActiveSchema(schema: string | undefined) {
   if (tab) queryStore.updateSchema(tab.id, schema);
 }
 function openGitHub() {
-  openUrl("https://github.com/RuoJi6/dbx-audit");
+  openUrl("https://github.com/t8y2/dbx");
 }
 function openMcpGuide() {
   openUrl("https://dbxio.com/cn/docs/mcp");
@@ -933,8 +1018,35 @@ async function reconnectRestoredTabs() {
 
 function handleContextMenu(e: MouseEvent) {
   const target = e.target as HTMLElement;
-  if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) return;
-  if (target.closest("[data-reka-collection-item], [data-radix-vue-collection-item], [data-context-menu]")) return;
+
+  // Check if target is a standard editable input element
+  if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
+    if (import.meta.env.DEV) {
+      console.debug("[contextmenu] Allowing for input/textarea:", target);
+    }
+    return;
+  }
+
+  // Check if target or any parent has contenteditable attribute
+  if (target.isContentEditable || target.closest("[contenteditable]")) {
+    if (import.meta.env.DEV) {
+      console.debug("[contextmenu] Allowing for contenteditable:", target);
+    }
+    return;
+  }
+
+  // Check if target is within a custom context menu container or collection item
+  if (target.closest("[data-reka-collection-item], [data-radix-vue-collection-item], [data-context-menu]")) {
+    if (import.meta.env.DEV) {
+      console.debug("[contextmenu] Allowing for custom context menu container:", target);
+    }
+    return;
+  }
+
+  // Prevent default context menu for all other elements
+  if (import.meta.env.DEV) {
+    console.debug("[contextmenu] Preventing default for:", target);
+  }
   e.preventDefault();
 }
 
@@ -942,27 +1054,9 @@ function openDriverStoreFromEvent() {
   showDriverStore.value = true;
 }
 
-function closePrimaryWorkspacePanels() {
-  showDriverStore.value = false;
-}
-
-function openConnectionDialog() {
-  closePrimaryWorkspacePanels();
-  showConnectionDialog.value = true;
-}
-
-function toggleDriverStore() {
-  showDriverStore.value = !showDriverStore.value;
-}
-
 function toggleAuditPanel() {
   showDriverStore.value = false;
   queryStore.openAuditTab(activeTab.value?.connectionId || connectionStore.activeConnectionId || undefined);
-}
-
-function openToolDialog(open: () => void) {
-  closePrimaryWorkspacePanels();
-  open();
 }
 
 function runUpdateNotificationChecks() {
@@ -1055,7 +1149,7 @@ onUnmounted(() => {
 
 <template>
   <LoginPage v-if="setupRequired || (needsAuth && !authenticated)" :setup-mode="setupRequired" @authenticated="onLoginSuccess" />
-  <div v-show="!setupRequired && (!needsAuth || authenticated)" class="h-screen w-screen overflow-hidden">
+  <div v-show="!setupRequired && (!needsAuth || authenticated)" class="fixed inset-0 h-screen w-screen overflow-hidden">
     <TooltipProvider :delay-duration="300">
       <div class="h-screen w-screen max-w-full min-w-[760px] min-h-[600px] flex flex-col bg-background text-foreground overflow-hidden">
         <AppToolbar
@@ -1071,25 +1165,25 @@ onUnmounted(() => {
           :agent-driver-update-count="toolbarAgentDriverUpdateCount"
           :has-connections="connectionStore.connections.length > 0"
           :has-sql-file-connections="hasSqlFileConnections"
-          @new-connection="openConnectionDialog"
+          @new-connection="showConnectionDialog = true"
           @new-query="newQuery"
           @set-theme-mode="setThemeMode"
           @toggle-ai="toggleAiPanel"
           @toggle-history="showHistory = !showHistory"
           @toggle-sql-library="toggleSqlLibrary"
           @open-github="openGitHub"
-          @open-settings="openToolDialog(() => (showSettingsDialog = true))"
-          @open-driver-store="toggleDriverStore"
+          @open-settings="showSettingsDialog = true"
+          @open-driver-store="showDriverStore = !showDriverStore"
           @check-updates="checkUpdates()"
-          @open-transfer="openToolDialog(() => (dialogs.showTransferDialog.value = true))"
-          @open-sql-file="openToolDialog(() => (dialogs.showSqlFileDialog.value = true))"
-          @open-schema-diff="openToolDialog(() => (dialogs.showSchemaDiffDialog.value = true))"
-          @open-data-compare="openToolDialog(() => (dialogs.showDataCompareDialog.value = true))"
+          @open-transfer="dialogs.showTransferDialog.value = true"
+          @open-sql-file="dialogs.showSqlFileDialog.value = true"
+          @open-schema-diff="dialogs.showSchemaDiffDialog.value = true"
+          @open-data-compare="dialogs.showDataCompareDialog.value = true"
           @toggle-audit="toggleAuditPanel"
         />
 
         <div :class="isClassicLayout ? 'app-layout-classic flex-1 flex min-h-0' : 'app-panel-gutter flex-1 flex min-h-0 gap-1 p-1'">
-          <AppSidebar v-show="sidebarOpen" ref="appSidebarRef" :sidebar-width="sidebarWidth" :classic-layout="isClassicLayout" @import="openToolDialog(dialogs.onImportClick)" @export="openToolDialog(dialogs.onExportClick)" @start-resize="startSidebarResize" @collapse="setSidebarOpen(false)" />
+          <AppSidebar v-show="sidebarOpen" ref="appSidebarRef" :sidebar-width="sidebarWidth" :classic-layout="isClassicLayout" @import="dialogs.onImportClick" @export="dialogs.onExportClick" @start-resize="startSidebarResize" @collapse="setSidebarOpen(false)" />
           <div v-show="!sidebarOpen" class="flex h-full w-8 shrink-0 items-start justify-center border-r bg-background/80 pt-2" :class="isClassicLayout ? '' : 'rounded-md border border-border/80'">
             <Button variant="ghost" size="icon" class="h-7 w-7" :title="t('sidebar.expand')" :aria-label="t('sidebar.expand')" @click="setSidebarOpen(true)">
               <ChevronsRight class="h-4 w-4" />
@@ -1098,7 +1192,7 @@ onUnmounted(() => {
 
           <div :class="isClassicLayout ? 'flex-1 min-w-0 overflow-hidden' : 'flex-1 min-w-0 overflow-hidden rounded-md border border-border/80 bg-background'">
             <div class="h-full flex flex-col min-w-0">
-              <AppTabBar :show-driver-store="showDriverStore" :agent-driver-update-count="toolbarAgentDriverUpdateCount" :show-audit-panel="false" @toggle-driver-store="toggleDriverStore" @close-driver-store="showDriverStore = false" />
+              <AppTabBar :show-driver-store="showDriverStore" :agent-driver-update-count="toolbarAgentDriverUpdateCount" :show-audit-panel="activeTab?.mode === 'audit'" @toggle-driver-store="showDriverStore = true" @close-driver-store="showDriverStore = false" @save-tab="handleSaveTab" />
               <DriverStorePage v-if="showDriverStore" class="flex-1 min-h-0" :update-notifications-enabled="updateNotificationsEnabled" @update-count-change="updateAgentDriverUpdateCount" />
               <div v-else-if="activeTab" class="flex flex-col flex-1 min-h-0">
                 <EditorToolbar
@@ -1107,7 +1201,9 @@ onUnmounted(() => {
                   :active-connection="activeConnection"
                   :executable-sql="executableSql"
                   :explain-mode="explainMode"
+                  :block-dangerous-redis-commands="blockDangerousRedisCommands"
                   @update:explain-mode="(m: 'explain' | 'autotrace') => (explainMode = m)"
+                  @update:block-dangerous-redis-commands="(v: boolean) => (blockDangerousRedisCommands = v)"
                   @execute="tryExecute()"
                   @cancel="cancelActiveExecution()"
                   @explain="tryExplain()"
@@ -1183,13 +1279,15 @@ onUnmounted(() => {
                 v-else
                 :connection-stats="connectionStats"
                 :recent-connections="recentConnections"
+                :saved-sql-history-items="savedSqlHistoryItems"
                 :app-version="appVersion"
                 :has-connections="connectionStore.connections.length > 0"
                 @open-connection-query="openConnectionQuery"
-                @new-connection="openConnectionDialog"
+                @open-saved-sql="openSavedSqlFromWelcome"
+                @new-connection="showConnectionDialog = true"
                 @new-query="newQuery"
                 @show-history="showHistory = true"
-                @import-config="openToolDialog(dialogs.onImportClick)"
+                @import-config="dialogs.onImportClick"
                 @open-github="openGitHub"
                 @open-mcp-guide="openMcpGuide"
               />
@@ -1258,7 +1356,15 @@ onUnmounted(() => {
         </Transition>
       </div>
 
-      <Dialog v-model:open="showSaveSqlDialog">
+      <Dialog
+        :open="showSaveSqlDialog"
+        @update:open="
+          (open: boolean) => {
+            showSaveSqlDialog = open;
+            if (!open) pendingSaveAndCloseTabId = null;
+          }
+        "
+      >
         <DialogContent class="sm:max-w-[420px]">
           <DialogHeader>
             <DialogTitle>{{ t("savedSql.saveToLibrary") }}</DialogTitle>
@@ -1277,14 +1383,21 @@ onUnmounted(() => {
                 <SelectContent position="popper">
                   <SelectItem :value="ROOT_SAVED_SQL_FOLDER">{{ t("savedSql.rootFolder") }}</SelectItem>
                   <SelectItem v-for="folder in saveSqlFolders" :key="folder.id" :value="folder.id">
-                    {{ folder.name }}
+                    {{ folder.displayName }}
                   </SelectItem>
                 </SelectContent>
               </Select>
             </div>
           </div>
           <DialogFooter>
-            <Button variant="outline" @click="showSaveSqlDialog = false">{{ t("dangerDialog.cancel") }}</Button>
+            <Button
+              variant="outline"
+              @click="
+                showSaveSqlDialog = false;
+                pendingSaveAndCloseTabId = null;
+              "
+              >{{ t("dangerDialog.cancel") }}</Button
+            >
             <Button :disabled="!saveSqlName.trim()" @click="confirmSaveSqlToLibrary">{{ t("savedSql.save") }}</Button>
           </DialogFooter>
         </DialogContent>

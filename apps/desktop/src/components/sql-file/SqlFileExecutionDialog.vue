@@ -500,7 +500,7 @@ watch(
           </div>
 
           <div class="w-full bg-muted rounded-full h-2 overflow-hidden">
-            <div class="h-full rounded-full transition-all duration-300" :class="terminalStatus === 'error' ? 'bg-destructive' : terminalStatus === 'cancelled' ? 'bg-yellow-500' : 'bg-primary'" :style="{ width: `${progressPercent}%` }" />
+            <div class="h-full rounded-full transition-[width] duration-300" :class="terminalStatus === 'error' ? 'bg-destructive' : terminalStatus === 'cancelled' ? 'bg-yellow-500' : 'bg-primary'" :style="{ width: `${progressPercent}%` }" />
           </div>
 
           <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">

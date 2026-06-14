@@ -86,7 +86,7 @@ const cases: PromptEvalCase[] = [
     name: "agent generate keeps the first SQL block executable and read-oriented",
     action: "generate",
     mode: "agent",
-    mustInclude: [/Agent 模式/, /可直接执行的只读 SQL/, /第一个 ```sql 代码块只能包含最终推荐执行的 SQL/, /不要把解释性 SQL、备选 SQL、危险 SQL 放在第一个代码块/],
+    mustInclude: [/Agent 模式/, /execute_query/, /第一个 ```sql 代码块只放最终推荐 SQL/, /只有 SELECT.*WITH.*SHOW.*DESCRIBE.*EXPLAIN.*可以通过 execute_query 执行/],
   },
   {
     name: "ask generate never implies auto execution",

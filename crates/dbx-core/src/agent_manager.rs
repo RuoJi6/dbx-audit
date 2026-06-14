@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use crate::db::agent_driver::{AgentDriverClient, AgentMethod};
+use crate::db::agent_driver::{AgentDriverClient, AgentLaunchSpec, AgentMethod};
 use crate::models::connection::DatabaseType;
 
 pub const DEFAULT_JRE_KEY: &str = "21";
@@ -60,6 +60,63 @@ mod tests {
             permissions.set_mode(0o755);
             fs::set_permissions(path, permissions).unwrap();
         }
+    }
+
+    #[test]
+    fn cleanup_pending_jre_removes_stash_dirs_and_persists() {
+        let manager = test_manager("pending-cleanup");
+        std::fs::create_dir_all(manager.base_dir()).unwrap();
+        let stash = manager.base_dir().join("jre-21.old-1700000000-deadbeef");
+        std::fs::create_dir_all(&stash).unwrap();
+        std::fs::write(stash.join("dummy"), b"x").unwrap();
+
+        let mut state = AgentState::default();
+        state.pending_jre_cleanup.push(stash.clone());
+        manager.save_state(&state).unwrap();
+
+        // Re-create the manager (simulates app restart).
+        let manager2 = AgentManager::new_with_base_dir(manager.base_dir().clone());
+
+        assert!(!stash.exists(), "stash dir should be removed");
+        let after = manager2.load_state();
+        assert!(after.pending_jre_cleanup.is_empty(), "cleanup should drain the list on success");
+    }
+
+    #[test]
+    fn cleanup_orphan_jre_dirs_removes_unrecorded_stash() {
+        let manager = test_manager("orphan-cleanup");
+        std::fs::create_dir_all(manager.base_dir()).unwrap();
+        let orphan = manager.base_dir().join("jre-21.old-1234567890-cafe");
+        std::fs::create_dir_all(&orphan).unwrap();
+
+        // Re-create manager — it should sweep orphans even without state.
+        let _manager2 = AgentManager::new_with_base_dir(manager.base_dir().clone());
+
+        assert!(!orphan.exists(), "orphan stash should be swept");
+    }
+
+    #[test]
+    fn cleanup_skips_active_jre_dir() {
+        let manager = test_manager("orphan-skip-active");
+        std::fs::create_dir_all(manager.base_dir()).unwrap();
+        let active = manager.jre_dir(DEFAULT_JRE_KEY); // jre-21
+        std::fs::create_dir_all(&active).unwrap();
+
+        let _manager2 = AgentManager::new_with_base_dir(manager.base_dir().clone());
+
+        assert!(active.exists(), "active jre-<key> dir must not be touched (no .old- in name)");
+    }
+
+    #[test]
+    fn agent_state_back_compat_without_pending_jre_cleanup() {
+        // Old state JSON without pending_jre_cleanup must still deserialize.
+        let json = r#"{
+            "jre_versions": {},
+            "installed_drivers": {},
+            "java_runtime": {"mode": "managed"}
+        }"#;
+        let state: AgentState = serde_json::from_str(json).expect("deserialize legacy state");
+        assert!(state.pending_jre_cleanup.is_empty());
     }
 
     #[test]
@@ -153,17 +210,56 @@ mod tests {
     async fn runtime_gateway_resolves_profile_specific_keys() {
         let manager = test_manager("profile-key");
 
-        assert_eq!(AgentManager::db_type_to_agent_key(&DatabaseType::Oracle, Some("oracle-10g")), Some("oracle-10g"));
-        assert_eq!(
-            AgentManager::db_type_to_agent_key(&DatabaseType::Oracle, Some("oracle-legacy")),
-            Some("oracle-legacy")
-        );
+        assert_eq!(AgentManager::db_type_to_agent_key(&DatabaseType::Oracle, Some("oracle-10g")), Some("oracle"));
+        assert_eq!(AgentManager::db_type_to_agent_key(&DatabaseType::Oracle, Some("oracle-legacy")), Some("oracle"));
         assert_eq!(AgentManager::db_type_to_agent_key(&DatabaseType::Oracle, None), Some("oracle"));
         assert_eq!(AgentManager::db_type_to_agent_key(&DatabaseType::Gbase, Some("gbase8s")), Some("gbase8s"));
         assert_eq!(AgentManager::db_type_to_agent_key(&DatabaseType::Gbase, None), Some("gbase"));
         manager.stop_daemon_by_key("oracle-legacy").await;
         manager.stop_daemon_by_key("oracle-10g").await;
         manager.stop_daemon_by_key("gbase8s").await;
+    }
+
+    #[test]
+    fn resolves_native_agent_launch_when_agent_executable_exists() {
+        let manager = test_manager("native-agent");
+        let native = manager.driver_native_path("dameng");
+        touch(&native);
+
+        let launch = manager
+            .resolve_agent_launch_spec(&AgentState::default(), "dameng", DEFAULT_JRE_KEY)
+            .expect("native launch should resolve");
+
+        assert_eq!(launch.program, native);
+        assert_eq!(launch.args, Vec::<String>::new());
+        assert_eq!(launch.working_dir.as_deref(), Some(manager.driver_dir("dameng").as_path()));
+    }
+
+    #[test]
+    fn resolves_manifest_agent_launch_with_driver_dir_templates() {
+        let manager = test_manager("manifest-agent");
+        let driver_dir = manager.driver_dir("dameng-go");
+        fs::create_dir_all(driver_dir.join("bin")).unwrap();
+        fs::write(
+            manager.driver_launch_config_path("dameng-go"),
+            r#"{
+                "command": "bin/dameng-agent",
+                "args": ["--config", "{driver_dir}/config.json"],
+                "working_dir": "{driver_dir}"
+            }"#,
+        )
+        .unwrap();
+
+        let launch = manager
+            .resolve_agent_launch_spec(&AgentState::default(), "dameng-go", DEFAULT_JRE_KEY)
+            .expect("manifest launch should resolve");
+
+        assert_eq!(launch.program, driver_dir.join("bin").join("dameng-agent"));
+        assert_eq!(
+            launch.args,
+            vec!["--config".to_string(), driver_dir.join("config.json").to_string_lossy().to_string()]
+        );
+        assert_eq!(launch.working_dir.as_deref(), Some(driver_dir.as_path()));
     }
 }
 
@@ -178,7 +274,10 @@ pub struct DriverInfo {
     pub version: String,
     pub label: String,
     pub min_app_version: String,
-    pub jar: ArtifactInfo,
+    #[serde(default)]
+    pub jar: Option<ArtifactInfo>,
+    #[serde(default)]
+    pub native: std::collections::HashMap<String, ArtifactInfo>,
     #[serde(default = "default_jre_key")]
     pub jre: String,
 }
@@ -199,6 +298,11 @@ pub struct AgentState {
     pub installed_drivers: std::collections::HashMap<String, InstalledDriver>,
     #[serde(default)]
     pub java_runtime: JavaRuntimeConfig,
+    /// Old JRE directories that could not be deleted in-place during a
+    /// reinstall on Windows; renamed aside (`<name>.old-<ts>-<rand>`) and
+    /// cleaned up best-effort on next `AgentManager::new`.
+    #[serde(default)]
+    pub pending_jre_cleanup: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,6 +311,15 @@ pub struct InstalledDriver {
     pub installed_at: String,
     #[serde(default = "default_jre_key")]
     pub jre: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentLaunchConfig {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub working_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -285,6 +398,8 @@ impl AgentManager {
         let mgr =
             Self { base_dir, app_version: app_version.into(), daemons: Mutex::new(std::collections::HashMap::new()) };
         mgr.migrate_legacy_jre();
+        mgr.cleanup_pending_jre_dirs();
+        mgr.cleanup_orphan_jre_dirs();
         mgr
     }
 
@@ -293,6 +408,62 @@ impl AgentManager {
         let versioned = self.jre_dir(DEFAULT_JRE_KEY);
         if legacy.exists() && !versioned.exists() {
             let _ = std::fs::rename(&legacy, &versioned);
+        }
+    }
+
+    /// Best-effort cleanup of `pending_jre_cleanup` paths recorded by previous
+    /// runs that fell back to renaming an old JRE aside on Windows. Successful
+    /// removals are pruned from the persisted state. Failures are kept for the
+    /// next launch and never block startup. (Issue #1100, D6.)
+    fn cleanup_pending_jre_dirs(&self) {
+        let mut state = self.load_state();
+        if state.pending_jre_cleanup.is_empty() {
+            return;
+        }
+        let mut remaining = Vec::new();
+        for path in std::mem::take(&mut state.pending_jre_cleanup) {
+            if !path.exists() {
+                continue;
+            }
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => log::info!("Cleaned up pending JRE stash: {}", path.display()),
+                Err(err) => {
+                    log::warn!("Pending JRE cleanup failed for {}: {err}", path.display());
+                    remaining.push(path);
+                }
+            }
+        }
+        state.pending_jre_cleanup = remaining;
+        if let Err(err) = self.save_state(&state) {
+            log::warn!("Failed to persist post-cleanup AgentState: {err}");
+        }
+    }
+
+    /// Sweep `base_dir` for orphan `*.old-*` JRE stash directories left behind
+    /// by previous runs (e.g. process crashed before the stash was recorded).
+    /// Best-effort — failures are ignored.
+    fn cleanup_orphan_jre_dirs(&self) {
+        let entries = match std::fs::read_dir(&self.base_dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            // Match `<...>.old-<digits>-<...>` (typically `jre-21.old-...`),
+            // which is the suffix scheme used by stash_old_jre_dir.
+            if !name.starts_with("jre-") || !name.contains(".old-") {
+                continue;
+            }
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => log::info!("Cleaned up orphan JRE stash: {}", path.display()),
+                Err(err) => log::warn!("Orphan JRE cleanup failed for {}: {err}", path.display()),
+            }
         }
     }
 
@@ -323,8 +494,21 @@ impl AgentManager {
         flat
     }
 
+    pub fn driver_dir(&self, db_type: &str) -> PathBuf {
+        self.base_dir.join("drivers").join(db_type)
+    }
+
     pub fn driver_jar_path(&self, db_type: &str) -> PathBuf {
-        self.base_dir.join("drivers").join(db_type).join("agent.jar")
+        self.driver_dir(db_type).join("agent.jar")
+    }
+
+    pub fn driver_native_path(&self, db_type: &str) -> PathBuf {
+        let executable_name = if cfg!(windows) { "agent.exe" } else { "agent" };
+        self.driver_dir(db_type).join(executable_name)
+    }
+
+    pub fn driver_launch_config_path(&self, db_type: &str) -> PathBuf {
+        self.driver_dir(db_type).join("agent-launch.json")
     }
 
     pub fn download_cache_dir(&self) -> PathBuf {
@@ -356,6 +540,81 @@ impl AgentManager {
 
     pub fn is_driver_installed(&self, db_type: &str) -> bool {
         self.driver_jar_path(db_type).exists()
+            || self.driver_native_path(db_type).exists()
+            || self.driver_launch_config_path(db_type).exists()
+    }
+
+    pub fn driver_requires_java_runtime(&self, db_type: &str) -> bool {
+        self.driver_jar_path(db_type).exists()
+            && !self.driver_native_path(db_type).exists()
+            && !self.driver_launch_config_path(db_type).exists()
+    }
+
+    pub fn resolve_agent_launch_spec(
+        &self,
+        state: &AgentState,
+        driver_key: &str,
+        jre_key: &str,
+    ) -> Result<AgentLaunchSpec, String> {
+        let driver_dir = self.driver_dir(driver_key);
+        let config_path = self.driver_launch_config_path(driver_key);
+        if config_path.exists() {
+            return self.resolve_configured_agent_launch_spec(driver_key, &driver_dir, &config_path);
+        }
+
+        let native_path = self.driver_native_path(driver_key);
+        if native_path.exists() {
+            return Ok(AgentLaunchSpec::new(native_path).with_working_dir(driver_dir));
+        }
+
+        let jar_path = self.driver_jar_path(driver_key);
+        if jar_path.exists() {
+            let java = self.resolve_java_runtime(state, jre_key)?;
+            return Ok(AgentLaunchSpec::java_jar(java, jar_path));
+        }
+
+        Err(format!("{driver_key} driver is not installed. Please install it from the Driver Manager."))
+    }
+
+    fn resolve_configured_agent_launch_spec(
+        &self,
+        driver_key: &str,
+        driver_dir: &Path,
+        config_path: &Path,
+    ) -> Result<AgentLaunchSpec, String> {
+        let json = std::fs::read_to_string(config_path)
+            .map_err(|e| format!("Failed to read {driver_key} agent launch config: {e}"))?;
+        let config: AgentLaunchConfig = serde_json::from_str(&json)
+            .map_err(|e| format!("Failed to parse {driver_key} agent launch config: {e}"))?;
+        let command = config.command.trim();
+        if command.is_empty() {
+            return Err(format!("{driver_key} agent launch config command is empty"));
+        }
+        let working_dir = config
+            .working_dir
+            .as_deref()
+            .map(|value| self.resolve_driver_launch_path(driver_dir, value))
+            .transpose()?
+            .unwrap_or_else(|| driver_dir.to_path_buf());
+        let program = self.resolve_driver_launch_path(driver_dir, command)?;
+        let args = config.args.iter().map(|arg| self.expand_agent_launch_template(driver_dir, arg)).collect::<Vec<_>>();
+        Ok(AgentLaunchSpec::new(program).with_args(args).with_working_dir(working_dir))
+    }
+
+    fn resolve_driver_launch_path(&self, driver_dir: &Path, value: &str) -> Result<PathBuf, String> {
+        let expanded = self.expand_agent_launch_template(driver_dir, value);
+        let path = PathBuf::from(&expanded);
+        if path.is_absolute() || expanded.contains('/') || expanded.contains('\\') || expanded.starts_with('.') {
+            return Ok(if path.is_absolute() { path } else { driver_dir.join(path) });
+        }
+        Ok(path)
+    }
+
+    fn expand_agent_launch_template(&self, driver_dir: &Path, value: &str) -> String {
+        value
+            .replace("{driver_dir}", &driver_dir.to_string_lossy())
+            .replace("{agent_dir}", &self.base_dir.to_string_lossy())
+            .replace("{platform}", Self::current_platform())
     }
 
     pub fn collect_driver_store_usage(&self, plugin_root: &Path) -> DriverStoreUsage {

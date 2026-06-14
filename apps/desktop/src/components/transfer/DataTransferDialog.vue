@@ -548,7 +548,7 @@ const overallRowsLabel = computed(() => (knownTotalRows.value > 0 ? `${formatRow
 
           <div class="w-full bg-muted rounded-full h-2 overflow-hidden">
             <div
-              class="h-full rounded-full transition-all duration-300"
+              class="h-full rounded-full transition-[width] duration-300"
               :class="overallError ? 'bg-destructive' : overallCancelled ? 'bg-yellow-500' : overallDone && failedTables ? 'bg-amber-500' : 'bg-primary'"
               :style="{
                 width: `${selectedTables.size ? (completedTables / selectedTables.size) * 100 : 0}%`,

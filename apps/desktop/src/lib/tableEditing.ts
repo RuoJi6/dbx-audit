@@ -5,8 +5,13 @@ export const DBX_ROWID_COLUMN = "__DBX_ROWID";
 export const DBX_NEO4J_ELEMENT_ID_COLUMN = "__DBX_ELEMENT_ID";
 export const DBX_TDENGINE_TBNAME_COLUMN = "tbname";
 
-export function editablePrimaryKeys(databaseType: DatabaseType | undefined, columns: ColumnInfo[]): string[] {
+function isViewTableType(tableType?: string): boolean {
+  return tableType?.toUpperCase().includes("VIEW") === true;
+}
+
+export function editablePrimaryKeys(databaseType: DatabaseType | undefined, columns: ColumnInfo[], tableType?: string): string[] {
   const primaryKeys = columns.filter((column) => column.is_primary_key).map((column) => column.name);
+  if (isViewTableType(tableType)) return primaryKeys;
   if (databaseType === "tdengine" && primaryKeys.length > 0) return [DBX_TDENGINE_TBNAME_COLUMN, ...primaryKeys];
   const syntheticKey = getDatabaseCapability(databaseType).syntheticKey;
   if (syntheticKey === "oracle-rowid" && primaryKeys.length === 0) return [DBX_ROWID_COLUMN];
@@ -14,7 +19,8 @@ export function editablePrimaryKeys(databaseType: DatabaseType | undefined, colu
   return primaryKeys;
 }
 
-export function isTableDataEditable(databaseType: DatabaseType | undefined, primaryKeys: string[]): boolean {
+export function isTableDataEditable(databaseType: DatabaseType | undefined, primaryKeys: string[], tableType?: string): boolean {
+  if (isViewTableType(tableType)) return false;
   const cap = getDatabaseCapability(databaseType).tableData;
   if (cap.readonly) return false;
   if (cap.insert) return true;

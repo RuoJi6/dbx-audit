@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -23,6 +23,38 @@ pub struct AgentDriverClient {
     stderr_tail: Arc<Mutex<StderrTail>>,
     handshake: Option<AgentHandshake>,
     next_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentLaunchSpec {
+    pub program: PathBuf,
+    pub args: Vec<String>,
+    pub working_dir: Option<PathBuf>,
+}
+
+impl AgentLaunchSpec {
+    pub fn new(program: impl Into<PathBuf>) -> Self {
+        Self { program: program.into(), args: Vec::new(), working_dir: None }
+    }
+
+    pub fn java_jar(java_path: impl Into<PathBuf>, jar_path: impl AsRef<Path>) -> Self {
+        let jar_path = jar_path.as_ref();
+        Self {
+            program: java_path.into(),
+            args: agent_java_args(&jar_path.to_string_lossy()),
+            working_dir: jar_path.parent().map(Path::to_path_buf),
+        }
+    }
+
+    pub fn with_args(mut self, args: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.args = args.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn with_working_dir(mut self, working_dir: impl Into<PathBuf>) -> Self {
+        self.working_dir = Some(working_dir.into());
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -239,13 +271,17 @@ impl StderrTail {
 }
 
 impl AgentDriverClient {
-    /// Spawn a Java agent process and wait for it to signal readiness.
+    /// Spawn an agent process and wait for it to signal readiness.
     ///
-    /// The agent is started via `java -jar <jar_path>` with stdin/stdout piped.
+    /// Agents can be Java JARs, native executables, or script runtimes as long as
+    /// they speak the DBX stdin/stdout JSON-RPC protocol.
     /// Blocks (async) until the agent writes `{"ready":true}` to stdout.
-    pub async fn spawn(java_path: &str, jar_path: &str) -> Result<Self, String> {
-        let mut command = Command::new(java_path);
-        command.args(agent_java_args(jar_path)).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    pub async fn spawn(launch: AgentLaunchSpec) -> Result<Self, String> {
+        let mut command = Command::new(&launch.program);
+        command.args(&launch.args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        if let Some(working_dir) = &launch.working_dir {
+            command.current_dir(working_dir);
+        }
         remove_agent_proxy_env(&mut command);
 
         #[cfg(windows)]
@@ -254,7 +290,8 @@ impl AgentDriverClient {
             command.creation_flags(CREATE_NO_WINDOW);
         }
 
-        let mut child = command.spawn().map_err(|e| format!("Failed to spawn agent process: {e}"))?;
+        let mut child =
+            command.spawn().map_err(|e| format!("Failed to spawn agent process {}: {e}", launch_display(&launch)))?;
 
         let child_stdin = child.stdin.take().ok_or("Failed to capture agent stdin")?;
         let child_stdout = child.stdout.take().ok_or("Failed to capture agent stdout")?;
@@ -779,6 +816,12 @@ fn agent_jar_path_matches_key(jar_path: &str, key: &str) -> bool {
     Path::new(jar_path).components().any(|component| component.as_os_str().to_string_lossy() == key)
 }
 
+fn launch_display(launch: &AgentLaunchSpec) -> String {
+    let mut parts = vec![launch.program.to_string_lossy().to_string()];
+    parts.extend(launch.args.iter().cloned());
+    parts.join(" ")
+}
+
 fn remove_agent_proxy_env(command: &mut Command) {
     for key in agent_proxy_env_vars() {
         command.env_remove(key);
@@ -1097,6 +1140,40 @@ mod tests {
     #[test]
     fn exposes_kv_protocol_wrapper() {
         let _call_kv_method = AgentDriverClient::call_kv_method::<serde_json::Value>;
+    }
+
+    #[test]
+    fn agent_query_result_default_column_types_is_empty_vec() {
+        // Old agent JARs predate the column_types field. Rust tolerates the
+        // missing field via #[serde(default)] on db::QueryResult.column_types
+        // and consumers must see an empty vector rather than an error.
+        let json = serde_json::json!({
+            "columns": ["id", "name"],
+            "rows": [[1, "Ada"]],
+            "affected_rows": 0,
+            "execution_time_ms": 1
+        });
+        let result: crate::types::QueryResult = serde_json::from_value(json).expect("deserialize legacy agent result");
+        assert_eq!(result.columns, vec!["id".to_string(), "name".to_string()]);
+        assert!(result.column_types.is_empty(), "missing column_types must default to empty");
+        assert_eq!(result.rows.len(), 1);
+    }
+
+    #[test]
+    fn agent_query_result_passes_through_column_types_when_present() {
+        // New PostgresLike agents (HighGo / KingBase / Vastbase / openGauss /
+        // GaussDB) include column_types alongside columns so the desktop UI
+        // can detect geometry/geography columns and offer the map preview.
+        let json = serde_json::json!({
+            "columns": ["id", "geom"],
+            "column_types": ["int4", "geometry"],
+            "rows": [[1, "POINT(116.397 39.908)"]],
+            "affected_rows": 0,
+            "execution_time_ms": 5
+        });
+        let result: crate::types::QueryResult = serde_json::from_value(json).expect("deserialize agent result");
+        assert_eq!(result.column_types, vec!["int4".to_string(), "geometry".to_string()]);
+        assert_eq!(result.rows[0][1], serde_json::json!("POINT(116.397 39.908)"));
     }
 
     #[test]

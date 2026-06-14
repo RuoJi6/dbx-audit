@@ -49,6 +49,7 @@ pub struct CreateDatabaseSqlOptions {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg(feature = "duckdb-bundled")]
 pub struct DuckDbAttachDatabaseSqlOptions {
     pub path: String,
     pub name: String,
@@ -136,6 +137,7 @@ pub fn build_create_database_sql(options: CreateDatabaseSqlOptions) -> String {
     format!("CREATE DATABASE {name} CHARACTER SET {charset}{collate_clause};")
 }
 
+#[cfg(feature = "duckdb-bundled")]
 pub fn build_duckdb_attach_database_sql(options: DuckDbAttachDatabaseSqlOptions) -> String {
     format!(
         "ATTACH {} AS {};",
@@ -165,6 +167,8 @@ pub fn build_drop_table_sql(options: TableAdminSqlOptions) -> String {
     let table = qualified_name(options.database_type, options.schema.as_deref(), &options.table_name);
     if matches!(options.database_type, Some(DatabaseType::Iotdb)) {
         return format!("DELETE TIMESERIES {};", iotdb_timeseries_pattern(&table));
+    } else if matches!(options.database_type, Some(DatabaseType::InfluxDb)) {
+        return format!("DROP MEASUREMENT {};", table);
     }
     format!("DROP TABLE {table};")
 }
@@ -509,6 +513,7 @@ mod tests {
         assert!(!supports_create_database_charset(Some(DatabaseType::Postgres), None));
     }
 
+    #[cfg(feature = "duckdb-bundled")]
     #[test]
     fn builds_duckdb_attach_sql() {
         assert_eq!(

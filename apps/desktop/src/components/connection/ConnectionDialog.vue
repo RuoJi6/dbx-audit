@@ -4,13 +4,15 @@ import { uuid } from "@/lib/utils";
 import { useI18n } from "vue-i18n";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import type { ConnectionConfig, DatabaseType, JdbcDriverInfo, ProxyTunnelConfig, SshTunnelConfig, TransportLayerConfig } from "@/types/database";
+import { Switch } from "@/components/ui/switch";
+import type { ConnectionConfig, DatabaseType, JdbcDriverInfo, JdbcMavenBundleInfo, ProxyTunnelConfig, SshTunnelConfig, TransportLayerConfig } from "@/types/database";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useToast } from "@/composables/useToast";
@@ -21,6 +23,7 @@ import { applyParsedConnectionUrl, normalizeMongoConnectionString, parseConnecti
 import type { ConnectionDeepLinkDraft } from "@/lib/connectionDeepLink";
 import { connectionUrlPlaceholder as getUrlPlaceholder } from "@/lib/connectionPresentation";
 import { h2ConnectionModeForConfig, h2FileJdbcUrl, h2FilePathFromJdbcUrl, type H2ConnectionMode } from "@/lib/h2Connection";
+import { isLocalFileTypeDb } from "@/lib/connectionFile";
 import { mongodbAuthFailureHint, mongoUrlParam, setMongoUrlParam } from "@/lib/mongoConnectionOptions";
 import { copyToClipboard } from "@/lib/clipboard";
 import { showAgentDriverInstallHint, type AgentDriverInstallState } from "@/lib/agentDriverInstallHint";
@@ -33,6 +36,11 @@ type DbCategory = { key: string; title: string; options: DbOption[] };
 type DialogStep = "select" | "config";
 type DbPickerView = "icon" | "list";
 type ConfigTab = "connection" | "advanced" | "tls" | "transport";
+type JdbcDriverSelectItem = {
+  id: string;
+  label: string;
+  paths: string[];
+};
 
 type LegacyTransportFields = {
   ssh_enabled?: boolean;
@@ -119,6 +127,7 @@ const defaultForm = (): ConnectionForm => ({
   redis_sentinel_password: "",
   redis_sentinel_tls: false,
   redis_cluster_nodes: "",
+  redis_key_separator: ":",
   etcd_endpoints: "",
   read_only: false,
   visible_databases: undefined,
@@ -137,6 +146,7 @@ function defaultSshTunnel(): SshTunnelConfig {
     key_passphrase: "",
     connect_timeout_secs: 5,
     expose_lan: false,
+    use_ssh_agent: false,
   };
 }
 
@@ -153,6 +163,7 @@ function normalizeSshTunnel(hop: Partial<SshTunnelConfig>): SshTunnelConfig {
     key_passphrase: hop.key_passphrase || "",
     connect_timeout_secs: Number(hop.connect_timeout_secs) || 5,
     expose_lan: !!hop.expose_lan,
+    use_ssh_agent: !!hop.use_ssh_agent,
   };
 }
 
@@ -228,6 +239,7 @@ function sshLayersForConfig(config: LegacyConnectionConfig): SshTunnelConfig[] {
         key_passphrase: config.ssh_key_passphrase || "",
         connect_timeout_secs: config.ssh_connect_timeout_secs || 5,
         expose_lan: config.ssh_expose_lan || false,
+        use_ssh_agent: false,
       }),
     ];
   }
@@ -242,8 +254,10 @@ const customDriverName = ref("");
 const mongoUseUrl = ref(false);
 const jdbcDriverPathsInput = ref("");
 const jdbcDrivers = ref<JdbcDriverInfo[]>([]);
+const jdbcMavenBundles = ref<JdbcMavenBundleInfo[]>([]);
 const agentDrivers = ref<AgentDriverInstallState[]>([]);
 const selectedJdbcDriverPath = ref("");
+const jdbcManualClasspathOpen = ref(false);
 const connectionUrlInput = ref("");
 const oceanbaseSubMode = ref<"mysql" | "oracle">("mysql");
 const h2ConnectionMode = ref<H2ConnectionMode>("file");
@@ -265,6 +279,31 @@ const colorOptions = [
 const isPresetColor = (color: string | undefined) => colorOptions.some((c) => c.value === (color || ""));
 const customColorInput = ref("");
 const customColorOpen = ref(false);
+
+const jdbcDriverSelectItems = computed<JdbcDriverSelectItem[]>(() => {
+  const bundles = jdbcMavenBundles.value.map((bundle) => ({
+    id: `maven:${bundle.id}`,
+    label: bundle.coordinate,
+    paths: bundle.artifacts.map((artifact) => artifact.path),
+  }));
+  const manual = jdbcDrivers.value
+    .filter((driver) => !driver.bundle_id)
+    .map((driver) => ({
+      id: `manual:${driver.path}`,
+      label: driver.name,
+      paths: [driver.path],
+    }));
+  return [...bundles, ...manual].sort((left, right) => left.label.localeCompare(right.label));
+});
+
+const jdbcDriverSelectItemById = computed(() => new Map(jdbcDriverSelectItems.value.map((item) => [item.id, item])));
+const jdbcManualClasspathCount = computed(
+  () =>
+    jdbcDriverPathsInput.value
+      .split(/\r?\n/)
+      .map((value) => value.trim())
+      .filter(Boolean).length,
+);
 
 function applyCustomColor(value: string) {
   form.value.color = value;
@@ -321,8 +360,6 @@ const driverProfiles: Record<
   },
   sqlserver: { type: "sqlserver", port: 1433, user: "sa", label: "SQL Server", icon: "sqlserver" },
   oracle: { type: "oracle", port: 1521, user: "system", label: "Oracle", icon: "oracle" },
-  "oracle-legacy": { type: "oracle", port: 1521, user: "system", label: "Oracle Legacy", icon: "oracle" },
-  "oracle-10g": { type: "oracle", port: 1521, user: "system", label: "Oracle 10g", icon: "oracle" },
   elasticsearch: {
     type: "elasticsearch",
     port: 9200,
@@ -416,6 +453,7 @@ const driverProfiles: Record<
   iotdb: { type: "iotdb", port: 6667, user: "root", label: "Apache IoTDB", icon: "iotdb" },
   etcd: { type: "etcd", port: 2379, user: "", label: "etcd", icon: "etcd" },
   iris: { type: "iris", port: 1972, user: "_SYSTEM", label: "IRIS", icon: "iris" },
+  influxdb: { type: "influxdb", port: 8086, user: "", label: "InfluxDB", icon: "InfluxDB" },
   custom_mysql: {
     type: "mysql",
     port: 3306,
@@ -435,6 +473,7 @@ const driverProfiles: Record<
 };
 
 function profileForConfig(config: ConnectionConfig) {
+  if (config.db_type === "oracle") return "oracle";
   if (config.driver_profile && driverProfiles[config.driver_profile]) {
     if (config.driver_profile === "oceanbase-oracle") return "oceanbase";
     return config.driver_profile;
@@ -544,6 +583,7 @@ watch(
         redis_sentinel_password: config.redis_sentinel_password || "",
         redis_sentinel_tls: config.redis_sentinel_tls || false,
         redis_cluster_nodes: config.redis_cluster_nodes || "",
+        redis_key_separator: config.redis_key_separator ?? ":",
         etcd_endpoints: config.etcd_endpoints || "",
         read_only: config.read_only || false,
         visible_databases: config.visible_databases,
@@ -667,8 +707,6 @@ const iconTypeMap: Record<string, string> = {
   clickhouse: "clickhouse",
   sqlserver: "sqlserver",
   oracle: "oracle",
-  "oracle-legacy": "oracle",
-  "oracle-10g": "oracle",
   elasticsearch: "elasticsearch",
   mariadb: "mariadb",
   tidb: "tidb",
@@ -715,12 +753,13 @@ const iconTypeMap: Record<string, string> = {
   bigquery: "bigquery",
   kylin: "kylin",
   sundb: "sundb",
+  influxdb: "influxdb",
   jdbc: "jdbc",
   custom_mysql: "mysql",
   custom_postgres: "postgres",
 };
 
-const dbOptions = [
+const dbOptions: DbOption[] = [
   { value: "postgres", label: "PostgreSQL" },
   { value: "mysql", label: "MySQL" },
   { value: "mongodb", label: "MongoDB" },
@@ -777,13 +816,21 @@ const dbOptions = [
   { value: "xugu", label: "虚谷 XuguDB" },
   { value: "iotdb", label: "Apache IoTDB" },
   { value: "etcd", label: "etcd" },
+  { value: "influxdb", label: "InfluxDB" },
   { value: "iris", label: "IRIS" },
   { value: "jdbc", label: "JDBC" },
-  { value: "custom_mysql", label: "Custom (MySQL)" },
-  { value: "custom_postgres", label: "Custom (PostgreSQL)" },
 ];
 
 const dbCategories = computed<DbCategory[]>(() => [{ key: "all", title: "", options: dbOptions }]);
+
+function matchesDbOption(option: DbOption, keyword: string, categoryTitle = "") {
+  const profile = driverProfiles[option.value];
+  return [option.label, option.value, profile?.label, profile?.type, categoryTitle].some((value) =>
+    String(value || "")
+      .toLowerCase()
+      .includes(keyword),
+  );
+}
 
 const filteredDbCategories = computed<DbCategory[]>(() => {
   const keyword = dbSearchQuery.value.trim().toLowerCase();
@@ -792,14 +839,7 @@ const filteredDbCategories = computed<DbCategory[]>(() => {
   return dbCategories.value
     .map((category) => ({
       ...category,
-      options: category.options.filter((option) => {
-        const profile = driverProfiles[option.value];
-        return [option.label, option.value, profile?.label, profile?.type, category.title].some((value) =>
-          String(value || "")
-            .toLowerCase()
-            .includes(keyword),
-        );
-      }),
+      options: category.options.filter((option) => matchesDbOption(option, keyword, category.title)),
     }))
     .filter((category) => category.options.length > 0);
 });
@@ -808,7 +848,7 @@ const hasDbPickerResults = computed(() => filteredDbCategories.value.some((categ
 const selectedDbIcon = computed(() => iconTypeMap[selectedType.value] || selectedProfile().icon || selectedType.value);
 const isJdbcConnection = computed(() => form.value.db_type === "jdbc");
 const isH2FileMode = computed(() => form.value.db_type === "h2" && h2ConnectionMode.value === "file");
-const usesLocalFilePathInput = computed(() => form.value.db_type === "sqlite" || form.value.db_type === "duckdb" || form.value.db_type === "access" || isH2FileMode.value);
+const usesLocalFilePathInput = computed(() => isLocalFileTypeDb(form.value.db_type) && (form.value.db_type !== "h2" || isH2FileMode.value));
 
 const connectionUrlPlaceholder = computed(() => getUrlPlaceholder(form.value.db_type));
 const filePathPlaceholder = computed(() => {
@@ -824,7 +864,7 @@ const sqliteExtensionPaths = computed({
     form.value.url_params = setSqliteExtensionPaths(form.value.url_params, value);
   },
 });
-const tlsCapableDatabaseTypes = new Set<DatabaseType>(["mysql", "postgres", "redshift", "gaussdb", "kwdb", "opengauss", "redis", "etcd", "clickhouse", "elasticsearch"]);
+const tlsCapableDatabaseTypes = new Set<DatabaseType>(["mysql", "postgres", "redshift", "gaussdb", "kwdb", "opengauss", "redis", "etcd", "clickhouse", "elasticsearch", "influxdb"]);
 const supportsTlsToggle = computed(() => tlsCapableDatabaseTypes.has(form.value.db_type));
 const supportsCaCertificatePath = computed(() => form.value.db_type === "clickhouse");
 const bareMysqlProfiles = new Set(["doris", "starrocks", "selectdb", "oceanbase"]);
@@ -1054,6 +1094,7 @@ function connectionConfigForSubmit(id: string): ConnectionConfig {
     config.redis_sentinel_password = undefined;
     config.redis_sentinel_tls = undefined;
     config.redis_cluster_nodes = undefined;
+    config.redis_key_separator = undefined;
   } else if (config.redis_connection_mode === "sentinel") {
     config.redis_sentinel_master = config.redis_sentinel_master?.trim() || "";
     config.redis_sentinel_nodes = normalizeRedisSentinelNodes(config.redis_sentinel_nodes || "");
@@ -1084,6 +1125,9 @@ function connectionConfigForSubmit(id: string): ConnectionConfig {
     config.redis_sentinel_password = undefined;
     config.redis_sentinel_tls = undefined;
     config.redis_cluster_nodes = undefined;
+  }
+  if (config.db_type === "redis") {
+    config.redis_key_separator = config.redis_key_separator?.trim() ?? ":";
   }
   if (config.db_type === "etcd") {
     config.etcd_endpoints = normalizeEndpointLines(config.etcd_endpoints || "");
@@ -1692,7 +1736,7 @@ function validateTransportLayers(config: LegacyConnectionConfig) {
     }
     if (layer.type === "ssh") {
       if (!layer.user?.trim()) throw new Error(t("connection.sshHopInvalidUser", { hop: label }));
-      if (!layer.password?.trim() && !layer.key_path?.trim()) {
+      if (!layer.password?.trim() && !layer.key_path?.trim() && !layer.use_ssh_agent) {
         throw new Error(t("connection.sshHopInvalidAuth", { hop: label }));
       }
       const timeout = Number(layer.connect_timeout_secs);
@@ -1927,9 +1971,12 @@ async function browseJdbcDriverPaths() {
 async function loadJdbcDrivers() {
   if (!isDesktop) return;
   try {
-    jdbcDrivers.value = await api.listJdbcDrivers();
+    const [drivers, bundles] = await Promise.all([api.listJdbcDrivers(), api.listJdbcMavenBundles()]);
+    jdbcDrivers.value = drivers;
+    jdbcMavenBundles.value = bundles;
   } catch {
     jdbcDrivers.value = [];
+    jdbcMavenBundles.value = [];
   }
 }
 
@@ -1950,18 +1997,21 @@ async function loadAgentDrivers() {
   }
 }
 
-function addJdbcDriverPath(path: string) {
+function addJdbcDriverPaths(paths: string[]) {
   const existing = jdbcDriverPathsInput.value
     .split(/\r?\n/)
     .map((value) => value.trim())
     .filter(Boolean);
-  jdbcDriverPathsInput.value = Array.from(new Set([...existing, path])).join("\n");
+  jdbcDriverPathsInput.value = Array.from(new Set([...existing, ...paths])).join("\n");
 }
 
-function onJdbcDriverSelect(path: any) {
-  if (typeof path !== "string" || !path) return;
-  selectedJdbcDriverPath.value = path;
-  addJdbcDriverPath(path);
+function onJdbcDriverSelect(id: any) {
+  if (typeof id !== "string" || !id) return;
+  const item = jdbcDriverSelectItemById.value.get(id);
+  if (!item) return;
+  selectedJdbcDriverPath.value = id;
+  addJdbcDriverPaths(item.paths);
+  jdbcManualClasspathOpen.value = false;
 }
 
 function openExternalUrl(url: string) {
@@ -2002,7 +2052,7 @@ function openExternalUrl(url: string) {
           <div class="max-h-[58vh] space-y-5 overflow-y-auto pr-2">
             <section v-for="category in filteredDbCategories" :key="category.key" class="space-y-2">
               <div class="flex items-center">
-                <h3 class="text-sm font-medium">{{ category.title }}</h3>
+                <h3 v-if="category.title" class="text-sm font-medium">{{ category.title }}</h3>
               </div>
 
               <div v-if="dbPickerView === 'icon'" class="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-5">
@@ -2188,24 +2238,29 @@ function openExternalUrl(url: string) {
                     <Label class="text-right">{{ t("connection.password") }}</Label>
                     <Input v-model="form.password" type="password" class="col-span-3" />
                   </div>
-                  <div class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right">{{ t("connection.jdbcDriverClass") }}</Label>
-                    <Input v-model="form.jdbc_driver_class" class="col-span-3" :placeholder="t('connection.jdbcDriverClassPlaceholder')" />
-                  </div>
                   <div class="grid grid-cols-4 items-start gap-4">
                     <Label class="text-right mt-2">{{ t("connection.jdbcDriverPaths") }}</Label>
                     <div class="col-span-3 space-y-2">
-                      <Select v-if="jdbcDrivers.length > 0" :model-value="selectedJdbcDriverPath" @update:model-value="onJdbcDriverSelect">
+                      <Select v-if="jdbcDriverSelectItems.length > 0" :model-value="selectedJdbcDriverPath" @update:model-value="onJdbcDriverSelect">
                         <SelectTrigger>
                           <SelectValue :placeholder="t('connection.jdbcDriverSelectPlaceholder')" />
                         </SelectTrigger>
                         <SelectContent>
-                          <SelectItem v-for="driver in jdbcDrivers" :key="driver.path" :value="driver.path">
-                            {{ driver.name }}
+                          <SelectItem v-for="driver in jdbcDriverSelectItems" :key="driver.id" :value="driver.id">
+                            {{ driver.label }}
                           </SelectItem>
                         </SelectContent>
                       </Select>
-                      <div class="flex items-start gap-1">
+                      <div class="flex items-center justify-between gap-3 rounded-md border bg-muted/20 px-3 py-2">
+                        <div class="flex min-w-0 items-center gap-2">
+                          <div class="truncate text-xs font-medium">{{ t("connection.jdbcManualClasspath") }}</div>
+                          <Badge variant="outline" class="h-5 shrink-0 rounded-full px-2 text-[10px] font-medium">
+                            {{ t("connection.jdbcManualClasspathCount", { count: jdbcManualClasspathCount }) }}
+                          </Badge>
+                        </div>
+                        <Switch v-model="jdbcManualClasspathOpen" />
+                      </div>
+                      <div v-if="jdbcManualClasspathOpen" class="flex items-start gap-1">
                         <textarea
                           v-model="jdbcDriverPathsInput"
                           class="flex min-h-12 w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
@@ -2221,6 +2276,10 @@ function openExternalUrl(url: string) {
                         </Tooltip>
                       </div>
                     </div>
+                  </div>
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <Label class="text-right">{{ t("connection.jdbcDriverClass") }}</Label>
+                    <Input v-model="form.jdbc_driver_class" class="col-span-3" :placeholder="t('connection.jdbcDriverClassPlaceholder')" />
                   </div>
                   <div class="grid grid-cols-4 items-start gap-4">
                     <span />
@@ -2372,6 +2431,10 @@ function openExternalUrl(url: string) {
                   <div class="grid grid-cols-4 items-center gap-4">
                     <Label class="text-right">{{ t("connection.password") }}</Label>
                     <Input v-model="form.password" type="password" class="col-span-3" :placeholder="t('connection.databasePlaceholder')" />
+                  </div>
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <Label class="text-right text-xs">{{ t("connection.redisKeySeparator") }}</Label>
+                    <Input v-model="form.redis_key_separator" class="col-span-3 h-8 text-xs" placeholder=":" />
                   </div>
                 </template>
 
@@ -2533,20 +2596,6 @@ function openExternalUrl(url: string) {
                       {{ t("connection.driverInstallHintPrefix") }}<a class="underline cursor-pointer text-primary hover:text-primary/80" @click="emit('openDriverStore')">{{ t("toolbar.driverManager") }}</a
                       >{{ t("connection.driverInstallHintSuffix") }}
                     </p>
-                  </div>
-
-                  <div v-if="form.db_type === 'oracle'" class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right text-xs">{{ t("connection.version") }}</Label>
-                    <Select :model-value="selectedType === 'oracle-legacy' || selectedType === 'oracle-10g' ? selectedType : 'oracle'" @update:model-value="(val) => applyProfile(String(val), true)">
-                      <SelectTrigger class="col-span-3 h-8 text-sm">
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="oracle">Oracle 19c+</SelectItem>
-                        <SelectItem value="oracle-legacy">Oracle 11g-19c</SelectItem>
-                        <SelectItem value="oracle-10g">Oracle 10g</SelectItem>
-                      </SelectContent>
-                    </Select>
                   </div>
 
                   <div v-if="form.db_type === 'oracle'" class="grid grid-cols-4 items-center gap-4">
@@ -2977,6 +3026,13 @@ function openExternalUrl(url: string) {
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label class="text-right text-xs">{{ t("connection.sshKeyPassphrase") }}</Label>
                       <Input v-model="selectedSshLayer.key_passphrase" type="password" class="col-span-3" :placeholder="t('connection.sshKeyPassphrasePlaceholder')" :disabled="selectedSshLayer.enabled === false" />
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <span />
+                      <label class="col-span-3 flex items-center gap-2 cursor-pointer">
+                        <input type="checkbox" v-model="selectedSshLayer.use_ssh_agent" class="mr-0" :disabled="selectedSshLayer.enabled === false" />
+                        <span class="text-xs text-muted-foreground">{{ t("connection.sshUseAgent") }}</span>
+                      </label>
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
                       <span />

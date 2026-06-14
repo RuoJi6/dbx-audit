@@ -1,16 +1,15 @@
 <script setup lang="ts">
 import { computed, ref, onMounted, onBeforeUnmount } from "vue";
 import { useI18n } from "vue-i18n";
-import { DatabaseZap, FilePlus2, Loader2, Languages, Moon, Sun, SunMoon, History, Bot, ArrowLeftRight, FileCode, FileStack, GitCompareArrows, TableProperties, ShieldCheck, Settings, CloudDownload, Package, Ellipsis } from "@lucide/vue";
+import { DatabaseZap, FilePlus2, Loader2, Moon, Sun, SunMoon, History, Bot, ArrowLeftRight, FileCode, BookMarked, GitCompareArrows, TableProperties, Settings, CloudDownload, Package, ShieldCheck } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import LightDropdown from "@/components/ui/LightDropdown.vue";
 import WindowControls from "@/components/layout/WindowControls.vue";
 import ExportProgressPopover from "@/components/export/ExportProgressPopover.vue";
 import { shouldReserveMacTrafficLightInset, useWindowControls } from "@/composables/useWindowControls";
-import { currentLocale, setLocale, type Locale } from "@/i18n";
+import { useSettingsStore } from "@/stores/settingsStore";
 import type { AppThemeMode } from "@/lib/appTheme";
-import { LOCALE_OPTIONS } from "@/lib/localeOptions";
 
 const props = defineProps<{
   isDark: boolean;
@@ -46,6 +45,8 @@ const emit = defineEmits<{
 }>();
 
 const { t } = useI18n();
+const settingsStore = useSettingsStore();
+const toolbarItems = computed(() => settingsStore.editorSettings.toolbarItems);
 const { isMac, isDesktop, showControls, isMaximized, isFullscreen, minimize, toggleMaximize, close } = useWindowControls();
 
 const themeItems = computed(() => [
@@ -53,13 +54,6 @@ const themeItems = computed(() => [
   { value: "dark", label: t("toolbar.themeDark"), icon: Moon },
   { value: "system", label: t("toolbar.themeSystem"), icon: SunMoon },
 ]);
-const localeItems = computed(() =>
-  LOCALE_OPTIONS.map((option) => ({
-    value: option.value,
-    label: option.label,
-    leadingText: option.flag,
-  })),
-);
 const themeTriggerIcon = computed(() => {
   if (props.themeMode === "system") return SunMoon;
   return props.isDark ? Moon : Sun;
@@ -74,12 +68,13 @@ function onToolbarDblClick(e: MouseEvent) {
 
 const toolbarEl = ref<HTMLElement>();
 const toolbarCollapsed = ref(false);
-const COLLAPSE_THRESHOLD = 1000;
 
 function checkToolbarWidth() {
   const el = toolbarEl.value;
   if (!el) return;
-  toolbarCollapsed.value = el.clientWidth < COLLAPSE_THRESHOLD;
+  const screenWidth = window.visualViewport?.width ?? window.innerWidth;
+  const threshold = screenWidth / 2;
+  toolbarCollapsed.value = el.clientWidth < threshold;
 }
 
 let resizeObserver: ResizeObserver | null = null;
@@ -87,56 +82,103 @@ let resizeObserver: ResizeObserver | null = null;
 onMounted(() => {
   resizeObserver = new ResizeObserver(checkToolbarWidth);
   if (toolbarEl.value) resizeObserver.observe(toolbarEl.value);
+  window.addEventListener("resize", checkToolbarWidth);
 });
 
 onBeforeUnmount(() => {
   resizeObserver?.disconnect();
+  window.removeEventListener("resize", checkToolbarWidth);
 });
 
-const collapsedItems = computed(() => [
-  {
-    value: "transfer",
-    label: t("transfer.dataTransfer"),
-    icon: ArrowLeftRight,
-    action: () => emit("open-transfer"),
-    disabled: !props.hasConnections,
-  },
-  {
-    value: "sql-file",
-    label: t("sqlFile.title"),
-    icon: FileCode,
-    action: () => emit("open-sql-file"),
-    disabled: !props.hasSqlFileConnections,
-  },
-  {
-    value: "schema-diff",
-    label: t("diff.title"),
-    icon: GitCompareArrows,
-    action: () => emit("open-schema-diff"),
-    disabled: !props.hasConnections,
-  },
-  {
-    value: "data-compare",
-    label: t("dataCompare.title"),
-    icon: TableProperties,
-    action: () => emit("open-data-compare"),
-    disabled: !props.hasConnections,
-  },
-  {
+const moreItems = computed(() => {
+  const items: Array<{ value: string; label: string; icon: any; action: () => void; disabled: boolean }> = [];
+
+  // Hidden left-side items go into "更多"
+  if (!toolbarItems.value.dataTransfer) {
+    items.push({
+      value: "transfer",
+      label: t("transfer.dataTransfer"),
+      icon: ArrowLeftRight,
+      action: () => emit("open-transfer"),
+      disabled: !props.hasConnections,
+    });
+  }
+  if (!toolbarItems.value.driverManager) {
+    items.push({
+      value: "driver-store",
+      label: t("toolbar.driverManager"),
+      icon: Package,
+      action: () => emit("open-driver-store"),
+      disabled: false,
+    });
+  }
+
+  // "更多" menu items (individually toggleable)
+  if (toolbarItems.value.sqlFile) {
+    items.push({
+      value: "sql-file",
+      label: t("sqlFile.title"),
+      icon: FileCode,
+      action: () => emit("open-sql-file"),
+      disabled: !props.hasSqlFileConnections,
+    });
+  }
+  if (toolbarItems.value.schemaDiff) {
+    items.push({
+      value: "schema-diff",
+      label: t("diff.title"),
+      icon: GitCompareArrows,
+      action: () => emit("open-schema-diff"),
+      disabled: !props.hasConnections,
+    });
+  }
+  if (toolbarItems.value.dataCompare) {
+    items.push({
+      value: "data-compare",
+      label: t("dataCompare.title"),
+      icon: TableProperties,
+      action: () => emit("open-data-compare"),
+      disabled: !props.hasConnections,
+    });
+  }
+  return items;
+});
+
+const showMoreDropdown = computed(() => moreItems.value.length > 0);
+
+const collapsedItems = computed(() => {
+  const items: Array<{ value: string; label: string; icon: any; action: () => void; disabled: boolean }> = [];
+  if (toolbarItems.value.dataTransfer) {
+    items.push({
+      value: "transfer",
+      label: t("transfer.dataTransfer"),
+      icon: ArrowLeftRight,
+      action: () => emit("open-transfer"),
+      disabled: !props.hasConnections,
+    });
+  }
+  if (toolbarItems.value.driverManager) {
+    items.push({
+      value: "driver-store",
+      label: props.agentDriverUpdateCount > 0 ? `${t("toolbar.driverManager")} (${props.agentDriverUpdateCount})` : t("toolbar.driverManager"),
+      icon: Package,
+      action: () => emit("open-driver-store"),
+      disabled: false,
+    });
+  }
+  items.push({
     value: "audit",
     label: t("audit.toolbar"),
     icon: ShieldCheck,
     action: () => emit("toggle-audit"),
     disabled: !props.hasConnections,
-  },
-  {
-    value: "driver-store",
-    label: props.agentDriverUpdateCount > 0 ? `${t("toolbar.driverManager")} (${props.agentDriverUpdateCount})` : t("toolbar.driverManager"),
-    icon: Package,
-    action: () => emit("open-driver-store"),
-    disabled: false,
-  },
-]);
+  });
+  // Always include moreItems (may contain hidden left-side items)
+  if (moreItems.value.length > 0) {
+    items.push(...moreItems.value);
+  }
+  return items;
+});
 </script>
 
 <template>
@@ -152,24 +194,17 @@ const collapsedItems = computed(() => [
     </Button>
 
     <template v-if="!toolbarCollapsed">
-      <Button variant="ghost" size="sm" class="h-8 px-2 text-xs gap-1" @click="emit('open-transfer')" :disabled="!hasConnections">
+      <Button v-if="toolbarItems.dataTransfer" variant="ghost" size="sm" class="h-8 px-2 text-xs gap-1" @click="emit('open-transfer')" :disabled="!hasConnections">
         <ArrowLeftRight class="h-3.5 w-3.5" />
         {{ t("transfer.dataTransfer") }}
       </Button>
 
-      <Button variant="ghost" size="sm" class="h-8 px-2 text-xs gap-1" @click="emit('open-sql-file')" :disabled="!hasSqlFileConnections">
-        <FileCode class="h-3.5 w-3.5" />
-        {{ t("sqlFile.title") }}
-      </Button>
-
-      <Button variant="ghost" size="sm" class="h-8 px-2 text-xs gap-1" @click="emit('open-schema-diff')" :disabled="!hasConnections">
-        <GitCompareArrows class="h-3.5 w-3.5" />
-        {{ t("diff.title") }}
-      </Button>
-
-      <Button variant="ghost" size="sm" class="h-8 px-2 text-xs gap-1" @click="emit('open-data-compare')" :disabled="!hasConnections">
-        <TableProperties class="h-3.5 w-3.5" />
-        {{ t("dataCompare.title") }}
+      <Button v-if="toolbarItems.driverManager" variant="ghost" size="sm" class="h-8 px-2 text-xs gap-1" :class="{ 'bg-accent': showDriverStore }" @click="emit('open-driver-store')">
+        <Package class="h-3.5 w-3.5" />
+        {{ t("toolbar.driverManager") }}
+        <span v-if="agentDriverUpdateCount > 0" class="ml-0.5 inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-red-500 px-1 text-[10px] font-medium leading-none text-white" :aria-label="t('toolbar.updatableDriverCount')">
+          {{ agentDriverUpdateCount > 99 ? "99+" : agentDriverUpdateCount }}
+        </span>
       </Button>
 
       <Button variant="ghost" size="sm" class="h-8 px-2 text-xs gap-1" :class="{ 'bg-accent': showAuditPanel }" @click="emit('toggle-audit')" :disabled="!hasConnections">
@@ -177,25 +212,36 @@ const collapsedItems = computed(() => [
         {{ t("audit.toolbar") }}
       </Button>
 
-      <Button variant="ghost" size="sm" class="h-8 px-2 text-xs gap-1" :class="{ 'bg-accent': showDriverStore }" @click="emit('open-driver-store')">
-        <Package class="h-3.5 w-3.5" />
-        {{ t("toolbar.driverManager") }}
-        <span v-if="agentDriverUpdateCount > 0" class="ml-0.5 inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-red-500 px-1 text-[10px] font-medium leading-none text-white" :aria-label="t('toolbar.updatableDriverCount')">
-          {{ agentDriverUpdateCount > 99 ? "99+" : agentDriverUpdateCount }}
-        </span>
-      </Button>
+      <LightDropdown
+        v-if="showMoreDropdown"
+        model-value=""
+        :items="moreItems"
+        :aria-label="t('common.more')"
+        :trigger-label="t('common.more')"
+        trigger-class="inline-flex h-8 items-center gap-1 rounded-lg px-2 text-xs font-medium hover:bg-muted hover:text-foreground dark:hover:bg-muted/50 transition-colors"
+        :show-trigger-label="true"
+        :show-chevron="true"
+        check-position="none"
+        align="start"
+        @update:model-value="
+          (value) => {
+            const item = moreItems.find((i) => i.value === value);
+            item?.action();
+          }
+        "
+      />
     </template>
 
     <template v-if="toolbarCollapsed">
       <LightDropdown
+        v-if="collapsedItems.length > 0"
         model-value=""
         :items="collapsedItems"
         :aria-label="t('common.more')"
-        :trigger-icon="Ellipsis"
-        trigger-class="inline-flex h-8 w-8 items-center justify-center rounded-md hover:bg-accent hover:text-accent-foreground"
-        trigger-icon-class="h-4 w-4"
-        :show-trigger-label="false"
-        :show-chevron="false"
+        :trigger-label="t('common.more')"
+        trigger-class="inline-flex h-8 items-center gap-1 rounded-lg px-2 text-xs font-medium hover:bg-muted hover:text-foreground dark:hover:bg-muted/50 transition-colors"
+        :show-trigger-label="true"
+        :show-chevron="true"
         check-position="none"
         align="start"
         @update:model-value="
@@ -209,29 +255,31 @@ const collapsedItems = computed(() => [
 
     <div class="flex-1" data-tauri-drag-region />
 
-    <Tooltip>
-      <TooltipTrigger as-child>
-        <Button variant="ghost" size="icon" class="relative h-8 w-8" :disabled="checkingUpdates" @click="emit('check-updates')">
-          <Loader2 v-if="checkingUpdates" class="h-4 w-4 animate-spin" />
-          <CloudDownload v-else class="h-4 w-4" />
-          <span v-if="hasUpdateAvailable" class="absolute right-1.5 top-1.5 h-2 w-2 rounded-full bg-red-500 ring-2 ring-background" />
-        </Button>
-      </TooltipTrigger>
-      <TooltipContent>{{ t("updates.check") }}</TooltipContent>
-    </Tooltip>
+    <template v-if="toolbarItems.checkUpdates">
+      <Tooltip>
+        <TooltipTrigger as-child>
+          <Button variant="ghost" size="icon" class="relative h-8 w-8" :disabled="checkingUpdates" @click="emit('check-updates')">
+            <Loader2 v-if="checkingUpdates" class="h-4 w-4 animate-spin" />
+            <CloudDownload v-else class="h-4 w-4" />
+            <span v-if="hasUpdateAvailable" class="absolute right-1.5 top-1.5 h-2 w-2 rounded-full bg-red-500 ring-2 ring-background" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>{{ t("updates.check") }}</TooltipContent>
+      </Tooltip>
+    </template>
 
     <ExportProgressPopover />
 
-    <Tooltip>
+    <Tooltip v-if="toolbarItems.sqlLibrary">
       <TooltipTrigger as-child>
         <Button variant="ghost" size="icon" class="h-8 w-8" :class="{ 'bg-accent': showSqlLibrary }" @click="emit('toggle-sql-library')">
-          <FileStack class="h-4 w-4" />
+          <BookMarked class="h-4 w-4" />
         </Button>
       </TooltipTrigger>
       <TooltipContent>{{ t("sqlLibrary.title") }}</TooltipContent>
     </Tooltip>
 
-    <Tooltip>
+    <Tooltip v-if="toolbarItems.history">
       <TooltipTrigger as-child>
         <Button variant="ghost" size="icon" class="h-8 w-8" :class="{ 'bg-accent': showHistory }" @click="emit('toggle-history')">
           <History class="h-4 w-4" />
@@ -240,7 +288,7 @@ const collapsedItems = computed(() => [
       <TooltipContent>{{ t("history.title") }}</TooltipContent>
     </Tooltip>
 
-    <Tooltip>
+    <Tooltip v-if="toolbarItems.ai">
       <TooltipTrigger as-child>
         <Button variant="ghost" size="icon" class="h-8 w-8" :class="{ 'bg-accent': showAiPanel }" @click="emit('toggle-ai')">
           <Bot class="h-4 w-4" />
@@ -249,7 +297,7 @@ const collapsedItems = computed(() => [
       <TooltipContent>AI</TooltipContent>
     </Tooltip>
 
-    <Tooltip>
+    <Tooltip v-if="toolbarItems.theme">
       <TooltipTrigger as-child>
         <span class="inline-flex">
           <LightDropdown
@@ -271,28 +319,7 @@ const collapsedItems = computed(() => [
       <TooltipContent>{{ t("toolbar.theme") }}</TooltipContent>
     </Tooltip>
 
-    <Tooltip>
-      <TooltipTrigger as-child>
-        <span class="inline-flex">
-          <LightDropdown
-            :model-value="currentLocale()"
-            :items="localeItems"
-            :aria-label="t('common.language')"
-            :trigger-icon="Languages"
-            trigger-class="inline-flex h-8 w-8 items-center justify-center rounded-md hover:bg-accent hover:text-accent-foreground"
-            trigger-icon-class="h-4 w-4"
-            :show-trigger-label="false"
-            :show-chevron="false"
-            check-position="none"
-            align="end"
-            @update:model-value="(value) => setLocale(value as Locale)"
-          />
-        </span>
-      </TooltipTrigger>
-      <TooltipContent>{{ t("common.language") }}</TooltipContent>
-    </Tooltip>
-
-    <Tooltip>
+    <Tooltip v-if="toolbarItems.github">
       <TooltipTrigger as-child>
         <Button variant="ghost" size="icon" class="h-8 w-8" @click="emit('open-github')">
           <svg class="h-4 w-4" viewBox="0 0 24 24" fill="currentColor">

@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, ref, defineAsyncComponent, watch, nextTick, onMounted, onUnmounted } from "vue";
+import type { CSSProperties } from "vue";
 import { useI18n } from "vue-i18n";
-import { Check, Columns3, Loader2, Search, Square, Bot, Table2, GitBranch, BarChart3, TableProperties, ChevronDown, ChevronUp, Inbox, RefreshCcw, Wrench, ListChecks } from "@lucide/vue";
+import { Check, Columns3, Loader2, Search, Square, Bot, GitBranch, BarChart3, TableProperties, ChevronDown, ChevronUp, Inbox, RefreshCcw, Wrench, ListChecks } from "@lucide/vue";
 import { Splitpanes, Pane } from "splitpanes";
 import "splitpanes/dist/splitpanes.css";
 import { Button } from "@/components/ui/button";
@@ -32,7 +33,7 @@ function preloadDataGridComponent() {
 const DataGrid = defineAsyncComponent(loadDataGridComponent);
 const RedisKeyBrowser = defineAsyncComponent(() => import("@/components/redis/RedisKeyBrowser.vue"));
 const EtcdKeyBrowser = defineAsyncComponent(() => import("@/components/etcd/EtcdKeyBrowser.vue"));
-const MongoDocBrowser = defineAsyncComponent(() => import("@/components/mongo/MongoDocBrowser.vue"));
+const DocumentBrowser = defineAsyncComponent(() => import("@/components/document/DocumentBrowser.vue"));
 const ObjectBrowser = defineAsyncComponent(() => import("@/components/objects/ObjectBrowser.vue"));
 const TableStructureEditor = defineAsyncComponent(() => import("@/components/structure/TableStructureEditor.vue"));
 const DatabaseUserAdmin = defineAsyncComponent(() => import("@/components/admin/DatabaseUserAdmin.vue"));
@@ -47,6 +48,8 @@ import { isTableDataEditable } from "@/lib/tableEditing";
 import { tableMetaForDataTab } from "@/lib/tableDataTabMeta";
 import { formatShortcut } from "@/lib/shortcutRegistry";
 import { effectiveDatabaseTypeForConnection } from "@/lib/jdbcDialect";
+import { chartableColumnIndexes } from "@/lib/chartData";
+import { useTabScroll } from "@/composables/useTabScroll";
 import type { QueryTab, ConnectionConfig } from "@/types/database";
 import type { SqlFormatDialect } from "@/lib/sqlFormatter";
 
@@ -147,6 +150,7 @@ const columnInfoLoading = ref(false);
 const columnInfoError = ref<string | undefined>(undefined);
 const dataGridRef = ref<DataGridHandle>();
 const queryEditorRef = ref<InstanceType<typeof QueryEditor>>();
+const resultTabsScrollerRef = ref<HTMLElement | null>(null);
 const columnVisibilitySearch = ref("");
 const columnVisibilityOptions = computed(() => dataGridRef.value?.filteredColumnVisibilityOptions(columnVisibilitySearch.value) ?? []);
 const redisKeyBrowserRef = ref<SearchableBrowserHandle>();
@@ -188,10 +192,31 @@ const modRKeys = computed(() =>
     .map((key) => (key === "Cmd" ? "⌘" : key)),
 );
 
+const {
+  hasTabOverflow: hasResultTabOverflow,
+  scrollThumbLeftPercent: resultTabsThumbLeftPercent,
+  scrollThumbWidthPercent: resultTabsThumbWidthPercent,
+  isScrollbarDragging: isResultTabsScrollbarDragging,
+  updateScrollButtons: updateResultTabsScrollbar,
+  onTabsWheel: onResultTabsWheel,
+  startScrollbarDrag: startResultTabsScrollbarDrag,
+} = useTabScroll(resultTabsScrollerRef);
+
+const resultTabsScrollerStyle: CSSProperties = {
+  msOverflowStyle: "none",
+  scrollbarWidth: "none",
+  WebkitOverflowScrolling: "touch",
+};
+
+const resultTabsScrollbarThumbStyle = computed<CSSProperties>(() => ({
+  insetInlineStart: `${resultTabsThumbLeftPercent.value}%`,
+  width: `${resultTabsThumbWidthPercent.value}%`,
+}));
+
 const hasNumericData = computed(() => {
   const r = props.activeTab.result;
   if (!r || r.rows.length === 0) return false;
-  return r.columns.some((_, idx) => r.rows.some((row) => typeof row[idx] === "number"));
+  return chartableColumnIndexes(r).length > 0;
 });
 
 const activeQueryError = computed(() => {
@@ -201,6 +226,12 @@ const activeQueryError = computed(() => {
 });
 const hasQueryOutput = computed(() => !!props.activeTab.result || !!props.activeTab.explainPlan || !!props.activeTab.explainError || props.activeTab.isExecuting === true || props.activeTab.isExplaining === true);
 const tabularResults = computed(() => tabularResultItems(props.activeTab.results));
+watch(
+  () => tabularResults.value.map((item) => item.index).join(","),
+  () => {
+    nextTick(updateResultTabsScrollbar);
+  },
+);
 const summaryItems = computed(() => executionSummaryItems(props.activeTab));
 const hasExecutionSummary = computed(() => summaryItems.value.length > 0 || props.activeTab.isExecuting);
 const hasTabularResult = computed(() => {
@@ -410,8 +441,8 @@ defineExpose({ focusSearch, refreshData, handleModRTarget });
     </template>
 
     <template v-else-if="activeTab.mode === 'query'">
-      <Splitpanes horizontal class="flex-1">
-        <Pane :size="resultsPaneOpen ? 40 : 100" :min-size="resultsPaneOpen ? 15 : 100">
+      <Splitpanes horizontal class="query-output-splitpanes flex-1 min-h-0 overflow-hidden">
+        <Pane class="min-h-0" :size="resultsPaneOpen ? 40 : 100" :min-size="resultsPaneOpen ? 15 : 100">
           <div class="h-full flex flex-col relative">
             <QueryEditor
               ref="queryEditorRef"
@@ -440,95 +471,106 @@ defineExpose({ focusSearch, refreshData, handleModRTarget });
               @close-column-panel="onHandleCloseColumnPanel"
             />
             <ColumnInfoPanel v-if="showColumnInfo" :columns="columnInfoColumns" :loading="columnInfoLoading" :error="columnInfoError" @close="closeColumnInfo" />
-            <Button v-if="hasQueryOutput && !resultsPaneOpen" variant="secondary" size="sm" class="absolute bottom-3 right-3 z-20 h-7 gap-1.5 rounded-full border bg-background/95 px-3 text-xs shadow-lg backdrop-blur hover:bg-accent" @click="resultsPaneOpen = true">
+            <Button v-if="hasQueryOutput && !resultsPaneOpen" variant="secondary" size="sm" class="absolute bottom-3 right-3 z-20 h-7 gap-1.5 rounded-full border bg-background/95 px-3 text-xs shadow-lg hover:bg-accent" @click="resultsPaneOpen = true">
               <ChevronUp class="h-3.5 w-3.5" />
               {{ t("editor.showResultsPane") }}
             </Button>
           </div>
         </Pane>
-        <Pane v-if="resultsPaneOpen" :size="60" :min-size="20">
+        <Pane v-if="resultsPaneOpen" class="min-h-0" :size="60" :min-size="20">
           <div class="h-full flex flex-col">
-            <div v-if="hasQueryOutput" class="h-8 shrink-0 border-b bg-muted/20 px-2 flex items-center gap-1 overflow-x-auto" style="scrollbar-width: none; -ms-overflow-style: none; -webkit-overflow-scrolling: touch">
-              <Button size="sm" :variant="activeOutputView === 'result' ? 'secondary' : 'ghost'" class="h-6 px-2 text-xs" :disabled="!hasTabularResult && !activeTab.isExecuting" @click="emit('update:activeOutputView', 'result')">
-                {{ t("tabs.tableData") }}
-              </Button>
-              <template v-if="tabularResults.length > 1">
-                <span class="mx-1 h-4 w-px bg-border" />
-                <Button
-                  v-for="item in tabularResults"
-                  :key="item.index"
-                  size="sm"
-                  :variant="activeOutputView === 'result' && activeTab.activeResultIndex === item.index ? 'default' : 'ghost'"
-                  class="h-6 px-2 text-xs shrink-0"
-                  @click="
-                    queryStore.setActiveResultIndex(activeTab.id, item.index);
-                    emit('update:activeOutputView', 'result');
-                  "
-                >
-                  {{ t("tabs.resultN", { n: item.n }) }}
+            <div v-if="hasQueryOutput" class="flex h-10 shrink-0 items-center gap-1 border-b bg-muted/20 px-2">
+              <div class="flex shrink-0 items-center gap-1">
+                <Button size="sm" :variant="activeOutputView === 'result' ? 'secondary' : 'ghost'" class="h-6 px-2 text-xs" :disabled="!hasTabularResult && !activeTab.isExecuting" @click="emit('update:activeOutputView', 'result')">
+                  {{ t("tabs.tableData") }}
                 </Button>
-              </template>
-              <Button size="sm" :variant="activeOutputView === 'summary' ? 'secondary' : 'ghost'" class="h-6 px-2 text-xs gap-1" :disabled="!hasExecutionSummary" @click="emit('update:activeOutputView', 'summary')">
-                <ListChecks class="h-3.5 w-3.5" />
-                {{ t("tabs.executionSummary") }}
-              </Button>
-              <Button size="sm" :variant="activeOutputView === 'chart' ? 'secondary' : 'ghost'" class="h-6 px-2 text-xs gap-1" :disabled="!hasNumericData" @click="emit('update:activeOutputView', 'chart')">
-                <BarChart3 class="h-3.5 w-3.5" />
-                {{ t("chart.title") }}
-              </Button>
-              <span class="mx-1 h-4 w-px shrink-0 bg-border" />
-              <Button size="sm" :variant="activeOutputView === 'explain' ? 'secondary' : 'ghost'" class="h-6 px-2 text-xs gap-1" :disabled="!activeTab.explainPlan && !activeTab.explainError && !activeTab.isExplaining" @click="emit('update:activeOutputView', 'explain')">
-                <GitBranch class="h-3.5 w-3.5" />
-                {{ t("explain.title") }}
-              </Button>
-              <Popover v-if="activeOutputView === 'result' && activeTab.result">
-                <PopoverTrigger as-child>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    class="ml-auto h-6 w-7 shrink-0 text-foreground hover:bg-accent"
-                    :class="{
-                      'bg-accent text-foreground': dataGridRef?.nullColumnsHidden || dataGridRef?.multiRowTranspose,
-                    }"
-                    :title="t('grid.viewOptions')"
-                    :aria-label="t('grid.viewOptions')"
-                  >
-                    <Wrench class="h-4 w-4" />
-                  </Button>
-                </PopoverTrigger>
-                <PopoverContent align="end" class="w-max min-w-44 max-w-[calc(100vw-2rem)] gap-0 overflow-hidden rounded-xl border bg-popover p-0 text-popover-foreground shadow-xl" @click.stop @keydown.stop>
-                  <div class="border-b bg-muted/40 px-3 py-2">
-                    <div class="text-xs font-semibold">{{ t("grid.viewOptions") }}</div>
+              </div>
+              <template v-if="tabularResults.length > 1">
+                <span class="mx-1 h-4 w-px shrink-0 bg-border" />
+                <div class="relative min-w-0 flex-1 self-stretch">
+                  <div v-if="hasResultTabOverflow" class="result-tab-scrollbar" :class="{ 'result-tab-scrollbar--dragging': isResultTabsScrollbarDragging }" @pointerdown="startResultTabsScrollbarDrag">
+                    <div class="result-tab-scrollbar__thumb" :style="resultTabsScrollbarThumbStyle" />
                   </div>
-                  <LightTooltip :text="t('grid.transposeMultiRowHint')" side="left" :side-offset="6" :delay="0" :open-on-focus="false">
-                    <label class="flex cursor-pointer items-center justify-between gap-3 px-3 py-2 text-xs hover:bg-accent">
-                      <span class="min-w-0 flex items-center gap-1.5 font-medium">
-                        {{ t("grid.transposeMultiRowToggle") }}
-                        <span class="text-muted-foreground">
-                          {{ dataGridRef?.multiRowTranspose ? t("grid.transposeMultiRow") : t("grid.transposeSingleRow") }}
+                  <div ref="resultTabsScrollerRef" class="result-tab-scroll flex h-full items-center gap-1 overflow-x-auto overflow-y-hidden px-1" :style="resultTabsScrollerStyle" @scroll="updateResultTabsScrollbar" @wheel="onResultTabsWheel">
+                    <Button
+                      v-for="item in tabularResults"
+                      :key="item.index"
+                      size="sm"
+                      :variant="activeOutputView === 'result' && activeTab.activeResultIndex === item.index ? 'default' : 'ghost'"
+                      class="h-6 px-2 text-xs shrink-0"
+                      @click="
+                        queryStore.setActiveResultIndex(activeTab.id, item.index);
+                        emit('update:activeOutputView', 'result');
+                      "
+                    >
+                      {{ t("tabs.resultN", { n: item.n }) }}
+                    </Button>
+                  </div>
+                </div>
+              </template>
+              <div class="ml-auto flex shrink-0 items-center gap-1">
+                <Button size="sm" :variant="activeOutputView === 'summary' ? 'secondary' : 'ghost'" class="h-6 px-2 text-xs gap-1" :disabled="!hasExecutionSummary" @click="emit('update:activeOutputView', 'summary')">
+                  <ListChecks class="h-3.5 w-3.5" />
+                  {{ t("tabs.executionSummary") }}
+                </Button>
+                <Button size="sm" :variant="activeOutputView === 'chart' ? 'secondary' : 'ghost'" class="h-6 px-2 text-xs gap-1" :disabled="!hasNumericData" @click="emit('update:activeOutputView', 'chart')">
+                  <BarChart3 class="h-3.5 w-3.5" />
+                  {{ t("chart.title") }}
+                </Button>
+                <span class="mx-1 h-4 w-px shrink-0 bg-border" />
+                <Button size="sm" :variant="activeOutputView === 'explain' ? 'secondary' : 'ghost'" class="h-6 px-2 text-xs gap-1" :disabled="!activeTab.explainPlan && !activeTab.explainError && !activeTab.isExplaining" @click="emit('update:activeOutputView', 'explain')">
+                  <GitBranch class="h-3.5 w-3.5" />
+                  {{ t("explain.title") }}
+                </Button>
+                <Popover v-if="activeOutputView === 'result' && activeTab.result">
+                  <PopoverTrigger as-child>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      class="h-6 w-7 shrink-0 text-foreground hover:bg-accent"
+                      :class="{
+                        'bg-accent text-foreground': dataGridRef?.nullColumnsHidden || dataGridRef?.multiRowTranspose,
+                      }"
+                      :title="t('grid.viewOptions')"
+                      :aria-label="t('grid.viewOptions')"
+                    >
+                      <Wrench class="h-4 w-4" />
+                    </Button>
+                  </PopoverTrigger>
+                  <PopoverContent align="end" class="w-max min-w-44 max-w-[calc(100vw-2rem)] gap-0 overflow-hidden rounded-xl border bg-popover p-0 text-popover-foreground shadow-xl" @click.stop @keydown.stop>
+                    <div class="border-b bg-muted/40 px-3 py-2">
+                      <div class="text-xs font-semibold">{{ t("grid.viewOptions") }}</div>
+                    </div>
+                    <LightTooltip :text="t('grid.transposeMultiRowHint')" side="left" :side-offset="6" :delay="0" :open-on-focus="false">
+                      <label class="flex cursor-pointer items-center justify-between gap-3 px-3 py-2 text-xs hover:bg-accent">
+                        <span class="min-w-0 flex items-center gap-1.5 font-medium">
+                          {{ t("grid.transposeMultiRowToggle") }}
+                          <span class="text-muted-foreground">
+                            {{ dataGridRef?.multiRowTranspose ? t("grid.transposeMultiRow") : t("grid.transposeSingleRow") }}
+                          </span>
                         </span>
+                        <Switch size="sm" :model-value="!!dataGridRef?.multiRowTranspose" :aria-label="t('grid.transposeMultiRow')" @update:model-value="(value: boolean) => dataGridRef?.setMultiRowTranspose(value)" />
+                      </label>
+                    </LightTooltip>
+                    <label class="flex cursor-pointer items-center gap-2 px-3 py-2 text-xs hover:bg-accent" :class="{ 'cursor-not-allowed opacity-60': !dataGridRef?.canToggleAllNullColumns }">
+                      <input type="checkbox" class="h-3.5 w-3.5 shrink-0 accent-primary" :checked="!!dataGridRef?.nullColumnsHidden" :disabled="!dataGridRef?.canToggleAllNullColumns" @change="dataGridRef?.toggleAllNullColumns()" />
+                      <span class="min-w-0 flex items-center gap-1.5 font-medium">
+                        {{ t("grid.hideNullColumns") }}
+                        <span v-if="(dataGridRef?.allNullColumnCount ?? 0) > 0" class="text-muted-foreground tabular-nums"> ({{ dataGridRef?.allNullColumnCount }}) </span>
                       </span>
-                      <Switch size="sm" :model-value="!!dataGridRef?.multiRowTranspose" :aria-label="t('grid.transposeMultiRow')" @update:model-value="(value: boolean) => dataGridRef?.setMultiRowTranspose(value)" />
                     </label>
-                  </LightTooltip>
-                  <label class="flex cursor-pointer items-center gap-2 px-3 py-2 text-xs hover:bg-accent" :class="{ 'cursor-not-allowed opacity-60': !dataGridRef?.canToggleAllNullColumns }">
-                    <input type="checkbox" class="h-3.5 w-3.5 shrink-0 accent-primary" :checked="!!dataGridRef?.nullColumnsHidden" :disabled="!dataGridRef?.canToggleAllNullColumns" @change="dataGridRef?.toggleAllNullColumns()" />
-                    <span class="min-w-0 flex items-center gap-1 font-medium">
-                      {{ t("grid.hideNullColumns") }}
-                      <span v-if="(dataGridRef?.allNullColumnCount ?? 0) > 0" class="text-muted-foreground tabular-nums"> ({{ dataGridRef?.allNullColumnCount }}) </span>
-                    </span>
-                  </label>
-                </PopoverContent>
-              </Popover>
-              <Button v-if="activeOutputView === 'result' && hasTabularResult" variant="ghost" size="sm" class="h-6 shrink-0 gap-1 px-2 text-xs text-muted-foreground hover:text-foreground" :disabled="activeTab.isExecuting" @click="refreshData">
-                <Loader2 v-if="activeTab.isExecuting" class="h-3.5 w-3.5 animate-spin" />
-                <RefreshCcw v-else class="h-3.5 w-3.5" />
-                {{ t("grid.refresh") }}
-              </Button>
-              <Button variant="ghost" size="sm" class="h-6 shrink-0 gap-1 px-2 text-xs text-muted-foreground hover:text-foreground" :class="{ 'ml-auto': activeOutputView !== 'result' || !hasTabularResult }" @click="resultsPaneOpen = false">
-                <ChevronDown class="h-3.5 w-3.5" />
-                {{ t("editor.hideResultsPane") }}
-              </Button>
+                  </PopoverContent>
+                </Popover>
+                <Button v-if="activeOutputView === 'result' && hasTabularResult" variant="ghost" size="sm" class="h-6 shrink-0 gap-1 px-2 text-xs text-muted-foreground hover:text-foreground" :disabled="activeTab.isExecuting" @click="refreshData">
+                  <Loader2 v-if="activeTab.isExecuting" class="h-3.5 w-3.5 animate-spin" />
+                  <RefreshCcw v-else class="h-3.5 w-3.5" />
+                  {{ t("grid.refresh") }}
+                </Button>
+                <Button variant="ghost" size="sm" class="h-6 shrink-0 gap-1 px-2 text-xs text-muted-foreground hover:text-foreground" @click="resultsPaneOpen = false">
+                  <ChevronDown class="h-3.5 w-3.5" />
+                  {{ t("editor.hideResultsPane") }}
+                </Button>
+              </div>
             </div>
 
             <ExplainPlanViewer v-if="activeOutputView === 'explain'" class="flex-1 min-h-0" :plan="activeTab.explainPlan" :error="activeTab.explainError" :loading="activeTab.isExplaining" :source-sql="activeTab.lastExplainedSql" :explain-sql="activeTab.explainSql" />
@@ -632,10 +674,6 @@ defineExpose({ focusSearch, refreshData, handleModRTarget });
     <template v-else-if="activeTab.mode === 'data'">
       <div class="flex-1 min-h-0 flex flex-col">
         <div class="h-9 shrink-0 border-b bg-background/80 px-3 flex items-center gap-2 text-xs">
-          <span class="inline-flex items-center gap-1 rounded border border-emerald-200 bg-emerald-50 px-2 py-0.5 font-medium text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950 dark:text-emerald-300">
-            <Table2 class="h-3.5 w-3.5" />
-            {{ t("tabs.tableData") }}
-          </span>
           <span class="inline-flex items-center rounded border border-border bg-muted/50 px-2 py-0.5 font-medium truncate">
             {{ activeTab.tableMeta?.tableName || activeTab.title }}
           </span>
@@ -740,7 +778,7 @@ defineExpose({ focusSearch, refreshData, handleModRTarget });
           :initial-order-by-input="activeTab.orderByInput"
           :sql="activeTab.sql"
           :loading="activeTab.isExecuting"
-          :editable="isTableDataEditable(activeEffectiveDatabaseType, activeTableMeta?.primaryKeys ?? [])"
+          :editable="isTableDataEditable(activeEffectiveDatabaseType, activeTableMeta?.primaryKeys ?? [], activeTableMeta?.tableType)"
           context="table-data"
           :initial-where-input="activeTab.whereInput"
           :database-type="activeEffectiveDatabaseType"
@@ -799,10 +837,10 @@ defineExpose({ focusSearch, refreshData, handleModRTarget });
       </div>
     </template>
 
-    <!-- MongoDB mode: document browser -->
+    <!-- Document mode: MongoDB collections and Elasticsearch indices -->
     <template v-else-if="activeTab.mode === 'mongo'">
       <div class="flex-1 min-h-0">
-        <MongoDocBrowser :key="activeTab.id" :connection-id="activeTab.connectionId" :database="activeTab.database" :collection="activeTab.sql" />
+        <DocumentBrowser :key="activeTab.id" :connection-id="activeTab.connectionId" :database="activeTab.database" :collection="activeTab.sql" :database-type="activeEffectiveDatabaseType" />
       </div>
     </template>
 
@@ -837,3 +875,58 @@ defineExpose({ focusSearch, refreshData, handleModRTarget });
     </template>
   </div>
 </template>
+
+<style scoped>
+.query-output-splitpanes {
+  isolation: isolate;
+}
+
+.query-output-splitpanes :deep(> .splitpanes__splitter) {
+  z-index: 1;
+  flex: 0 0 3px;
+}
+
+.result-tab-scroll::-webkit-scrollbar {
+  display: none;
+}
+
+.result-tab-scrollbar {
+  position: absolute;
+  inset-inline: 0.5rem;
+  bottom: 2px;
+  z-index: 20;
+  height: 8px;
+  cursor: pointer;
+  touch-action: none;
+}
+
+.result-tab-scrollbar::before {
+  content: "";
+  position: absolute;
+  inset-inline: 0;
+  top: 3px;
+  height: 2px;
+  border-radius: 999px;
+  background: color-mix(in oklch, var(--foreground) 10%, transparent);
+}
+
+.result-tab-scrollbar__thumb {
+  position: absolute;
+  top: 2px;
+  height: 4px;
+  min-width: 20px;
+  border-radius: 999px;
+  background: color-mix(in oklch, var(--foreground) 38%, transparent);
+  transition:
+    height 120ms ease,
+    background-color 120ms ease,
+    top 120ms ease;
+}
+
+.result-tab-scrollbar:hover .result-tab-scrollbar__thumb,
+.result-tab-scrollbar--dragging .result-tab-scrollbar__thumb {
+  top: 1px;
+  height: 6px;
+  background: color-mix(in oklch, var(--foreground) 58%, transparent);
+}
+</style>

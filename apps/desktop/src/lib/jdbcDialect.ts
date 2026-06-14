@@ -1,5 +1,5 @@
 import type { ConnectionConfig, DatabaseType } from "@/types/database";
-import { isSchemaAware, usesDatabaseObjectTreeMode } from "@/lib/databaseFeatureSupport";
+import { isSchemaAware, usesDatabaseObjectTreeMode, usesTreeSchemaMode } from "@/lib/databaseFeatureSupport";
 
 const JDBC_DIALECT_MATCHERS: Array<{ type: DatabaseType; patterns: RegExp[] }> = [
   { type: "databend", patterns: [/jdbc:databend:/i, /com\.databend\.jdbc\.DatabendDriver/i, /databend-jdbc/i] },
@@ -34,8 +34,10 @@ export function connectionUsesDatabaseObjectTreeMode(connection?: Pick<Connectio
   if (!connection) return false;
   if (connection.db_type !== "jdbc") return usesDatabaseObjectTreeMode(connection.db_type);
   const dialect = inferJdbcDialect(connection);
+  if (!dialect) return true;
   if (dialect === "hive" || dialect === "trino") return false;
-  return true;
+  if (dialect === "databend") return true;
+  return !usesTreeSchemaMode(dialect);
 }
 
 export function connectionUsesSchemaExecutionContext(connection?: Pick<ConnectionConfig, "db_type" | "connection_string" | "jdbc_driver_class" | "jdbc_driver_paths">): boolean {

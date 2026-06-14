@@ -190,6 +190,7 @@ mod tests {
             redis_sentinel_password: String::new(),
             redis_sentinel_tls: false,
             redis_cluster_nodes: String::new(),
+            redis_key_separator: dbx_core::models::connection::default_redis_key_separator(),
             etcd_endpoints: String::new(),
             external_config: None,
             jdbc_driver_class: None,
@@ -317,6 +318,7 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
                 drop(con);
                 Ok("Connection successful".to_string())
             }
+            #[cfg(feature = "duckdb-bundled")]
             DatabaseType::DuckDb => {
                 if state.duckdb_existing_pool_is_usable_for_config(&config).await? {
                     Ok("Connection successful".to_string())
@@ -326,6 +328,8 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
                     Ok("Connection successful".to_string())
                 }
             }
+            #[cfg(not(feature = "duckdb-bundled"))]
+            DatabaseType::DuckDb => Err("DuckDB support not compiled (enable duckdb-bundled feature)".to_string()),
             DatabaseType::MongoDb => {
                 let native_err = match db::mongo_driver::connect(&url, connect_timeout, idle_timeout).await {
                     Ok(client) => {
@@ -426,6 +430,20 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
                     .await
                     .map(|_| "Connection successful".to_string())
             }
+            DatabaseType::InfluxDb => {
+                let username = if config.username.is_empty() { None } else { Some(config.username.clone()) };
+                let password = if config.password.is_empty() { None } else { Some(config.password.clone()) };
+                let client = db::influxdb_driver::InfluxdbClient::new_with_ca_cert(
+                    &url,
+                    username,
+                    password,
+                    Some(&config.ca_cert_path),
+                    connect_timeout,
+                )?;
+                db::influxdb_driver::test_connection(&client, connect_timeout)
+                    .await
+                    .map(|_| "Connection successful".to_string())
+            }
             db_type if database_capabilities::is_agent_type(&db_type) => {
                 test_agent_connection(state.inner(), &config, &host, port).await
             }
@@ -507,6 +525,7 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
             };
             con
         }
+        #[cfg(feature = "duckdb-bundled")]
         DatabaseType::DuckDb => {
             let con = db::duckdb_driver::connect_path(&expand_tilde(&db_config.host))?;
             {
@@ -517,6 +536,8 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
             }
             PoolKind::DuckDb(con)
         }
+        #[cfg(not(feature = "duckdb-bundled"))]
+        DatabaseType::DuckDb => return Err("DuckDB support not compiled (enable duckdb-bundled feature)".to_string()),
         DatabaseType::MongoDb => {
             let native_err = match db::mongo_driver::connect(&url, connect_timeout, idle_timeout).await {
                 Ok(client) => {
@@ -616,6 +637,19 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
             let client = db::turso_driver::TursoClient::new(&url, &auth_token, db_config.ssl, connect_timeout)?;
             db::turso_driver::test_connection(&client, connect_timeout).await?;
             PoolKind::Turso(client)
+        }
+        DatabaseType::InfluxDb => {
+            let username = if db_config.username.is_empty() { None } else { Some(db_config.username.clone()) };
+            let password = if db_config.password.is_empty() { None } else { Some(db_config.password.clone()) };
+            let client = db::influxdb_driver::InfluxdbClient::new_with_ca_cert(
+                &url,
+                username,
+                password,
+                Some(&db_config.ca_cert_path),
+                connect_timeout,
+            )?;
+            db::influxdb_driver::test_connection(&client, connect_timeout).await?;
+            PoolKind::InfluxDb(client)
         }
         db_type if database_capabilities::is_agent_type(&db_type) => {
             connect_agent_pool(state.inner(), &db_config, &host, port).await?

@@ -1841,7 +1841,7 @@ dependencies = [
 
 [[package]]
 name = "dbx-audit"
-version = "0.5.31"
+version = "0.5.32"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1907,6 +1907,7 @@ dependencies = [
  "log",
  "mongodb",
  "mysql_async",
+ "pageant",
  "percent-encoding",
  "portpicker",
  "rayon",
@@ -1936,7 +1937,7 @@ dependencies = [
 
 [[package]]
 name = "dbx-web"
-version = "0.5.31"
+version = "0.5.32"
 dependencies = [
  "aes-gcm 0.10.3",
  "argon2",

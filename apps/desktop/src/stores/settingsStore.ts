@@ -27,11 +27,22 @@ export interface AiConfig {
   enableThinking?: boolean;
 }
 
+export interface AiTestConnectionResult {
+  success: boolean;
+  message: string;
+  latencyMs?: number;
+  modelUsed: string;
+  errorCategory?: string;
+}
+
 export interface DesktopSettings {
   show_tray_icon: boolean;
   icon_theme: DesktopIconTheme;
   debug_logging_enabled: boolean;
   saved_sql_sync_dir?: string | null;
+  driver_store_dir?: string | null;
+  plugin_store_dir?: string | null;
+  agent_store_dir?: string | null;
 }
 
 export type DesktopIconTheme = "default" | "black";
@@ -41,6 +52,9 @@ export const DEFAULT_DESKTOP_SETTINGS: DesktopSettings = {
   icon_theme: "default",
   debug_logging_enabled: false,
   saved_sql_sync_dir: null,
+  driver_store_dir: null,
+  plugin_store_dir: null,
+  agent_store_dir: null,
 };
 
 function normalizeDesktopSettings(settings: Partial<DesktopSettings> | null | undefined): DesktopSettings {
@@ -50,6 +64,9 @@ function normalizeDesktopSettings(settings: Partial<DesktopSettings> | null | un
     icon_theme: iconTheme,
     debug_logging_enabled: settings?.debug_logging_enabled ?? DEFAULT_DESKTOP_SETTINGS.debug_logging_enabled,
     saved_sql_sync_dir: settings?.saved_sql_sync_dir?.trim() || DEFAULT_DESKTOP_SETTINGS.saved_sql_sync_dir,
+    driver_store_dir: settings?.driver_store_dir?.trim() || DEFAULT_DESKTOP_SETTINGS.driver_store_dir,
+    plugin_store_dir: settings?.plugin_store_dir?.trim() || DEFAULT_DESKTOP_SETTINGS.plugin_store_dir,
+    agent_store_dir: settings?.agent_store_dir?.trim() || DEFAULT_DESKTOP_SETTINGS.agent_store_dir,
   };
 }
 
@@ -213,13 +230,36 @@ export const DEFAULT_CUSTOM_THEME_COLORS: CustomThemeColors = {
   builtin: "#f38ba8",
 };
 
+export interface CustomThemeDdlColors {
+  addedRowBg: string;
+  addedRowBgAlpha: number;
+  removedRowBg: string;
+  removedRowBgAlpha: number;
+  modifiedRowBg: string;
+  modifiedRowBgAlpha: number;
+  modifiedCharBg: string;
+  modifiedCharBgAlpha: number;
+}
+
+export const DEFAULT_CUSTOM_THEME_DDL_COLORS: CustomThemeDdlColors = {
+  addedRowBg: "#22c55e",
+  addedRowBgAlpha: 10,
+  removedRowBg: "#ef4444",
+  removedRowBgAlpha: 10,
+  modifiedRowBg: "#eab308",
+  modifiedRowBgAlpha: 10,
+  modifiedCharBg: "#f59e0b",
+  modifiedCharBgAlpha: 50,
+};
+
 export interface CustomTheme {
   id: string;
   name: string;
   colors: CustomThemeColors;
+  ddlColors: CustomThemeDdlColors;
 }
 
-export const DEFAULT_CUSTOM_THEMES: CustomTheme[] = [{ id: "default", name: "Custom", colors: { ...DEFAULT_CUSTOM_THEME_COLORS } }];
+export const DEFAULT_CUSTOM_THEMES: CustomTheme[] = [{ id: "default", name: "Custom", colors: { ...DEFAULT_CUSTOM_THEME_COLORS }, ddlColors: { ...DEFAULT_CUSTOM_THEME_DDL_COLORS } }];
 
 export interface EditorSettings {
   fontFamily: string;
@@ -260,7 +300,36 @@ export interface EditorSettings {
   customColumnFormatters: Record<string, CustomColumnFormatterConfig>;
   snippets: SqlSnippet[];
   exportBatchSize: number;
+  toolbarItems: ToolbarItems;
 }
+
+export interface ToolbarItems {
+  dataTransfer: boolean;
+  driverManager: boolean;
+  sqlFile: boolean;
+  schemaDiff: boolean;
+  dataCompare: boolean;
+  checkUpdates: boolean;
+  sqlLibrary: boolean;
+  history: boolean;
+  ai: boolean;
+  theme: boolean;
+  github: boolean;
+}
+
+export const DEFAULT_TOOLBAR_ITEMS: ToolbarItems = {
+  dataTransfer: true,
+  driverManager: true,
+  sqlFile: true,
+  schemaDiff: true,
+  dataCompare: true,
+  checkUpdates: true,
+  sqlLibrary: true,
+  history: true,
+  ai: true,
+  theme: true,
+  github: true,
+};
 
 export const EDITOR_THEMES: { value: EditorTheme; label: string; dark: boolean }[] = [
   { value: "app", label: "Follow app theme", dark: false },
@@ -313,7 +382,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   cellDetailDrawerWidth: 320,
   cellDetailPanelLayout: "bottom",
   shortcuts: normalizeShortcutSettings(),
-  sqlFormatter: { ...DEFAULT_SQL_FORMATTER_SETTINGS },
+  sqlFormatter: normalizeSqlFormatterSettings(DEFAULT_SQL_FORMATTER_SETTINGS),
   sidebarActivation: "single",
   sidebarObjectDisplay: "grouped",
   autoSelectActiveSidebarNode: false,
@@ -327,6 +396,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   customColumnFormatters: {},
   snippets: DEFAULT_SQL_SNIPPETS,
   exportBatchSize: 10000,
+  toolbarItems: { ...DEFAULT_TOOLBAR_ITEMS },
 };
 
 export const STORAGE_KEY = "dbx-editor-settings";
@@ -390,6 +460,7 @@ function normalizeCustomColumnFormatters(value: unknown): Record<string, CustomC
 
 function normalizeSqlSnippets(value: unknown, existing?: SqlSnippet[]): SqlSnippet[] {
   if (!Array.isArray(value)) return existing ?? DEFAULT_SQL_SNIPPETS;
+  if (value.length === 0) return [];
   const valid: SqlSnippet[] = [];
   const seenPrefixes = new Set<string>();
   for (const item of value) {
@@ -404,6 +475,24 @@ function normalizeSqlSnippets(value: unknown, existing?: SqlSnippet[]): SqlSnipp
   return valid;
 }
 
+function normalizeToolbarItems(items: Partial<ToolbarItems> | undefined): ToolbarItems {
+  const defaults = DEFAULT_TOOLBAR_ITEMS;
+  if (!items || typeof items !== "object") return { ...defaults };
+  return {
+    dataTransfer: items.dataTransfer ?? defaults.dataTransfer,
+    driverManager: items.driverManager ?? defaults.driverManager,
+    sqlFile: items.sqlFile ?? defaults.sqlFile,
+    schemaDiff: items.schemaDiff ?? defaults.schemaDiff,
+    dataCompare: items.dataCompare ?? defaults.dataCompare,
+    checkUpdates: items.checkUpdates ?? defaults.checkUpdates,
+    sqlLibrary: items.sqlLibrary ?? defaults.sqlLibrary,
+    history: items.history ?? defaults.history,
+    ai: items.ai ?? defaults.ai,
+    theme: items.theme ?? defaults.theme,
+    github: items.github ?? defaults.github,
+  };
+}
+
 export function normalizeEditorSettings(settings: Partial<EditorSettings>, existing?: EditorSettings): EditorSettings {
   return {
     fontFamily: settings.fontFamily ?? DEFAULT_EDITOR_SETTINGS.fontFamily,
@@ -416,7 +505,14 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     },
     customThemes: (() => {
       if (Array.isArray(settings.customThemes) && settings.customThemes.length > 0) {
-        return settings.customThemes.map((theme) => (theme.name === "默认" ? { ...theme, name: "Custom" } : theme));
+        return settings.customThemes.map((theme) => {
+          const renamed = theme.name === "默认" ? { ...theme, name: "Custom" } : { ...theme };
+          return {
+            ...renamed,
+            colors: { ...DEFAULT_CUSTOM_THEME_COLORS, ...renamed.colors },
+            ddlColors: { ...DEFAULT_CUSTOM_THEME_DDL_COLORS, ...(renamed as any).ddlColors },
+          };
+        });
       }
       return [
         ...(settings.customThemeColors
@@ -425,10 +521,10 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
                 id: "migrated",
                 name: "Migrated",
                 colors: { ...DEFAULT_CUSTOM_THEME_COLORS, ...settings.customThemeColors },
+                ddlColors: { ...DEFAULT_CUSTOM_THEME_DDL_COLORS },
               },
             ]
           : []),
-        ...DEFAULT_CUSTOM_THEMES,
       ];
     })(),
     activeCustomThemeId: settings.activeCustomThemeId ?? "default",
@@ -463,6 +559,7 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     customColumnFormatters: normalizeCustomColumnFormatters(settings.customColumnFormatters),
     snippets: normalizeSqlSnippets(settings.snippets, existing?.snippets),
     exportBatchSize: typeof settings.exportBatchSize === "number" && settings.exportBatchSize >= 100 && settings.exportBatchSize <= 100000 ? Math.round(settings.exportBatchSize) : DEFAULT_EDITOR_SETTINGS.exportBatchSize,
+    toolbarItems: normalizeToolbarItems(settings.toolbarItems),
   };
 }
 
@@ -617,6 +714,7 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.customColumnFormatters !== undefined) editorSettings.value.customColumnFormatters = partial.customColumnFormatters;
     if (partial.snippets !== undefined) editorSettings.value.snippets = normalizeSqlSnippets(partial.snippets);
     if (partial.exportBatchSize !== undefined) editorSettings.value.exportBatchSize = Math.min(100000, Math.max(100, Math.round(partial.exportBatchSize)));
+    if (partial.toolbarItems !== undefined) editorSettings.value.toolbarItems = normalizeToolbarItems(partial.toolbarItems);
     saveEditorSettings(editorSettings.value);
   }
 

@@ -1,19 +1,29 @@
+#[cfg(feature = "duckdb-bundled")]
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+#[cfg(feature = "duckdb-bundled")]
 use duckdb::types::{TimeUnit, Value, ValueRef};
 use mysql_async::prelude::Queryable;
 use std::future::Future;
 use std::time::Duration;
+#[cfg(feature = "duckdb-bundled")]
+use tokio::task::JoinHandle;
+#[cfg(feature = "duckdb-bundled")]
+use tokio::time::sleep;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 use crate::connection::{AppState, PoolKind};
 use crate::db;
 use crate::models::connection::DatabaseType;
-use crate::sql::{split_sql_batches, split_sql_statements, starts_with_duckdb_result_sql_keyword};
+#[cfg(feature = "duckdb-bundled")]
+use crate::sql::starts_with_duckdb_result_sql_keyword;
+use crate::sql::{split_sql_batches, split_sql_statements};
 
 pub const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_ROWS: usize = 10000;
 pub const QUERY_CANCELED: &str = "Query canceled";
+#[cfg(feature = "duckdb-bundled")]
+const DUCKDB_INTERRUPT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Check read-only protection for a connection, blocking write SQL statements.
 /// Only clones the connection name when read-only mode is active, avoiding
@@ -109,10 +119,12 @@ fn query_result_row_limit(max_rows: Option<usize>) -> usize {
     max_rows.unwrap_or(MAX_ROWS).max(1)
 }
 
+#[cfg(feature = "duckdb-bundled")]
 pub fn duckdb_execute(con: &duckdb::Connection, sql: &str) -> Result<db::QueryResult, String> {
     duckdb_execute_with_max_rows(con, sql, None)
 }
 
+#[cfg(feature = "duckdb-bundled")]
 fn duckdb_value_to_json(row: &duckdb::Row<'_>, idx: usize) -> serde_json::Value {
     let Ok(value_ref) = row.get_ref(idx) else {
         return serde_json::Value::Null;
@@ -164,6 +176,7 @@ fn duckdb_value_to_json(row: &duckdb::Row<'_>, idx: usize) -> serde_json::Value 
     }
 }
 
+#[cfg(feature = "duckdb-bundled")]
 fn duckdb_owned_value_to_json(value: &Value) -> serde_json::Value {
     match value {
         Value::Null => serde_json::Value::Null,
@@ -222,6 +235,7 @@ fn duckdb_owned_value_to_json(value: &Value) -> serde_json::Value {
     }
 }
 
+#[cfg(feature = "duckdb-bundled")]
 fn duckdb_interval_to_string(months: i32, days: i32, nanos: i64) -> String {
     let mut parts = Vec::new();
     if months != 0 {
@@ -262,11 +276,13 @@ fn duckdb_interval_to_string(months: i32, days: i32, nanos: i64) -> String {
     }
 }
 
+#[cfg(feature = "duckdb-bundled")]
 fn duckdb_date32_to_string(days: i32) -> Option<String> {
     let epoch = NaiveDate::from_ymd_opt(1970, 1, 1)?;
     epoch.checked_add_signed(ChronoDuration::days(i64::from(days))).map(|date| date.to_string())
 }
 
+#[cfg(feature = "duckdb-bundled")]
 fn duckdb_time64_to_string(unit: TimeUnit, value: i64) -> Option<String> {
     let nanos = duckdb_time_unit_to_nanos(unit, value)?;
     let seconds = nanos.div_euclid(1_000_000_000);
@@ -278,6 +294,7 @@ fn duckdb_time64_to_string(unit: TimeUnit, value: i64) -> Option<String> {
     Some(format_temporal_without_empty_fraction(time.to_string()))
 }
 
+#[cfg(feature = "duckdb-bundled")]
 fn duckdb_timestamp_to_string(unit: TimeUnit, value: i64) -> Option<String> {
     let nanos = duckdb_time_unit_to_nanos(unit, value)?;
     let seconds = nanos.div_euclid(1_000_000_000);
@@ -286,6 +303,7 @@ fn duckdb_timestamp_to_string(unit: TimeUnit, value: i64) -> Option<String> {
     Some(format_naive_datetime(dt.naive_utc()))
 }
 
+#[cfg(feature = "duckdb-bundled")]
 fn duckdb_time_unit_to_nanos(unit: TimeUnit, value: i64) -> Option<i64> {
     match unit {
         TimeUnit::Second => value.checked_mul(1_000_000_000),
@@ -295,6 +313,7 @@ fn duckdb_time_unit_to_nanos(unit: TimeUnit, value: i64) -> Option<i64> {
     }
 }
 
+#[cfg(feature = "duckdb-bundled")]
 fn format_naive_datetime(value: NaiveDateTime) -> String {
     if value.and_utc().timestamp_subsec_nanos() == 0 {
         value.format("%Y-%m-%d %H:%M:%S").to_string()
@@ -303,6 +322,7 @@ fn format_naive_datetime(value: NaiveDateTime) -> String {
     }
 }
 
+#[cfg(feature = "duckdb-bundled")]
 fn format_temporal_without_empty_fraction(value: String) -> String {
     if !value.contains('.') {
         return value;
@@ -311,6 +331,7 @@ fn format_temporal_without_empty_fraction(value: String) -> String {
     trimmed.to_string()
 }
 
+#[cfg(feature = "duckdb-bundled")]
 pub fn duckdb_execute_with_max_rows(
     con: &duckdb::Connection,
     sql: &str,
@@ -368,6 +389,61 @@ pub fn duckdb_execute_with_max_rows(
     }
 }
 
+#[cfg(feature = "duckdb-bundled")]
+async fn wait_for_duckdb_task_with_interrupt(
+    cancel_token: Option<CancellationToken>,
+    timeout_duration: Option<Duration>,
+    interrupt_handle: std::sync::Arc<duckdb::InterruptHandle>,
+    mut task: JoinHandle<Result<db::QueryResult, String>>,
+) -> Result<db::QueryResult, String> {
+    match (cancel_token, timeout_duration) {
+        (Some(token), Some(duration)) => {
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => {
+                    interrupt_handle.interrupt();
+                    drain_interrupted_duckdb_task(&mut task).await;
+                    Err(canceled_error())
+                }
+                result = &mut task => result.map_err(|e| e.to_string())?,
+                _ = sleep(duration) => {
+                    interrupt_handle.interrupt();
+                    drain_interrupted_duckdb_task(&mut task).await;
+                    Err(timeout_error())
+                }
+            }
+        }
+        (Some(token), None) => {
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => {
+                    interrupt_handle.interrupt();
+                    drain_interrupted_duckdb_task(&mut task).await;
+                    Err(canceled_error())
+                }
+                result = &mut task => result.map_err(|e| e.to_string())?,
+            }
+        }
+        (None, Some(duration)) => {
+            tokio::select! {
+                result = &mut task => result.map_err(|e| e.to_string())?,
+                _ = sleep(duration) => {
+                    interrupt_handle.interrupt();
+                    drain_interrupted_duckdb_task(&mut task).await;
+                    Err(timeout_error())
+                }
+            }
+        }
+        (None, None) => task.await.map_err(|e| e.to_string())?,
+    }
+}
+
+#[cfg(feature = "duckdb-bundled")]
+async fn drain_interrupted_duckdb_task(task: &mut JoinHandle<Result<db::QueryResult, String>>) {
+    let _ = timeout(DUCKDB_INTERRUPT_DRAIN_TIMEOUT, task).await;
+}
+
+#[cfg(feature = "duckdb-bundled")]
 fn duckdb_execute_for_database(
     con: &duckdb::Connection,
     attached_names: &[String],
@@ -386,6 +462,7 @@ fn duckdb_execute_for_database(
     duckdb_execute_with_max_rows(con, sql, max_rows)
 }
 
+#[cfg(feature = "duckdb-bundled")]
 fn duckdb_quote_ident(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
@@ -604,7 +681,7 @@ pub async fn do_execute(
     options: QueryExecutionOptions,
 ) -> Result<db::QueryResult, String> {
     let query_timeout = resolve_query_timeout(options.timeout_secs);
-    let (duckdb_attached_names, conn_name_if_readonly) = {
+    let (_duckdb_attached_names, conn_name_if_readonly) = {
         let configs = state.configs.read().await;
         let config = crate::connection::config_for_pool_key(pool_key, &configs);
         let attached = config
@@ -621,27 +698,30 @@ pub async fn do_execute(
     let pool = connections.get(pool_key).ok_or("Connection not found")?;
 
     match pool {
+        #[cfg(feature = "duckdb-bundled")]
         PoolKind::DuckDb(con) => {
             let con = con.clone();
+            let interrupt_handle = con.lock().map_err(|e| e.to_string())?.interrupt_handle();
             if let Some(ref execution_id) = options.execution_id {
-                let interrupt_handle = con.lock().map_err(|e| e.to_string())?.interrupt_handle();
+                let cancel_interrupt_handle = interrupt_handle.clone();
                 state.running_queries.register_interrupt(execution_id, move || {
-                    interrupt_handle.interrupt();
+                    cancel_interrupt_handle.interrupt();
                 });
             }
             let sql = sql.to_string();
             let database = database.map(str::to_string);
-            let attached_names = duckdb_attached_names;
+            let attached_names = _duckdb_attached_names;
             let max_rows = options.max_rows;
             drop(connections);
-            wait_for_query_opt(cancel_token, query_timeout, async move {
-                let task = tokio::task::spawn_blocking(move || {
-                    let con = con.lock().map_err(|e| e.to_string())?;
-                    duckdb_execute_for_database(&con, &attached_names, database.as_deref(), &sql, max_rows)
-                });
-                task.await.map_err(|e| e.to_string())?
-            })
-            .await
+            let task = tokio::task::spawn_blocking(move || {
+                let con = con.lock().map_err(|e| e.to_string())?;
+                duckdb_execute_for_database(&con, &attached_names, database.as_deref(), &sql, max_rows)
+            });
+            wait_for_duckdb_task_with_interrupt(cancel_token, query_timeout, interrupt_handle, task).await
+        }
+        #[cfg(not(feature = "duckdb-bundled"))]
+        PoolKind::DuckDb(_) => {
+            return Err("DuckDB support is not compiled in this build".to_string());
         }
         PoolKind::Mysql(p, mode) => {
             let p = p.clone();
@@ -749,6 +829,15 @@ pub async fn do_execute(
         }
         PoolKind::Redis(_) => Err("Use Redis-specific commands".to_string()),
         PoolKind::MongoDb(_) => Err("Use MongoDB-specific commands".to_string()),
+        PoolKind::InfluxDb(client) => {
+            let client = client.clone();
+            let database = pool_key.split(':').nth(1).unwrap_or("default").to_string();
+            let max_rows = options.max_rows;
+            drop(connections);
+            wait_for_query_opt(cancel_token, query_timeout, db::influxdb_driver::execute_query(&client, &database, sql))
+                .await
+                .map(|result| truncate_result_with_max_rows(result, max_rows))
+        }
         PoolKind::Agent(client) => {
             let client = client.clone();
             let sql = sql.to_string();
@@ -773,28 +862,31 @@ pub async fn do_execute(
             .await
             .map(|result| normalize_query_result_for_js(truncate_result_with_max_rows(result, max_rows)))
         }
+        #[cfg(feature = "duckdb-bundled")]
         PoolKind::ExternalTabular(ext_pool) => {
             if !starts_with_duckdb_result_sql_keyword(sql) {
                 return Err("External data sources are read-only. Only SELECT queries are supported.".to_string());
             }
             let con = ext_pool.cache.clone();
+            let interrupt_handle = con.lock().map_err(|e| e.to_string())?.interrupt_handle();
             if let Some(ref execution_id) = options.execution_id {
-                let interrupt_handle = con.lock().map_err(|e| e.to_string())?.interrupt_handle();
+                let cancel_interrupt_handle = interrupt_handle.clone();
                 state.running_queries.register_interrupt(execution_id, move || {
-                    interrupt_handle.interrupt();
+                    cancel_interrupt_handle.interrupt();
                 });
             }
             let sql = sql.to_string();
             let max_rows = options.max_rows;
             drop(connections);
-            wait_for_query_opt(cancel_token, query_timeout, async move {
-                let task = tokio::task::spawn_blocking(move || {
-                    let con = con.lock().map_err(|e| e.to_string())?;
-                    duckdb_execute_with_max_rows(&con, &sql, max_rows)
-                });
-                task.await.map_err(|e| e.to_string())?
-            })
-            .await
+            let task = tokio::task::spawn_blocking(move || {
+                let con = con.lock().map_err(|e| e.to_string())?;
+                duckdb_execute_with_max_rows(&con, &sql, max_rows)
+            });
+            wait_for_duckdb_task_with_interrupt(cancel_token, query_timeout, interrupt_handle, task).await
+        }
+        #[cfg(not(feature = "duckdb-bundled"))]
+        PoolKind::ExternalTabular(_) => {
+            Err("External data sources require DuckDB support. Rebuild with default features.".to_string())
         }
         PoolKind::ExternalDriver { config, session, .. } => {
             let config = config.clone();
@@ -1293,10 +1385,20 @@ pub async fn execute_statements_in_transaction(
             | PoolKind::Turso(_)
             | PoolKind::SqlServer(_)
             | PoolKind::Agent(_) => TxPath::Explicit,
+            #[cfg(feature = "duckdb-bundled")]
             PoolKind::DuckDb(_)
             | PoolKind::Redis(_)
             | PoolKind::MongoDb(_)
             | PoolKind::Elasticsearch(_)
+            | PoolKind::InfluxDb(_)
+            | PoolKind::ExternalTabular(_)
+            | PoolKind::ExternalDriver { .. } => TxPath::None,
+            #[cfg(not(feature = "duckdb-bundled"))]
+            PoolKind::DuckDb(_)
+            | PoolKind::Redis(_)
+            | PoolKind::MongoDb(_)
+            | PoolKind::Elasticsearch(_)
+            | PoolKind::InfluxDb(_)
             | PoolKind::ExternalTabular(_)
             | PoolKind::ExternalDriver { .. } => TxPath::None,
         })
@@ -1574,7 +1676,7 @@ async fn exec_tx_none_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::connection::{ConnectionConfig, DatabaseType};
+    use crate::models::connection::{default_redis_key_separator, ConnectionConfig, DatabaseType};
 
     #[tokio::test]
     async fn wait_for_query_returns_cancelled_when_token_is_cancelled() {
@@ -1619,6 +1721,38 @@ mod tests {
         .await;
 
         assert_eq!(result.unwrap_err(), timeout_error());
+    }
+
+    #[cfg(feature = "duckdb-bundled")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn duckdb_timeout_interrupts_running_task_and_releases_connection() {
+        let con = std::sync::Arc::new(std::sync::Mutex::new(duckdb::Connection::open_in_memory().unwrap()));
+        let interrupt_handle = con.lock().unwrap().interrupt_handle();
+        let running_con = con.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            let con = running_con.lock().map_err(|e| e.to_string())?;
+            duckdb_execute_with_max_rows(&con, "SELECT sum(sin(i::DOUBLE)) FROM range(10000000000) tbl(i)", None)
+        });
+
+        let result =
+            wait_for_duckdb_task_with_interrupt(None, Some(Duration::from_millis(10)), interrupt_handle, task).await;
+
+        assert_eq!(result.unwrap_err(), timeout_error());
+
+        let follow_con = con.clone();
+        let follow_up = timeout(
+            Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || {
+                let con = follow_con.lock().map_err(|e| e.to_string())?;
+                duckdb_execute_with_max_rows(&con, "SELECT 1", None)
+            }),
+        )
+        .await
+        .expect("DuckDB connection should be released after timeout")
+        .expect("follow-up task should not panic")
+        .expect("follow-up query should succeed");
+
+        assert_eq!(follow_up.rows, vec![vec![serde_json::json!(1)]]);
     }
 
     #[test]
@@ -1668,6 +1802,7 @@ mod tests {
         assert!(!is_connection_error("os error 13"));
     }
 
+    #[cfg(feature = "duckdb-bundled")]
     #[test]
     fn duckdb_execute_preserves_double_precision() {
         let con = duckdb::Connection::open_in_memory().expect("connect in-memory DuckDB");
@@ -1685,6 +1820,7 @@ mod tests {
         assert_eq!(row[3], serde_json::json!(1.0));
     }
 
+    #[cfg(feature = "duckdb-bundled")]
     #[test]
     fn duckdb_execute_create_insert_select_double() {
         let con = duckdb::Connection::open_in_memory().expect("connect in-memory DuckDB");
@@ -1699,6 +1835,7 @@ mod tests {
         assert_eq!(result.rows[2][0], serde_json::json!(99.999));
     }
 
+    #[cfg(feature = "duckdb-bundled")]
     #[test]
     fn duckdb_execute_returns_rows_for_from_first_query() {
         let con = duckdb::Connection::open_in_memory().expect("connect in-memory DuckDB");
@@ -1713,6 +1850,7 @@ mod tests {
         assert_eq!(result.rows[1], vec![serde_json::json!(2), serde_json::json!("Grace")]);
     }
 
+    #[cfg(feature = "duckdb-bundled")]
     #[test]
     fn duckdb_execute_returns_rows_for_summarize_query() {
         let con = duckdb::Connection::open_in_memory().expect("connect in-memory DuckDB");
@@ -1725,6 +1863,7 @@ mod tests {
         assert!(!result.rows.is_empty());
     }
 
+    #[cfg(feature = "duckdb-bundled")]
     #[test]
     fn duckdb_execute_handles_various_types() {
         let con = duckdb::Connection::open_in_memory().expect("connect in-memory DuckDB");
@@ -1742,6 +1881,7 @@ mod tests {
         assert_eq!(row[4], serde_json::json!(123456789012345_i64));
     }
 
+    #[cfg(feature = "duckdb-bundled")]
     #[test]
     fn duckdb_execute_returns_list_values_as_json_arrays() {
         let con = duckdb::Connection::open_in_memory().expect("connect in-memory DuckDB");
@@ -1750,6 +1890,7 @@ mod tests {
         assert_eq!(result.rows, vec![vec![serde_json::json!(["a", "b", "c", "d"])]]);
     }
 
+    #[cfg(feature = "duckdb-bundled")]
     #[test]
     fn duckdb_execute_preserves_nulls_inside_list_values() {
         let con = duckdb::Connection::open_in_memory().expect("connect in-memory DuckDB");
@@ -1759,6 +1900,7 @@ mod tests {
         assert_eq!(result.rows, vec![vec![serde_json::json!([1, null, 3])]]);
     }
 
+    #[cfg(feature = "duckdb-bundled")]
     #[test]
     fn duckdb_execute_returns_nested_complex_values_as_json() {
         let con = duckdb::Connection::open_in_memory().expect("connect in-memory DuckDB");
@@ -1782,6 +1924,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "duckdb-bundled")]
     #[test]
     fn duckdb_execute_formats_temporal_values_by_column_type() {
         let con = duckdb::Connection::open_in_memory().expect("connect in-memory DuckDB");
@@ -1838,6 +1981,7 @@ mod tests {
             redis_sentinel_password: String::new(),
             redis_sentinel_tls: false,
             redis_cluster_nodes: String::new(),
+            redis_key_separator: default_redis_key_separator(),
             etcd_endpoints: String::new(),
             external_config: None,
             jdbc_driver_class: None,

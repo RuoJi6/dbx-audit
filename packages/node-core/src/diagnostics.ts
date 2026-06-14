@@ -53,6 +53,7 @@ export const BRIDGE_REQUIRED_TYPES = [
   "xugu",
   "jdbc",
   "access",
+  "influxdb",
 ] as const;
 
 export interface DbxDiagnostics {

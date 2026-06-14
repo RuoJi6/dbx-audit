@@ -36,6 +36,12 @@ pub struct DesktopSettings {
     pub debug_logging_enabled: bool,
     #[serde(default)]
     pub saved_sql_sync_dir: Option<String>,
+    #[serde(default)]
+    pub driver_store_dir: Option<String>,
+    #[serde(default)]
+    pub plugin_store_dir: Option<String>,
+    #[serde(default)]
+    pub agent_store_dir: Option<String>,
 }
 
 impl Default for DesktopSettings {
@@ -45,6 +51,9 @@ impl Default for DesktopSettings {
             icon_theme: DesktopIconTheme::Default,
             debug_logging_enabled: false,
             saved_sql_sync_dir: None,
+            driver_store_dir: None,
+            plugin_store_dir: None,
+            agent_store_dir: None,
         }
     }
 }
@@ -130,6 +139,7 @@ const SCHEMA_STATEMENTS: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS saved_sql_folders (
         id TEXT PRIMARY KEY,
         connection_id TEXT NOT NULL,
+        parent_folder_id TEXT,
         name TEXT NOT NULL DEFAULT '',
         order_index INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL DEFAULT '',
@@ -144,6 +154,8 @@ const SCHEMA_STATEMENTS: &[&str] = &[
         schema_name TEXT,
         sql_text TEXT NOT NULL DEFAULT '',
         order_index INTEGER NOT NULL DEFAULT 0,
+        open_count INTEGER NOT NULL DEFAULT 0,
+        opened_at TEXT,
         created_at TEXT NOT NULL DEFAULT '',
         updated_at TEXT NOT NULL DEFAULT ''
     )",
@@ -207,8 +219,13 @@ fn ensure_history_columns_sync(conn: &Connection) -> Result<(), String> {
 }
 
 fn ensure_saved_sql_columns_sync(conn: &Connection) -> Result<(), String> {
-    const FOLDER_COLUMNS: &[(&str, &str)] = &[("order_index", "INTEGER NOT NULL DEFAULT 0")];
-    const FILE_COLUMNS: &[(&str, &str)] = &[("order_index", "INTEGER NOT NULL DEFAULT 0")];
+    const FOLDER_COLUMNS: &[(&str, &str)] =
+        &[("parent_folder_id", "TEXT"), ("order_index", "INTEGER NOT NULL DEFAULT 0")];
+    const FILE_COLUMNS: &[(&str, &str)] = &[
+        ("order_index", "INTEGER NOT NULL DEFAULT 0"),
+        ("open_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("opened_at", "TEXT"),
+    ];
 
     ensure_table_columns(conn, "saved_sql_folders", FOLDER_COLUMNS)?;
     ensure_table_columns(conn, "saved_sql_files", FILE_COLUMNS)?;
@@ -499,6 +516,30 @@ impl Storage {
                 settings.remove("saved_sql_sync_dir");
             }
         }
+        match desktop_settings.driver_store_dir.as_ref().filter(|path| !path.trim().is_empty()) {
+            Some(path) => {
+                settings.insert("driver_store_dir".to_string(), serde_json::Value::String(path.clone()));
+            }
+            None => {
+                settings.remove("driver_store_dir");
+            }
+        }
+        match desktop_settings.plugin_store_dir.as_ref().filter(|path| !path.trim().is_empty()) {
+            Some(path) => {
+                settings.insert("plugin_store_dir".to_string(), serde_json::Value::String(path.clone()));
+            }
+            None => {
+                settings.remove("plugin_store_dir");
+            }
+        }
+        match desktop_settings.agent_store_dir.as_ref().filter(|path| !path.trim().is_empty()) {
+            Some(path) => {
+                settings.insert("agent_store_dir".to_string(), serde_json::Value::String(path.clone()));
+            }
+            None => {
+                settings.remove("agent_store_dir");
+            }
+        }
         self.save_app_settings_json(&settings).await
     }
 
@@ -517,6 +558,24 @@ impl Storage {
                 .unwrap_or_else(|| DesktopSettings::default().debug_logging_enabled),
             saved_sql_sync_dir: settings
                 .get("saved_sql_sync_dir")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string),
+            driver_store_dir: settings
+                .get("driver_store_dir")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string),
+            plugin_store_dir: settings
+                .get("plugin_store_dir")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string),
+            agent_store_dir: settings
+                .get("agent_store_dir")
                 .and_then(|value| value.as_str())
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
@@ -865,11 +924,12 @@ impl Storage {
 
             for folder in &library.folders {
                 tx.execute(
-                    "INSERT INTO saved_sql_folders (id, connection_id, name, order_index, created_at, updated_at) \
-                     VALUES (?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO saved_sql_folders (id, connection_id, parent_folder_id, name, order_index, created_at, updated_at) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?)",
                     params![
                         folder.id,
                         folder.connection_id,
+                        folder.parent_folder_id,
                         folder.name,
                         folder.order_index,
                         folder.created_at,
@@ -882,8 +942,8 @@ impl Storage {
             for file in &library.files {
                 tx.execute(
                     "INSERT INTO saved_sql_files \
-                     (id, connection_id, folder_id, name, database_name, schema_name, sql_text, order_index, created_at, updated_at) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     (id, connection_id, folder_id, name, database_name, schema_name, sql_text, order_index, open_count, opened_at, created_at, updated_at) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     params![
                         file.id,
                         file.connection_id,
@@ -893,6 +953,8 @@ impl Storage {
                         file.schema,
                         file.sql,
                         file.order_index,
+                        file.open_count,
+                        file.opened_at,
                         file.created_at,
                         file.updated_at
                     ],
@@ -909,8 +971,8 @@ impl Storage {
         self.with_conn(|conn| {
             let mut folder_stmt = conn
                 .prepare(
-                    "SELECT id, connection_id, name, order_index, created_at, updated_at \
-                     FROM saved_sql_folders ORDER BY order_index, connection_id, name COLLATE NOCASE",
+                    "SELECT id, connection_id, parent_folder_id, name, order_index, created_at, updated_at \
+                     FROM saved_sql_folders ORDER BY COALESCE(parent_folder_id, ''), order_index, connection_id, name COLLATE NOCASE",
                 )
                 .map_err(|e| e.to_string())?;
             let folders = folder_stmt
@@ -918,10 +980,11 @@ impl Storage {
                     Ok(SavedSqlFolder {
                         id: row.get(0)?,
                         connection_id: row.get(1)?,
-                        name: row.get(2)?,
-                        order_index: row.get(3)?,
-                        created_at: row.get(4)?,
-                        updated_at: row.get(5)?,
+                        parent_folder_id: row.get(2)?,
+                        name: row.get(3)?,
+                        order_index: row.get(4)?,
+                        created_at: row.get(5)?,
+                        updated_at: row.get(6)?,
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -930,7 +993,7 @@ impl Storage {
 
             let mut file_stmt = conn
                 .prepare(
-                    "SELECT id, connection_id, folder_id, name, database_name, schema_name, sql_text, order_index, created_at, updated_at \
+                    "SELECT id, connection_id, folder_id, name, database_name, schema_name, sql_text, order_index, open_count, opened_at, created_at, updated_at \
                      FROM saved_sql_files ORDER BY COALESCE(folder_id, ''), order_index, connection_id, name COLLATE NOCASE",
                 )
                 .map_err(|e| e.to_string())?;
@@ -945,8 +1008,10 @@ impl Storage {
                         schema: row.get(5)?,
                         sql: row.get(6)?,
                         order_index: row.get(7)?,
-                        created_at: row.get(8)?,
-                        updated_at: row.get(9)?,
+                        open_count: row.get(8)?,
+                        opened_at: row.get(9)?,
+                        created_at: row.get(10)?,
+                        updated_at: row.get(11)?,
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -962,16 +1027,18 @@ impl Storage {
         let folder = folder.clone();
         self.with_conn(move |conn| {
             conn.execute(
-                "INSERT INTO saved_sql_folders (id, connection_id, name, order_index, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?) \
+                "INSERT INTO saved_sql_folders (id, connection_id, parent_folder_id, name, order_index, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?) \
                  ON CONFLICT(id) DO UPDATE SET \
                  connection_id = excluded.connection_id, \
+                 parent_folder_id = excluded.parent_folder_id, \
                  name = excluded.name, \
                  order_index = excluded.order_index, \
                  updated_at = excluded.updated_at",
                 params![
                     folder.id,
                     folder.connection_id,
+                    folder.parent_folder_id,
                     folder.name,
                     folder.order_index,
                     folder.created_at,
@@ -988,8 +1055,27 @@ impl Storage {
         let id = id.to_string();
         self.with_conn(move |conn| {
             let tx = conn.transaction().map_err(|e| e.to_string())?;
-            tx.execute("DELETE FROM saved_sql_files WHERE folder_id = ?1", [id.as_str()]).map_err(|e| e.to_string())?;
-            tx.execute("DELETE FROM saved_sql_folders WHERE id = ?1", [id.as_str()]).map_err(|e| e.to_string())?;
+            let mut folder_ids = vec![id.clone()];
+            let mut index = 0;
+            while index < folder_ids.len() {
+                let parent_id = folder_ids[index].clone();
+                let mut stmt = tx
+                    .prepare("SELECT id FROM saved_sql_folders WHERE parent_folder_id = ?1")
+                    .map_err(|e| e.to_string())?;
+                let child_ids = stmt
+                    .query_map([parent_id.as_str()], |row| row.get::<_, String>(0))
+                    .map_err(|e| e.to_string())?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| e.to_string())?;
+                folder_ids.extend(child_ids);
+                index += 1;
+            }
+            for folder_id in folder_ids.iter().rev() {
+                tx.execute("DELETE FROM saved_sql_files WHERE folder_id = ?1", [folder_id.as_str()])
+                    .map_err(|e| e.to_string())?;
+                tx.execute("DELETE FROM saved_sql_folders WHERE id = ?1", [folder_id.as_str()])
+                    .map_err(|e| e.to_string())?;
+            }
             tx.commit().map_err(|e| e.to_string())
         })
         .await
@@ -1000,8 +1086,8 @@ impl Storage {
         self.with_conn(move |conn| {
             conn.execute(
                 "INSERT INTO saved_sql_files \
-                 (id, connection_id, folder_id, name, database_name, schema_name, sql_text, order_index, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                 (id, connection_id, folder_id, name, database_name, schema_name, sql_text, order_index, open_count, opened_at, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
                  ON CONFLICT(id) DO UPDATE SET \
                  connection_id = excluded.connection_id, \
                  folder_id = excluded.folder_id, \
@@ -1010,6 +1096,8 @@ impl Storage {
                  schema_name = excluded.schema_name, \
                  sql_text = excluded.sql_text, \
                  order_index = excluded.order_index, \
+                 open_count = excluded.open_count, \
+                 opened_at = excluded.opened_at, \
                  updated_at = excluded.updated_at",
                 params![
                     file.id,
@@ -1020,6 +1108,8 @@ impl Storage {
                     file.schema,
                     file.sql,
                     file.order_index,
+                    file.open_count,
+                    file.opened_at,
                     file.created_at,
                     file.updated_at
                 ],
@@ -1449,6 +1539,9 @@ mod tests {
                 icon_theme: DesktopIconTheme::Black,
                 debug_logging_enabled: true,
                 saved_sql_sync_dir: None,
+                driver_store_dir: Some("/tmp/dbx-drivers".to_string()),
+                plugin_store_dir: Some("/tmp/dbx-plugins".to_string()),
+                agent_store_dir: Some("/tmp/dbx-agents".to_string()),
             })
             .await
             .unwrap();
@@ -1460,7 +1553,10 @@ mod tests {
                 show_tray_icon: false,
                 icon_theme: DesktopIconTheme::Black,
                 debug_logging_enabled: true,
-                saved_sql_sync_dir: None
+                saved_sql_sync_dir: None,
+                driver_store_dir: Some("/tmp/dbx-drivers".to_string()),
+                plugin_store_dir: Some("/tmp/dbx-plugins".to_string()),
+                agent_store_dir: Some("/tmp/dbx-agents".to_string())
             }
         );
     }

@@ -102,7 +102,7 @@ function toggleShowAll() {
 
             <!-- Progress bar -->
             <div v-if="isActive(task.status)" class="w-full bg-muted rounded-full h-1.5 overflow-hidden">
-              <div class="h-full bg-primary rounded-full transition-all duration-300" :class="{ 'animate-pulse': !task.totalRows }" :style="{ width: task.totalRows ? `${progressPercent(task.totalRows, task.rowsExported)}%` : '50%' }" />
+              <div class="h-full bg-primary rounded-full transition-[width] duration-300" :class="{ 'animate-pulse': !task.totalRows }" :style="{ width: task.totalRows ? `${progressPercent(task.totalRows, task.rowsExported)}%` : '50%' }" />
             </div>
             <div v-else-if="task.status === 'Done'" class="w-full bg-muted rounded-full h-1.5 overflow-hidden">
               <div class="h-full bg-green-500 rounded-full" style="width: 100%" />

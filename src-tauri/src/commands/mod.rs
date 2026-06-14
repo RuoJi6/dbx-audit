@@ -13,6 +13,7 @@ pub mod deep_link;
 pub mod etcd_cmd;
 pub mod external_db;
 pub mod external_sql;
+pub mod fs_open;
 pub mod history;
 pub mod keychain;
 pub mod mcp;

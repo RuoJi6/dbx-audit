@@ -45,6 +45,7 @@ const SCHEME_PROFILES: Record<string, ConnectionProfile> = {
   kwdb: { type: "kwdb", profile: "kwdb", label: "KWDB", defaultPort: 26257 },
   gbase: { type: "gbase", profile: "gbase", label: "GBase", defaultPort: 5258 },
   "gbasedbt-sqli": { type: "gbase", profile: "gbase8s", label: "GBase 8s", defaultPort: 9088 },
+  "informix-sqli": { type: "informix", profile: "informix", label: "Informix", defaultPort: 9088 },
   yashandb: { type: "yashandb", profile: "yashandb", label: "YashanDB", defaultPort: 1688 },
   opengauss: { type: "gaussdb", profile: "opengauss", label: "openGauss", defaultPort: 5432 },
   tdengine: { type: "tdengine", profile: "tdengine", label: "TDengine", defaultPort: 6041 },
@@ -362,6 +363,28 @@ function parseJdbcGbase8sUrl(source: string): ParsedConnectionUrl | null {
   };
 }
 
+function parseJdbcInformixUrl(source: string): ParsedConnectionUrl | null {
+  const match = /^jdbc:informix-sqli:\/\/(?:(?<userinfo>[^@/?#]*)@)?(?<host>\[[^\]]+\]|[^:/?#]+)(?::(?<port>\d+))?\/(?<database>[^:?#]*)(?::(?<params>[^?#]*))?/i.exec(source);
+  if (!match?.groups) return null;
+
+  const rawUserInfo = match.groups.userinfo || "";
+  const [rawUser = "", ...passwordParts] = rawUserInfo.split(":");
+  const host = match.groups.host.replace(/^\[/, "").replace(/\]$/, "");
+
+  return {
+    dbType: "informix",
+    driverProfile: "informix",
+    driverLabel: "Informix",
+    host,
+    port: match.groups.port ? Number(match.groups.port) : 9088,
+    username: decodeUrlPart(rawUser),
+    password: decodeUrlPart(passwordParts.join(":")),
+    database: decodeUrlPart(match.groups.database || ""),
+    urlParams: match.groups.params || "",
+    ssl: false,
+  };
+}
+
 export function parseConnectionUrl(value: string, preferredProfile?: string): ParsedConnectionUrl {
   const input = value.trim();
   if (!input) {
@@ -371,6 +394,8 @@ export function parseConnectionUrl(value: string, preferredProfile?: string): Pa
   if (jdbcUCanAccess) return jdbcUCanAccess;
   const jdbcGbase8s = parseJdbcGbase8sUrl(input);
   if (jdbcGbase8s) return jdbcGbase8s;
+  const jdbcInformix = parseJdbcInformixUrl(input);
+  if (jdbcInformix) return jdbcInformix;
   const jdbcOracle = parseJdbcOracleUrl(input);
   if (jdbcOracle) return jdbcOracle;
   const jdbcSqlServer = parseJdbcSqlServerUrl(input);

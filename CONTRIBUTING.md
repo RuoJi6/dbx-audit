@@ -50,6 +50,18 @@ cargo fmt --check
 cargo check --workspace --locked
 ```
 
+> [!TIP]
+> DuckDB compiles from source and takes a while. Skip it during routine
+> development when you're not touching DuckDB features:
+>
+> ```bash
+> cargo check --workspace --no-default-features
+> cargo test  --workspace --no-default-features
+> pnpm tauri dev -- --no-default-features
+> ```
+>
+> Release builds and CI should always include DuckDB (omit the flag).
+
 For package changes, also run:
 
 ```bash
@@ -61,7 +73,18 @@ For Docker or deployment changes, run the relevant Docker Compose or Docker buil
 
 ## Database Driver Metadata
 
-When adding or changing a database type, update `crates/dbx-core/assets/database-drivers.manifest.json` first. The manifest is the shared source for driver mode, MCP/CLI routing, agent keys, and core capability expectations. Then run:
+When adding or changing a database type, update `crates/dbx-core/assets/database-drivers.manifest.json` first. The manifest is the shared source for driver mode, MCP/CLI routing, agent keys, support level, and top-level product capabilities.
+
+Choose the support level conservatively:
+
+- `connect` — connection and SQL/command execution only.
+- `browse` — connection plus metadata browsing.
+- `understand` — browsing plus higher-level understanding features such as search, object sources, or diagrams.
+- `operate` — advanced operation surfaces such as table data editing, structure editing, import, transfer, database creation, explain plans, or user administration.
+
+Set `capabilities` explicitly for the product surfaces DBX should expose. Keep detailed feature behavior in the owning feature module, such as table structure sub-capabilities or user administration dialects. Custom JDBC support should remain conservative unless dialect inference or a dedicated profile proves the advanced capability works.
+
+Then run:
 
 ```bash
 cargo test -p dbx-core --test database_capabilities

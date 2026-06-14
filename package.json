@@ -1,6 +1,6 @@
 {
   "name": "dbx-audit",
-  "version": "0.5.31",
+  "version": "0.5.32",
   "private": true,
   "license": "Apache-2.0",
   "type": "module",
@@ -57,6 +57,7 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "codemirror": "^6.0.2",
+    "diff": "^9.0.0",
     "dom-to-image-more": "^3.7.2",
     "echarts": "^6.1.0",
     "leaflet": "^1.9.4",
@@ -75,6 +76,7 @@
     "vue-virtual-scroller": "^3.0.4"
   },
   "devDependencies": {
+    "@lezer/highlight": "^1.2.3",
     "@oxfmt/binding-darwin-arm64": "0.53.0",
     "@oxlint/binding-darwin-arm64": "1.68.0",
     "@tailwindcss/vite": "^4.3.0",

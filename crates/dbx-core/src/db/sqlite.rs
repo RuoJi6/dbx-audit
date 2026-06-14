@@ -1,6 +1,7 @@
 use percent_encoding::percent_decode_str;
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, LoadExtensionGuard, OpenFlags};
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -327,6 +328,165 @@ mod tests {
         assert_eq!(result.rows[0][0], serde_json::json!("s"));
         assert_eq!(result.rows[1][0], serde_json::json!("b"));
     }
+
+    fn parse_pk(sql: &str) -> Vec<String> {
+        let mut cols: Vec<String> = parse_sqlite_autoincrement_pk_columns(sql).into_iter().collect();
+        cols.sort();
+        cols
+    }
+
+    #[test]
+    fn parses_implicit_integer_primary_key_as_autoincrement() {
+        assert_eq!(parse_pk("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)"), vec!["id".to_string()]);
+    }
+
+    #[test]
+    fn parses_explicit_integer_primary_key_autoincrement() {
+        assert_eq!(
+            parse_pk("CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT)"),
+            vec!["id".to_string()]
+        );
+    }
+
+    #[test]
+    fn parses_ef_core_style_named_constraint_primary_key_autoincrement() {
+        // The actual table from issue #1129.
+        let sql = r#"CREATE TABLE "OnlineLogs" (
+            "OnlineLogId" INTEGER NOT NULL CONSTRAINT "PK_OnlineLogs" PRIMARY KEY AUTOINCREMENT,
+            "LogTime" TEXT NOT NULL,
+            "ReportedAddresses" TEXT NOT NULL,
+            "DeviceId" TEXT NOT NULL
+        )"#;
+        assert_eq!(parse_pk(sql), vec!["onlinelogid".to_string()]);
+    }
+
+    #[test]
+    fn does_not_match_non_integer_primary_key() {
+        assert!(parse_sqlite_autoincrement_pk_columns("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)").is_empty());
+        assert!(parse_sqlite_autoincrement_pk_columns("CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT)").is_empty());
+    }
+
+    #[test]
+    fn does_not_match_without_rowid_table() {
+        let sql = "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT) WITHOUT ROWID";
+        assert!(parse_sqlite_autoincrement_pk_columns(sql).is_empty());
+    }
+
+    #[test]
+    fn does_not_match_composite_primary_key() {
+        let sql = "CREATE TABLE t (a INTEGER, b INTEGER, PRIMARY KEY (a, b))";
+        assert!(parse_sqlite_autoincrement_pk_columns(sql).is_empty());
+    }
+
+    #[test]
+    fn parses_table_level_single_column_primary_key_for_integer() {
+        let sql = "CREATE TABLE t (id INTEGER NOT NULL, name TEXT, PRIMARY KEY (id))";
+        assert_eq!(parse_pk(sql), vec!["id".to_string()]);
+    }
+
+    #[test]
+    fn ignores_non_pk_integer_not_null_column() {
+        let sql = "CREATE TABLE t (id INTEGER PRIMARY KEY, count INTEGER NOT NULL)";
+        assert_eq!(parse_pk(sql), vec!["id".to_string()]);
+    }
+
+    #[test]
+    fn parser_falls_back_to_empty_on_garbage_sql() {
+        assert!(parse_sqlite_autoincrement_pk_columns("not a create table statement").is_empty());
+        assert!(parse_sqlite_autoincrement_pk_columns("").is_empty());
+    }
+
+    #[test]
+    fn parser_skips_check_expression_with_primary_key_token() {
+        // PRIMARY KEY tokens inside a CHECK expression must not falsely mark the column.
+        let sql = r#"CREATE TABLE t (
+            id INTEGER,
+            kind TEXT CHECK (kind IN ('PRIMARY KEY', 'OTHER')),
+            PRIMARY KEY (id)
+        )"#;
+        assert_eq!(parse_pk(sql), vec!["id".to_string()]);
+    }
+
+    #[test]
+    fn parser_handles_block_and_line_comments() {
+        let sql = r#"CREATE TABLE t (
+            -- line comment with INTEGER PRIMARY KEY tokens
+            /* block comment INTEGER PRIMARY KEY */
+            id INTEGER PRIMARY KEY,
+            name TEXT
+        )"#;
+        assert_eq!(parse_pk(sql), vec!["id".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn get_columns_marks_integer_primary_key_as_autoincrement() {
+        let pool = connect_path(":memory:").await.expect("connect in-memory SQLite");
+        execute_query(&pool, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL)").await.expect("create");
+
+        let cols = get_columns(&pool, "main", "t").await.expect("get_columns");
+        let id = cols.iter().find(|c| c.name == "id").expect("id col");
+        assert_eq!(id.extra.as_deref(), Some("autoincrement"));
+        let name = cols.iter().find(|c| c.name == "name").expect("name col");
+        assert!(name.extra.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_columns_marks_ef_core_style_autoincrement_primary_key() {
+        let pool = connect_path(":memory:").await.expect("connect in-memory SQLite");
+        execute_query(
+            &pool,
+            r#"CREATE TABLE "OnlineLogs" (
+                "OnlineLogId" INTEGER NOT NULL CONSTRAINT "PK_OnlineLogs" PRIMARY KEY AUTOINCREMENT,
+                "LogTime" TEXT NOT NULL,
+                "DeviceId" TEXT NOT NULL
+            )"#,
+        )
+        .await
+        .expect("create");
+
+        let cols = get_columns(&pool, "main", "OnlineLogs").await.expect("get_columns");
+        let id = cols.iter().find(|c| c.name == "OnlineLogId").expect("OnlineLogId");
+        assert_eq!(id.extra.as_deref(), Some("autoincrement"));
+        for other in cols.iter().filter(|c| c.name != "OnlineLogId") {
+            assert!(other.extra.is_none(), "{} should not be autoincrement", other.name);
+        }
+    }
+
+    #[tokio::test]
+    async fn get_columns_skips_without_rowid_table() {
+        let pool = connect_path(":memory:").await.expect("connect in-memory SQLite");
+        execute_query(&pool, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL) WITHOUT ROWID")
+            .await
+            .expect("create");
+
+        let cols = get_columns(&pool, "main", "t").await.expect("get_columns");
+        let id = cols.iter().find(|c| c.name == "id").expect("id col");
+        assert!(id.extra.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_columns_skips_composite_primary_key() {
+        let pool = connect_path(":memory:").await.expect("connect in-memory SQLite");
+        execute_query(&pool, "CREATE TABLE t (a INTEGER NOT NULL, b INTEGER NOT NULL, PRIMARY KEY (a, b))")
+            .await
+            .expect("create");
+
+        let cols = get_columns(&pool, "main", "t").await.expect("get_columns");
+        for col in &cols {
+            assert!(col.extra.is_none(), "{} should not be autoincrement", col.name);
+        }
+    }
+
+    #[tokio::test]
+    async fn get_columns_skips_non_integer_primary_key() {
+        let pool = connect_path(":memory:").await.expect("connect in-memory SQLite");
+        // Use BIGINT to avoid SQLite's strict-table parser quirks; INT is sometimes promoted in SQLite.
+        execute_query(&pool, "CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT)").await.expect("create");
+
+        let cols = get_columns(&pool, "main", "t").await.expect("get_columns");
+        let id = cols.iter().find(|c| c.name == "id").expect("id col");
+        assert!(id.extra.is_none());
+    }
 }
 
 pub async fn list_databases(_pool: &SqliteHandle) -> Result<Vec<DatabaseInfo>, String> {
@@ -368,16 +528,24 @@ pub async fn get_columns(pool: &SqliteHandle, _schema: &str, table: &str) -> Res
     tokio::task::spawn_blocking(move || {
         let sql = format!("PRAGMA table_info(\"{}\")", table.replace('"', "\"\""));
         pool.with_connection(|conn| {
+            let autoincrement_columns = sqlite_autoincrement_pk_columns(conn, &table).unwrap_or_default();
             let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
             let rows = stmt
                 .query_map([], |row| {
+                    let name: String = row.get("name")?;
+                    let is_pk = row.get::<_, i32>("pk")? > 0;
+                    let extra = if is_pk && autoincrement_columns.contains(&name.to_ascii_lowercase()) {
+                        Some("autoincrement".to_string())
+                    } else {
+                        None
+                    };
                     Ok(ColumnInfo {
-                        name: row.get("name")?,
+                        name,
                         data_type: row.get("type")?,
                         is_nullable: row.get::<_, i32>("notnull")? == 0,
                         column_default: row.get("dflt_value")?,
-                        is_primary_key: row.get::<_, i32>("pk")? > 0,
-                        extra: None,
+                        is_primary_key: is_pk,
+                        extra,
                         comment: None,
                         numeric_precision: None,
                         numeric_scale: None,
@@ -390,6 +558,565 @@ pub async fn get_columns(pool: &SqliteHandle, _schema: &str, table: &str) -> Res
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// Read `sqlite_master.sql` for `table` and return the lowercase column names that
+/// are rowid-alias autoincrement primary keys (i.e. SQLite will assign a value when
+/// the column is omitted from an INSERT). Returns `None` only on connection / query
+/// errors; an unparseable build statement yields `Some(empty)`.
+fn sqlite_autoincrement_pk_columns(conn: &Connection, table: &str) -> Option<HashSet<String>> {
+    let create_sql: Option<String> = conn
+        .query_row("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1", [table], |row| row.get(0))
+        .ok()
+        .flatten();
+    Some(parse_sqlite_autoincrement_pk_columns(create_sql.as_deref()?))
+}
+
+/// Parse a SQLite `CREATE TABLE` statement and return the lowercase names of columns
+/// that are rowid-alias autoincrement primary keys.
+///
+/// A column is recognized when ALL of the following hold:
+/// - The table is NOT declared `WITHOUT ROWID`.
+/// - The column's declared type, after case-insensitive normalization, is exactly
+///   `INTEGER` (NOT `INT`, `BIGINT`, `SMALLINT`, etc.).
+/// - The column is the (only) primary key, declared either inline (`PRIMARY KEY`,
+///   optionally with `AUTOINCREMENT`) or via a single-column table-level
+///   `PRIMARY KEY (col)` constraint.
+///
+/// On any parse failure (malformed SQL, unrecognized syntax) the function returns
+/// an empty set rather than panicking — callers fall back to the conservative
+/// behavior of treating the column as a normal NOT NULL column.
+fn parse_sqlite_autoincrement_pk_columns(create_sql: &str) -> HashSet<String> {
+    let body = match extract_create_table_body(create_sql) {
+        Some(body) => body,
+        None => return HashSet::new(),
+    };
+    if has_without_rowid_clause(&body.tail) {
+        return HashSet::new();
+    }
+
+    let entries = split_table_body_entries(&body.body);
+
+    // First pass: find table-level PRIMARY KEY (col) — a single-column primary key
+    // that may apply to a column declared as INTEGER elsewhere in the body.
+    let mut table_level_pk: Option<String> = None;
+    let mut has_composite_table_pk = false;
+    for entry in &entries {
+        if let Some(cols) = parse_table_level_primary_key(entry) {
+            if cols.len() == 1 {
+                if table_level_pk.is_none() && !has_composite_table_pk {
+                    table_level_pk = Some(cols.into_iter().next().unwrap());
+                }
+            } else if cols.len() > 1 {
+                has_composite_table_pk = true;
+                table_level_pk = None;
+            }
+        }
+    }
+    if has_composite_table_pk {
+        return HashSet::new();
+    }
+
+    let mut found: HashSet<String> = HashSet::new();
+    let mut inline_pk_count = 0_usize;
+    let mut inline_pk_candidate: Option<String> = None;
+
+    for entry in &entries {
+        if parse_table_level_primary_key(entry).is_some() {
+            continue;
+        }
+        if is_table_level_constraint(entry) {
+            continue;
+        }
+        let Some(column) = parse_column_definition(entry) else {
+            continue;
+        };
+        if column.has_inline_pk {
+            inline_pk_count += 1;
+            inline_pk_candidate = Some(column.name.clone());
+            if column.is_integer_type {
+                found.insert(column.name.clone());
+            }
+        }
+        if let Some(ref pk_name) = table_level_pk {
+            if pk_name.eq_ignore_ascii_case(&column.name) && column.is_integer_type {
+                found.insert(column.name.clone());
+            }
+        }
+    }
+
+    // Multiple inline PRIMARY KEY columns means a composite key — clear the inline matches.
+    if inline_pk_count > 1 {
+        if let Some(name) = inline_pk_candidate {
+            found.remove(&name);
+        }
+        // Also drop any other inline PK columns we may have inserted.
+        // (Conservative: walk entries again and remove inline PK names that ended up in `found`.)
+        let mut to_remove: Vec<String> = Vec::new();
+        for entry in &entries {
+            if let Some(column) = parse_column_definition(entry) {
+                if column.has_inline_pk && found.contains(&column.name) {
+                    to_remove.push(column.name);
+                }
+            }
+        }
+        for name in to_remove {
+            found.remove(&name);
+        }
+    }
+
+    found
+}
+
+struct CreateTableBody {
+    body: String,
+    tail: String,
+}
+
+fn extract_create_table_body(create_sql: &str) -> Option<CreateTableBody> {
+    let stripped = strip_sql_comments(create_sql);
+    let lower = stripped.to_ascii_lowercase();
+    if !lower.contains("create") || !lower.contains("table") {
+        return None;
+    }
+    // Find the first top-level '(' after the table name.
+    let bytes = stripped.as_bytes();
+    let mut start = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'(' {
+            start = Some(i);
+            break;
+        }
+    }
+    let start = start?;
+    let mut depth = 0_usize;
+    let mut end = None;
+    let mut chars = stripped[start..].char_indices();
+    while let Some((rel, ch)) = chars.next() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(start + rel);
+                    break;
+                }
+            }
+            '\'' | '"' | '`' => {
+                // skip a quoted string / identifier in the loop directly
+                let quote = ch;
+                while let Some((_, qch)) = chars.next() {
+                    if qch == quote {
+                        // SQLite supports doubled quote as escape inside identifiers.
+                        // Peek next char without consuming.
+                        let mut peek = chars.clone();
+                        if let Some((_, next_ch)) = peek.next() {
+                            if next_ch == quote {
+                                chars.next();
+                                continue;
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+            '[' => {
+                // SQL Server style identifier — closes at first ']'.
+                for (_, qch) in chars.by_ref() {
+                    if qch == ']' {
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let end = end?;
+    let body = stripped[start + 1..end].to_string();
+    let tail = stripped[end + 1..].to_string();
+    Some(CreateTableBody { body, tail })
+}
+
+fn has_without_rowid_clause(tail: &str) -> bool {
+    let normalized: String = tail.split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_lowercase();
+    normalized.contains("without rowid")
+}
+
+fn strip_sql_comments(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            // line comment
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+        } else if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            if i + 1 < bytes.len() {
+                i += 2;
+            } else {
+                i = bytes.len();
+            }
+        } else if b == b'\'' || b == b'"' || b == b'`' {
+            // copy quoted segment as-is (we still need it for identifier parsing later)
+            let quote = b;
+            out.push(b as char);
+            i += 1;
+            while i < bytes.len() {
+                let qb = bytes[i];
+                out.push(qb as char);
+                if qb == quote {
+                    if i + 1 < bytes.len() && bytes[i + 1] == quote {
+                        // doubled quote escape
+                        out.push(quote as char);
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+        } else if b == b'[' {
+            out.push('[');
+            i += 1;
+            while i < bytes.len() {
+                let qb = bytes[i];
+                out.push(qb as char);
+                i += 1;
+                if qb == b']' {
+                    break;
+                }
+            }
+        } else {
+            // copy as char (handle multi-byte utf-8 by walking)
+            out.push(input[i..].chars().next().unwrap());
+            i += input[i..].chars().next().unwrap().len_utf8();
+        }
+    }
+    out
+}
+
+fn split_table_body_entries(body: &str) -> Vec<String> {
+    let mut entries = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0_usize;
+    let mut chars = body.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '(' => {
+                depth += 1;
+                current.push(ch);
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                current.push(ch);
+            }
+            ',' if depth == 0 => {
+                let trimmed = current.trim();
+                if !trimmed.is_empty() {
+                    entries.push(trimmed.to_string());
+                }
+                current.clear();
+            }
+            '\'' | '"' | '`' => {
+                let quote = ch;
+                current.push(ch);
+                while let Some(qch) = chars.next() {
+                    current.push(qch);
+                    if qch == quote {
+                        if let Some(&next_ch) = chars.peek() {
+                            if next_ch == quote {
+                                current.push(chars.next().unwrap());
+                                continue;
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+            '[' => {
+                current.push(ch);
+                for qch in chars.by_ref() {
+                    current.push(qch);
+                    if qch == ']' {
+                        break;
+                    }
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+    let trimmed = current.trim();
+    if !trimmed.is_empty() {
+        entries.push(trimmed.to_string());
+    }
+    entries
+}
+
+struct ColumnDefinition {
+    name: String,
+    is_integer_type: bool,
+    has_inline_pk: bool,
+}
+
+fn parse_column_definition(entry: &str) -> Option<ColumnDefinition> {
+    let mut tokens = tokenize_entry(entry);
+    if tokens.is_empty() {
+        return None;
+    }
+    // Skip leading "CONSTRAINT name" if it appears (rare in column defs but tolerated).
+    if tokens[0].kind == TokenKind::Keyword && tokens[0].value.eq_ignore_ascii_case("constraint") && tokens.len() >= 2 {
+        // not a column definition
+        return None;
+    }
+    let name_token = tokens.remove(0);
+    if name_token.kind != TokenKind::Identifier {
+        return None;
+    }
+    let name_lower = name_token.value.to_ascii_lowercase();
+
+    // Type token: optional, followed by optional parenthesized size.
+    let mut is_integer_type = false;
+    if let Some(first) = tokens.first() {
+        if first.kind == TokenKind::Identifier {
+            if first.value.eq_ignore_ascii_case("integer") {
+                is_integer_type = true;
+            }
+            // consume the type token; also consume size like "(10, 2)"
+            tokens.remove(0);
+            if let Some(t) = tokens.first() {
+                if t.value == "(" {
+                    // consume balanced parens
+                    let mut depth = 0_usize;
+                    while !tokens.is_empty() {
+                        let t = tokens.remove(0);
+                        if t.value == "(" {
+                            depth += 1;
+                        } else if t.value == ")" {
+                            depth = depth.saturating_sub(1);
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let has_inline_pk = tokens_contain_primary_key(&tokens);
+
+    Some(ColumnDefinition { name: name_lower, is_integer_type, has_inline_pk })
+}
+
+fn tokens_contain_primary_key(tokens: &[Token]) -> bool {
+    for window in tokens.windows(2) {
+        if window[0].kind == TokenKind::Keyword
+            && window[0].value.eq_ignore_ascii_case("primary")
+            && window[1].kind == TokenKind::Keyword
+            && window[1].value.eq_ignore_ascii_case("key")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_table_level_constraint(entry: &str) -> bool {
+    let trimmed = entry.trim_start();
+    let lower = trimmed.to_ascii_lowercase();
+    lower.starts_with("constraint")
+        || lower.starts_with("primary key")
+        || lower.starts_with("unique")
+        || lower.starts_with("check")
+        || lower.starts_with("foreign key")
+}
+
+/// If the entry is a table-level `PRIMARY KEY (col[, col, ...])` constraint,
+/// return the lowercase column names. Otherwise `None`.
+fn parse_table_level_primary_key(entry: &str) -> Option<Vec<String>> {
+    let tokens = tokenize_entry(entry);
+    let mut idx = 0;
+    if idx < tokens.len()
+        && tokens[idx].kind == TokenKind::Keyword
+        && tokens[idx].value.eq_ignore_ascii_case("constraint")
+    {
+        idx += 1;
+        if idx < tokens.len() && tokens[idx].kind == TokenKind::Identifier {
+            idx += 1;
+        }
+    }
+    if idx + 1 >= tokens.len() {
+        return None;
+    }
+    if !(tokens[idx].kind == TokenKind::Keyword
+        && tokens[idx].value.eq_ignore_ascii_case("primary")
+        && tokens[idx + 1].kind == TokenKind::Keyword
+        && tokens[idx + 1].value.eq_ignore_ascii_case("key"))
+    {
+        return None;
+    }
+    idx += 2;
+    if idx >= tokens.len() || tokens[idx].value != "(" {
+        return None;
+    }
+    idx += 1;
+    let mut cols = Vec::new();
+    while idx < tokens.len() && tokens[idx].value != ")" {
+        if tokens[idx].kind == TokenKind::Identifier {
+            cols.push(tokens[idx].value.to_ascii_lowercase());
+        }
+        idx += 1;
+        // skip optional ASC/DESC and a comma
+        while idx < tokens.len() && tokens[idx].value != "," && tokens[idx].value != ")" {
+            idx += 1;
+        }
+        if idx < tokens.len() && tokens[idx].value == "," {
+            idx += 1;
+        }
+    }
+    Some(cols)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TokenKind {
+    Identifier,
+    Keyword,
+    Punct,
+    Other,
+}
+
+#[derive(Debug, Clone)]
+struct Token {
+    value: String,
+    kind: TokenKind,
+}
+
+fn tokenize_entry(entry: &str) -> Vec<Token> {
+    let mut tokens = Vec::new();
+    let mut chars = entry.chars().peekable();
+    while let Some(&ch) = chars.peek() {
+        if ch.is_whitespace() {
+            chars.next();
+            continue;
+        }
+        if ch == '"' || ch == '`' {
+            let quote = ch;
+            chars.next();
+            let mut value = String::new();
+            while let Some(&qch) = chars.peek() {
+                chars.next();
+                if qch == quote {
+                    if chars.peek() == Some(&quote) {
+                        value.push(quote);
+                        chars.next();
+                        continue;
+                    }
+                    break;
+                }
+                value.push(qch);
+            }
+            tokens.push(Token { value, kind: TokenKind::Identifier });
+            continue;
+        }
+        if ch == '[' {
+            chars.next();
+            let mut value = String::new();
+            while let Some(&qch) = chars.peek() {
+                chars.next();
+                if qch == ']' {
+                    break;
+                }
+                value.push(qch);
+            }
+            tokens.push(Token { value, kind: TokenKind::Identifier });
+            continue;
+        }
+        if ch == '\'' {
+            // string literal — skip
+            chars.next();
+            while let Some(&qch) = chars.peek() {
+                chars.next();
+                if qch == '\'' {
+                    if chars.peek() == Some(&'\'') {
+                        chars.next();
+                        continue;
+                    }
+                    break;
+                }
+            }
+            continue;
+        }
+        if ch == '(' || ch == ')' || ch == ',' {
+            chars.next();
+            tokens.push(Token { value: ch.to_string(), kind: TokenKind::Punct });
+            continue;
+        }
+        if ch.is_ascii_alphabetic() || ch == '_' {
+            let mut value = String::new();
+            while let Some(&wch) = chars.peek() {
+                if wch.is_ascii_alphanumeric() || wch == '_' {
+                    value.push(wch);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            let kind = if is_sql_keyword(&value) { TokenKind::Keyword } else { TokenKind::Identifier };
+            tokens.push(Token { value, kind });
+            continue;
+        }
+        // anything else — skip but record for completeness
+        chars.next();
+        tokens.push(Token { value: ch.to_string(), kind: TokenKind::Other });
+    }
+    tokens
+}
+
+fn is_sql_keyword(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "constraint"
+            | "primary"
+            | "key"
+            | "not"
+            | "null"
+            | "default"
+            | "unique"
+            | "check"
+            | "foreign"
+            | "references"
+            | "on"
+            | "delete"
+            | "update"
+            | "cascade"
+            | "set"
+            | "restrict"
+            | "no"
+            | "action"
+            | "deferrable"
+            | "initially"
+            | "deferred"
+            | "immediate"
+            | "match"
+            | "collate"
+            | "autoincrement"
+            | "asc"
+            | "desc"
+            | "generated"
+            | "always"
+            | "stored"
+            | "virtual"
+            | "as"
+    )
 }
 
 pub async fn list_indexes(pool: &SqliteHandle, _schema: &str, table: &str) -> Result<Vec<IndexInfo>, String> {
@@ -455,6 +1182,8 @@ pub async fn list_foreign_keys(pool: &SqliteHandle, _schema: &str, table: &str) 
                         ref_schema: None,
                         ref_table: row.get("table")?,
                         ref_column: row.get("to")?,
+                        on_update: None,
+                        on_delete: None,
                     })
                 })
                 .map_err(|e| e.to_string())?;
@@ -476,7 +1205,7 @@ pub async fn list_triggers(pool: &SqliteHandle, _schema: &str, table: &str) -> R
             let rows = stmt
                 .query_map([table], |row| {
                     let sql_text: Option<String> = row.get("sql")?;
-                    let upper = sql_text.unwrap_or_default().to_uppercase();
+                    let upper = sql_text.clone().unwrap_or_default().to_uppercase();
                     let timing = if upper.contains("BEFORE") {
                         "BEFORE"
                     } else if upper.contains("AFTER") {
@@ -491,7 +1220,12 @@ pub async fn list_triggers(pool: &SqliteHandle, _schema: &str, table: &str) -> R
                     } else {
                         "DELETE"
                     };
-                    Ok(TriggerInfo { name: row.get("name")?, event: event.to_string(), timing: timing.to_string() })
+                    Ok(TriggerInfo {
+                        name: row.get("name")?,
+                        event: event.to_string(),
+                        timing: timing.to_string(),
+                        statement: sql_text,
+                    })
                 })
                 .map_err(|e| e.to_string())?;
             rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())

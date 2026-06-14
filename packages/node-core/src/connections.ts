@@ -25,6 +25,7 @@ export interface ConnectionConfig {
   redis_sentinel_username?: string;
   redis_sentinel_password?: string;
   redis_sentinel_tls?: boolean;
+  redis_key_separator?: string;
   read_only?: boolean;
 }
 
@@ -42,6 +43,7 @@ export interface SshTunnelConfig {
   key_passphrase?: string;
   connect_timeout_secs?: number;
   expose_lan?: boolean;
+  use_ssh_agent?: boolean;
 }
 
 export interface ProxyTunnelConfig {
@@ -161,6 +163,7 @@ function normalizeTransportLayers(config: LegacyConnectionConfig): TransportLaye
       key_passphrase: config.ssh_key_passphrase || "",
       connect_timeout_secs: config.ssh_connect_timeout_secs || 5,
       expose_lan: !!config.ssh_expose_lan,
+      use_ssh_agent: false,
     });
   }
   if (config.proxy_enabled && config.proxy_host) {

@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+﻿import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   ConnectionConfig,
@@ -11,22 +11,27 @@ import type {
   IndexInfo,
   ForeignKeyInfo,
   TriggerInfo,
+  FunctionInfo,
+  SequenceInfo,
+  RuleInfo,
+  OwnerInfo,
   QueryResult,
   SqlReferenceAnalysis,
   DatabaseType,
   InstalledPlugin,
   JdbcDriverInfo,
+  JdbcMavenBundleInfo,
   JdbcPluginStatus,
   SavedSqlFile,
   SavedSqlFolder,
   SavedSqlLibrary,
 } from "@/types/database";
 import type { SidebarObjectKind } from "@/lib/databaseObjectCapabilities";
-import type { AiConfig } from "@/stores/settingsStore";
+import type { AiConfig, AiTestConnectionResult } from "@/stores/settingsStore";
 import type { QueryEditability } from "@/lib/sqlAnalysis";
 import type { DataGridColumnValueFilterConditionOptions, DataGridContextFilterConditionOptions, DataGridCountSqlOptions, DataGridCopyInsertStatementOptions, DataGridCopyUpdateStatementOptions, DataGridSaveStatementOptions, HiveTablePropertiesSqlOptions } from "@/lib/dataGridSql";
 import type { DataCompareFromTablesOptions, DataCompareFromTablesPreparation, DataCompareSyncPlan, DataCompareSyncPlanOptions, DataComparePreparation, DataComparePreparationOptions } from "@/lib/dataCompare";
-import type { SchemaDiffPreparation, SchemaDiffPreparationOptions, TableDiff } from "@/lib/schemaDiff";
+import type { SchemaDiffPreparation, SchemaDiffPreparationOptions, TableDiff, FunctionDiff, SequenceDiff, RuleDiff, OwnerDiff } from "@/lib/schemaDiff";
 import type { BuildTableStructureChangeSqlOptions, BuildSingleColumnAlterSqlOptions, TableStructureChangeSql } from "@/lib/tableStructureEditorSql";
 import type { BuildTableSelectSqlOptions } from "@/lib/tableSelectSql";
 import type { DatabaseSearchSql, DatabaseSearchSqlOptions, SearchResultWhereOptions } from "@/lib/databaseSearch";
@@ -121,6 +126,9 @@ export interface DesktopSettings {
   icon_theme: "default" | "black";
   debug_logging_enabled: boolean;
   saved_sql_sync_dir?: string | null;
+  driver_store_dir?: string | null;
+  plugin_store_dir?: string | null;
+  agent_store_dir?: string | null;
 }
 
 export interface SavedSqlSyncEntry {
@@ -453,11 +461,36 @@ export async function aiStream(sessionId: string, request: AiCompletionRequest, 
   }
 }
 
+export type AgentEvent =
+  | { type: "turn_start"; turn: number }
+  | { type: "text_delta"; delta: string }
+  | { type: "reasoning_delta"; delta: string }
+  | { type: "tool_call_start"; tool_call_id: string; tool_name: string; args: Record<string, unknown> }
+  | { type: "tool_call_end"; tool_call_id: string; tool_name: string; result: unknown; is_error: boolean }
+  | { type: "turn_end"; turn: number }
+  | { type: "agent_end"; total_tokens?: number }
+  | { type: "error"; message: string };
+
+export async function aiAgentStream(sessionId: string, request: AiCompletionRequest, connectionId: string, database: string, dbType: string, onEvent: (event: AgentEvent) => void, mode?: string, _signal?: AbortSignal): Promise<string> {
+  const unlisten: UnlistenFn = await listen<AgentEvent>("ai-agent-event", (event) => {
+    onEvent(event.payload);
+    if (event.payload.type === "agent_end" || event.payload.type === "error") {
+      unlisten();
+    }
+  });
+  try {
+    return await invoke("ai_agent_stream", { sessionId, request, connectionId, database, dbType, mode });
+  } catch (e) {
+    unlisten();
+    throw e;
+  }
+}
+
 export async function saveAiConfig(config: AiConfig): Promise<void> {
   return invoke("save_ai_config", { config });
 }
 
-export async function aiTestConnection(config: AiConfig): Promise<string> {
+export async function aiTestConnection(config: AiConfig): Promise<AiTestConnectionResult> {
   return invoke("ai_test_connection", { config });
 }
 
@@ -479,6 +512,38 @@ export async function loadDesktopSettings(): Promise<DesktopSettings> {
 
 export async function saveDesktopSettings(settings: DesktopSettings): Promise<void> {
   return invoke("save_desktop_settings", { settings });
+}
+
+export interface DriverStoreMigrationResult {
+  driver_store_dir: string | null;
+  plugin_store_dir: string | null;
+  agent_store_dir: string | null;
+  migrated_plugins: boolean;
+  migrated_agents: boolean;
+}
+
+export async function setDriverStoreDir(newDir: string | null): Promise<DriverStoreMigrationResult> {
+  return invoke("set_driver_store_dir", { newDir });
+}
+
+export async function setPluginStoreDir(newDir: string | null): Promise<DriverStoreMigrationResult> {
+  return invoke("set_plugin_store_dir", { newDir });
+}
+
+export async function setAgentStoreDir(newDir: string | null): Promise<DriverStoreMigrationResult> {
+  return invoke("set_agent_store_dir", { newDir });
+}
+
+export interface DriverStorePathInfo {
+  driver_store_dir: string | null;
+  plugin_store_dir: string | null;
+  agent_store_dir: string | null;
+  plugins_dir: string;
+  agents_dir: string;
+}
+
+export async function getDriverStorePath(): Promise<DriverStorePathInfo> {
+  return invoke("get_driver_store_path");
 }
 
 export async function webdavSyncTest(config: WebDavConfig): Promise<void> {
@@ -599,8 +664,8 @@ export async function deleteSchemaCachePrefix(prefix: string): Promise<void> {
   return invoke("delete_schema_cache_prefix", { prefix });
 }
 
-export async function listTables(connectionId: string, database: string, schema: string, filter?: string, limit?: number): Promise<TableInfo[]> {
-  return invoke("list_tables", { connectionId, database, schema, filter, limit });
+export async function listTables(connectionId: string, database: string, schema: string, filter?: string, limit?: number, offset?: number): Promise<TableInfo[]> {
+  return invoke("list_tables", { connectionId, database, schema, filter, limit, offset });
 }
 
 export async function listObjects(connectionId: string, database: string, schema: string, objectTypes?: SidebarObjectKind[]): Promise<ObjectInfo[]> {
@@ -904,8 +969,33 @@ export async function prepareSchemaDiff(options: SchemaDiffPreparationOptions): 
   return invoke("prepare_schema_diff", { options });
 }
 
-export async function generateSchemaSyncSql(diffs: TableDiff[], databaseType: DatabaseType, targetSchema?: string): Promise<string> {
-  return invoke("generate_schema_sync_sql", { diffs, databaseType, targetSchema });
+export async function generateSchemaSyncSql(diffs: TableDiff[], databaseType: DatabaseType, targetSchema?: string, functionDiffs?: FunctionDiff[], sequenceDiffs?: SequenceDiff[], ruleDiffs?: RuleDiff[], ownerDiffs?: OwnerDiff[], cascadeDelete?: boolean): Promise<string> {
+  return invoke("generate_schema_sync_sql", {
+    diffs,
+    databaseType,
+    targetSchema,
+    functionDiffs: functionDiffs ?? [],
+    sequenceDiffs: sequenceDiffs ?? [],
+    ruleDiffs: ruleDiffs ?? [],
+    ownerDiffs: ownerDiffs ?? [],
+    cascadeDelete: cascadeDelete ?? false,
+  });
+}
+
+export async function listFunctions(connectionId: string, database: string, schema: string): Promise<FunctionInfo[]> {
+  return invoke("list_functions", { connectionId, database, schema });
+}
+
+export async function listSequences(connectionId: string, database: string, schema: string, withLastValues: boolean): Promise<SequenceInfo[]> {
+  return invoke("list_sequences", { connectionId, database, schema, withLastValues });
+}
+
+export async function listRules(connectionId: string, database: string, schema: string): Promise<RuleInfo[]> {
+  return invoke("list_rules", { connectionId, database, schema });
+}
+
+export async function listOwners(connectionId: string, database: string, schema: string): Promise<OwnerInfo[]> {
+  return invoke("list_owners", { connectionId, database, schema });
 }
 
 export async function saveConnections(configs: ConnectionConfig[]): Promise<void> {
@@ -937,6 +1027,10 @@ export async function listJdbcDrivers(): Promise<JdbcDriverInfo[]> {
   return invoke("list_jdbc_drivers");
 }
 
+export async function listJdbcMavenBundles(): Promise<JdbcMavenBundleInfo[]> {
+  return invoke("list_jdbc_maven_bundles");
+}
+
 export async function importJdbcDrivers(paths: (string | File)[]): Promise<JdbcDriverInfo[]> {
   if (paths.some((path) => typeof path !== "string")) {
     throw new Error("Desktop JDBC driver import requires local file paths");
@@ -944,8 +1038,16 @@ export async function importJdbcDrivers(paths: (string | File)[]): Promise<JdbcD
   return invoke("import_jdbc_drivers", { paths });
 }
 
+export async function installJdbcDriverFromMaven(coordinate: string, repositories: string[] = []): Promise<JdbcDriverInfo[]> {
+  return invoke("install_jdbc_driver_from_maven", { request: { coordinate, repositories } });
+}
+
 export async function deleteJdbcDriver(path: string): Promise<JdbcDriverInfo[]> {
   return invoke("delete_jdbc_driver", { path });
+}
+
+export async function deleteJdbcMavenBundle(bundleId: string): Promise<JdbcDriverInfo[]> {
+  return invoke("delete_jdbc_maven_bundle", { bundleId });
 }
 
 export async function jdbcPluginStatus(): Promise<JdbcPluginStatus> {
@@ -1073,6 +1175,10 @@ export async function openSavedSqlStorageDir(dir?: string | null): Promise<void>
   return invoke("open_saved_sql_storage_dir", { dir });
 }
 
+export async function revealPathInFileManager(path: string): Promise<void> {
+  return invoke("reveal_path_in_file_manager", { path });
+}
+
 export async function syncSavedSqlDirectory(request: SavedSqlSyncRequest): Promise<void> {
   return invoke("sync_saved_sql_directory", { request });
 }
@@ -1174,8 +1280,8 @@ export async function redisScanKeys(connectionId: string, db: number, cursor: nu
   return invoke("redis_scan_keys", { connectionId, db, cursor, pattern, count });
 }
 
-export async function redisScanValues(connectionId: string, db: number, cursor: number, pattern: string, query: string, count: number): Promise<RedisScanResult> {
-  return invoke("redis_scan_values", { connectionId, db, cursor, pattern, query, count });
+export async function redisScanValues(connectionId: string, db: number, cursor: number, pattern: string, query: string, count: number, includeKeyMatches = false): Promise<RedisScanResult> {
+  return invoke("redis_scan_values", { connectionId, db, cursor, pattern, query, includeKeyMatches, count });
 }
 
 export async function redisGetValue(connectionId: string, db: number, keyRaw: string): Promise<RedisValue> {
@@ -1250,8 +1356,8 @@ export async function redisFlushDb(connectionId: string, db: number): Promise<vo
   return invoke("redis_flush_db", { connectionId, db });
 }
 
-export async function redisExecuteCommand(connectionId: string, db: number, command: string): Promise<RedisCommandResult> {
-  return invoke("redis_execute_command", { connectionId, db, command });
+export async function redisExecuteCommand(connectionId: string, db: number, command: string, skipSafetyCheck?: boolean): Promise<RedisCommandResult> {
+  return invoke("redis_execute_command", { connectionId, db, command, skipSafetyCheck: skipSafetyCheck ?? false });
 }
 
 export async function redisLoadMore(connectionId: string, db: number, keyRaw: string, keyType: string, cursor: number, count: number): Promise<RedisValue> {
@@ -1330,8 +1436,16 @@ export async function mongoListCollections(connectionId: string, database: strin
   return invoke("mongo_list_collections", { connectionId, database });
 }
 
+export async function elasticsearchListIndices(connectionId: string): Promise<string[]> {
+  return mongoListCollections(connectionId, "default");
+}
+
 export async function mongoFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, sort?: string): Promise<MongoDocumentResult> {
   return invoke("mongo_find_documents", { connectionId, database, collection, skip, limit, filter, sort });
+}
+
+export async function documentFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, sort?: string): Promise<MongoDocumentResult> {
+  return invoke("document_find_documents", { connectionId, database, collection, skip, limit, filter, sort });
 }
 
 export async function mongoAggregateDocuments(connectionId: string, database: string, collection: string, pipelineJson: string, maxRows?: number): Promise<MongoDocumentResult> {

@@ -261,19 +261,29 @@ pub fn run() {
             apply_debug_log_level(desktop_settings.debug_logging_enabled);
             eprintln!("[STARTUP] storage ready in {:?}", t.elapsed());
 
-            let state = if data_dir::uses_custom_data_dir() {
+            let legacy_driver_base = desktop_settings.driver_store_dir.as_ref().map(std::path::PathBuf::from);
+            let plugin_dir = desktop_settings
+                .plugin_store_dir
+                .as_ref()
+                .map(std::path::PathBuf::from)
+                .or_else(|| legacy_driver_base.as_ref().map(|base| base.join("plugins")))
+                .unwrap_or_else(|| data_dir.join("plugins"));
+            let agent_dir = desktop_settings
+                .agent_store_dir
+                .as_ref()
+                .map(std::path::PathBuf::from)
+                .or_else(|| legacy_driver_base.as_ref().map(|base| base.join("agents")))
+                .or_else(|| data_dir::uses_custom_data_dir().then(|| data_dir.join("agents")));
+
+            let state = if let Some(agent_dir) = agent_dir {
                 Arc::new(AppState::new_with_plugin_and_agent_dir_and_app_version(
                     storage,
-                    data_dir.join("plugins"),
-                    data_dir.join("agents"),
+                    plugin_dir,
+                    agent_dir,
                     env!("CARGO_PKG_VERSION"),
                 ))
             } else {
-                Arc::new(AppState::new_with_plugin_dir_and_app_version(
-                    storage,
-                    data_dir.join("plugins"),
-                    env!("CARGO_PKG_VERSION"),
-                ))
+                Arc::new(AppState::new_with_plugin_dir_and_app_version(storage, plugin_dir, env!("CARGO_PKG_VERSION")))
             };
             app.manage(state.clone());
             app.manage(commands::saved_sql::SavedSqlStorageState { data_dir: data_dir.clone() });
@@ -317,6 +327,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::ai::ai_complete,
             commands::ai::ai_stream,
+            commands::ai::ai_agent_stream,
             commands::ai::ai_cancel_stream,
             commands::ai::ai_test_connection,
             commands::ai::ai_list_models,
@@ -327,6 +338,10 @@ pub fn run() {
             commands::ai::delete_ai_conversation,
             commands::app_settings::load_desktop_settings,
             commands::app_settings::save_desktop_settings,
+            commands::app_settings::set_driver_store_dir,
+            commands::app_settings::set_plugin_store_dir,
+            commands::app_settings::set_agent_store_dir,
+            commands::app_settings::get_driver_store_path,
             commands::app_settings::load_pinned_tree_node_ids,
             commands::app_settings::save_pinned_tree_node_ids,
             commands::app_settings::load_native_debug_logs,
@@ -357,8 +372,11 @@ pub fn run() {
             commands::connection::load_sidebar_layout,
             commands::plugins::list_plugins,
             commands::plugins::list_jdbc_drivers,
+            commands::plugins::list_jdbc_maven_bundles,
             commands::plugins::import_jdbc_drivers,
+            commands::plugins::install_jdbc_driver_from_maven,
             commands::plugins::delete_jdbc_driver,
+            commands::plugins::delete_jdbc_maven_bundle,
             commands::plugins::jdbc_plugin_status,
             commands::plugins::install_jdbc_plugin,
             commands::plugins::install_jdbc_plugin_local,
@@ -374,6 +392,10 @@ pub fn run() {
             commands::schema::list_foreign_keys,
             commands::schema::list_triggers,
             commands::schema::get_table_ddl,
+            commands::schema::list_functions,
+            commands::schema::list_sequences,
+            commands::schema::list_rules,
+            commands::schema::list_owners,
             commands::schema_diff::prepare_schema_diff,
             commands::schema_diff::generate_schema_sync_sql,
             commands::schema_cache::save_schema_cache,
@@ -403,6 +425,7 @@ pub fn run() {
             commands::query::build_search_result_where,
             commands::query::build_rename_object_sql,
             commands::query::build_create_database_sql,
+            #[cfg(feature = "duckdb-bundled")]
             commands::query::build_duckdb_attach_database_sql,
             commands::query::build_drop_object_sql,
             commands::query::build_drop_table_sql,
@@ -482,8 +505,10 @@ pub fn run() {
             commands::saved_sql::saved_sql_storage_dir,
             commands::saved_sql::open_saved_sql_storage_dir,
             commands::saved_sql::sync_saved_sql_directory,
+            commands::fs_open::reveal_path_in_file_manager,
             commands::mongo_cmd::mongo_list_databases,
             commands::mongo_cmd::mongo_list_collections,
+            commands::mongo_cmd::document_find_documents,
             commands::mongo_cmd::mongo_find_documents,
             commands::mongo_cmd::mongo_aggregate_documents,
             commands::mongo_cmd::mongo_insert_document,

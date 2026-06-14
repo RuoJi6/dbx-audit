@@ -169,7 +169,7 @@ fn is_safe_read_pragma(upper_stripped: &str) -> bool {
     let pragma_name = &rest[..name_end];
 
     // Check if it's in the safe list
-    if !SAFE_READ_PRAGMA_NAMES.iter().any(|&safe| pragma_name == safe) {
+    if !SAFE_READ_PRAGMA_NAMES.contains(&pragma_name) {
         return false;
     }
 
