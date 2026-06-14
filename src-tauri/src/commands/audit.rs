@@ -251,7 +251,7 @@ async fn run_field_name_scan(state: Arc<AppState>, request: AuditScanRequest, jo
 
         for (schema_index, schema) in schemas.iter().enumerate() {
             let tables = if request.tables.is_empty() {
-                dbx_core::schema::list_tables_core(&state, &request.connection_id, database, schema, None, None)
+                dbx_core::schema::list_tables_core(&state, &request.connection_id, database, schema, None, None, None)
                     .await?
                     .into_iter()
                     .map(|table| table.name)
