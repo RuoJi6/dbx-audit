@@ -2,7 +2,7 @@
 import { ref, watch, shallowRef, computed, onMounted } from "vue";
 import type { EditorView as EditorViewType } from "@codemirror/view";
 import { useI18n } from "vue-i18n";
-import { AlertTriangle, CheckCircle2, CircleHelp, Cloud, Copy, Download, ExternalLink, Loader2, PackageSearch, Pencil, RefreshCw, RotateCcw, Settings, Terminal, Trash2, Upload, X } from "@lucide/vue";
+import { AlertTriangle, CheckCircle2, CircleHelp, Cloud, Copy, Download, ExternalLink, Loader2, Moon, PackageSearch, Pencil, RefreshCw, RotateCcw, Settings, Sun, SunMoon, Terminal, Trash2, Upload, X } from "@lucide/vue";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -14,7 +14,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { Tooltip, TooltipContent, TooltipTrigger, TooltipProvider } from "@/components/ui/tooltip";
 import {
   useSettingsStore,
   AI_PROVIDER_PRESETS,
@@ -56,7 +56,7 @@ import { LOCALE_OPTIONS } from "@/lib/localeOptions";
 const { t } = useI18n();
 const settingsStore = useSettingsStore();
 const connectionStore = useConnectionStore();
-const { isDark } = useTheme();
+const { isDark, themeMode, setThemeMode } = useTheme();
 
 const props = defineProps<{
   open: boolean;
@@ -104,6 +104,7 @@ const editSidebarHiddenTablePrefixes = ref(settingsStore.editorSettings.sidebarH
 const editSidebarHideTableComments = ref(settingsStore.editorSettings.sidebarHideTableComments);
 const editSidebarAllowHorizontalScroll = ref(settingsStore.editorSettings.sidebarAllowHorizontalScroll);
 const editExportBatchSize = ref(settingsStore.editorSettings.exportBatchSize);
+const editToolbarItems = ref({ ...settingsStore.editorSettings.toolbarItems });
 const redisScanPageSizeOptions = [200, 1000, 5000, 10000];
 const systemFonts = ref<string[]>([]);
 const systemFontsLoading = ref(false);
@@ -263,6 +264,7 @@ watch(
       editSidebarHideTableComments.value = settingsStore.editorSettings.sidebarHideTableComments;
       editSidebarAllowHorizontalScroll.value = settingsStore.editorSettings.sidebarAllowHorizontalScroll;
       editExportBatchSize.value = settingsStore.editorSettings.exportBatchSize;
+      editToolbarItems.value = { ...settingsStore.editorSettings.toolbarItems };
       editSnippets.value = settingsStore.editorSettings.snippets.map((s) => ({ ...s }));
       void loadSystemFontOptions();
     }
@@ -276,6 +278,8 @@ const shortcutConflicts = computed(() =>
     return conflict ? [definition.id] : [];
   }),
 );
+const formatterEditorShortcutIds: ShortcutActionId[] = ["formatSql", "find", "replace", "saveSql", "acceptCompletion", "indentMore", "indentLess", "duplicateLine", "deleteLine", "moveLineUp", "moveLineDown", "copyLineUp", "copyLineDown", "undo", "redo", "selectAll"];
+const formatterEditorShortcutDefinitions = computed(() => formatterEditorShortcutIds.map((id) => SHORTCUT_DEFINITIONS.find((definition) => definition.id === id)).filter((definition): definition is (typeof SHORTCUT_DEFINITIONS)[number] => !!definition));
 const hasShortcutConflicts = computed(() => shortcutConflicts.value.length > 0);
 const shortcutsChanged = computed(() => JSON.stringify(editShortcuts.value) !== JSON.stringify(settingsStore.editorSettings.shortcuts));
 const hasBlockingShortcutConflicts = computed(() => shortcutsChanged.value && hasShortcutConflicts.value);
@@ -312,6 +316,7 @@ function hasChanges(): boolean {
     editSidebarHideTableComments.value !== settingsStore.editorSettings.sidebarHideTableComments ||
     editSidebarAllowHorizontalScroll.value !== settingsStore.editorSettings.sidebarAllowHorizontalScroll ||
     editExportBatchSize.value !== settingsStore.editorSettings.exportBatchSize ||
+    JSON.stringify(editToolbarItems.value) !== JSON.stringify(settingsStore.editorSettings.toolbarItems) ||
     JSON.stringify(normalizeSidebarHiddenTablePrefixes(editSidebarHiddenTablePrefixes.value)) !== JSON.stringify(settingsStore.editorSettings.sidebarHiddenTablePrefixes) ||
     JSON.stringify(editSnippets.value) !== JSON.stringify(settingsStore.editorSettings.snippets)
   );
@@ -347,6 +352,7 @@ async function persistSettings() {
     sidebarAllowHorizontalScroll: editSidebarAllowHorizontalScroll.value,
     sidebarHiddenTablePrefixes: normalizeSidebarHiddenTablePrefixes(editSidebarHiddenTablePrefixes.value),
     exportBatchSize: editExportBatchSize.value,
+    toolbarItems: { ...editToolbarItems.value },
     snippets: editSnippets.value,
   });
   await settingsStore.updateDesktopSettings({
@@ -399,6 +405,7 @@ function resetDefaults() {
   editSidebarAllowHorizontalScroll.value = DEFAULT_EDITOR_SETTINGS.sidebarAllowHorizontalScroll;
   editSidebarHiddenTablePrefixes.value = DEFAULT_EDITOR_SETTINGS.sidebarHiddenTablePrefixes.join("\n");
   editExportBatchSize.value = DEFAULT_EDITOR_SETTINGS.exportBatchSize;
+  editToolbarItems.value = { ...DEFAULT_EDITOR_SETTINGS.toolbarItems };
   editSnippets.value = DEFAULT_SQL_SNIPPETS.map((s) => ({ ...s }));
 }
 
@@ -830,6 +837,13 @@ async function downloadWebDavSnapshot() {
   });
 }
 
+const oldPassword = ref("");
+const newPassword = ref("");
+const confirmNewPassword = ref("");
+const passwordMessage = ref("");
+const passwordError = ref(false);
+const changingPassword = ref(false);
+
 watch(
   () => props.open,
   async (open) => {
@@ -867,13 +881,6 @@ watch(activeSettingsTab, (tab) => {
 onMounted(() => {
   void refreshWebDavPasswordStatus();
 });
-
-const oldPassword = ref("");
-const newPassword = ref("");
-const confirmNewPassword = ref("");
-const passwordMessage = ref("");
-const passwordError = ref(false);
-const changingPassword = ref(false);
 
 async function changePassword() {
   if (newPassword.value !== confirmNewPassword.value) {
@@ -935,12 +942,25 @@ const aiCompletionsMode = computed(() => aiEditApiStyle.value === "completions")
 const aiTesting = ref(false);
 const aiTestResult = ref<"" | "success" | "error">("");
 const aiTestError = ref("");
+const aiTestLatency = ref<number | null>(null);
 const aiRequiresApiKey = computed(() => AI_PROVIDER_PRESETS[aiEditProvider.value].requiresApiKey);
 const aiSupportsAuthMethod = computed(() => aiEditProvider.value === "claude");
 const aiCredentialLabel = computed(() => (aiSupportsAuthMethod.value && aiEditAuthMethod.value === "bearer" ? "Auth Token" : "API Key"));
 const aiCredentialPlaceholder = computed(() => {
   if (!aiRequiresApiKey.value) return "Optional";
   if (aiSupportsAuthMethod.value && aiEditAuthMethod.value === "bearer") return "ANTHROPIC_AUTH_TOKEN";
+  return "";
+});
+const aiEndpointPlaceholder = computed(() => {
+  if (aiEditProvider.value === "openai-compatible" || aiEditProvider.value === "custom") {
+    return "https://api.example.com/v1";
+  }
+  return "https://api.openai.com/v1";
+});
+const aiEndpointHint = computed(() => {
+  if (aiEditProvider.value === "openai-compatible" || aiEditProvider.value === "custom") {
+    return "大多数 OpenAI 兼容 API 需要 /v1 路径前缀";
+  }
   return "";
 });
 const aiSupportsApiStyle = computed(() => aiEditProvider.value === "openai" || aiEditProvider.value === "openai-compatible" || aiEditProvider.value === "custom");
@@ -1058,6 +1078,7 @@ function syncAiEditState() {
   aiEditEnableThinking.value = settingsStore.aiConfig.enableThinking ?? true;
   aiTestResult.value = "";
   aiTestError.value = "";
+  aiTestLatency.value = null;
   clearAiModelOptions();
 }
 
@@ -1068,6 +1089,9 @@ function aiSelectProvider(provider: AiProvider) {
   aiEditApiStyle.value = AI_PROVIDER_PRESETS[provider].apiStyle;
   aiEditAuthMethod.value = AI_PROVIDER_PRESETS[provider].authMethod;
   if (!AI_PROVIDER_PRESETS[provider].requiresApiKey) aiEditApiKey.value = "";
+  aiTestResult.value = "";
+  aiTestError.value = "";
+  aiTestLatency.value = null;
   clearAiModelOptions();
 }
 
@@ -1094,9 +1118,11 @@ async function aiTestConn() {
   aiTesting.value = true;
   aiTestResult.value = "";
   aiTestError.value = "";
+  aiTestLatency.value = null;
   try {
-    await aiTestConnection(currentAiEditConfig());
+    const result = await aiTestConnection(currentAiEditConfig());
     aiTestResult.value = "success";
+    aiTestLatency.value = result.latencyMs ?? null;
   } catch (e: any) {
     aiTestResult.value = "error";
     aiTestError.value = e?.message || String(e);
@@ -1342,6 +1368,72 @@ watch(
             </section>
 
             <section v-else-if="activeSettingsTab === 'formatter'" class="flex flex-col gap-5 py-2">
+              <div class="space-y-3 rounded-md border border-border/70 bg-muted/10 p-3">
+                <div class="text-sm font-medium">{{ t("settings.sqlFormatterEditorShortcuts") }}</div>
+                <div class="overflow-hidden rounded-md border border-border/70 bg-background">
+                  <div v-for="definition in formatterEditorShortcutDefinitions" :key="definition.id" class="group -mt-px grid gap-2 border-t border-border/70 px-3 py-2 transition-colors first:mt-0 first:border-t-0 hover:bg-muted/40 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center">
+                    <div class="min-w-0">
+                      <Label class="min-w-0 truncate leading-none">{{ t(definition.labelKey) }}</Label>
+                    </div>
+                    <div class="min-w-0 space-y-1">
+                      <div class="flex items-center justify-end gap-1.5">
+                        <input
+                          :data-shortcut-input="definition.id"
+                          :value="editingShortcutId === definition.id ? '' : formatShortcutPill(editShortcuts[definition.id])"
+                          :style="{
+                            width: editingShortcutId === definition.id ? shortcutPressShortcutInputWidth : `${Math.max(4, formatShortcutPill(editShortcuts[definition.id]).length + 3)}ch`,
+                          }"
+                          readonly
+                          :aria-invalid="shortcutConflicts.includes(definition.id)"
+                          :placeholder="t('settings.shortcutPressShortcut')"
+                          class="h-7 w-auto min-w-12 max-w-32 shrink-0 cursor-default rounded-full border border-transparent bg-background px-2.5 text-center font-mono text-[13px] font-semibold text-foreground/75 shadow-inner outline-none selection:bg-transparent placeholder:text-muted-foreground aria-invalid:border-destructive/70 aria-invalid:text-destructive aria-invalid:ring-destructive/20"
+                          :class="editingShortcutId === definition.id ? 'max-w-44 cursor-text border-border/80 bg-background text-left text-foreground shadow-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/35' : ''"
+                          @keydown="(event: KeyboardEvent) => onShortcutKeydown(definition.id, event)"
+                        />
+                        <Button
+                          v-if="editingShortcutId !== definition.id"
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          class="h-7 w-7 shrink-0 text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100"
+                          :aria-label="t('settings.shortcutPressShortcut')"
+                          @click="focusShortcutInput(definition.id)"
+                        >
+                          <Pencil class="h-4 w-4" />
+                        </Button>
+                        <Button v-else type="button" variant="ghost" size="sm" class="h-7 shrink-0 px-2 text-sm font-medium text-muted-foreground hover:text-foreground" @click="cancelShortcutEdit">
+                          {{ t("settings.cancel") }}
+                        </Button>
+                        <Button
+                          v-if="editingShortcutId !== definition.id"
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          class="h-7 w-7 shrink-0 text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100"
+                          :aria-label="t('settings.reset')"
+                          @click="resetShortcut(definition.id)"
+                        >
+                          <RotateCcw class="h-4 w-4" />
+                        </Button>
+                        <Button
+                          v-if="editingShortcutId !== definition.id && editShortcuts[definition.id]"
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          class="h-7 w-7 shrink-0 text-muted-foreground opacity-0 transition-opacity hover:text-destructive focus-visible:opacity-100 group-hover:opacity-100"
+                          :aria-label="t('settings.shortcutClear')"
+                          @click="clearShortcut(definition.id)"
+                        >
+                          <X class="h-4 w-4" />
+                        </Button>
+                      </div>
+                      <p v-if="shortcutConflicts.includes(definition.id)" class="text-xs text-destructive">
+                        {{ t("settings.shortcutConflict") }}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              </div>
               <SqlFormatterSettingsPanel v-model="editSqlFormatter" @validity-change="(value: boolean) => (sqlFormatterConfigValid = value)" />
             </section>
 
@@ -1363,6 +1455,29 @@ watch(
                     </SelectItem>
                   </SelectContent>
                 </Select>
+              </div>
+
+              <div class="space-y-2">
+                <Label>{{ t("settings.theme") }}</Label>
+                <div class="flex gap-2">
+                  <Button
+                    v-for="option in [
+                      { value: 'light', label: t('toolbar.themeLight'), icon: Sun },
+                      { value: 'dark', label: t('toolbar.themeDark'), icon: Moon },
+                      { value: 'system', label: t('toolbar.themeSystem'), icon: SunMoon },
+                    ]"
+                    :key="option.value"
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    class="h-auto gap-1.5 px-3 py-1.5"
+                    :class="themeMode === option.value ? 'border-blue-300 ring-2 ring-blue-300/50' : ''"
+                    @click="setThemeMode(option.value as 'light' | 'dark' | 'system')"
+                  >
+                    <component :is="option.icon" class="h-3.5 w-3.5" />
+                    {{ option.label }}
+                  </Button>
+                </div>
               </div>
 
               <Separator />
@@ -1509,6 +1624,46 @@ watch(
                     </p>
                   </div>
                   <Switch id="compact-column-header-actions" v-model="editCompactColumnHeaderActions" />
+                </div>
+              </div>
+
+              <Separator />
+
+              <div class="space-y-2">
+                <div class="flex items-center gap-2">
+                  <Label>{{ t("settings.toolbarTitle") }}</Label>
+                  <TooltipProvider>
+                    <Tooltip>
+                      <TooltipTrigger as-child>
+                        <CircleHelp class="h-3.5 w-3.5 text-muted-foreground cursor-help" />
+                      </TooltipTrigger>
+                      <TooltipContent class="max-w-64">
+                        <p>{{ t("settings.toolbarHiddenHint") }}</p>
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                </div>
+                <div class="grid grid-cols-3 gap-2 mt-2">
+                  <div
+                    v-for="item in [
+                      { key: 'dataTransfer', label: t('transfer.dataTransfer') },
+                      { key: 'driverManager', label: t('toolbar.driverManager') },
+                      { key: 'sqlFile', label: t('sqlFile.title') },
+                      { key: 'schemaDiff', label: t('diff.title') },
+                      { key: 'dataCompare', label: t('dataCompare.title') },
+                      { key: 'checkUpdates', label: t('updates.check') },
+                      { key: 'sqlLibrary', label: t('sqlLibrary.title') },
+                      { key: 'history', label: t('history.title') },
+                      { key: 'ai', label: 'AI' },
+                      { key: 'theme', label: t('toolbar.theme') },
+                      { key: 'github', label: 'GitHub' },
+                    ]"
+                    :key="item.key"
+                    class="flex items-center gap-2"
+                  >
+                    <Switch :id="`toolbar-${item.key}`" :model-value="(editToolbarItems as any)[item.key]" @update:model-value="(v: boolean) => ((editToolbarItems as any)[item.key] = v)" />
+                    <Label :for="`toolbar-${item.key}`" class="text-sm cursor-pointer">{{ item.label }}</Label>
+                  </div>
                 </div>
               </div>
             </section>
@@ -1961,9 +2116,12 @@ watch(
                   <Input v-model="aiEditApiKey" type="password" autocomplete="off" class="col-span-2 h-8 text-xs" :placeholder="aiCredentialPlaceholder" />
                 </div>
 
-                <div class="grid grid-cols-3 items-center gap-3">
-                  <Label class="text-right text-xs">Endpoint</Label>
-                  <Input v-model="aiEditEndpoint" placeholder="https://api.openai.com/v1" autocomplete="off" class="col-span-2 h-8 text-xs" />
+                <div class="grid grid-cols-3 items-start gap-3">
+                  <Label class="pt-2 text-right text-xs">Endpoint</Label>
+                  <div class="col-span-2 space-y-1.5">
+                    <Input v-model="aiEditEndpoint" :placeholder="aiEndpointPlaceholder" autocomplete="off" class="h-8 text-xs" />
+                    <p v-if="aiEndpointHint" class="text-[11px] text-muted-foreground">{{ aiEndpointHint }}</p>
+                  </div>
                 </div>
 
                 <div class="grid grid-cols-3 items-start gap-3">
@@ -2304,8 +2462,9 @@ watch(
                 <Loader2 v-if="aiTesting" class="h-3 w-3 animate-spin mr-1" />
                 {{ t("connection.test") }}
               </Button>
-              <span v-if="aiTestResult === 'success'" class="text-xs text-green-500">
-                {{ t("connection.testSuccess") }}
+              <span v-if="aiTestResult === 'success'" class="text-xs text-green-500 flex items-center gap-1.5">
+                <span>{{ t("connection.testSuccess") }}</span>
+                <span v-if="aiTestLatency != null" class="text-green-500/70">{{ aiTestLatency }}ms</span>
               </span>
               <span v-else-if="aiTestResult === 'error'" class="text-xs text-destructive truncate max-w-[200px]" :title="aiTestError">
                 {{ aiTestError }}

@@ -59,6 +59,7 @@ async function openTableTarget(target: NavigationTarget) {
       queryStore.setTableMeta(tabId, {
         schema: target.schema,
         tableName: target.tableName,
+        tableType: "TABLE",
         columns,
         primaryKeys,
       });
@@ -76,6 +77,7 @@ async function openTableTarget(target: NavigationTarget) {
     queryStore.setTableMeta(tabId, {
       schema: target.schema,
       tableName: target.tableName,
+      tableType: "TABLE",
       columns: [],
       primaryKeys: [],
     });
@@ -89,6 +91,7 @@ async function openTableTarget(target: NavigationTarget) {
       queryStore.setTableMeta(tabId, {
         schema: target.schema,
         tableName: target.tableName,
+        tableType: "TABLE",
         columns,
         primaryKeys,
       });
@@ -150,7 +153,7 @@ export function useNavigationTargets(dialogs: { showFieldLineageDialog: { value:
         queryStore.setTableMeta(tab.id, {
           ...tab.tableMeta!,
           columns,
-          primaryKeys: editablePrimaryKeys(effectiveDatabaseTypeForConnection(connection), columns),
+          primaryKeys: editablePrimaryKeys(effectiveDatabaseTypeForConnection(connection), columns, tab.tableMeta!.tableType),
         });
         if (tab.id === queryStore.activeTabId) await reloadData();
       } catch (e: any) {

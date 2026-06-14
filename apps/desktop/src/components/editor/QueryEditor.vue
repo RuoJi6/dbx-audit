@@ -31,14 +31,14 @@ import {
 } from "@/lib/queryEditorTableDrop";
 import { EDITOR_FONT_FAMILY_CSS_VAR, EDITOR_FONT_SIZE_CSS_VAR, loadEditorTheme, editorFontTheme, sqlCompletionTheme } from "@/lib/editorThemes";
 import { clampEditorFontSize, createEditorZoomCommitScheduler, fontSizeFromGestureScale, fontSizeFromWheelDelta } from "@/lib/editorZoom";
-import { shortcutToCodeMirrorKey } from "@/lib/shortcutRegistry";
+import { normalizeShortcutSettings, shortcutToCodeMirrorKey } from "@/lib/shortcutRegistry";
 import { trimmedSelectionLayer } from "@/lib/codemirrorTrimmedSelectionLayer";
 import { selectionMatchOccurrences } from "@/lib/codemirrorSelectionMatches";
 import { isSchemaAware, isSingleDatabase } from "@/lib/databaseFeatureSupport";
 import * as api from "@/lib/api";
 import { areSqlSemanticDiagnosticsEqual, buildSqlParserErrorDiagnostic, buildSqlSemanticDiagnostics, shouldRunSqlSemanticDiagnostics, type SqlSemanticDiagnostic } from "@/lib/sqlSemanticDiagnostics";
 import type { SqlCompletionColumn, SqlCompletionForeignKey, SqlCompletionItem, SqlCompletionObject } from "@/lib/sqlCompletion";
-import type { DatabaseType, ForeignKeyInfo, SqlReferenceAnalysis, SqlTableReference, SqlTextSpan } from "@/types/database";
+import type { DatabaseType, SqlReferenceAnalysis, SqlTableReference, SqlTextSpan } from "@/types/database";
 
 const props = defineProps<{
   modelValue: string;
@@ -131,6 +131,7 @@ const completionTranslations = computed(() => ({
   functionDescriptions: Object.fromEntries(SQL_FUNCTION_NAMES.map((name) => [name, t(`editor.completion.functionDescriptions.${name}`)])) as Record<string, string>,
 }));
 const MAX_COMPLETION_TABLES = 200;
+const MAX_JOIN_FK_PREFETCH_TABLES = 24;
 const liveFontSize = ref(settingsStore.editorSettings.fontSize);
 const gestureStartFontSize = ref(settingsStore.editorSettings.fontSize);
 const isGestureZooming = ref(false);
@@ -165,6 +166,15 @@ let codeMirrorCompletionStatus: typeof import("@codemirror/autocomplete").comple
 let codeMirrorAcceptCompletion: typeof import("@codemirror/autocomplete").acceptCompletion | null = null;
 let codeMirrorStartCompletion: typeof import("@codemirror/autocomplete").startCompletion | null = null;
 let codeMirrorIndentMore: typeof import("@codemirror/commands").indentMore | null = null;
+let codeMirrorIndentLess: typeof import("@codemirror/commands").indentLess | null = null;
+let codeMirrorCopyLineDown: typeof import("@codemirror/commands").copyLineDown | null = null;
+let codeMirrorCopyLineUp: typeof import("@codemirror/commands").copyLineUp | null = null;
+let codeMirrorDeleteLine: typeof import("@codemirror/commands").deleteLine | null = null;
+let codeMirrorMoveLineUp: typeof import("@codemirror/commands").moveLineUp | null = null;
+let codeMirrorMoveLineDown: typeof import("@codemirror/commands").moveLineDown | null = null;
+let codeMirrorUndo: typeof import("@codemirror/commands").undo | null = null;
+let codeMirrorRedo: typeof import("@codemirror/commands").redo | null = null;
+let codeMirrorSelectAll: typeof import("@codemirror/commands").selectAll | null = null;
 let codeMirrorInsertNewlineKeepIndent: typeof import("@codemirror/commands").insertNewlineKeepIndent | null = null;
 let setSqlDiagnosticsEffect: import("@codemirror/state").StateEffectType<SqlSemanticDiagnostic[]> | null = null;
 let semanticDiagnostics: SqlSemanticDiagnostic[] = [];
@@ -172,6 +182,8 @@ let semanticDiagnosticTimer: ReturnType<typeof setTimeout> | null = null;
 let semanticDiagnosticRunId = 0;
 let editorIsActive = true;
 let tableReferenceDropListenerRegistered = false;
+let imeCompositionActive = false;
+let pendingImeModelEmit = false;
 
 function editorThemeAppearance() {
   return isDark.value ? "dark" : "light";
@@ -340,8 +352,9 @@ const contextMenuItems = computed<ContextMenuItem[]>(() => [
 ]);
 
 function runKeymapExtension(codeMirrorKeymap: (typeof import("@codemirror/view"))["keymap"]) {
-  const shortcuts = settingsStore.editorSettings.shortcuts;
+  const shortcuts = normalizeShortcutSettings(settingsStore.editorSettings.shortcuts);
   const Prec = codeMirrorPrec;
+  const binding = (shortcut: string, run: (view: EditorViewType) => boolean) => (shortcut ? [{ key: shortcutToCodeMirrorKey(shortcut), preventDefault: true, run }] : []);
   return [
     Prec?.high(
       codeMirrorKeymap.of([
@@ -350,37 +363,36 @@ function runKeymapExtension(codeMirrorKeymap: (typeof import("@codemirror/view")
           run: codeMirrorInsertNewlineKeepIndent ?? undefined,
           shift: codeMirrorInsertNewlineKeepIndent ?? undefined,
         },
-        {
-          key: shortcutToCodeMirrorKey(shortcuts.find),
-          preventDefault: true,
-          run: openSearch,
-        },
-        {
-          key: shortcutToCodeMirrorKey(shortcuts.replace),
-          preventDefault: true,
-          run: openReplace,
-        },
-        {
-          key: shortcutToCodeMirrorKey(shortcuts.executeSql),
-          preventDefault: true,
-          run: executeCurrentSql,
-        },
-        {
-          key: shortcutToCodeMirrorKey(shortcuts.saveSql),
-          preventDefault: true,
-          run: () => {
-            emit("save");
-            return true;
-          },
-        },
+        ...binding(shortcuts.find, openSearch),
+        ...binding(shortcuts.replace, openReplace),
+        ...binding(shortcuts.executeSql, executeCurrentSql),
+        ...binding(shortcuts.saveSql, () => {
+          emit("save");
+          return true;
+        }),
+        ...binding(shortcuts.formatSql, () => {
+          void formatCurrentSql();
+          return true;
+        }),
+        ...binding(shortcuts.indentMore, (view) => codeMirrorIndentMore?.(view) ?? false),
+        ...binding(shortcuts.indentLess, (view) => codeMirrorIndentLess?.(view) ?? false),
+        ...binding(shortcuts.duplicateLine, (view) => codeMirrorCopyLineDown?.(view) ?? false),
+        ...binding(shortcuts.deleteLine, (view) => codeMirrorDeleteLine?.(view) ?? false),
+        ...binding(shortcuts.moveLineUp, (view) => codeMirrorMoveLineUp?.(view) ?? false),
+        ...binding(shortcuts.moveLineDown, (view) => codeMirrorMoveLineDown?.(view) ?? false),
+        ...binding(shortcuts.copyLineUp, (view) => codeMirrorCopyLineUp?.(view) ?? false),
+        ...binding(shortcuts.copyLineDown, (view) => codeMirrorCopyLineDown?.(view) ?? false),
+        ...binding(shortcuts.undo, (view) => codeMirrorUndo?.(view) ?? false),
+        ...binding(shortcuts.redo, (view) => codeMirrorRedo?.(view) ?? false),
+        ...binding(shortcuts.selectAll, (view) => codeMirrorSelectAll?.(view) ?? false),
       ]),
     ) ?? [],
-    codeMirrorKeymap.of([
-      {
-        key: shortcutToCodeMirrorKey(shortcuts.acceptCompletion),
-        run: (view) => codeMirrorAcceptCompletion?.(view) ?? false,
-      },
-    ]),
+    codeMirrorKeymap.of(
+      binding(shortcuts.acceptCompletion, (view) => codeMirrorAcceptCompletion?.(view) ?? false).map((item) => ({
+        ...item,
+        preventDefault: false,
+      })),
+    ),
   ];
 }
 
@@ -444,23 +456,24 @@ async function ensureForeignKeysForTable(table: { name: string; schema?: string 
   if (cachedForeignKeysByTable.has(cacheKey) || !props.connectionId || props.database == null) return;
   const target = completionMetadataTarget(table);
   if (!target) return;
-  const querySchema = target.schema ?? target.database;
   try {
-    const foreignKeys = await api.listForeignKeys(props.connectionId, target.database, querySchema, table.name);
-    cachedForeignKeysByTable.set(
-      cacheKey,
-      foreignKeys.map((foreignKey: ForeignKeyInfo) => ({
-        name: foreignKey.name,
-        column: foreignKey.column,
-        ref_schema: foreignKey.ref_schema,
-        ref_table: foreignKey.ref_table,
-        ref_column: foreignKey.ref_column,
-      })),
-    );
+    const foreignKeys = await connectionStore.listCompletionForeignKeys(props.connectionId, target.database, table.name, target.schema);
+    cachedForeignKeysByTable.set(cacheKey, foreignKeys);
   } catch (e) {
     console.warn(`[DBX] Failed to load foreign keys for ${cacheKey}:`, e);
     cachedForeignKeysByTable.set(cacheKey, []);
   }
+}
+
+async function ensureForeignKeysForTables(tables: Array<{ name: string; schema?: string | null }>) {
+  const seen = new Set<string>();
+  const uniqueTables = tables.filter((table) => {
+    const key = completionCacheKey(table).toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  await Promise.all(uniqueTables.map((table) => ensureForeignKeysForTable(table)));
 }
 
 function createHoverDom(title: string, detail: string, rows: string[] = []) {
@@ -673,7 +686,7 @@ async function refreshSemanticDiagnostics() {
     setSemanticDiagnostics([]);
     return;
   }
-  if (props.databaseType === "mongodb" || props.databaseType === "elasticsearch") {
+  if (props.databaseType === "mongodb" || props.databaseType === "elasticsearch" || props.databaseType === "redis") {
     setSemanticDiagnostics([]);
     return;
   }
@@ -719,6 +732,7 @@ function scheduleSemanticDiagnostics(delay = 500) {
 }
 
 async function formatCurrentSql() {
+  if (props.readOnly) return;
   const currentView = view.value;
   if (!currentView) return;
 
@@ -854,7 +868,11 @@ function completionOptionForItem(item: QueryCompletionItem) {
         if (typeof originalApply === "function") {
           originalApply(view, completionItem as never, from, to);
         } else {
-          view.dispatch({ changes: { from, to, insert: String(originalApply ?? item.label) } });
+          const insert = String(originalApply ?? item.label);
+          view.dispatch({
+            changes: { from, to, insert },
+            selection: { anchor: from + insert.length },
+          });
         }
       },
     };
@@ -867,7 +885,11 @@ function completionOptionForItem(item: QueryCompletionItem) {
     boost: item.boost,
     apply(view: EditorViewType, _completionItem: unknown, from: number, to: number) {
       record();
-      view.dispatch({ changes: { from, to, insert: item.apply ?? item.label } });
+      const insert = item.apply ?? item.label;
+      view.dispatch({
+        changes: { from, to, insert },
+        selection: { anchor: from + insert.length },
+      });
     },
   };
 }
@@ -894,6 +916,7 @@ async function provideElasticsearchCompletions(currentState: import("@codemirror
 }
 
 async function provideSqlCompletions(currentState: import("@codemirror/state").EditorState, position: number, explicit: boolean) {
+  if (imeCompositionActive || view.value?.compositionStarted || view.value?.composing) return null;
   if (!props.connectionId) return null;
   const fullDoc = currentState.doc.toString();
   if (props.databaseType === "elasticsearch") {
@@ -980,6 +1003,23 @@ async function provideSqlCompletions(currentState: import("@codemirror/state").E
   }
 }
 
+function isEditorComposing(currentView: EditorViewType): boolean {
+  return imeCompositionActive || currentView.compositionStarted || currentView.composing;
+}
+
+function flushImeComposition() {
+  const currentView = view.value;
+  if (!currentView || !pendingImeModelEmit) return;
+  pendingImeModelEmit = false;
+  emit("update:modelValue", currentView.state.doc.toString());
+  scheduleSemanticDiagnostics();
+  syncContextMenuState(currentView);
+  emit("selectionChange", selectedSqlFromView(currentView));
+  emit("cursorChange", currentView.state.selection.main.head);
+  latestSelection = readEditorSelection(currentView);
+  if (editorIsActive) emitEditorSelection(latestSelection);
+}
+
 function buildLocalSqlCompletionResult(completionContext: ReturnType<typeof getSqlCompletionContext>, fullDoc: string, position: number) {
   if (!props.connectionId || props.database == null) return null;
   const databaseNames = supportsDatabaseQualifierCompletion() && completionContext.suggestTables && !completionContext.insertTable ? connectionStore.lookupLocalCompletionDatabases(props.connectionId, completionContext.qualifier || completionContext.prefix, MAX_COMPLETION_TABLES) : [];
@@ -1028,6 +1068,10 @@ function buildLocalSqlCompletionResult(completionContext: ReturnType<typeof getS
     if (localColumns.length > 0) {
       columnsByTable.set(cacheKey, localColumns);
     }
+    const localForeignKeys = target ? connectionStore.lookupLocalCompletionForeignKeys(props.connectionId, target.database, refTable.name, target.schema) : [];
+    if (localForeignKeys.length > 0) {
+      cachedForeignKeysByTable.set(cacheKey, localForeignKeys);
+    }
   }
 
   if (tables.length === 0 && completionObjects.length === 0 && schemaNames.length === 0 && columnsByTable.size === 0 && (completionContext.exclusiveTableSuggestions || completionContext.exclusiveColumnSuggestions || completionContext.exclusiveRoutineSuggestions)) {
@@ -1059,6 +1103,9 @@ function scheduleCompletionMetadataRefresh(completionContext: ReturnType<typeof 
       .refreshCompletionTables(connectionId, database, completionContext.qualifier && !schema ? completionContext.qualifier : completionContext.prefix, MAX_COMPLETION_TABLES, schema)
       .then((tables) => {
         cachedTables = mergeCompletionTables(cachedTables, tables);
+        if (completionContext.suggestTables && completionContext.referencedTables.length > 0) {
+          void ensureForeignKeysForTables([...completionContext.referencedTables, ...tables.slice(0, MAX_JOIN_FK_PREFETCH_TABLES)]);
+        }
       })
       .catch(() => {});
   }
@@ -1098,6 +1145,9 @@ function scheduleCompletionMetadataRefresh(completionContext: ReturnType<typeof 
         if (columns.length > 0) cachedColumnsByTable.set(cacheKey, columns);
       })
       .catch(() => {});
+  }
+  if ((completionContext.suggestTables || completionContext.suggestJoinConditions) && completionContext.referencedTables.length > 0) {
+    void ensureForeignKeysForTables(completionContext.referencedTables);
   }
 }
 
@@ -1241,13 +1291,9 @@ async function performAsyncCompletionWithResult(epoch: number, completionContext
   );
   if (epoch !== completionEpoch) return null;
 
-  if (completionContext.suggestJoinConditions) {
-    await Promise.all(
-      refs.map(async (refTable) => {
-        if (refTable.columns && refTable.columns.length > 0) return;
-        await ensureForeignKeysForTable(refTable);
-      }),
-    );
+  if ((completionContext.suggestTables || completionContext.suggestJoinConditions) && refs.length > 0) {
+    const fkPrefetchTables = completionContext.suggestTables ? [...refs, ...tables.slice(0, MAX_JOIN_FK_PREFETCH_TABLES)] : refs;
+    await ensureForeignKeysForTables(fkPrefetchTables.filter((table) => !("columns" in table) || !table.columns || table.columns.length === 0));
     if (epoch !== completionEpoch) return null;
   }
 
@@ -1277,7 +1323,12 @@ async function performAsyncCompletionWithResult(epoch: number, completionContext
       if (cached) {
         columnsByTable.set(cacheKey, cached);
       }
-      const cachedForeignKeys = cachedForeignKeysByTable.get(cacheKey);
+      let cachedForeignKeys = cachedForeignKeysByTable.get(cacheKey);
+      if (!cachedForeignKeys) {
+        const target = completionMetadataTarget(refTable);
+        cachedForeignKeys = target ? connectionStore.lookupLocalCompletionForeignKeys(props.connectionId!, target.database, refTable.name, target.schema) : [];
+        if (cachedForeignKeys.length > 0) cachedForeignKeysByTable.set(cacheKey, cachedForeignKeys);
+      }
       if (cachedForeignKeys) {
         foreignKeysByTable.set(cacheKey, cachedForeignKeys);
       }
@@ -1342,7 +1393,7 @@ onMounted(async () => {
     { EditorState, Compartment, Prec, StateEffect, StateField },
     { sql, MSSQL, MySQL, PostgreSQL, SQLDialect },
     { autocompletion, startCompletion, acceptCompletion, closeBrackets, closeBracketsKeymap, snippetCompletion, completionStatus, completionKeymap },
-    { indentMore, insertNewlineKeepIndent, history, defaultKeymap, historyKeymap },
+    { copyLineDown, copyLineUp, deleteLine, indentLess, indentMore, insertNewlineKeepIndent, moveLineDown, moveLineUp, redo, selectAll, undo, history, defaultKeymap, historyKeymap },
     { bracketMatching, foldGutter, indentOnInput, syntaxHighlighting, defaultHighlightStyle, foldKeymap },
     { searchKeymap },
   ] = await Promise.all([import("@codemirror/view"), import("@codemirror/state"), import("@codemirror/lang-sql"), import("@codemirror/autocomplete"), import("@codemirror/commands"), import("@codemirror/language"), import("@codemirror/search")]);
@@ -1361,6 +1412,15 @@ onMounted(async () => {
   codeMirrorAcceptCompletion = acceptCompletion;
   codeMirrorStartCompletion = startCompletion;
   codeMirrorIndentMore = indentMore;
+  codeMirrorIndentLess = indentLess;
+  codeMirrorCopyLineDown = copyLineDown;
+  codeMirrorCopyLineUp = copyLineUp;
+  codeMirrorDeleteLine = deleteLine;
+  codeMirrorMoveLineUp = moveLineUp;
+  codeMirrorMoveLineDown = moveLineDown;
+  codeMirrorUndo = undo;
+  codeMirrorRedo = redo;
+  codeMirrorSelectAll = selectAll;
   codeMirrorInsertNewlineKeepIndent = insertNewlineKeepIndent;
 
   const diagnosticTheme = EditorView.baseTheme({
@@ -1528,14 +1588,19 @@ onMounted(async () => {
       rectangularSelection({ eventFilter: (e: MouseEvent) => e.altKey || e.button === 1 }),
       EditorView.updateListener.of((update) => {
         if (update.docChanged) {
-          emit("update:modelValue", update.state.doc.toString());
-          scheduleSemanticDiagnostics();
-          let insertedText = "";
-          update.changes.iterChanges((_fromA, _toA, _fromB, _toB, inserted) => {
-            insertedText += inserted.toString();
-          });
-          if (insertedText.endsWith(".")) {
-            startCompletion(update.view);
+          if (isEditorComposing(update.view)) {
+            pendingImeModelEmit = true;
+            completionEpoch++;
+          } else {
+            emit("update:modelValue", update.state.doc.toString());
+            scheduleSemanticDiagnostics();
+            let insertedText = "";
+            update.changes.iterChanges((_fromA, _toA, _fromB, _toB, inserted) => {
+              insertedText += inserted.toString();
+            });
+            if (insertedText.endsWith(".")) {
+              startCompletion(update.view);
+            }
           }
         }
         if (update.selectionSet || update.docChanged) {
@@ -1565,6 +1630,16 @@ onMounted(async () => {
         blur(_event, currentView) {
           latestSelection = readEditorSelection(currentView);
           if (editorIsActive) emitEditorSelection(latestSelection);
+          return false;
+        },
+        compositionstart() {
+          imeCompositionActive = true;
+          completionEpoch++;
+          return false;
+        },
+        compositionend() {
+          imeCompositionActive = false;
+          window.setTimeout(flushImeComposition, 0);
           return false;
         },
         wheel(event) {
@@ -1717,6 +1792,7 @@ watch(
   () => props.modelValue,
   (val) => {
     if (view.value && val !== view.value.state.doc.toString()) {
+      if (isEditorComposing(view.value)) return;
       view.value.dispatch({
         changes: { from: 0, to: view.value.state.doc.length, insert: val },
       });

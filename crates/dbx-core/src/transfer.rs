@@ -9,7 +9,9 @@ use crate::db::mongo_driver::MongoDocumentResult;
 use crate::models::connection::DatabaseType;
 use crate::object_source_sql::{build_executable_object_source_statements, EditableObjectSourceSqlInput};
 use crate::query::{agent_execute_query_params, QueryExecutionOptions};
+#[cfg(feature = "duckdb-bundled")]
 use crate::sql::starts_with_executable_sql_keyword;
+use crate::sql_dialect::{qualified_transfer_table, quote_transfer_identifier};
 
 static CANCELLED: std::sync::LazyLock<RwLock<HashSet<String>>> =
     std::sync::LazyLock::new(|| RwLock::new(HashSet::new()));
@@ -68,24 +70,11 @@ pub enum TransferStatus {
 }
 
 pub fn quote_identifier(name: &str, db_type: &DatabaseType) -> String {
-    match db_type {
-        DatabaseType::Mysql
-        | DatabaseType::ClickHouse
-        | DatabaseType::Doris
-        | DatabaseType::StarRocks
-        | DatabaseType::Hive => format!("`{}`", name.replace('`', "``")),
-        DatabaseType::SqlServer => format!("[{}]", name.replace(']', "]]")),
-        _ => format!("\"{}\"", name.replace('"', "\"\"")),
-    }
+    quote_transfer_identifier(name, db_type)
 }
 
 pub fn qualified_table(table: &str, schema: &str, db_type: &DatabaseType) -> String {
-    let qt = quote_identifier(table, db_type);
-    if schema.is_empty() || matches!(db_type, DatabaseType::Mysql | DatabaseType::MongoDb) {
-        qt
-    } else {
-        format!("{}.{}", quote_identifier(schema, db_type), qt)
-    }
+    qualified_transfer_table(table, schema, db_type)
 }
 
 fn quote_string_literal(value: &str) -> String {
@@ -171,6 +160,134 @@ fn postgres_default_clause(
         "DEFAULT {}",
         rewrite_postgres_schema_qualified_references(default_value, source_schema, target_schema)
     ))
+}
+
+fn is_mysql_family_target(target_db: &DatabaseType) -> bool {
+    matches!(
+        target_db,
+        DatabaseType::Mysql
+            | DatabaseType::Doris
+            | DatabaseType::StarRocks
+            | DatabaseType::Goldendb
+            | DatabaseType::Sundb
+    )
+}
+
+fn is_mysql_numeric_base_type(data_type: &str) -> bool {
+    let normalized = data_type.trim().to_ascii_lowercase();
+    let base = normalized.split(['(', ' ']).next().unwrap_or("");
+    matches!(
+        base,
+        "tinyint"
+            | "smallint"
+            | "mediumint"
+            | "int"
+            | "integer"
+            | "bigint"
+            | "decimal"
+            | "numeric"
+            | "float"
+            | "double"
+            | "real"
+            | "bit"
+            | "year"
+    )
+}
+
+fn is_mysql_function_default(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("NULL") {
+        return true;
+    }
+    let upper = trimmed.to_ascii_uppercase();
+    if upper == "CURRENT_TIMESTAMP" || upper.starts_with("CURRENT_TIMESTAMP(") {
+        return true;
+    }
+    if upper == "LOCALTIME" || upper.starts_with("LOCALTIME(") {
+        return true;
+    }
+    if upper == "LOCALTIMESTAMP" || upper.starts_with("LOCALTIMESTAMP(") {
+        return true;
+    }
+    matches!(upper.as_str(), "CURRENT_DATE" | "CURRENT_TIME" | "NOW()" | "UTC_TIMESTAMP()" | "UUID()")
+}
+
+fn looks_like_numeric_literal(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    trimmed.parse::<i64>().is_ok() || trimmed.parse::<u64>().is_ok() || trimmed.parse::<f64>().is_ok()
+}
+
+fn format_mysql_default_literal(raw: &str, data_type: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("NULL") {
+        return "NULL".to_string();
+    }
+    if is_mysql_function_default(trimmed) {
+        return trimmed.to_string();
+    }
+    if trimmed.len() >= 2 && trimmed.starts_with('\'') && trimmed.ends_with('\'') {
+        return trimmed.to_string();
+    }
+    if is_mysql_numeric_base_type(data_type) && looks_like_numeric_literal(trimmed) {
+        return trimmed.to_string();
+    }
+    format!("'{}'", trimmed.replace('\'', "''"))
+}
+
+fn column_default_clause(
+    column: &db::ColumnInfo,
+    source_schema: &str,
+    target_schema: &str,
+    source_db: &DatabaseType,
+    target_db: &DatabaseType,
+) -> Option<String> {
+    if is_postgres_compat_transfer(source_db, target_db) {
+        return postgres_default_clause(column, source_schema, target_schema, source_db, target_db);
+    }
+    if is_mysql_family_target(target_db) {
+        let default_value = column.column_default.as_deref()?.trim();
+        if default_value.is_empty() {
+            return None;
+        }
+        return Some(format!("DEFAULT {}", format_mysql_default_literal(default_value, &column.data_type)));
+    }
+    None
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct MysqlExtraClauses {
+    auto_increment: bool,
+    on_update: Option<String>,
+}
+
+fn parse_mysql_extra_clauses(extra: Option<&str>) -> MysqlExtraClauses {
+    let mut result = MysqlExtraClauses::default();
+    let Some(raw) = extra else {
+        return result;
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return result;
+    }
+
+    let lowered = trimmed.to_ascii_lowercase();
+    if lowered.contains("auto_increment") {
+        result.auto_increment = true;
+    }
+
+    let pattern = Regex::new(r"(?i)\bon\s+update\s+(.+)$").expect("valid mysql on-update regex");
+    if let Some(captures) = pattern.captures(trimmed) {
+        let raw_expr = captures.get(1).map(|m| m.as_str()).unwrap_or("");
+        let cleaned = raw_expr.trim().trim_end_matches([',', ';', ' ']).trim();
+        if !cleaned.is_empty() {
+            result.on_update = Some(cleaned.to_string());
+        }
+    }
+
+    result
 }
 
 fn postgres_order_by_expression(columns: &[String], db_type: &DatabaseType) -> Option<String> {
@@ -468,9 +585,17 @@ pub fn escape_value_typed(val: &serde_json::Value, db_type: &DatabaseType, colum
             | DatabaseType::Doris
             | DatabaseType::StarRocks => {
                 if *b {
-                    "1".to_string()
+                    if column_type.is_some_and(is_mysql_bit_type) {
+                        "b'1'".to_string()
+                    } else {
+                        "1".to_string()
+                    }
                 } else {
-                    "0".to_string()
+                    if column_type.is_some_and(is_mysql_bit_type) {
+                        "b'0'".to_string()
+                    } else {
+                        "0".to_string()
+                    }
                 }
             }
             _ => {
@@ -481,9 +606,26 @@ pub fn escape_value_typed(val: &serde_json::Value, db_type: &DatabaseType, colum
                 }
             }
         },
-        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Number(n) => match db_type {
+            DatabaseType::Mysql | DatabaseType::Doris | DatabaseType::StarRocks => {
+                if column_type.is_some_and(is_mysql_bit_type) {
+                    format!("b'{}'", n.to_string())
+                } else {
+                    n.to_string()
+                }
+            }
+            _ => n.to_string(),
+        },
         serde_json::Value::String(s) => {
-            format!("'{}'", format_literal_string(s, db_type, column_type).replace('\\', "\\\\").replace('\'', "''"))
+            let escaped = format_literal_string(s, db_type, column_type).replace('\\', "\\\\").replace('\'', "''");
+            match db_type {
+                DatabaseType::Mysql | DatabaseType::Doris | DatabaseType::StarRocks
+                    if column_type.is_some_and(is_mysql_bit_type) =>
+                {
+                    format!("b'{escaped}'")
+                }
+                _ => format!("'{escaped}'"),
+            }
         }
         serde_json::Value::Array(arr) => match db_type {
             DatabaseType::ClickHouse | DatabaseType::Databend => format_ch_array_sql_literal(arr),
@@ -494,6 +636,12 @@ pub fn escape_value_typed(val: &serde_json::Value, db_type: &DatabaseType, colum
             format!("'{}'", s.replace('\\', "\\\\").replace('\'', "''"))
         }
     }
+}
+
+fn is_mysql_bit_type(column_type: &str) -> bool {
+    let trimmed = column_type.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    lower == "bit" || lower.starts_with("bit(") || lower.starts_with("bit ")
 }
 
 pub fn format_pg_array_sql_literal(arr: &[serde_json::Value]) -> String {
@@ -887,7 +1035,7 @@ pub fn generate_create_table_ddl(
         col_lines.push({
             let mapped_type = postgres_column_type_sql(c, source_schema, schema, source_db, target_db);
             let mut line = format!("  {} {}", quote_identifier(&c.name, target_db), mapped_type);
-            if let Some(default_clause) = postgres_default_clause(c, source_schema, schema, source_db, target_db) {
+            if let Some(default_clause) = column_default_clause(c, source_schema, schema, source_db, target_db) {
                 line.push(' ');
                 line.push_str(&default_clause);
             }
@@ -895,6 +1043,13 @@ pub fn generate_create_table_ddl(
                 line.push_str(" NOT NULL");
             }
             if is_mysql_family {
+                let extra_clauses = parse_mysql_extra_clauses(c.extra.as_deref());
+                if extra_clauses.auto_increment {
+                    line.push_str(" AUTO_INCREMENT");
+                }
+                if let Some(on_update_expr) = extra_clauses.on_update {
+                    line.push_str(&format!(" ON UPDATE {on_update_expr}"));
+                }
                 if let Some(ref comment) = c.comment {
                     let trimmed = comment.trim();
                     if !trimmed.is_empty() {
@@ -1672,6 +1827,7 @@ pub async fn execute_on_pool_with_max_rows(
             );
             client.execute_query(params).await
         }
+        #[cfg(feature = "duckdb-bundled")]
         PoolKind::DuckDb(con) => {
             let con = con.clone();
             let sql = sql.to_string();
@@ -1741,6 +1897,7 @@ pub async fn execute_on_pool_with_max_rows(
             .await
             .map_err(|e| e.to_string())?
         }
+        #[cfg(feature = "duckdb-bundled")]
         PoolKind::ExternalTabular(ext_pool) => {
             let con = ext_pool.cache.clone();
             let sql = sql.to_string();
@@ -1781,6 +1938,7 @@ pub async fn get_columns_for_transfer(
 ) -> Result<Vec<db::ColumnInfo>, String> {
     let connections = state.connections.read().await;
 
+    #[cfg(feature = "duckdb-bundled")]
     if let Some(PoolKind::DuckDb(con)) = connections.get(pool_key) {
         let con = con.clone();
         drop(connections);
@@ -1794,6 +1952,7 @@ pub async fn get_columns_for_transfer(
         .map_err(|e| e.to_string())?;
     }
 
+    #[cfg(feature = "duckdb-bundled")]
     if let Some(PoolKind::ExternalTabular(ext_pool)) = connections.get(pool_key) {
         let con = ext_pool.cache.clone();
         drop(connections);
@@ -1821,6 +1980,13 @@ pub async fn get_columns_for_transfer(
         drop(connections);
         let mut client = client.lock().await;
         return db::sqlserver::get_columns(&mut client, &schema, &table).await;
+    }
+    if let Some(PoolKind::InfluxDb(client)) = connections.get(pool_key) {
+        let client = client.clone();
+        let database = database.to_string();
+        let table = table.to_string();
+        drop(connections);
+        return db::influxdb_driver::get_columns(&client, &database, &table).await;
     }
     if let Some(PoolKind::Agent(client)) = connections.get(pool_key) {
         let client = client.clone();
@@ -2560,6 +2726,7 @@ where
         &request.source_schema,
         Some(table),
         Some(1),
+        None,
     )
     .await
     .unwrap_or_default()
@@ -2574,6 +2741,7 @@ where
         &request.target_schema,
         Some(table),
         Some(1),
+        None,
     )
     .await
     .map(|tables| !tables.is_empty())
@@ -3115,11 +3283,17 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "duckdb-bundled")]
     use crate::connection::{AppState, PoolKind};
+    #[cfg(feature = "duckdb-bundled")]
+    use crate::models::connection::default_redis_key_separator;
+    #[cfg(feature = "duckdb-bundled")]
     use crate::storage::Storage;
     use serde_json::json;
+    #[cfg(feature = "duckdb-bundled")]
     use std::sync::Arc;
 
+    #[cfg(feature = "duckdb-bundled")]
     fn duckdb_test_config(id: &str) -> crate::models::connection::ConnectionConfig {
         crate::models::connection::ConnectionConfig {
             id: id.to_string(),
@@ -3154,6 +3328,7 @@ mod tests {
             redis_sentinel_password: String::new(),
             redis_sentinel_tls: false,
             redis_cluster_nodes: String::new(),
+            redis_key_separator: default_redis_key_separator(),
             etcd_endpoints: String::new(),
             external_config: None,
             jdbc_driver_class: None,
@@ -3507,6 +3682,8 @@ mod tests {
                 ref_schema: None,
                 ref_table: "users".to_string(),
                 ref_column: "id".to_string(),
+                on_update: None,
+                on_delete: None,
             },
             db::ForeignKeyInfo {
                 name: "orders_user_id_fkey".to_string(),
@@ -3514,6 +3691,8 @@ mod tests {
                 ref_schema: None,
                 ref_table: "users".to_string(),
                 ref_column: "tenant_id".to_string(),
+                on_update: None,
+                on_delete: None,
             },
         ];
 
@@ -3723,6 +3902,7 @@ mod tests {
         assert!(statements[0].contains("ON DUPLICATE KEY UPDATE"));
     }
 
+    #[cfg(feature = "duckdb-bundled")]
     #[tokio::test]
     async fn duckdb_transfer_columns_use_requested_schema() {
         let dir = std::env::temp_dir().join(format!("dbx-transfer-test-{}", uuid::Uuid::new_v4()));
@@ -3788,5 +3968,128 @@ mod tests {
     #[test]
     fn parse_mysql_row_error_returns_none_for_non_mysql_error() {
         assert_eq!(parse_mysql_row_error("some other error"), None);
+    }
+
+    #[test]
+    fn mysql_create_table_preserves_auto_increment_primary_key() {
+        let cols = vec![
+            db::ColumnInfo {
+                is_primary_key: true,
+                is_nullable: false,
+                extra: Some("auto_increment".to_string()),
+                ..test_column("id", "int")
+            },
+            db::ColumnInfo { is_nullable: false, ..test_column("name", "varchar(64)") },
+        ];
+
+        let ddl = generate_create_table_ddl(&cols, "users", "", "", &DatabaseType::Mysql, &DatabaseType::Mysql, None);
+
+        assert!(ddl.contains("`id` INT NOT NULL AUTO_INCREMENT"), "ddl: {ddl}");
+        assert!(ddl.contains("PRIMARY KEY (`id`)"), "ddl: {ddl}");
+    }
+
+    #[test]
+    fn mysql_create_table_preserves_numeric_default_zero() {
+        let cols = vec![db::ColumnInfo {
+            is_nullable: false,
+            column_default: Some("0".to_string()),
+            ..test_column("status", "tinyint")
+        }];
+
+        let ddl = generate_create_table_ddl(&cols, "items", "", "", &DatabaseType::Mysql, &DatabaseType::Mysql, None);
+
+        assert!(ddl.contains("DEFAULT 0"), "ddl: {ddl}");
+        assert!(!ddl.contains("'0'"), "ddl should not quote numeric default: {ddl}");
+    }
+
+    #[test]
+    fn mysql_create_table_quotes_string_default_with_escape() {
+        let cols =
+            vec![db::ColumnInfo { column_default: Some("o'clock".to_string()), ..test_column("label", "varchar(32)") }];
+
+        let ddl = generate_create_table_ddl(&cols, "items", "", "", &DatabaseType::Mysql, &DatabaseType::Mysql, None);
+
+        assert!(ddl.contains("DEFAULT 'o''clock'"), "ddl: {ddl}");
+    }
+
+    #[test]
+    fn mysql_create_table_keeps_current_timestamp_default_and_on_update() {
+        let cols = vec![db::ColumnInfo {
+            is_nullable: false,
+            column_default: Some("CURRENT_TIMESTAMP".to_string()),
+            extra: Some("DEFAULT_GENERATED on update CURRENT_TIMESTAMP".to_string()),
+            ..test_column("updated_at", "timestamp")
+        }];
+
+        let ddl = generate_create_table_ddl(&cols, "items", "", "", &DatabaseType::Mysql, &DatabaseType::Mysql, None);
+
+        assert!(ddl.contains("DEFAULT CURRENT_TIMESTAMP"), "ddl: {ddl}");
+        assert!(ddl.contains("ON UPDATE CURRENT_TIMESTAMP"), "ddl: {ddl}");
+        assert!(ddl.contains("NOT NULL"), "ddl: {ddl}");
+        assert!(!ddl.contains("DEFAULT_GENERATED"), "ddl should not leak DEFAULT_GENERATED: {ddl}");
+    }
+
+    #[test]
+    fn mysql_create_table_keeps_current_timestamp_with_fsp() {
+        let cols = vec![db::ColumnInfo {
+            is_nullable: false,
+            column_default: Some("CURRENT_TIMESTAMP(6)".to_string()),
+            ..test_column("created_at", "timestamp(6)")
+        }];
+
+        let ddl = generate_create_table_ddl(&cols, "items", "", "", &DatabaseType::Mysql, &DatabaseType::Mysql, None);
+
+        assert!(ddl.contains("DEFAULT CURRENT_TIMESTAMP(6)"), "ddl: {ddl}");
+    }
+
+    #[test]
+    fn mysql_create_table_emits_on_update_without_default() {
+        let cols = vec![db::ColumnInfo {
+            is_nullable: false,
+            extra: Some("on update CURRENT_TIMESTAMP(3)".to_string()),
+            ..test_column("touched_at", "timestamp(3)")
+        }];
+
+        let ddl = generate_create_table_ddl(&cols, "items", "", "", &DatabaseType::Mysql, &DatabaseType::Mysql, None);
+
+        assert!(ddl.contains("ON UPDATE CURRENT_TIMESTAMP(3)"), "ddl: {ddl}");
+        assert!(!ddl.contains("DEFAULT"), "ddl should not emit DEFAULT when none was set: {ddl}");
+    }
+
+    #[test]
+    fn non_mysql_target_does_not_emit_auto_increment() {
+        let cols = vec![db::ColumnInfo {
+            is_primary_key: true,
+            is_nullable: false,
+            extra: Some("auto_increment".to_string()),
+            ..test_column("id", "int")
+        }];
+
+        let ddl = generate_create_table_ddl(&cols, "users", "", "", &DatabaseType::Sqlite, &DatabaseType::Mysql, None);
+
+        assert!(!ddl.contains("AUTO_INCREMENT"), "non-mysql target should not emit AUTO_INCREMENT: {ddl}");
+    }
+
+    #[test]
+    fn postgres_create_table_default_clause_unchanged() {
+        let cols = vec![db::ColumnInfo {
+            data_type: "integer".to_string(),
+            column_default: Some("nextval('public.t_id_seq'::regclass)".to_string()),
+            is_primary_key: true,
+            is_nullable: false,
+            ..test_column("id", "integer")
+        }];
+
+        let ddl = generate_create_table_ddl(
+            &cols,
+            "t",
+            "public",
+            "public",
+            &DatabaseType::Postgres,
+            &DatabaseType::Postgres,
+            None,
+        );
+
+        assert!(ddl.contains("GENERATED BY DEFAULT AS IDENTITY"), "ddl: {ddl}");
     }
 }

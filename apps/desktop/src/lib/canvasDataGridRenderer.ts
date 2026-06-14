@@ -30,6 +30,7 @@ export interface CanvasSingleSelectedCell {
 }
 
 export interface CanvasSearchMatch {
+  kind: "cell" | "column";
   displayRow: number;
   col: number;
 }
@@ -324,7 +325,7 @@ export function drawCanvasDataGrid(options: DrawCanvasDataGridOptions) {
         const isDirtyCell = item.isDirtyCol[actualColIdx];
         const selectedFillVisual = rowSelectionVisual || (selectedCell && (!isSingleSelectedCell || isDirtyCell) && (!rowIsActive || isDirtyCell));
         const selectedBorderVisual = rowSelectionVisual || selectedCell;
-        const isSearchMatch = paintSearchMatches && searchMatchKeys.has(`${item.displayIndex}:${actualColIdx}`);
+        const isSearchMatch = paintSearchMatches && searchMatchKeys.has(`cell:${item.displayIndex}:${actualColIdx}`);
         const isCurrentSearchMatch = paintSearchMatches && currentSearchMatch?.displayRow === item.displayIndex && currentSearchMatch.col === actualColIdx;
         const clippedX = Math.max(x, rowNumberWidth);
         const cellPaintWidth = colWidth - Math.max(0, clippedX - x);
@@ -394,7 +395,7 @@ export function drawCanvasDataGrid(options: DrawCanvasDataGridOptions) {
           const selectedLeftX = clippedX + 0.5;
           const selectedRightX = clippedX + cellPaintWidth - 1.5;
           const selectedTopY = Math.max(y + 0.5, 1);
-          const drawSelectedLeftBorder = selectedLeftX > rowNumberWidth + 0.5;
+          const drawSelectedLeftBorder = selectedLeftX >= rowNumberWidth + 0.5;
           ctx.strokeStyle = theme.cellSelectedBorder;
           ctx.beginPath();
           ctx.moveTo(selectedLeftX, selectedTopY);

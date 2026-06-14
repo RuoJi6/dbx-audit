@@ -61,8 +61,8 @@ test("agent mode prompt makes the first SQL block the executable recommendation"
   const prompt = buildSystemPrompt("generate", context(), "agent");
 
   assert.match(prompt, /Agent 模式/);
-  assert.match(prompt, /第一个 ```sql 代码块只能包含最终推荐执行的 SQL/);
-  assert.match(prompt, /不要把解释性 SQL、备选 SQL、危险 SQL 放在第一个代码块/);
+  assert.match(prompt, /第一个 ```sql 代码块只放最终推荐 SQL/);
+  assert.match(prompt, /execute_query/);
 });
 
 test("ask mode prompt forbids auto-execution assumptions", () => {

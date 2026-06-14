@@ -354,23 +354,22 @@ a {
 /* Reveal animation */
 
 .landing-reveal {
-  opacity: 0;
-  transform: translateY(26px);
+  opacity: 1;
+  transform: none;
   transition:
     opacity 0.72s ease,
     transform 0.72s cubic-bezier(0.16, 1, 0.3, 1);
   transition-delay: var(--reveal-delay, 0ms);
-  will-change: opacity, transform;
 }
 
 .landing-reveal.is-visible {
   opacity: 1;
-  transform: translateY(0);
+  transform: none;
 }
 
 .landing-reveal [data-stagger] {
-  opacity: 0;
-  transform: translateY(14px);
+  opacity: 1;
+  transform: none;
   transition:
     opacity 0.58s ease,
     transform 0.58s cubic-bezier(0.16, 1, 0.3, 1);
@@ -861,6 +860,87 @@ a {
     0 0 0 1px rgba(255, 255, 255, 0.025) inset;
 }
 
+/* Contributors wall */
+
+.landing-contributor-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: center;
+  margin-top: 3px;
+}
+
+.landing-contributor-avatar {
+  display: block;
+  position: relative;
+  width: 58px;
+  height: 58px;
+  border-radius: 50%;
+  border: 1.5px solid rgba(155, 176, 205, 0.16);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.02)), rgba(12, 15, 22, 0.78);
+  box-shadow:
+    0 8px 24px rgba(0, 0, 0, 0.18),
+    0 0 0 1px rgba(255, 255, 255, 0.03) inset;
+  transition:
+    border-color 0.2s ease,
+    transform 0.2s cubic-bezier(0.16, 1, 0.3, 1),
+    box-shadow 0.2s ease;
+}
+
+.landing-contributor-avatar:hover {
+  border-color: rgba(110, 168, 255, 0.42);
+  transform: translateY(-3px) scale(1.08);
+  box-shadow:
+    0 14px 36px rgba(110, 168, 255, 0.22),
+    0 0 0 1px rgba(255, 255, 255, 0.06) inset;
+  z-index: 2;
+  overflow: visible;
+}
+
+.landing-contributor-avatar img {
+  border-radius: 50%;
+}
+
+.landing-contributor-tooltip {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 50%;
+  transform: translateX(-50%) translateY(4px);
+  pointer-events: none;
+  white-space: nowrap;
+  padding: 6px 12px;
+  border-radius: 6px;
+  background: rgba(18, 22, 32, 0.96);
+  border: 1px solid rgba(155, 176, 205, 0.22);
+  box-shadow:
+    0 8px 24px rgba(0, 0, 0, 0.32),
+    0 0 0 1px rgba(255, 255, 255, 0.04) inset;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  opacity: 0;
+  transition:
+    opacity 0.18s ease,
+    transform 0.18s ease;
+}
+
+.landing-contributor-tooltip.is-visible {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+
+.landing-contributor-tooltip-name {
+  font-size: 13px;
+  font-weight: 650;
+  color: var(--color-landing-ink);
+}
+
+.landing-contributor-tooltip-count {
+  font-size: 11px;
+  color: var(--color-landing-muted);
+}
+
 /* Capability card */
 
 .landing-capability {
@@ -955,6 +1035,15 @@ a {
   .landing-testimonial-wall::before,
   .landing-testimonial-wall::after {
     width: 46px;
+  }
+
+  .landing-contributor-grid {
+    gap: 8px;
+  }
+
+  .landing-contributor-avatar {
+    width: 46px;
+    height: 46px;
   }
 }
 

@@ -29,8 +29,10 @@ pub async fn list_tables(
     schema: String,
     filter: Option<String>,
     limit: Option<usize>,
+    offset: Option<usize>,
 ) -> Result<Vec<db::TableInfo>, String> {
-    dbx_core::schema::list_tables_core(&state, &connection_id, &database, &schema, filter.as_deref(), limit).await
+    dbx_core::schema::list_tables_core(&state, &connection_id, &database, &schema, filter.as_deref(), limit, offset)
+        .await
 }
 
 #[tauri::command]
@@ -39,9 +41,8 @@ pub async fn list_objects(
     connection_id: String,
     database: String,
     schema: String,
-    object_types: Option<Vec<String>>,
 ) -> Result<Vec<db::ObjectInfo>, String> {
-    dbx_core::schema::list_objects_core(&state, &connection_id, &database, &schema, object_types).await
+    dbx_core::schema::list_objects_core(&state, &connection_id, &database, &schema).await
 }
 
 #[tauri::command]
@@ -119,4 +120,45 @@ pub async fn get_table_ddl(
     table: String,
 ) -> Result<String, String> {
     dbx_core::schema::get_table_ddl_core(&state, &connection_id, &database, &schema, &table).await
+}
+
+#[tauri::command]
+pub async fn list_functions(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    database: String,
+    schema: String,
+) -> Result<Vec<db::FunctionInfo>, String> {
+    dbx_core::schema::list_functions_core(&state, &connection_id, &database, &schema).await
+}
+
+#[tauri::command]
+pub async fn list_sequences(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    database: String,
+    schema: String,
+    with_last_values: bool,
+) -> Result<Vec<db::SequenceInfo>, String> {
+    dbx_core::schema::list_sequences_core(&state, &connection_id, &database, &schema, with_last_values).await
+}
+
+#[tauri::command]
+pub async fn list_rules(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    database: String,
+    schema: String,
+) -> Result<Vec<db::RuleInfo>, String> {
+    dbx_core::schema::list_rules_core(&state, &connection_id, &database, &schema).await
+}
+
+#[tauri::command]
+pub async fn list_owners(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    database: String,
+    schema: String,
+) -> Result<Vec<db::OwnerInfo>, String> {
+    dbx_core::schema::list_owners_core(&state, &connection_id, &database, &schema).await
 }

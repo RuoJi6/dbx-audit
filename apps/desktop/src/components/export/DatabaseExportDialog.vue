@@ -457,7 +457,7 @@ watch(
             </div>
 
             <div class="w-full bg-muted rounded-full h-2 overflow-hidden">
-              <div class="h-full rounded-full transition-all duration-300" :class="exportError ? 'bg-destructive' : exportCancelled ? 'bg-yellow-500' : 'bg-primary'" :style="{ width: `${progressPercent}%` }" />
+              <div class="h-full rounded-full transition-[width] duration-300" :class="exportError ? 'bg-destructive' : exportCancelled ? 'bg-yellow-500' : 'bg-primary'" :style="{ width: `${progressPercent}%` }" />
             </div>
 
             <div class="text-xs text-muted-foreground">

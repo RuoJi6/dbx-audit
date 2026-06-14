@@ -1,4 +1,5 @@
 import type { DatabaseType, QueryResult } from "@/types/database";
+import { supportsDatabaseFeature } from "./databaseDriverManifest";
 
 export type UserAdminDialect = "mysql" | "postgres";
 export type PrivilegeScope = "mysql" | "database" | "schema" | "table" | "role";
@@ -54,7 +55,7 @@ export const POSTGRES_SCHEMA_PRIVILEGES = ["USAGE", "CREATE"] as const;
 export const POSTGRES_TABLE_PRIVILEGES = ["SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER"] as const;
 
 export function supportsDatabaseUserAdmin(dbType: DatabaseType | undefined): boolean {
-  return !!getDatabaseUserAdminProvider(dbType);
+  return !!dbType && supportsDatabaseFeature(dbType, "userAdmin") && !!getDatabaseUserAdminProvider(dbType);
 }
 
 export function getDatabaseUserAdminProvider(dbType: DatabaseType | undefined): DatabaseUserAdminProvider | null {

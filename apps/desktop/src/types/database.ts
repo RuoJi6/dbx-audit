@@ -49,6 +49,7 @@ export type DatabaseType =
   | "iotdb"
   | "etcd"
   | "iris"
+  | "influxdb"
   | "jdbc";
 
 export interface SqlSnippet {
@@ -93,6 +94,7 @@ export interface ConnectionConfig {
   redis_sentinel_password?: string;
   redis_sentinel_tls?: boolean;
   redis_cluster_nodes?: string;
+  redis_key_separator?: string;
   etcd_endpoints?: string;
   one_time?: boolean;
   read_only?: boolean;
@@ -112,6 +114,7 @@ export interface SshTunnelConfig {
   key_passphrase?: string;
   connect_timeout_secs?: number;
   expose_lan?: boolean;
+  use_ssh_agent?: boolean;
 }
 
 export interface ProxyTunnelConfig {
@@ -156,6 +159,29 @@ export interface JdbcDriverInfo {
   name: string;
   path: string;
   size: number;
+  bundle_id?: string | null;
+}
+
+export interface JdbcMavenArtifactInfo {
+  group_id: string;
+  artifact_id: string;
+  version: string;
+  classifier: string;
+  extension: string;
+  file_name: string;
+  path: string;
+  size: number;
+  sha256: string;
+}
+
+export interface JdbcMavenBundleInfo {
+  id: string;
+  coordinate: string;
+  scope: string;
+  repositories: string[];
+  installed_at: string;
+  path: string;
+  artifacts: JdbcMavenArtifactInfo[];
 }
 
 export interface JdbcPluginStatus {
@@ -233,12 +259,46 @@ export interface ForeignKeyInfo {
   ref_schema?: string | null;
   ref_table: string;
   ref_column: string;
+  on_update?: string | null;
+  on_delete?: string | null;
 }
 
 export interface TriggerInfo {
   name: string;
   event: string;
   timing: string;
+  statement?: string | null;
+}
+
+export interface FunctionInfo {
+  name: string;
+  function_type: string;
+  data_type: string;
+  definition: string;
+  arguments: string;
+}
+
+export interface SequenceInfo {
+  name: string;
+  data_type: string;
+  start_value: string;
+  min_value: string;
+  max_value: string;
+  increment: string;
+  cycle: boolean;
+  last_value?: string | null;
+}
+
+export interface RuleInfo {
+  name: string;
+  table_name: string;
+  definition: string;
+}
+
+export interface OwnerInfo {
+  object_name: string;
+  object_type: string;
+  owner: string;
 }
 
 export interface QueryResult {
@@ -315,6 +375,7 @@ export type TreeNodeType =
   | "saved-sql-root"
   | "saved-sql-folder"
   | "saved-sql-file"
+  | "load-more"
   | "column"
   | "index"
   | "fkey"
@@ -322,7 +383,8 @@ export type TreeNodeType =
   | "redis-db"
   | "etcd-root"
   | "mongo-db"
-  | "mongo-collection";
+  | "mongo-collection"
+  | "elasticsearch-index";
 
 export interface ConnectionGroup {
   id: string;
@@ -330,7 +392,7 @@ export interface ConnectionGroup {
   collapsed: boolean;
 }
 
-export type SidebarOrderEntry = { type: "group"; id: string; connectionIds: string[] } | { type: "connection"; id: string };
+export type SidebarOrderEntry = { type: "group"; id: string; children?: SidebarOrderEntry[]; connectionIds?: string[] } | { type: "connection"; id: string };
 
 export interface SidebarLayout {
   groups: ConnectionGroup[];
@@ -357,6 +419,11 @@ export interface TreeNode {
   savedSqlId?: string;
   savedSqlFolderId?: string;
   meta?: ColumnInfo | IndexInfo | ForeignKeyInfo | TriggerInfo;
+  loadMore?: {
+    parentId: string;
+    offset: number;
+    pageSize: number;
+  };
 }
 
 export interface QueryTab {
@@ -368,6 +435,7 @@ export interface QueryTab {
   schema?: string;
   sql: string;
   savedSqlId?: string;
+  originalSql?: string;
   lastExecutedSql?: string;
   resultBaseSql?: string;
   resultSortedSql?: string;
@@ -421,6 +489,7 @@ export interface QueryTab {
   tableMeta?: {
     schema?: string;
     tableName: string;
+    tableType?: string;
     columns: ColumnInfo[];
     primaryKeys: string[];
   };
@@ -448,6 +517,7 @@ export interface QueryTab {
 export interface SavedSqlFolder {
   id: string;
   connectionId: string;
+  parentFolderId?: string;
   name: string;
   orderIndex?: number;
   createdAt: string;
@@ -463,6 +533,8 @@ export interface SavedSqlFile {
   schema?: string;
   sql: string;
   orderIndex?: number;
+  openCount?: number;
+  openedAt?: string;
   createdAt: string;
   updatedAt: string;
 }

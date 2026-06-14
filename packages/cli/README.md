@@ -4,8 +4,17 @@ Command line interface for DBX database connections, schema inspection, safe que
 
 ## Install
 
+### npm
+
 ```bash
 npm install -g @dbx-app/cli
+```
+
+### Homebrew
+
+```bash
+brew tap t8y2/dbx
+brew install dbx-cli
 ```
 
 Requires Node.js 22.13.0 or newer.

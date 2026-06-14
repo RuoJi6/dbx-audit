@@ -49,6 +49,19 @@ function maxOrderIndex(values: Array<{ orderIndex?: number }>) {
   return values.reduce((max, item) => Math.max(max, item.orderIndex ?? -1), -1);
 }
 
+function folderDepth(items: SavedSqlFolder[], folderId: string) {
+  const byId = new Map(items.map((folder) => [folder.id, folder]));
+  const seen = new Set<string>();
+  let depth = 0;
+  let current = byId.get(folderId);
+  while (current?.parentFolderId && !seen.has(current.parentFolderId)) {
+    seen.add(current.parentFolderId);
+    depth++;
+    current = byId.get(current.parentFolderId);
+  }
+  return depth;
+}
+
 function loadLegacyState(): SavedSqlState {
   try {
     const raw = localStorage.getItem(LEGACY_STORAGE_KEY);
@@ -68,6 +81,7 @@ export const useSavedSqlStore = defineStore("savedSql", () => {
   const files = ref<SavedSqlFile[]>([]);
   const isLoaded = ref(false);
   let pendingSync: Promise<void> | null = null;
+  const pendingFolderCreates = new Map<string, Promise<SavedSqlFolder>>();
 
   const version = ref(0);
   function bumpVersion() {
@@ -101,32 +115,56 @@ export const useSavedSqlStore = defineStore("savedSql", () => {
   }
 
   function listFolders(connectionId: string) {
-    return sortFoldersByOrder(folders.value.filter((folder) => folder.connectionId === connectionId));
+    return listChildFolders(connectionId);
+  }
+
+  function listChildFolders(connectionId: string, parentFolderId?: string) {
+    return sortFoldersByOrder(folders.value.filter((folder) => folder.connectionId === connectionId && (folder.parentFolderId || "") === (parentFolderId || "")));
   }
 
   function listFiles(connectionId: string, folderId?: string) {
     return sortFilesByOrder(files.value.filter((file) => file.connectionId === connectionId && (file.folderId || "") === (folderId || "")));
   }
 
+  function folderCreateKey(connectionId: string, name: string, parentFolderId?: string) {
+    return JSON.stringify([connectionId, parentFolderId || "", name]);
+  }
+
   function getFile(id: string) {
     return files.value.find((file) => file.id === id);
   }
 
-  async function createFolder(connectionId: string, name: string) {
-    const timestamp = nowIso();
-    const folder: SavedSqlFolder = {
-      id: uuid(),
-      connectionId,
-      name,
-      orderIndex: maxOrderIndex(folders.value) + 1,
-      createdAt: timestamp,
-      updatedAt: timestamp,
-    };
-    const saved = await api.saveSavedSqlFolder(folder);
-    folders.value = [...folders.value.filter((item) => item.id !== saved.id), saved];
-    bumpVersion();
-    await syncToLocalDirectory();
-    return saved;
+  async function createFolder(connectionId: string, name: string, parentFolderId?: string) {
+    const key = folderCreateKey(connectionId, name, parentFolderId);
+    const pending = pendingFolderCreates.get(key);
+    if (pending) return pending;
+
+    const createPromise = (async () => {
+      const timestamp = nowIso();
+      const folder: SavedSqlFolder = {
+        id: uuid(),
+        connectionId,
+        parentFolderId: parentFolderId || undefined,
+        name,
+        orderIndex: maxOrderIndex(folders.value.filter((item) => item.connectionId === connectionId && (item.parentFolderId || "") === (parentFolderId || ""))) + 1,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      };
+      const saved = await api.saveSavedSqlFolder(folder);
+      folders.value = [...folders.value.filter((item) => item.id !== saved.id), saved];
+      bumpVersion();
+      await syncToLocalDirectory();
+      return saved;
+    })();
+
+    pendingFolderCreates.set(key, createPromise);
+    try {
+      return await createPromise;
+    } finally {
+      if (pendingFolderCreates.get(key) === createPromise) {
+        pendingFolderCreates.delete(key);
+      }
+    }
   }
 
   async function renameFolder(id: string, name: string) {
@@ -139,9 +177,10 @@ export const useSavedSqlStore = defineStore("savedSql", () => {
   }
 
   async function deleteFolder(id: string) {
+    const removedIds = descendantFolderIds(id);
     await api.deleteSavedSqlFolder(id);
-    folders.value = folders.value.filter((folder) => folder.id !== id);
-    files.value = files.value.filter((file) => file.folderId !== id);
+    folders.value = folders.value.filter((folder) => !removedIds.has(folder.id));
+    files.value = files.value.filter((file) => !file.folderId || !removedIds.has(file.folderId));
     bumpVersion();
     await syncToLocalDirectory();
   }
@@ -187,6 +226,24 @@ export const useSavedSqlStore = defineStore("savedSql", () => {
     await syncToLocalDirectory();
   }
 
+  async function recordFileUsage(id: string) {
+    const existing = getFile(id);
+    if (!existing) return;
+    try {
+      const saved = await api.saveSavedSqlFile({
+        ...existing,
+        openCount: (existing.openCount ?? 0) + 1,
+        openedAt: nowIso(),
+      });
+      files.value = files.value.map((file) => (file.id === id ? saved : file));
+      bumpVersion();
+      return saved;
+    } catch (error) {
+      console.warn("[DBX][saved-sql:usage:error]", error);
+      return existing;
+    }
+  }
+
   async function deleteFile(id: string) {
     await api.deleteSavedSqlFile(id);
     files.value = files.value.filter((file) => file.id !== id);
@@ -195,7 +252,7 @@ export const useSavedSqlStore = defineStore("savedSql", () => {
   }
 
   async function persistFolders(nextFolders: SavedSqlFolder[]) {
-    const reindexed = reindexFolders(nextFolders).map((folder) => ({ ...folder, updatedAt: nowIso() }));
+    const reindexed = nextFolders.map((folder) => ({ ...folder, updatedAt: folder.updatedAt || nowIso() }));
     await Promise.all(reindexed.map((folder) => api.saveSavedSqlFolder(folder)));
     folders.value = reindexed;
     bumpVersion();
@@ -211,8 +268,20 @@ export const useSavedSqlStore = defineStore("savedSql", () => {
 
   function syncEntries() {
     const folderById = new Map(folders.value.map((folder) => [folder.id, folder]));
+    const folderPath = (folderId?: string): string | undefined => {
+      if (!folderId) return undefined;
+      const parts: string[] = [];
+      const seen = new Set<string>();
+      let current = folderById.get(folderId);
+      while (current && !seen.has(current.id)) {
+        seen.add(current.id);
+        parts.unshift(current.name);
+        current = current.parentFolderId ? folderById.get(current.parentFolderId) : undefined;
+      }
+      return parts.join("/");
+    };
     return sortFilesByOrder(files.value).map((file) => ({
-      folderName: file.folderId ? folderById.get(file.folderId)?.name : undefined,
+      folderName: folderPath(file.folderId),
       fileName: file.name,
       sql: file.sql,
     }));
@@ -238,16 +307,68 @@ export const useSavedSqlStore = defineStore("savedSql", () => {
   }
 
   async function reorderFolders(draggedId: string, targetId: string, position: "before" | "after") {
-    const ordered = sortFoldersByOrder(folders.value);
-    const dragged = ordered.find((folder) => folder.id === draggedId);
-    const target = ordered.find((folder) => folder.id === targetId);
+    const dragged = folders.value.find((folder) => folder.id === draggedId);
+    const target = folders.value.find((folder) => folder.id === targetId);
     if (!dragged || !target || dragged.id === target.id) return;
+    if (descendantFolderIds(draggedId).has(targetId)) return;
 
+    const timestamp = nowIso();
+    const targetParentFolderId = target.parentFolderId || undefined;
+    const previousParentFolderId = dragged.parentFolderId || undefined;
+    const ordered = sortFoldersByOrder(folders.value.filter((folder) => (folder.parentFolderId || "") === (targetParentFolderId || "")));
     const remaining = ordered.filter((folder) => folder.id !== draggedId);
     const targetIndex = remaining.findIndex((folder) => folder.id === targetId);
     const insertIndex = position === "before" ? targetIndex : targetIndex + 1;
-    remaining.splice(insertIndex, 0, dragged);
-    await persistFolders(remaining);
+    remaining.splice(insertIndex, 0, { ...dragged, parentFolderId: targetParentFolderId, updatedAt: timestamp });
+
+    const updatedTargetGroup = reindexFolders(remaining).map((folder) => ({
+      ...folder,
+      parentFolderId: targetParentFolderId,
+      updatedAt: timestamp,
+    }));
+    const updatedSourceGroup =
+      previousParentFolderId === targetParentFolderId
+        ? []
+        : reindexFolders(sortFoldersByOrder(folders.value.filter((folder) => folder.id !== draggedId && (folder.parentFolderId || "") === (previousParentFolderId || "")))).map((folder) => ({
+            ...folder,
+            updatedAt: timestamp,
+          }));
+    const untouched = folders.value.filter((folder) => folder.id !== draggedId && (folder.parentFolderId || "") !== (targetParentFolderId || "") && (folder.parentFolderId || "") !== (previousParentFolderId || ""));
+    await persistFolders([...untouched, ...updatedSourceGroup, ...updatedTargetGroup]);
+  }
+
+  function descendantFolderIds(folderId: string) {
+    const ids = new Set<string>([folderId]);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const folder of folders.value) {
+        if (folder.parentFolderId && ids.has(folder.parentFolderId) && !ids.has(folder.id)) {
+          ids.add(folder.id);
+          changed = true;
+        }
+      }
+    }
+    return ids;
+  }
+
+  async function moveFolderToFolder(folderId: string, parentFolderId?: string) {
+    const target = folders.value.find((folder) => folder.id === folderId);
+    if (!target) return;
+    const nextParentFolderId = parentFolderId || undefined;
+    if ((target.parentFolderId || undefined) === nextParentFolderId) return;
+    if (nextParentFolderId && descendantFolderIds(folderId).has(nextParentFolderId)) return;
+
+    const timestamp = nowIso();
+    const previousParentFolderId = target.parentFolderId || undefined;
+    const sourceGroup = reindexFolders(sortFoldersByOrder(folders.value.filter((folder) => folder.id !== folderId && (folder.parentFolderId || "") === (previousParentFolderId || "")))).map((folder) => ({ ...folder, updatedAt: timestamp }));
+    const destinationGroup = reindexFolders([...sortFoldersByOrder(folders.value.filter((folder) => folder.id !== folderId && (folder.parentFolderId || "") === (nextParentFolderId || ""))), { ...target, parentFolderId: nextParentFolderId, updatedAt: timestamp }]).map((folder) => ({
+      ...folder,
+      parentFolderId: nextParentFolderId,
+      updatedAt: timestamp,
+    }));
+    const untouched = folders.value.filter((folder) => folder.id !== folderId && (folder.parentFolderId || "") !== (previousParentFolderId || "") && (folder.parentFolderId || "") !== (nextParentFolderId || ""));
+    await persistFolders([...untouched, ...sourceGroup, ...destinationGroup]);
   }
 
   async function moveFileToFolder(fileId: string, folderId?: string) {
@@ -312,6 +433,16 @@ export const useSavedSqlStore = defineStore("savedSql", () => {
 
   const allFolders = computed(() => sortFoldersByOrder(folders.value));
 
+  const allFoldersTreeOrder = computed(() =>
+    [...folders.value].sort((a, b) => {
+      const depthDiff = folderDepth(folders.value, a.id) - folderDepth(folders.value, b.id);
+      if (depthDiff !== 0) return depthDiff;
+      const orderDiff = (a.orderIndex ?? 0) - (b.orderIndex ?? 0);
+      if (orderDiff !== 0) return orderDiff;
+      return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" });
+    }),
+  );
+
   const allFiles = computed(() => sortFilesByOrder(files.value));
 
   function filesInFolder(folderId: string) {
@@ -333,6 +464,7 @@ export const useSavedSqlStore = defineStore("savedSql", () => {
     version,
     initFromStorage,
     listFolders,
+    listChildFolders,
     listFiles,
     getFile,
     createFolder,
@@ -340,12 +472,15 @@ export const useSavedSqlStore = defineStore("savedSql", () => {
     deleteFolder,
     saveFile,
     renameFile,
+    recordFileUsage,
     deleteFile,
     reorderFolders,
+    moveFolderToFolder,
     reorderFiles,
     moveFileToFolder,
     syncToLocalDirectory,
     allFolders,
+    allFoldersTreeOrder,
     allFiles,
     filesInFolder,
     filesWithoutFolder,

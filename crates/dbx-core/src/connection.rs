@@ -8,8 +8,8 @@ use mysql_async::Row as MysqlRow;
 
 use crate::agent_connection::{
     agent_connect_params, h2_file_path_from_jdbc_url, is_h2_file_connection, mongo_legacy_error_with_auth_hint,
-    oracle_alternate_connect_config, oracle_auth_fallback_profiles, oracle_error_with_driver_hint,
-    should_retry_oracle_with_10g_driver,
+    oracle_alternate_connect_config_labels, oracle_alternate_connect_configs, oracle_auth_fallback_profiles,
+    oracle_error_with_driver_hint, should_retry_oracle_with_10g_driver,
 };
 use crate::agent_manager::{JavaRuntimeMode, DEFAULT_JRE_KEY};
 use crate::database_capabilities;
@@ -17,7 +17,6 @@ use crate::db;
 use crate::db::agent_driver::AgentMethod;
 use crate::db::proxy_tunnel::ProxyTunnelManager;
 use crate::db::ssh_tunnel::TunnelManager;
-use crate::external;
 use crate::models::connection::{
     parse_jdbc_host_port, parse_mongo_first_host, rewrite_jdbc_url_host, ConnectionConfig, DatabaseType,
 };
@@ -28,6 +27,20 @@ use crate::storage::Storage;
 
 pub const JDBC_PLUGIN_NOT_INSTALLED: &str =
     "JDBC plugin is not installed. Install the optional JDBC plugin to use this connection.";
+
+#[cfg(feature = "duckdb-bundled")]
+mod duckdb_types {
+    use std::sync::Arc;
+    pub type DuckDbHandle = Arc<std::sync::Mutex<duckdb::Connection>>;
+    pub type ExternalTabularHandle = Arc<crate::external::ExternalPool>;
+}
+#[cfg(not(feature = "duckdb-bundled"))]
+mod duckdb_types {
+    pub type DuckDbHandle = ();
+    pub type ExternalTabularHandle = ();
+}
+
+use duckdb_types::{DuckDbHandle, ExternalTabularHandle};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MysqlMode {
@@ -43,13 +56,14 @@ pub enum PoolKind {
     Rqlite(db::rqlite_driver::RqliteClient),
     Turso(db::turso_driver::TursoClient),
     Redis(db::redis_driver::RedisConnection),
-    DuckDb(Arc<std::sync::Mutex<duckdb::Connection>>),
+    DuckDb(DuckDbHandle),
     MongoDb(mongodb::Client),
     ClickHouse(db::clickhouse_driver::ChClient),
     SqlServer(Arc<tokio::sync::Mutex<db::sqlserver::SqlServerClient>>),
     Elasticsearch(db::elasticsearch_driver::EsClient),
+    InfluxDb(db::influxdb_driver::InfluxdbClient),
     Agent(Arc<tokio::sync::Mutex<db::agent_driver::AgentDriverClient>>),
-    ExternalTabular(Arc<external::ExternalPool>),
+    ExternalTabular(ExternalTabularHandle),
     ExternalDriver { driver_id: String, config: Arc<ConnectionConfig>, session: Arc<PluginDriverSession> },
 }
 
@@ -310,7 +324,10 @@ impl AppState {
 
         let conns = self.connections.read().await;
         if conns.contains_key(&pool_key) {
-            return Ok(pool_key);
+            drop(conns);
+            if !self.remove_stale_connection_pool(&pool_key).await {
+                return Ok(pool_key);
+            }
         } else {
             drop(conns);
         }
@@ -398,11 +415,12 @@ impl AppState {
                     ))
                 } else {
                     db::redis_driver::RedisConnection::Direct(tokio::sync::Mutex::new(
-                        db::redis_driver::connect(&url, connect_timeout).await?,
+                        db::redis_driver::connect_standalone(&db_config, &host, port, connect_timeout).await?,
                     ))
                 };
                 PoolKind::Redis(con)
             }
+            #[cfg(feature = "duckdb-bundled")]
             DatabaseType::DuckDb => {
                 let con = db::duckdb_driver::connect_path(&expand_tilde(&db_config.host))?;
                 {
@@ -412,6 +430,10 @@ impl AppState {
                     }
                 }
                 PoolKind::DuckDb(con)
+            }
+            #[cfg(not(feature = "duckdb-bundled"))]
+            DatabaseType::DuckDb => {
+                return Err("DuckDB support is not compiled in this build. Rebuild with default features.".to_string());
             }
             DatabaseType::MongoDb => {
                 let native_err = match db::mongo_driver::connect(&url, connect_timeout, idle_timeout).await {
@@ -482,6 +504,19 @@ impl AppState {
                 db::elasticsearch_driver::test_connection(&mut client, connect_timeout).await?;
                 PoolKind::Elasticsearch(client)
             }
+            DatabaseType::InfluxDb => {
+                let username = if db_config.username.is_empty() { None } else { Some(db_config.username.clone()) };
+                let password = if db_config.password.is_empty() { None } else { Some(db_config.password.clone()) };
+                let client = db::influxdb_driver::InfluxdbClient::new_with_ca_cert(
+                    &url,
+                    username,
+                    password,
+                    Some(&db_config.ca_cert_path),
+                    connect_timeout,
+                )?;
+                db::influxdb_driver::test_connection(&client, connect_timeout).await?;
+                PoolKind::InfluxDb(client)
+            }
             DatabaseType::Dameng
             | DatabaseType::Kingbase
             | DatabaseType::Highgo
@@ -521,27 +556,48 @@ impl AppState {
                 let connect_result =
                     client.call_method::<serde_json::Value>(AgentMethod::Connect, connect_params.clone()).await;
                 if let Err(err) = connect_result {
-                    if let Some(alternate_config) = oracle_alternate_connect_config(&db_config, &err) {
+                    let alternate_configs = oracle_alternate_connect_configs(&db_config, &err);
+                    if !alternate_configs.is_empty() {
                         log::warn!(
-                            "Oracle connect failed with {:?} descriptor: {}. Retrying with {:?} descriptor.",
+                            "Oracle connect failed with {:?} descriptor: {}. Retrying with Oracle JDBC URL variants: {:?}.",
                             db_config.oracle_connection_type,
                             err,
-                            alternate_config.oracle_connection_type
+                            oracle_alternate_connect_config_labels(&alternate_configs)
                         );
-                        client
-                            .call_method::<serde_json::Value>(
-                                AgentMethod::Connect,
-                                agent_connect_params(
-                                    &alternate_config,
-                                    &host,
-                                    port,
-                                    alternate_config.effective_database().unwrap_or(""),
-                                ),
-                            )
-                            .await
-                            .map_err(|alternate_err| {
-                                format!("{err}\n\nFallback with alternate Oracle descriptor failed: {alternate_err}")
-                            })?;
+                        let mut fallback_errors = Vec::new();
+                        let mut connected = false;
+                        for alternate_config in alternate_configs {
+                            let label = oracle_alternate_connect_config_labels(std::slice::from_ref(&alternate_config))
+                                .into_iter()
+                                .next()
+                                .unwrap_or_else(|| "alternate".to_string());
+                            match client
+                                .call_method::<serde_json::Value>(
+                                    AgentMethod::Connect,
+                                    agent_connect_params(
+                                        &alternate_config,
+                                        &host,
+                                        port,
+                                        alternate_config.effective_database().unwrap_or(""),
+                                    ),
+                                )
+                                .await
+                            {
+                                Ok(_) => {
+                                    connected = true;
+                                    break;
+                                }
+                                Err(alternate_err) => {
+                                    fallback_errors.push(format!("{label}: {alternate_err}"));
+                                }
+                            }
+                        }
+                        if !connected {
+                            return Err(format!(
+                                "{err}\n\nFallback with alternate Oracle JDBC URLs failed: {}",
+                                fallback_errors.join("\n")
+                            ));
+                        }
                     } else if should_retry_oracle_with_10g_driver(&db_config, &err) {
                         log::warn!(
                             "Oracle connect failed with profile {:?}: {}. Retrying with legacy Oracle profiles.",
@@ -620,6 +676,49 @@ impl AppState {
         .await?;
 
         Ok(("127.0.0.1".to_string(), local_port))
+    }
+
+    async fn remove_stale_connection_pool(&self, pool_key: &str) -> bool {
+        let stale = {
+            let connections = self.connections.read().await;
+            let Some(pool) = connections.get(pool_key) else {
+                return false;
+            };
+            match pool {
+                PoolKind::SqlServer(client) => {
+                    let client = client.clone();
+                    drop(connections);
+                    let mut client = client.lock().await;
+                    match db::sqlserver::test_connection(&mut client).await {
+                        Ok(()) => false,
+                        Err(err) => {
+                            log::warn!("SQL Server connection pool '{pool_key}' is stale: {err}");
+                            true
+                        }
+                    }
+                }
+                PoolKind::Redis(redis) => match db::redis_driver::test_connection(redis).await {
+                    Ok(()) => false,
+                    Err(err) => {
+                        log::warn!("Redis connection pool '{pool_key}' is stale: {err}");
+                        true
+                    }
+                },
+                _ => false,
+            }
+        };
+
+        if !stale {
+            return false;
+        }
+
+        let removed = self.connections.write().await.remove(pool_key);
+        if let Some(pool) = removed {
+            close_pool_kind(pool).await;
+            true
+        } else {
+            false
+        }
     }
 
     pub async fn reconnect_pool(&self, connection_id: &str, database: Option<&str>) -> Result<String, String> {
@@ -732,6 +831,7 @@ impl AppState {
         keys
     }
 
+    #[cfg(feature = "duckdb-bundled")]
     pub async fn duckdb_existing_pool_is_usable_for_config(&self, config: &ConnectionConfig) -> Result<bool, String> {
         if config.db_type != DatabaseType::DuckDb {
             return Ok(false);
@@ -953,13 +1053,17 @@ pub async fn close_pool_kind(pool: PoolKind) {
         PoolKind::Rqlite(_) => {}
         PoolKind::Turso(_) => {}
         PoolKind::Redis(_) => {}
+        #[cfg(feature = "duckdb-bundled")]
         PoolKind::DuckDb(con) => {
             crate::db::duckdb_driver::close_connection(con);
         }
+        #[cfg(not(feature = "duckdb-bundled"))]
+        PoolKind::DuckDb(_) => {}
         PoolKind::MongoDb(_) => {}
         PoolKind::ClickHouse(_) => {}
         PoolKind::SqlServer(_) => {}
         PoolKind::Elasticsearch(_) => {}
+        PoolKind::InfluxDb(_) => {}
         PoolKind::Agent(client) => {
             let mut client = client.lock().await;
             let _ = client.disconnect().await;
@@ -1008,7 +1112,7 @@ fn default_plugin_dir() -> PathBuf {
     default_dbx_dir().join("plugins")
 }
 
-fn default_agent_dir() -> PathBuf {
+pub fn default_agent_dir() -> PathBuf {
     default_dbx_dir().join("agents")
 }
 
@@ -1068,6 +1172,7 @@ fn native_postgres_url_config(config: &ConnectionConfig) -> Option<ConnectionCon
     }
 }
 
+#[cfg(feature = "duckdb-bundled")]
 fn duckdb_paths_match(left: &str, right: &str) -> bool {
     let left = expand_tilde(left);
     let right = expand_tilde(right);
@@ -1190,8 +1295,8 @@ mod tests {
     use crate::agent_manager::{AgentState, JavaRuntimeConfig, JavaRuntimeMode, DEFAULT_JRE_KEY};
     use crate::db;
     use crate::models::connection::{
-        default_connect_timeout_secs, ConnectionConfig, DatabaseType, ProxyTunnelConfig, ProxyType,
-        TransportLayerConfig,
+        default_connect_timeout_secs, default_redis_key_separator, ConnectionConfig, DatabaseType, ProxyTunnelConfig,
+        ProxyType, TransportLayerConfig,
     };
     use crate::query;
     use crate::schema;
@@ -1231,6 +1336,7 @@ mod tests {
             redis_sentinel_password: String::new(),
             redis_sentinel_tls: false,
             redis_cluster_nodes: String::new(),
+            redis_key_separator: default_redis_key_separator(),
             etcd_endpoints: String::new(),
             external_config: None,
             jdbc_driver_class: None,
@@ -1407,7 +1513,7 @@ mod tests {
         config.db_type = DatabaseType::Oracle;
         config.driver_profile = Some("oracle".to_string());
 
-        assert!(should_retry_oracle_with_10g_driver(
+        assert!(!should_retry_oracle_with_10g_driver(
             &config,
             "Agent RPC error (-1): ORA-28040: No matching authentication protocol"
         ));
@@ -1441,16 +1547,18 @@ mod tests {
         )
         .expect("listener errors should allow alternate descriptor retry");
         assert_eq!(retry.driver_profile.as_deref(), Some("oracle"));
-        assert_eq!(retry.oracle_connection_type.as_deref(), Some("sid"));
+        assert_eq!(retry.connection_string.as_deref(), Some("jdbc:oracle:thin:@127.0.0.1:3306:ORCL"));
 
+        let mut sid_config = config.clone();
+        sid_config.oracle_connection_type = Some("sid".to_string());
         let service_retry = oracle_alternate_connect_config(
-            &retry,
+            &sid_config,
             "Agent RPC error (-1): ORA-12505: listener does not currently know of SID given",
         )
         .expect("SID listener errors should allow service-name retry");
-        assert_eq!(service_retry.oracle_connection_type.as_deref(), Some("service_name"));
+        assert_eq!(service_retry.connection_string.as_deref(), Some("jdbc:oracle:thin:@//127.0.0.1:3306/ORCL"));
 
-        assert!(oracle_alternate_connect_config(&config, "ORA-12541: TNS:no listener").is_none());
+        assert!(oracle_alternate_connect_config(&config, "ORA-12541: TNS:no listener").is_some());
     }
 
     #[test]
@@ -1909,6 +2017,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[cfg(feature = "duckdb-bundled")]
     #[tokio::test]
     async fn duckdb_existing_pool_can_be_used_for_connection_test() {
         let (state, dir) = test_app_state().await;
@@ -1955,6 +2064,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[cfg(feature = "duckdb-bundled")]
     #[tokio::test]
     async fn duckdb_client_session_reuses_base_pool_to_avoid_file_locks() {
         let (state, dir) = test_app_state().await;
@@ -2176,7 +2286,8 @@ mod tests {
 
         let schemas = schema::list_schemas_core(&state, "kwdb-live", &database).await.unwrap();
         assert!(schemas.iter().any(|schema| schema == test_schema));
-        let tables = schema::list_tables_core(&state, "kwdb-live", &database, test_schema, None, None).await.unwrap();
+        let tables =
+            schema::list_tables_core(&state, "kwdb-live", &database, test_schema, None, None, None).await.unwrap();
         assert!(tables.iter().any(|table| table.name == "devices" && table.table_type == "BASE TABLE"));
         let columns = schema::get_columns_core(&state, "kwdb-live", &database, test_schema, "devices").await.unwrap();
         let id_column = columns.iter().find(|column| column.name == "id").expect("id column should be listed");

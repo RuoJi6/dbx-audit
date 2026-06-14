@@ -21,11 +21,24 @@ import { useToast } from "@/composables/useToast";
 import { type SqlHighlighter, createShikiSqlHighlighter } from "@/lib/sqlHighlighter";
 import { copyToClipboard } from "@/lib/clipboard";
 import { queryTimeoutSecsForConnection } from "@/lib/queryTimeout";
-import { type EditableStructureColumn, type EditableStructureIndex } from "@/lib/tableStructureEditorSql";
+import { type EditableStructureColumn, type EditableStructureForeignKey, type EditableStructureIndex, type EditableStructureTrigger } from "@/lib/tableStructureEditorSql";
+import { getTableMetadataCapabilities } from "@/lib/tableMetadataCapabilities";
 import { getTableStructureCapabilities } from "@/lib/tableStructureCapabilities";
 import { connectionObjectTreeQuerySchema, effectiveDatabaseTypeForConnection } from "@/lib/jdbcDialect";
-import { buildStructureTargetLabel, combineDataTypeForDatabase, createColumnDrafts, createIndexDrafts, getDataTypeOptions, getDefaultLengthForType, splitDataType, toColumnNames } from "@/lib/tableStructureEditorState";
-import type { ForeignKeyInfo, TriggerInfo } from "@/types/database";
+import {
+  buildStructureTargetLabel,
+  combineDataTypeForDatabase,
+  createColumnDrafts,
+  createForeignKeyDrafts,
+  createIndexDrafts,
+  createTriggerDrafts,
+  generateIndexName,
+  generateUniqueIndexName,
+  getDataTypeOptions,
+  getDefaultLengthForType,
+  splitDataType,
+  toColumnNames,
+} from "@/lib/tableStructureEditorState";
 import * as api from "@/lib/api";
 
 const { t } = useI18n();
@@ -72,7 +85,7 @@ const ddlLoading = ref(false);
 const ddlFetched = ref(false);
 
 async function fetchDdl() {
-  if (!props.connectionId || !props.database || !props.tableName || ddlFetched.value) return;
+  if (!props.connectionId || !props.database || !props.tableName || ddlFetched.value || !tableMetadataCapabilities.value.ddl) return;
   ddlLoading.value = true;
   try {
     ddlContent.value = await api.getTableDdl(props.connectionId, props.database, metadataSchema.value, props.tableName);
@@ -89,8 +102,8 @@ const columns = ref<EditableStructureColumn[]>([]);
 const indexes = ref<EditableStructureIndex[]>([]);
 const pendingStatements = ref<string[]>([]);
 const warnings = ref<string[]>([]);
-const foreignKeys = ref<ForeignKeyInfo[]>([]);
-const triggers = ref<TriggerInfo[]>([]);
+const foreignKeys = ref<EditableStructureForeignKey[]>([]);
+const triggers = ref<EditableStructureTrigger[]>([]);
 
 function isPlainModShortcut(event: KeyboardEvent, key: string): boolean {
   if (event.isComposing || event.altKey || event.shiftKey) return false;
@@ -268,6 +281,7 @@ function onIndexColResize(e: MouseEvent, col: number) {
 const connection = computed(() => (props.connectionId ? store.getConfig(props.connectionId) : undefined));
 const databaseType = computed(() => effectiveDatabaseTypeForConnection(connection.value));
 const structureCapabilities = computed(() => getTableStructureCapabilities(databaseType.value));
+const tableMetadataCapabilities = computed(() => getTableMetadataCapabilities(databaseType.value));
 const structureDialect = computed(() => structureCapabilities.value.dialect);
 const isTableCommentDisabled = computed(() => !structureCapabilities.value.comment);
 const dataTypeOptions = computed(() => getDataTypeOptions(databaseType.value));
@@ -305,6 +319,9 @@ const colLabels = computed(() => {
   return labels;
 });
 const indexColLabels = computed(() => [t("structureEditor.indexName"), t("structureEditor.indexColumns"), t("structureEditor.unique"), t("structureEditor.indexType"), t("structureEditor.includedColumns"), t("structureEditor.filter"), t("structureEditor.comment"), t("structureEditor.actions")]);
+const foreignKeyActionOptions = ["", "CASCADE", "SET NULL", "RESTRICT", "NO ACTION"];
+const triggerTimingOptions = ["BEFORE", "AFTER"];
+const triggerEventOptions = ["INSERT", "UPDATE", "DELETE"];
 const metadataSchema = computed(() => connectionObjectTreeQuerySchema(connection.value, props.database, props.schema));
 const refreshVersion = computed(() => (props.connectionId && props.tableName ? queryStore.tableStructureRefreshVersion(props.connectionId, props.database, props.schema, props.tableName) : 0));
 const isCreateMode = computed(() => !props.tableName);
@@ -325,6 +342,8 @@ async function refreshSqlPreview() {
     tableName: isCreateMode.value ? newTableName.value : props.tableName || "",
     columns: columns.value,
     indexes: indexes.value,
+    foreignKeys: foreignKeys.value,
+    triggers: triggers.value,
     tableComment: tableComment.value,
     originalTableComment: isCreateMode.value ? undefined : originalTableComment.value,
   };
@@ -371,14 +390,14 @@ async function loadStructure(silent = false) {
     await store.ensureConnected(props.connectionId);
     const nextColumns = await api.getColumns(props.connectionId, props.database, metadataSchema.value, props.tableName);
     const [nextIndexes, nextForeignKeys, nextTriggers] = await Promise.all([
-      api.listIndexes(props.connectionId, props.database, metadataSchema.value, props.tableName).catch(() => []),
-      api.listForeignKeys(props.connectionId, props.database, metadataSchema.value, props.tableName).catch(() => []),
-      api.listTriggers(props.connectionId, props.database, metadataSchema.value, props.tableName).catch(() => []),
+      tableMetadataCapabilities.value.indexes ? api.listIndexes(props.connectionId, props.database, metadataSchema.value, props.tableName).catch(() => []) : Promise.resolve([]),
+      tableMetadataCapabilities.value.foreignKeys ? api.listForeignKeys(props.connectionId, props.database, metadataSchema.value, props.tableName).catch(() => []) : Promise.resolve([]),
+      tableMetadataCapabilities.value.triggers ? api.listTriggers(props.connectionId, props.database, metadataSchema.value, props.tableName).catch(() => []) : Promise.resolve([]),
     ]);
     columns.value = createColumnDrafts(nextColumns, databaseType.value);
     indexes.value = createIndexDrafts(nextIndexes);
-    foreignKeys.value = nextForeignKeys;
-    triggers.value = nextTriggers;
+    foreignKeys.value = createForeignKeyDrafts(nextForeignKeys);
+    triggers.value = createTriggerDrafts(nextTriggers);
     try {
       const tables = await api.listTables(props.connectionId, props.database, metadataSchema.value);
       const table = tables.find((t) => t.name.toLowerCase() === props.tableName!.toLowerCase() && t.table_type !== "VIEW");
@@ -480,6 +499,7 @@ function addIndex() {
     id: `new:${uuid()}`,
     name: "",
     columns: [],
+    nameEdited: false,
     isUnique: false,
     isPrimary: false,
     filter: "",
@@ -498,6 +518,32 @@ function addIndex() {
   });
 }
 
+function structureIndexTableName(): string {
+  return (isCreateMode.value ? newTableName.value : props.tableName).trim();
+}
+
+function existingIndexNamesForDraft(index: EditableStructureIndex): string[] {
+  return indexes.value.filter((item) => item.id !== index.id && !item.markedForDrop).map((item) => item.name);
+}
+
+function generatedIndexNameForDraft(index: EditableStructureIndex, columnsForName = index.columns): string {
+  return generateUniqueIndexName(structureIndexTableName(), columnsForName, existingIndexNamesForDraft(index));
+}
+
+function refreshAutoIndexName(index: EditableStructureIndex, previousColumns = index.columns) {
+  if (index.original || index.nameEdited) return;
+  const previousName = generateIndexName(structureIndexTableName(), previousColumns);
+  const previousUniqueName = generateUniqueIndexName(structureIndexTableName(), previousColumns, existingIndexNamesForDraft(index));
+  const currentName = index.name.trim();
+  if (currentName && currentName !== previousName && currentName !== previousUniqueName) return;
+  index.name = generatedIndexNameForDraft(index);
+}
+
+function onIndexNameInput(index: EditableStructureIndex, value: string | number) {
+  index.name = String(value ?? "");
+  index.nameEdited = true;
+}
+
 const availableColumnNames = computed(() =>
   columns.value
     .filter((c) => !c.markedForDrop)
@@ -513,9 +559,11 @@ const filteredColumnNames = computed(() => {
 });
 
 function toggleIndexColumn(index: EditableStructureIndex, col: string) {
+  const previousColumns = [...index.columns];
   const i = index.columns.indexOf(col);
   if (i >= 0) index.columns.splice(i, 1);
   else index.columns.push(col);
+  refreshAutoIndexName(index, previousColumns);
 }
 
 function toggleIncludedColumn(index: EditableStructureIndex, col: string) {
@@ -550,6 +598,80 @@ function canEditIndexComment(index: EditableStructureIndex): boolean {
 
 function canDropIndex(index: EditableStructureIndex): boolean {
   return !!index.original && !index.isPrimary && structureCapabilities.value.dropIndex;
+}
+
+const canEditMysqlForeignKeys = computed(() => structureDialect.value === "mysql");
+const canEditMysqlTriggers = computed(() => structureDialect.value === "mysql");
+
+function generatedForeignKeyName(column = ""): string {
+  const table = structureIndexTableName() || "table";
+  const suffix = column || "column";
+  const base = `fk_${table}_${suffix}`
+    .replace(/[^a-zA-Z0-9_]+/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  const taken = new Set(foreignKeys.value.map((item) => item.name.trim().toLowerCase()).filter(Boolean));
+  if (!taken.has(base.toLowerCase())) return base;
+  for (let counter = 2; counter < 10_000; counter++) {
+    const candidate = `${base}_${counter}`;
+    if (!taken.has(candidate.toLowerCase())) return candidate;
+  }
+  return base;
+}
+
+function addForeignKey() {
+  if (!canEditMysqlForeignKeys.value) return;
+  activeTab.value = "foreignKeys";
+  foreignKeys.value.push({
+    id: `new:${uuid()}`,
+    name: generatedForeignKeyName(),
+    column: "",
+    refSchema: "",
+    refTable: "",
+    refColumn: "",
+    onUpdate: "",
+    onDelete: "",
+    markedForDrop: false,
+  });
+}
+
+function removeNewForeignKey(foreignKey: EditableStructureForeignKey) {
+  foreignKeys.value = foreignKeys.value.filter((item) => item.id !== foreignKey.id);
+}
+
+function toggleDropForeignKey(foreignKey: EditableStructureForeignKey) {
+  if (!foreignKey.original) return;
+  foreignKey.markedForDrop = !foreignKey.markedForDrop;
+}
+
+function canEditForeignKeyDraft(foreignKey: EditableStructureForeignKey): boolean {
+  return canEditMysqlForeignKeys.value && !foreignKey.markedForDrop;
+}
+
+function addTrigger() {
+  if (!canEditMysqlTriggers.value) return;
+  activeTab.value = "triggers";
+  triggers.value.push({
+    id: `new:${uuid()}`,
+    name: "",
+    timing: "BEFORE",
+    event: "INSERT",
+    statement: "BEGIN\n  \nEND",
+    markedForDrop: false,
+  });
+}
+
+function removeNewTrigger(trigger: EditableStructureTrigger) {
+  triggers.value = triggers.value.filter((item) => item.id !== trigger.id);
+}
+
+function toggleDropTrigger(trigger: EditableStructureTrigger) {
+  if (!trigger.original) return;
+  trigger.markedForDrop = !trigger.markedForDrop;
+}
+
+function canEditTriggerDraft(trigger: EditableStructureTrigger): boolean {
+  return canEditMysqlTriggers.value && !trigger.markedForDrop;
 }
 
 function primarySqlOperation(sql: string): string {
@@ -626,6 +748,14 @@ function addItemForActiveTab(): boolean {
     addIndex();
     return true;
   }
+  if (activeTab.value === "foreignKeys" && canEditMysqlForeignKeys.value) {
+    addForeignKey();
+    return true;
+  }
+  if (activeTab.value === "triggers" && canEditMysqlTriggers.value) {
+    addTrigger();
+    return true;
+  }
   return false;
 }
 
@@ -670,13 +800,38 @@ onBeforeUnmount(() => {
   unregisterStructureEditorShortcuts();
 });
 
+function firstStructureMetadataTab(capabilities = tableMetadataCapabilities.value) {
+  if (capabilities.columns) return "columns";
+  if (capabilities.indexes) return "indexes";
+  if (capabilities.foreignKeys) return "foreignKeys";
+  if (capabilities.triggers) return "triggers";
+  if (capabilities.ddl && !isCreateMode.value) return "ddl";
+  return "columns";
+}
+
+watch(tableMetadataCapabilities, (capabilities) => {
+  const supported =
+    (activeTab.value === "columns" && capabilities.columns) ||
+    (activeTab.value === "indexes" && capabilities.indexes) ||
+    (activeTab.value === "foreignKeys" && capabilities.foreignKeys) ||
+    (activeTab.value === "triggers" && capabilities.triggers) ||
+    (activeTab.value === "ddl" && capabilities.ddl && !isCreateMode.value);
+  if (!supported) activeTab.value = firstStructureMetadataTab(capabilities);
+});
+
 watch(
-  [isCreateMode, databaseType, () => props.schema, () => props.tableName, newTableName, tableComment, columns, indexes],
+  [isCreateMode, databaseType, () => props.schema, () => props.tableName, newTableName, tableComment, columns, indexes, foreignKeys, triggers],
   () => {
     void refreshSqlPreview();
   },
   { deep: true, immediate: true },
 );
+
+watch([() => props.tableName, newTableName], () => {
+  for (const index of indexes.value) {
+    refreshAutoIndexName(index);
+  }
+});
 
 watch(refreshVersion, (version, previous) => {
   if (version === previous || !version || isCreateMode.value) return;
@@ -728,11 +883,11 @@ watch(activeTab, (tab) => {
         <Tabs v-model="activeTab" class="flex h-full min-h-0 flex-col">
           <div class="flex shrink-0 items-center justify-between gap-2 border-b px-2 py-[var(--structure-header-py)]">
             <TabsList>
-              <TabsTrigger value="columns">{{ t("structureEditor.columns") }}</TabsTrigger>
-              <TabsTrigger value="indexes">{{ t("structureEditor.indexes") }}</TabsTrigger>
-              <TabsTrigger value="foreignKeys">{{ t("structureEditor.foreignKeys") }}</TabsTrigger>
-              <TabsTrigger value="triggers">{{ t("structureEditor.triggers") }}</TabsTrigger>
-              <TabsTrigger value="ddl" v-if="!isCreateMode">DDL</TabsTrigger>
+              <TabsTrigger v-if="tableMetadataCapabilities.columns" value="columns">{{ t("structureEditor.columns") }}</TabsTrigger>
+              <TabsTrigger v-if="tableMetadataCapabilities.indexes" value="indexes">{{ t("structureEditor.indexes") }}</TabsTrigger>
+              <TabsTrigger v-if="tableMetadataCapabilities.foreignKeys" value="foreignKeys">{{ t("structureEditor.foreignKeys") }}</TabsTrigger>
+              <TabsTrigger v-if="tableMetadataCapabilities.triggers" value="triggers">{{ t("structureEditor.triggers") }}</TabsTrigger>
+              <TabsTrigger v-if="tableMetadataCapabilities.ddl && !isCreateMode" value="ddl">DDL</TabsTrigger>
             </TabsList>
             <div class="flex shrink-0 items-center gap-1.5">
               <div class="flex items-center gap-1.5">
@@ -756,10 +911,18 @@ watch(activeTab, (tab) => {
                 <Plus :class="structureIconClass" />
                 {{ t("structureEditor.addIndex") }}
               </Button>
+              <Button v-if="activeTab === 'foreignKeys'" size="sm" :class="structureToolbarButtonClass" :disabled="!canEditMysqlForeignKeys" @click="addForeignKey">
+                <Plus :class="structureIconClass" />
+                {{ t("structureEditor.addForeignKey") }}
+              </Button>
+              <Button v-if="activeTab === 'triggers'" size="sm" :class="structureToolbarButtonClass" :disabled="!canEditMysqlTriggers" @click="addTrigger">
+                <Plus :class="structureIconClass" />
+                {{ t("structureEditor.addTrigger") }}
+              </Button>
             </div>
           </div>
 
-          <TabsContent value="columns" class="m-0 min-h-0 flex-1 overflow-auto p-0">
+          <TabsContent v-if="tableMetadataCapabilities.columns" value="columns" class="m-0 min-h-0 flex-1 overflow-auto p-0">
             <table class="border-separate border-spacing-0 text-[length:var(--structure-font-size)] leading-[var(--structure-line-height)]" :style="{ minWidth: visibleColWidths.reduce((a, w) => a + w, 0) + 'px' }">
               <thead class="sticky top-0 z-10 bg-background">
                 <tr>
@@ -977,7 +1140,7 @@ watch(activeTab, (tab) => {
             </table>
           </TabsContent>
 
-          <TabsContent value="indexes" class="m-0 min-h-0 flex-1 overflow-auto p-0">
+          <TabsContent v-if="tableMetadataCapabilities.indexes" value="indexes" class="m-0 min-h-0 flex-1 overflow-auto p-0">
             <table class="border-separate border-spacing-0 text-[length:var(--structure-font-size)] leading-[var(--structure-line-height)]" :style="{ minWidth: indexColWidths.reduce((a, w) => a + w, 0) + 'px' }">
               <thead class="sticky top-0 z-10 bg-background">
                 <tr>
@@ -998,7 +1161,7 @@ watch(activeTab, (tab) => {
               <tbody>
                 <tr v-for="index in indexes" :key="index.id" :class="index.markedForDrop ? 'bg-destructive/5 opacity-60' : ''" :data-new-index-row="!index.original ? 'true' : undefined">
                   <td :class="structureCellClass">
-                    <Input v-model="index.name" :class="structureControlClass" :disabled="!canEditIndexDraft(index)" data-index-name-input />
+                    <Input :model-value="index.name" :class="structureControlClass" :disabled="!canEditIndexDraft(index)" data-index-name-input @update:model-value="(value: string | number) => onIndexNameInput(index, value)" />
                   </td>
                   <td :class="[structureCellClass, 'overflow-hidden']">
                     <DropdownMenu v-if="canEditIndexDraft(index)">
@@ -1077,31 +1240,98 @@ watch(activeTab, (tab) => {
             </table>
           </TabsContent>
 
-          <TabsContent value="foreignKeys" class="m-0 min-h-0 flex-1 overflow-auto p-[var(--structure-cell-px)]">
+          <TabsContent v-if="tableMetadataCapabilities.foreignKeys" value="foreignKeys" class="m-0 min-h-0 flex-1 overflow-auto p-[var(--structure-cell-px)]">
             <div v-if="foreignKeys.length === 0" class="py-10 text-center text-muted-foreground">
               {{ t("structureEditor.emptyReadonly") }}
             </div>
             <div v-else class="space-y-1.5">
-              <div v-for="fk in foreignKeys" :key="fk.name" class="rounded-md border px-[var(--structure-cell-px)] py-[var(--structure-header-py)] text-[length:var(--structure-font-size)]">
-                <div class="font-medium">{{ fk.name }}</div>
-                <div class="mt-1 font-mono text-muted-foreground">{{ fk.column }} -> {{ fk.ref_table }}.{{ fk.ref_column }}</div>
+              <div v-for="fk in foreignKeys" :key="fk.id" class="rounded-md border px-[var(--structure-cell-px)] py-[var(--structure-header-py)] text-[length:var(--structure-font-size)]" :class="fk.markedForDrop ? 'bg-destructive/5 opacity-60' : ''">
+                <div class="grid grid-cols-[minmax(110px,1fr)_minmax(110px,1fr)_minmax(110px,1fr)_minmax(90px,0.8fr)_minmax(90px,0.8fr)_auto] gap-1.5">
+                  <Input v-model="fk.name" :class="structureControlClass" :placeholder="t('structureEditor.foreignKeyName')" :disabled="!canEditForeignKeyDraft(fk)" />
+                  <Input v-model="fk.column" :class="structureControlClass" :placeholder="t('structureEditor.columnName')" :disabled="!canEditForeignKeyDraft(fk)" />
+                  <Input v-model="fk.refTable" :class="structureControlClass" :placeholder="t('structureEditor.referencedTable')" :disabled="!canEditForeignKeyDraft(fk)" />
+                  <Input v-model="fk.refColumn" :class="structureControlClass" :placeholder="t('structureEditor.referencedColumn')" :disabled="!canEditForeignKeyDraft(fk)" />
+                  <Input v-model="fk.refSchema" :class="structureControlClass" :placeholder="t('structureEditor.referencedSchema')" :disabled="!canEditForeignKeyDraft(fk)" />
+                  <div class="flex items-center justify-end gap-1">
+                    <Button v-if="fk.original" variant="ghost" size="sm" :class="structureToolbarButtonClass" @click="toggleDropForeignKey(fk)">
+                      <Trash2 :class="structureIconClass" />
+                      {{ fk.markedForDrop ? t("structureEditor.restore") : t("structureEditor.drop") }}
+                    </Button>
+                    <Button v-else variant="ghost" size="sm" :class="structureToolbarButtonClass" @click="removeNewForeignKey(fk)">
+                      <X :class="structureIconClass" />
+                      {{ t("structureEditor.remove") }}
+                    </Button>
+                  </div>
+                </div>
+                <div class="mt-1.5 grid grid-cols-[minmax(110px,0.5fr)_minmax(110px,0.5fr)_1fr] gap-1.5">
+                  <Select :model-value="fk.onDelete || '__default'" :disabled="!canEditForeignKeyDraft(fk)" @update:model-value="(v: any) => (fk.onDelete = String(v === '__default' ? '' : (v ?? '')))">
+                    <SelectTrigger class="h-[var(--structure-control-height)] rounded-md px-[var(--structure-control-px)] text-[length:var(--structure-font-size)]">
+                      <SelectValue :placeholder="t('structureEditor.onDelete')" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem v-for="action in foreignKeyActionOptions" :key="`delete-${action || 'default'}`" :value="action || '__default'">{{ action || t("structureEditor.defaultAction") }}</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  <Select :model-value="fk.onUpdate || '__default'" :disabled="!canEditForeignKeyDraft(fk)" @update:model-value="(v: any) => (fk.onUpdate = String(v === '__default' ? '' : (v ?? '')))">
+                    <SelectTrigger class="h-[var(--structure-control-height)] rounded-md px-[var(--structure-control-px)] text-[length:var(--structure-font-size)]">
+                      <SelectValue :placeholder="t('structureEditor.onUpdate')" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem v-for="action in foreignKeyActionOptions" :key="`update-${action || 'default'}`" :value="action || '__default'">{{ action || t("structureEditor.defaultAction") }}</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  <div class="truncate font-mono text-muted-foreground">{{ fk.column }} -> {{ fk.refSchema ? `${fk.refSchema}.` : "" }}{{ fk.refTable }}.{{ fk.refColumn }}</div>
+                </div>
               </div>
             </div>
           </TabsContent>
 
-          <TabsContent value="triggers" class="m-0 min-h-0 flex-1 overflow-auto p-[var(--structure-cell-px)]">
+          <TabsContent v-if="tableMetadataCapabilities.triggers" value="triggers" class="m-0 min-h-0 flex-1 overflow-auto p-[var(--structure-cell-px)]">
             <div v-if="triggers.length === 0" class="py-10 text-center text-muted-foreground">
               {{ t("structureEditor.emptyReadonly") }}
             </div>
             <div v-else class="space-y-1.5">
-              <div v-for="trigger in triggers" :key="trigger.name" class="rounded-md border px-[var(--structure-cell-px)] py-[var(--structure-header-py)] text-[length:var(--structure-font-size)]">
-                <div class="font-medium">{{ trigger.name }}</div>
-                <div class="mt-1 font-mono text-muted-foreground">{{ trigger.timing }} {{ trigger.event }}</div>
+              <div v-for="trigger in triggers" :key="trigger.id" class="rounded-md border px-[var(--structure-cell-px)] py-[var(--structure-header-py)] text-[length:var(--structure-font-size)]" :class="trigger.markedForDrop ? 'bg-destructive/5 opacity-60' : ''">
+                <div class="grid grid-cols-[minmax(140px,1fr)_110px_110px_auto] gap-1.5">
+                  <Input v-model="trigger.name" :class="structureControlClass" :placeholder="t('structureEditor.triggerName')" :disabled="!canEditTriggerDraft(trigger)" />
+                  <Select v-model="trigger.timing" :disabled="!canEditTriggerDraft(trigger)">
+                    <SelectTrigger class="h-[var(--structure-control-height)] rounded-md px-[var(--structure-control-px)] text-[length:var(--structure-font-size)]">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem v-for="timing in triggerTimingOptions" :key="timing" :value="timing">{{ timing }}</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  <Select v-model="trigger.event" :disabled="!canEditTriggerDraft(trigger)">
+                    <SelectTrigger class="h-[var(--structure-control-height)] rounded-md px-[var(--structure-control-px)] text-[length:var(--structure-font-size)]">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem v-for="event in triggerEventOptions" :key="event" :value="event">{{ event }}</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  <div class="flex items-center justify-end gap-1">
+                    <Button v-if="trigger.original" variant="ghost" size="sm" :class="structureToolbarButtonClass" @click="toggleDropTrigger(trigger)">
+                      <Trash2 :class="structureIconClass" />
+                      {{ trigger.markedForDrop ? t("structureEditor.restore") : t("structureEditor.drop") }}
+                    </Button>
+                    <Button v-else variant="ghost" size="sm" :class="structureToolbarButtonClass" @click="removeNewTrigger(trigger)">
+                      <X :class="structureIconClass" />
+                      {{ t("structureEditor.remove") }}
+                    </Button>
+                  </div>
+                </div>
+                <textarea
+                  v-model="trigger.statement"
+                  class="mt-1.5 min-h-28 w-full resize-y rounded-md border bg-background px-[var(--structure-control-px)] py-[var(--structure-cell-py)] font-mono text-[length:var(--structure-font-size)] leading-5 outline-none focus-visible:ring-2 focus-visible:ring-ring/40 disabled:cursor-not-allowed disabled:opacity-50"
+                  :placeholder="t('structureEditor.triggerStatement')"
+                  :disabled="!canEditTriggerDraft(trigger)"
+                />
               </div>
             </div>
           </TabsContent>
 
-          <TabsContent value="ddl" class="m-0 min-h-0 flex-1 overflow-auto p-[var(--structure-cell-px)]">
+          <TabsContent v-if="tableMetadataCapabilities.ddl" value="ddl" class="m-0 min-h-0 flex-1 overflow-auto p-[var(--structure-cell-px)]">
             <div v-if="ddlLoading" class="flex items-center justify-center gap-2 py-10 text-muted-foreground">
               <Loader2 class="h-4 w-4 animate-spin" />
               {{ t("common.loading") }}

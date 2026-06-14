@@ -53,19 +53,19 @@ function sortRedisTreeNodes(nodes: RedisKeyTreeNode[]): RedisKeyTreeNode[] {
   );
 }
 
-export function buildRedisKeyTree(keys: RedisKeyInfo[], db: number): RedisKeyTreeNode[] {
+export function buildRedisKeyTree(keys: RedisKeyInfo[], db: number, separator = ":"): RedisKeyTreeNode[] {
   const root: RedisKeyTreeNode[] = [];
   const groupMap = new Map<string, RedisKeyTreeGroupNode>();
 
   for (const key of keys) {
-    insertKeyIntoTree(root, groupMap, key, db);
+    insertKeyIntoTree(root, groupMap, key, db, separator);
   }
 
   return sortRedisTreeNodes(root);
 }
 
-function insertKeyIntoTree(root: RedisKeyTreeNode[], groupMap: Map<string, RedisKeyTreeGroupNode>, key: RedisKeyInfo, db: number): void {
-  const pathSegments = key.key_display.split(":");
+function insertKeyIntoTree(root: RedisKeyTreeNode[], groupMap: Map<string, RedisKeyTreeGroupNode>, key: RedisKeyInfo, db: number, separator: string): void {
+  const pathSegments = separator ? key.key_display.split(separator) : [key.key_display];
   if (pathSegments.length === 1) {
     root.push({
       kind: "leaf",
@@ -134,8 +134,8 @@ function rebuildGroupMap(tree: RedisKeyTreeNode[]): Map<string, RedisKeyTreeGrou
   return groupMap;
 }
 
-export function mergeKeysIntoRedisKeyTree(existingTree: RedisKeyTreeNode[], newKeys: RedisKeyInfo[], db: number): RedisKeyTreeNode[] {
-  if (existingTree.length === 0) return buildRedisKeyTree(newKeys, db);
+export function mergeKeysIntoRedisKeyTree(existingTree: RedisKeyTreeNode[], newKeys: RedisKeyInfo[], db: number, separator = ":"): RedisKeyTreeNode[] {
+  if (existingTree.length === 0) return buildRedisKeyTree(newKeys, db, separator);
 
   const groupMap = rebuildGroupMap(existingTree);
   const existingKeyIds = new Set<string>();
@@ -152,7 +152,7 @@ export function mergeKeysIntoRedisKeyTree(existingTree: RedisKeyTreeNode[], newK
 
   for (const key of newKeys) {
     if (existingKeyIds.has(key.key_raw)) continue;
-    insertKeyIntoTree(existingTree, groupMap, key, db);
+    insertKeyIntoTree(existingTree, groupMap, key, db, separator);
   }
 
   return sortRedisTreeNodes(existingTree);

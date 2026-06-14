@@ -60,6 +60,8 @@ pub struct ConnectionConfig {
     pub redis_sentinel_tls: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub redis_cluster_nodes: String,
+    #[serde(default = "default_redis_key_separator", skip_serializing_if = "is_default_redis_separator")]
+    pub redis_key_separator: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub etcd_endpoints: String,
     /// Typed configuration for external tabular sources.
@@ -136,6 +138,8 @@ pub struct SshTunnelConfig {
     pub connect_timeout_secs: u64,
     #[serde(default)]
     pub expose_lan: bool,
+    #[serde(default)]
+    pub use_ssh_agent: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -194,6 +198,14 @@ fn default_proxy_port() -> u16 {
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+pub fn default_redis_key_separator() -> String {
+    ":".to_string()
+}
+
+fn is_default_redis_separator(value: &str) -> bool {
+    value == ":"
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -274,6 +286,8 @@ pub enum DatabaseType {
     Iris,
     #[serde(rename = "turso")]
     Turso,
+    #[serde(rename = "influxdb")]
+    InfluxDb,
     Jdbc,
 }
 
@@ -335,6 +349,8 @@ struct ConnectionConfigData {
     pub redis_sentinel_tls: bool,
     #[serde(default)]
     pub redis_cluster_nodes: String,
+    #[serde(default = "default_redis_key_separator")]
+    pub redis_key_separator: String,
     #[serde(default)]
     pub etcd_endpoints: String,
     #[serde(default)]
@@ -384,6 +400,7 @@ impl From<ConnectionConfigData> for ConnectionConfig {
             redis_sentinel_password: data.redis_sentinel_password,
             redis_sentinel_tls: data.redis_sentinel_tls,
             redis_cluster_nodes: data.redis_cluster_nodes,
+            redis_key_separator: data.redis_key_separator,
             etcd_endpoints: data.etcd_endpoints,
             external_config: data.external_config,
             jdbc_driver_class: data.jdbc_driver_class,
@@ -728,6 +745,10 @@ impl ConnectionConfig {
                 format!("etcd://{host}:{port}")
             }
             DatabaseType::Iris => format!("iris://{host}:{port}{db_part}"),
+            DatabaseType::InfluxDb => {
+                let scheme = if self.ssl { "https" } else { "http" };
+                format!("{scheme}://{host}:{port}")
+            }
             DatabaseType::Jdbc => "jdbc:<redacted>".to_string(),
         }
     }
@@ -917,6 +938,10 @@ impl ConnectionConfig {
             }
             DatabaseType::Iris => {
                 format!("iris://{}:{}@{host}:{port}{db_part}", username, password)
+            }
+            DatabaseType::InfluxDb => {
+                let scheme = if self.ssl { "https" } else { "http" };
+                format!("{scheme}://{host}:{port}")
             }
             DatabaseType::Jdbc => {
                 self.connection_string.as_deref().filter(|value| !value.is_empty()).unwrap_or("jdbc:").to_string()
@@ -1327,8 +1352,8 @@ fn bracket_ipv6(host: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_query_timeout_secs, default_ssh_connect_timeout_secs, ConnectionConfig, DatabaseType,
-        ProxyTunnelConfig, ProxyType, TransportLayerConfig,
+        default_query_timeout_secs, default_redis_key_separator, default_ssh_connect_timeout_secs, ConnectionConfig,
+        DatabaseType, ProxyTunnelConfig, ProxyType, TransportLayerConfig,
     };
     use std::str::FromStr;
 
@@ -1366,6 +1391,7 @@ mod tests {
             redis_sentinel_password: String::new(),
             redis_sentinel_tls: false,
             redis_cluster_nodes: String::new(),
+            redis_key_separator: default_redis_key_separator(),
             etcd_endpoints: String::new(),
             external_config: None,
             jdbc_driver_class: None,

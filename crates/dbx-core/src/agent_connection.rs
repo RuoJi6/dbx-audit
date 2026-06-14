@@ -15,8 +15,10 @@ pub fn agent_connect_params(config: &ConnectionConfig, host: &str, port: u16, da
     };
     let connection_string = if config.db_type == DatabaseType::MongoDb {
         config.connection_url_with_host(host, port)
-    } else if matches!(config.db_type, DatabaseType::Oracle | DatabaseType::OceanbaseOracle) {
+    } else if config.db_type == DatabaseType::Oracle {
         oracle_jdbc_connection_string(config, host, port, database)
+    } else if config.db_type == DatabaseType::OceanbaseOracle {
+        oceanbase_oracle_jdbc_connection_string(config, host, port, database)
     } else if matches!(config.db_type, DatabaseType::Kingbase | DatabaseType::Highgo | DatabaseType::Vastbase) {
         postgres_like_agent_jdbc_connection_string(config, host, port, database)
     } else if config.db_type == DatabaseType::SapHana {
@@ -46,6 +48,8 @@ pub fn agent_connect_params(config: &ConnectionConfig, host: &str, port: u16, da
         "client_cert_path": config.client_cert_path,
         "client_key_path": config.client_key_path,
         "etcd_endpoints": etcd_endpoints,
+        "jdbc_driver_class": config.jdbc_driver_class.as_deref().unwrap_or(""),
+        "jdbc_driver_paths": &config.jdbc_driver_paths,
     })
 }
 
@@ -189,18 +193,71 @@ pub fn oracle_error_with_driver_hint(config: &ConnectionConfig, err: &str) -> St
     if config.db_type != DatabaseType::Oracle {
         return err.to_string();
     }
-    if matches!(config.driver_profile.as_deref(), Some("oracle-legacy" | "oracle-10g")) {
-        return err.to_string();
-    }
 
     let normalized = err.to_lowercase();
     if !normalized.contains("ora-12541") && !err.contains("没有监听程序") {
         return err.to_string();
     }
 
-    format!(
-        "{err}\n\nOracle listener was not reachable with the current driver. If the host and port are correct, try switching Version to Oracle 11g-19c or Oracle 10g."
-    )
+    format!("{err}\n\nOracle listener was not reachable. If the host and port are correct, try switching between Service Name and SID.")
+}
+
+pub fn oracle_alternate_connect_configs(config: &ConnectionConfig, err: &str) -> Vec<ConnectionConfig> {
+    if config.db_type != DatabaseType::Oracle {
+        return Vec::new();
+    }
+    if config.driver_profile.as_deref() == Some("oracle-10g") {
+        return Vec::new();
+    }
+    if config.connection_string.as_deref().is_some_and(|value| !value.trim().is_empty()) {
+        return Vec::new();
+    }
+    if !oracle_listener_error_can_retry(err) {
+        return Vec::new();
+    }
+
+    let database = config.effective_database().unwrap_or("").trim();
+    if database.is_empty() {
+        return Vec::new();
+    }
+
+    let host = config.host.trim();
+    let port = config.port;
+    let current_url = oracle_jdbc_connection_string(config, host, port, database);
+    let service_url = oracle_service_jdbc_url(host, port, database);
+    let sid_url = oracle_sid_jdbc_url(host, port, database);
+    let legacy_service_url = oracle_legacy_service_jdbc_url(host, port, database);
+    let descriptor_service_url = oracle_descriptor_jdbc_url(host, port, database, "SERVICE_NAME");
+    let descriptor_sid_url = oracle_descriptor_jdbc_url(host, port, database, "SID");
+
+    let normalized = err.to_lowercase();
+    let candidates = if normalized.contains("ora-12505") {
+        vec![service_url, descriptor_service_url, legacy_service_url]
+    } else if normalized.contains("ora-12514") {
+        vec![sid_url, descriptor_sid_url, legacy_service_url]
+    } else {
+        match config.oracle_connection_type.as_deref() {
+            Some("sid") => vec![service_url, legacy_service_url, descriptor_sid_url, descriptor_service_url],
+            _ => vec![sid_url, legacy_service_url, descriptor_service_url, descriptor_sid_url],
+        }
+    };
+
+    let mut urls = Vec::new();
+    for url in candidates {
+        if url == current_url || urls.iter().any(|seen| seen == &url) {
+            continue;
+        }
+        urls.push(url);
+    }
+
+    urls.into_iter()
+        .map(|url| {
+            let mut retry = config.clone();
+            retry.oracle_connection_type = None;
+            retry.connection_string = Some(url);
+            retry
+        })
+        .collect()
 }
 
 fn oracle_jdbc_connection_string(config: &ConnectionConfig, host: &str, port: u16, database: &str) -> String {
@@ -218,10 +275,52 @@ fn oracle_jdbc_connection_string(config: &ConnectionConfig, host: &str, port: u1
     }
 
     if config.oracle_connection_type.as_deref() == Some("sid") {
-        format!("jdbc:oracle:thin:@{host}:{port}:{database}")
+        oracle_sid_jdbc_url(host, port, database)
     } else {
-        format!("jdbc:oracle:thin:@//{host}:{port}/{database}")
+        oracle_service_jdbc_url(host, port, database)
     }
+}
+
+fn oracle_listener_error_can_retry(err: &str) -> bool {
+    let normalized = err.to_lowercase();
+    normalized.contains("ora-12505")
+        || normalized.contains("ora-12514")
+        || normalized.contains("ora-12541")
+        || normalized.contains("no listener")
+        || err.contains("没有监听程序")
+}
+
+fn oracle_service_jdbc_url(host: &str, port: u16, database: &str) -> String {
+    format!("jdbc:oracle:thin:@//{host}:{port}/{database}")
+}
+
+fn oracle_sid_jdbc_url(host: &str, port: u16, database: &str) -> String {
+    format!("jdbc:oracle:thin:@{host}:{port}:{database}")
+}
+
+fn oracle_legacy_service_jdbc_url(host: &str, port: u16, database: &str) -> String {
+    format!("jdbc:oracle:thin:@{host}:{port}/{database}")
+}
+
+fn oracle_descriptor_jdbc_url(host: &str, port: u16, database: &str, key: &str) -> String {
+    format!("jdbc:oracle:thin:@(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST={host})(PORT={port}))(CONNECT_DATA=({key}={database})))")
+}
+
+fn oceanbase_oracle_jdbc_connection_string(config: &ConnectionConfig, host: &str, port: u16, database: &str) -> String {
+    if let Some(connection_string) = config.connection_string.as_deref().filter(|value| !value.trim().is_empty()) {
+        let connection_string = connection_string.trim();
+        if host == config.host && port == config.port {
+            return connection_string.to_string();
+        }
+        return crate::models::connection::rewrite_jdbc_url_host(connection_string, host, port);
+    }
+
+    let database = database.trim();
+    if database.is_empty() {
+        return String::new();
+    }
+
+    append_agent_url_params(format!("jdbc:oceanbase://{host}:{port}/{database}"), config.url_params.as_deref())
 }
 
 fn postgres_like_agent_jdbc_connection_string(
@@ -252,32 +351,39 @@ pub fn oracle_auth_fallback_profiles(config: &ConnectionConfig, err: &str) -> Ve
     if !normalized.contains("ora-28040") && !normalized.contains("no matching authentication protocol") {
         return Vec::new();
     }
-    match config.driver_profile.as_deref() {
-        Some("oracle-10g") => Vec::new(),
-        Some("oracle-legacy") => vec!["oracle-10g"],
-        _ => vec!["oracle-legacy", "oracle-10g"],
-    }
+    Vec::new()
 }
 
 pub fn oracle_alternate_connect_config(config: &ConnectionConfig, err: &str) -> Option<ConnectionConfig> {
-    if config.db_type != DatabaseType::Oracle {
-        return None;
-    }
-    if config.driver_profile.as_deref() == Some("oracle-10g") {
-        return None;
-    }
-    if config.connection_string.as_deref().is_some_and(|value| !value.trim().is_empty()) {
-        return None;
-    }
-    let normalized = err.to_lowercase();
-    if !normalized.contains("ora-12505") && !normalized.contains("ora-12514") {
-        return None;
-    }
+    oracle_alternate_connect_configs(config, err).into_iter().next()
+}
 
-    let mut retry = config.clone();
-    retry.oracle_connection_type =
-        Some(if config.oracle_connection_type.as_deref() == Some("sid") { "service_name" } else { "sid" }.to_string());
-    Some(retry)
+pub fn oracle_alternate_connect_config_labels(configs: &[ConnectionConfig]) -> Vec<String> {
+    configs
+        .iter()
+        .map(|config| {
+            config
+                .connection_string
+                .as_deref()
+                .map(oracle_connection_string_label)
+                .unwrap_or_else(|| config.oracle_connection_type.as_deref().unwrap_or("service_name").to_string())
+        })
+        .collect()
+}
+
+fn oracle_connection_string_label(connection_string: &str) -> String {
+    let upper = connection_string.to_ascii_uppercase();
+    if upper.contains("(SERVICE_NAME=") {
+        "descriptor service name".to_string()
+    } else if upper.contains("(SID=") {
+        "descriptor SID".to_string()
+    } else if connection_string.starts_with("jdbc:oracle:thin:@//") {
+        "service name".to_string()
+    } else if connection_string.contains(':') && !connection_string.contains('/') {
+        "SID".to_string()
+    } else {
+        "legacy service name".to_string()
+    }
 }
 
 fn sap_hana_jdbc_connection_string(config: &ConnectionConfig, host: &str, port: u16, database: &str) -> String {
@@ -392,6 +498,7 @@ mod tests {
     use super::*;
     use crate::models::connection::{
         default_connect_timeout_secs, default_idle_timeout_secs, default_query_timeout_secs,
+        default_redis_key_separator,
     };
 
     fn config(db_type: DatabaseType, database: Option<&str>) -> ConnectionConfig {
@@ -428,6 +535,7 @@ mod tests {
             redis_sentinel_password: String::new(),
             redis_sentinel_tls: false,
             redis_cluster_nodes: String::new(),
+            redis_key_separator: default_redis_key_separator(),
             etcd_endpoints: String::new(),
             external_config: None,
             jdbc_driver_class: None,
@@ -515,17 +623,17 @@ mod tests {
         let hinted = oracle_error_with_driver_hint(&cfg, err);
 
         assert!(hinted.starts_with(err));
-        assert!(hinted.contains("Oracle 11g-19c"));
-        assert!(hinted.contains("Oracle 10g"));
+        assert!(hinted.contains("Service Name"));
+        assert!(hinted.contains("SID"));
     }
 
     #[test]
-    fn oracle_listener_error_hint_skips_legacy_profiles_and_other_databases() {
+    fn oracle_listener_error_hint_skips_other_databases() {
         let err = "Agent RPC error (-1): ORA-12541: TNS:no listener";
         let mut cfg = config(DatabaseType::Oracle, Some("ORCL"));
         cfg.driver_profile = Some("oracle-legacy".to_string());
 
-        assert_eq!(oracle_error_with_driver_hint(&cfg, err), err);
+        assert!(oracle_error_with_driver_hint(&cfg, err).contains("Service Name"));
 
         cfg.db_type = DatabaseType::OceanbaseOracle;
         cfg.driver_profile = None;
@@ -571,7 +679,7 @@ mod tests {
     }
 
     #[test]
-    fn oceanbase_oracle_uses_oracle_jdbc_connection_string_for_agent_protocol() {
+    fn oceanbase_oracle_uses_oceanbase_jdbc_connection_string_for_agent_protocol() {
         let mut cfg = config(DatabaseType::OceanbaseOracle, Some("sys"));
         cfg.host = "oceanbase.example.com".to_string();
         cfg.port = 2881;
@@ -580,7 +688,19 @@ mod tests {
 
         assert_eq!(params["database"], "sys");
         assert_eq!(params["sysdba"], false);
-        assert_eq!(params["connection_string"], "jdbc:oracle:thin:@//oceanbase.example.com:2881/sys");
+        assert_eq!(params["connection_string"], "jdbc:oceanbase://oceanbase.example.com:2881/sys");
+    }
+
+    #[test]
+    fn oceanbase_oracle_jdbc_url_appends_params_and_rewrites_forwarded_host() {
+        let mut cfg = config(DatabaseType::OceanbaseOracle, Some("sys"));
+        cfg.host = "oceanbase.example.com".to_string();
+        cfg.port = 2881;
+        cfg.url_params = Some("useSSL=false".to_string());
+
+        let params = agent_connect_params(&cfg, "127.0.0.1", 12881, "sys");
+
+        assert_eq!(params["connection_string"], "jdbc:oceanbase://127.0.0.1:12881/sys?useSSL=false");
     }
 
     #[test]
@@ -627,26 +747,20 @@ mod tests {
 
         let retry = oracle_alternate_connect_config(&cfg, "ORA-12514: listener does not know service").unwrap();
 
-        assert_eq!(retry.oracle_connection_type.as_deref(), Some("sid"));
+        assert_eq!(retry.connection_string.as_deref(), Some("jdbc:oracle:thin:@127.0.0.1:3306:ORCL"));
         assert!(oracle_alternate_connect_config(&retry, "ORA-01017: invalid username/password").is_none());
-        assert!(oracle_alternate_connect_config(&cfg, "ORA-12541: TNS:no listener").is_none());
+        assert!(oracle_alternate_connect_config(&cfg, "ORA-12541: TNS:no listener").is_some());
     }
 
     #[test]
-    fn oracle_auth_errors_use_legacy_then_10g_fallbacks() {
+    fn oracle_auth_errors_do_not_switch_driver_profiles() {
         let mut cfg = config(DatabaseType::Oracle, Some("ORCL"));
         cfg.driver_profile = Some("oracle".to_string());
 
-        assert_eq!(
-            oracle_auth_fallback_profiles(&cfg, "ORA-28040: No matching authentication protocol"),
-            vec!["oracle-legacy", "oracle-10g"]
-        );
+        assert!(oracle_auth_fallback_profiles(&cfg, "ORA-28040: No matching authentication protocol").is_empty());
 
         cfg.driver_profile = Some("oracle-legacy".to_string());
-        assert_eq!(
-            oracle_auth_fallback_profiles(&cfg, "ORA-28040: No matching authentication protocol"),
-            vec!["oracle-10g"]
-        );
+        assert!(oracle_auth_fallback_profiles(&cfg, "ORA-28040: No matching authentication protocol").is_empty());
 
         cfg.driver_profile = Some("oracle-10g".to_string());
         assert!(oracle_auth_fallback_profiles(&cfg, "ORA-28040: No matching authentication protocol").is_empty());
@@ -660,6 +774,28 @@ mod tests {
         cfg.connection_string = Some("jdbc:oracle:thin:@//oracle.example.com:1521/ORCL".to_string());
 
         assert!(oracle_alternate_connect_config(&cfg, "ORA-12514: listener does not know service").is_none());
+    }
+
+    #[test]
+    fn oracle_no_listener_errors_try_common_jdbc_url_variants() {
+        let mut cfg = config(DatabaseType::Oracle, Some("ORCL"));
+        cfg.host = "oracle.example.com".to_string();
+        cfg.port = 1521;
+        cfg.driver_profile = Some("oracle".to_string());
+        cfg.oracle_connection_type = Some("service_name".to_string());
+
+        let retries = oracle_alternate_connect_configs(&cfg, "ORA-12541: TNS:no listener");
+        let urls: Vec<_> = retries.iter().filter_map(|retry| retry.connection_string.as_deref()).collect();
+
+        assert_eq!(
+            urls,
+            vec![
+                "jdbc:oracle:thin:@oracle.example.com:1521:ORCL",
+                "jdbc:oracle:thin:@oracle.example.com:1521/ORCL",
+                "jdbc:oracle:thin:@(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=oracle.example.com)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=ORCL)))",
+                "jdbc:oracle:thin:@(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=oracle.example.com)(PORT=1521))(CONNECT_DATA=(SID=ORCL)))",
+            ]
+        );
     }
 
     #[test]

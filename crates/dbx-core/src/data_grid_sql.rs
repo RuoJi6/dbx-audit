@@ -1592,4 +1592,93 @@ mod tests {
         );
         assert!(result.statements.is_empty());
     }
+
+    fn pk_column(name: &str, data_type: &str, nullable: bool, extra: Option<&str>) -> DataGridColumnInfo {
+        DataGridColumnInfo {
+            name: name.to_string(),
+            data_type: data_type.to_string(),
+            is_nullable: nullable,
+            is_primary_key: true,
+            column_default: None,
+            extra: extra.map(ToString::to_string),
+        }
+    }
+
+    #[test]
+    fn prepare_data_grid_save_skips_sqlite_autoincrement_pk_validation() {
+        let result = prepare_data_grid_save(DataGridSaveStatementOptions {
+            database_type: Some(DatabaseType::Sqlite),
+            table_meta: DataGridTableMeta {
+                schema: None,
+                table_name: "OnlineLogs".to_string(),
+                primary_keys: vec!["OnlineLogId".to_string()],
+                columns: Some(vec![
+                    pk_column("OnlineLogId", "INTEGER", false, Some("autoincrement")),
+                    column("LogTime", "TEXT", false, None),
+                ]),
+            },
+            columns: vec!["OnlineLogId".to_string(), "LogTime".to_string()],
+            source_columns: None,
+            rows: vec![],
+            dirty_rows: vec![],
+            deleted_rows: vec![],
+            new_rows: vec![vec![Value::Null, json!("2026-06-12T00:00:00Z")]],
+        });
+
+        assert_eq!(result.validation_error, None);
+        assert_eq!(result.statements, vec![r#"INSERT INTO "OnlineLogs" ("LogTime") VALUES ('2026-06-12T00:00:00Z');"#]);
+    }
+
+    #[test]
+    fn prepare_data_grid_save_includes_explicit_sqlite_pk_value() {
+        let result = prepare_data_grid_save(DataGridSaveStatementOptions {
+            database_type: Some(DatabaseType::Sqlite),
+            table_meta: DataGridTableMeta {
+                schema: None,
+                table_name: "OnlineLogs".to_string(),
+                primary_keys: vec!["OnlineLogId".to_string()],
+                columns: Some(vec![
+                    pk_column("OnlineLogId", "INTEGER", false, Some("autoincrement")),
+                    column("LogTime", "TEXT", false, None),
+                ]),
+            },
+            columns: vec!["OnlineLogId".to_string(), "LogTime".to_string()],
+            source_columns: None,
+            rows: vec![],
+            dirty_rows: vec![],
+            deleted_rows: vec![],
+            new_rows: vec![vec![json!(42), json!("2026-06-12T00:00:00Z")]],
+        });
+
+        assert_eq!(result.validation_error, None);
+        assert_eq!(
+            result.statements,
+            vec![r#"INSERT INTO "OnlineLogs" ("OnlineLogId", "LogTime") VALUES (42, '2026-06-12T00:00:00Z');"#]
+        );
+    }
+
+    #[test]
+    fn prepare_data_grid_save_still_validates_other_not_null_columns_in_sqlite() {
+        let result = prepare_data_grid_save(DataGridSaveStatementOptions {
+            database_type: Some(DatabaseType::Sqlite),
+            table_meta: DataGridTableMeta {
+                schema: None,
+                table_name: "OnlineLogs".to_string(),
+                primary_keys: vec!["OnlineLogId".to_string()],
+                columns: Some(vec![
+                    pk_column("OnlineLogId", "INTEGER", false, Some("autoincrement")),
+                    column("LogTime", "TEXT", false, None),
+                ]),
+            },
+            columns: vec!["OnlineLogId".to_string(), "LogTime".to_string()],
+            source_columns: None,
+            rows: vec![],
+            dirty_rows: vec![],
+            deleted_rows: vec![],
+            new_rows: vec![vec![Value::Null, Value::Null]],
+        });
+
+        assert_eq!(result.validation_error, Some(r#"Column "LogTime" does not allow NULL."#.to_string()));
+        assert!(result.statements.is_empty());
+    }
 }

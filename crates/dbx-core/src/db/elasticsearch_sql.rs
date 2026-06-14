@@ -264,7 +264,7 @@ fn translate_order_by(items: &[OrderByExpr]) -> Result<Option<Json>, String> {
 fn extract_limit_offset(query: &Query) -> Result<(Option<usize>, Option<usize>), String> {
     let limit = match &query.limit_clause {
         Some(sqlparser::ast::LimitClause::LimitOffset { limit, .. }) => {
-            limit.as_ref().map(|expr| usize_literal(expr)).transpose()?
+            limit.as_ref().map(usize_literal).transpose()?
         }
         _ => None,
     };

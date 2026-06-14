@@ -5,12 +5,13 @@ import { Search, X, ListFilter, Crosshair, Server, Database, FolderTree, Table2,
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useQueryStore } from "@/stores/queryStore";
 import { useSettingsStore } from "@/stores/settingsStore";
-import type { QueryTab, TreeNode, TreeNodeType } from "@/types/database";
+import type { TreeNode, TreeNodeType } from "@/types/database";
 import { filterSidebarSearchRootsByConnectionState, filterSidebarTree } from "@/lib/sidebarSearchTree";
 import { isCancelSearchShortcut } from "@/lib/keyboardShortcuts";
 import { usesTreeSchemaMode } from "@/lib/databaseFeatureSupport";
-import { connectionUsesDatabaseObjectTreeMode } from "@/lib/jdbcDialect";
-import { findSidebarNodeForActiveTab, findNodePathForActiveTab, scrollTopForSidebarNode, shouldScrollActiveSidebarSelection } from "@/lib/sidebarActiveTabTarget";
+import { connectionUsesDatabaseObjectTreeMode, effectiveDatabaseTypeForConnection } from "@/lib/jdbcDialect";
+import { activeTabSidebarTarget, findSidebarNodeForActiveTab, findSidebarNodeForTarget, findNodePathForTarget, scrollTopForSidebarNode, shouldScrollActiveSidebarSelection, type ActiveTabSidebarTarget } from "@/lib/sidebarActiveTabTarget";
+import { findLoadedTableTargetForCandidate, queryContextTargetFromCandidate, queryCursorTableCandidate, type QueryCursorTableCandidate } from "@/lib/queryCursorTableTarget";
 import { SIDEBAR_TREE_ROW_HEIGHT, SIDEBAR_TREE_PRERENDER_COUNT, SIDEBAR_TREE_SCROLL_BUFFER, flattenTree, scrollTopForExpandedTreeNode, shouldAutoScrollExpandedTreeNode, shouldVirtualizeFlatTree, type FlatTreeNode } from "@/composables/useFlatTree";
 import { sidebarTreeContextKey } from "@/lib/sidebarTreeContext";
 import TreeItem from "./TreeItem.vue";
@@ -57,7 +58,7 @@ const SEARCH_SCOPE_TO_NODE_TYPES: Record<SearchScope, TreeNodeType[]> = {
   connection: ["connection"],
   database: ["database", "redis-db", "mongo-db"],
   schema: ["schema"],
-  table: ["table", "mongo-collection"],
+  table: ["table", "mongo-collection", "elasticsearch-index"],
   view: ["view"],
 };
 
@@ -211,8 +212,14 @@ async function locateActiveTabInSidebar() {
     }
   }
 
-  // Ensure the tree is loaded deep enough to contain the target node
-  await ensureTreeLoadedForTab(tab);
+  const config = connId ? store.getConfig(connId) : undefined;
+  const cursorCandidate = queryCursorTableCandidate(tab, effectiveDatabaseTypeForConnection(config));
+  const fallbackTarget = queryContextTargetFromCandidate(tab, cursorCandidate) ?? activeTabSidebarTarget(tab);
+  const initialTarget = cursorCandidate ? tableTargetFromCandidate(cursorCandidate) : fallbackTarget;
+  if (!initialTarget) return;
+
+  // Ensure the tree is loaded deep enough to contain the preferred target.
+  await ensureTreeLoadedForTarget(initialTarget);
 
   // Clear any active search filter so the node is visible
   if (isFiltering.value) {
@@ -221,15 +228,24 @@ async function locateActiveTabInSidebar() {
     clearSearchScopeFilter();
   }
 
-  let nodePath = findNodePathForActiveTab(tab, store.treeNodes);
+  let target = resolveLoadedLocateTarget(initialTarget, cursorCandidate);
+  let nodePath = target ? findNodePathForTarget(target, store.treeNodes) : null;
   if (!nodePath) {
     // The first load may have served a stale schema cache whose async refresh
     // replaced the database node before its tables finished loading, so the
     // table isn't in the tree yet. Force a synchronous reload and retry once so
     // locate reaches the table, not just the database (issue #715).
-    await ensureTreeLoadedForTab(tab, { force: true });
-    nodePath = findNodePathForActiveTab(tab, store.treeNodes);
+    await ensureTreeLoadedForTarget(initialTarget, { force: true });
+    target = resolveLoadedLocateTarget(initialTarget, cursorCandidate);
+    nodePath = target ? findNodePathForTarget(target, store.treeNodes) : null;
   }
+
+  if (!nodePath && cursorCandidate && fallbackTarget) {
+    await ensureTreeLoadedForTarget(fallbackTarget);
+    target = fallbackTarget;
+    nodePath = findNodePathForTarget(fallbackTarget, store.treeNodes);
+  }
+
   if (!nodePath) return;
 
   for (const ancestor of nodePath) {
@@ -240,7 +256,7 @@ async function locateActiveTabInSidebar() {
 
   await nextTick();
 
-  const match = findSidebarNodeForActiveTab(tab, flatNodes.value);
+  const match = target ? findSidebarNodeForTarget(target, flatNodes.value) : null;
   if (!match) return;
 
   store.selectedTreeNodeId = match.id;
@@ -255,8 +271,24 @@ async function locateActiveTabInSidebar() {
   await scrollToSidebarNode(match.id);
 }
 
-async function ensureTreeLoadedForTab(tab: QueryTab, opts?: { force?: boolean }) {
-  const connId = tab.connectionId;
+function tableTargetFromCandidate(candidate: QueryCursorTableCandidate): ActiveTabSidebarTarget {
+  return {
+    type: "table",
+    connectionId: candidate.connectionId,
+    database: candidate.database,
+    schema: candidate.schema,
+    tableName: candidate.tableName,
+  };
+}
+
+function resolveLoadedLocateTarget(target: ActiveTabSidebarTarget, candidate: QueryCursorTableCandidate | null): ActiveTabSidebarTarget | null {
+  if (!candidate) return target;
+  return findLoadedTableTargetForCandidate(store.treeNodes, candidate);
+}
+
+async function ensureTreeLoadedForTarget(target: ActiveTabSidebarTarget, opts?: { force?: boolean }) {
+  if (target.type === "saved-sql-file" || target.type === "etcd-root") return;
+  const connId = target.connectionId;
   if (!connId) return;
 
   const config = store.getConfig(connId);
@@ -275,8 +307,10 @@ async function ensureTreeLoadedForTab(tab: QueryTab, opts?: { force?: boolean })
     try {
       if (config.db_type === "redis") {
         await store.loadRedisDatabases(connId);
-      } else if (config.db_type === "mongodb" || config.db_type === "elasticsearch") {
+      } else if (config.db_type === "mongodb") {
         await store.loadMongoDatabases(connId);
+      } else if (config.db_type === "elasticsearch") {
+        await store.loadElasticsearchIndices(connId);
       } else {
         await store.loadDatabases(connId, loadOptions);
       }
@@ -285,37 +319,73 @@ async function ensureTreeLoadedForTab(tab: QueryTab, opts?: { force?: boolean })
     }
   }
 
-  if (!tab.database) return;
+  if (!("database" in target) || !target.database) return;
 
   // Find the database node
-  const dbNode = findDatabaseNode(store.treeNodes, connId, tab.database);
+  const dbNode = findDatabaseNode(store.treeNodes, connId, target.database);
   if (!dbNode) return;
-  if (!force && dbNode.children && dbNode.children.length > 0) return;
+  const targetSchema = "schema" in target ? target.schema : undefined;
+  const databaseChildrenLoaded = !!dbNode.children && dbNode.children.length > 0;
+  const shouldLoadSchemaTables = target.type === "table" && !!targetSchema && usesTreeSchemaMode(config.db_type) && !connectionUsesDatabaseObjectTreeMode(config);
+  if (!force && databaseChildrenLoaded && !shouldLoadSchemaTables) return;
 
   // Load database contents
   try {
     if (config.db_type === "sqlserver") {
-      await store.loadSqlServerDatabaseObjects(connId, tab.database, loadOptions);
+      if (force || !databaseChildrenLoaded) {
+        await store.loadSqlServerDatabaseObjects(connId, target.database, loadOptions);
+      }
     } else if (usesTreeSchemaMode(config.db_type) && !connectionUsesDatabaseObjectTreeMode(config)) {
-      await store.loadSchemas(connId, tab.database, loadOptions);
+      if (force || !databaseChildrenLoaded) {
+        await store.loadSchemas(connId, target.database, loadOptions);
+      }
       // If we have a schema, also load tables under that schema
-      if (tab.schema) {
-        const schemaNode = findSchemaNode(store.treeNodes, connId, tab.database, tab.schema);
+      if (targetSchema) {
+        const schemaNode = findSchemaNode(store.treeNodes, connId, target.database, targetSchema);
         if (schemaNode && (force || !schemaNode.children || schemaNode.children.length === 0)) {
-          await store.loadTables(connId, tab.database, tab.schema, loadOptions);
+          await store.loadTables(connId, target.database, targetSchema, loadOptions);
         }
       }
     } else {
-      await store.loadTables(connId, tab.database, undefined, loadOptions);
+      await store.loadTables(connId, target.database, undefined, loadOptions);
+    }
+
+    if (target.type === "table") {
+      await ensureTableObjectGroupsLoaded(target, loadOptions);
     }
   } catch {
     // Node just won't have children loaded
   }
 }
 
+async function ensureTableObjectGroupsLoaded(target: Extract<ActiveTabSidebarTarget, { type: "table" }>, options?: { force?: boolean }) {
+  const groups = findTableObjectGroupNodes(store.treeNodes, target);
+  for (const group of groups) {
+    if (!options?.force && group.children && group.children.length > 0) continue;
+    await store.loadObjectGroupChildren(group, options);
+  }
+}
+
+function findTableObjectGroupNodes(nodes: TreeNode[], target: Extract<ActiveTabSidebarTarget, { type: "table" }>): TreeNode[] {
+  const matches: TreeNode[] = [];
+  for (const node of nodes) {
+    if ((node.type === "group-tables" || node.type === "group-views") && node.connectionId === target.connectionId && sameTreeName(node.database, target.database) && (!target.schema || sameTreeName(node.schema, target.schema))) {
+      matches.push(node);
+    }
+    if (node.children) {
+      matches.push(...findTableObjectGroupNodes(node.children, target));
+    }
+  }
+  return matches;
+}
+
+function sameTreeName(left: string | undefined, right: string | undefined): boolean {
+  return (left || "").toLowerCase() === (right || "").toLowerCase();
+}
+
 function findDatabaseNode(nodes: TreeNode[], connId: string, database: string): TreeNode | null {
   for (const node of nodes) {
-    if (node.type === "database" && node.connectionId === connId && node.database === database) {
+    if (node.type === "database" && node.connectionId === connId && sameTreeName(node.database, database)) {
       return node;
     }
     if (node.children) {
@@ -328,7 +398,7 @@ function findDatabaseNode(nodes: TreeNode[], connId: string, database: string): 
 
 function findSchemaNode(nodes: TreeNode[], connId: string, database: string, schema: string): TreeNode | null {
   for (const node of nodes) {
-    if (node.type === "schema" && node.connectionId === connId && node.database === database && node.label === schema) {
+    if (node.type === "schema" && node.connectionId === connId && sameTreeName(node.database, database) && sameTreeName(node.label, schema)) {
       return node;
     }
     if (node.children) {

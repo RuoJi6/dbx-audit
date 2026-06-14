@@ -1,6 +1,6 @@
-import { useConnectionStore } from "@/stores/connectionStore";
+﻿import { useConnectionStore } from "@/stores/connectionStore";
 import { useSettingsStore } from "@/stores/settingsStore";
-import type { QueryResult, QueryTab } from "@/types/database";
+import type { ConnectionConfig, QueryResult, QueryTab } from "@/types/database";
 
 type Translate = (key: string, params?: Record<string, unknown>) => string;
 
@@ -14,10 +14,27 @@ export function connectionColor(connectionId: string): string {
   return connectionStore.getConfig(connectionId)?.color || "";
 }
 
+export function isConnectionReadonly(connectionId: string): boolean {
+  const connectionStore = useConnectionStore();
+  return connectionStore.getConfig(connectionId)?.read_only ?? false;
+}
+
+function jdbcTargetLabel(connection: ConnectionConfig): string {
+  const url = connection.connection_string?.trim() || "";
+  const serviceMatch = url.match(/@\/\/[^/?;]+\/([^?;]+)/);
+  if (serviceMatch?.[1]) return serviceMatch[1];
+  const sidMatch = url.match(/@[^:]+:\d+:([^?;]+)/);
+  if (sidMatch?.[1]) return sidMatch[1];
+  const pathMatch = url.match(/^jdbc:[^:]+:\/\/[^/?;]+\/([^?;]+)/);
+  if (pathMatch?.[1]) return pathMatch[1];
+  return connection.driver_label || "JDBC";
+}
+
 export function databaseDisplayNameForTab(connectionId: string, database: string, t: Translate): string {
   const connectionStore = useConnectionStore();
   const connection = connectionStore.getConfig(connectionId);
   if (connection?.db_type === "redis" && database !== "") return `db${database}`;
+  if (connection?.db_type === "jdbc" && !database) return jdbcTargetLabel(connection);
   return database || t("editor.noDatabase");
 }
 

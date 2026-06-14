@@ -1,5 +1,6 @@
 import type { DatabaseType, QueryResult } from "@/types/database";
 import * as api from "@/lib/api";
+import { supportsDatabaseFeature } from "./databaseDriverManifest";
 
 export interface ExplainPlanNode {
   id: string;
@@ -24,7 +25,7 @@ export type BuildExplainSqlResult = { ok: true; sql: string } | { ok: false; rea
 
 const SUPPORTED_EXPLAIN_TYPES = new Set<DatabaseType>(["mysql", "postgres", "dameng"]);
 export function supportsExplainPlan(databaseType?: DatabaseType): databaseType is "mysql" | "postgres" | "dameng" {
-  return !!databaseType && SUPPORTED_EXPLAIN_TYPES.has(databaseType);
+  return !!databaseType && supportsDatabaseFeature(databaseType, "sqlExplain") && SUPPORTED_EXPLAIN_TYPES.has(databaseType);
 }
 
 export function buildExplainSql(databaseType: DatabaseType | undefined, sql: string): Promise<BuildExplainSqlResult> {

@@ -99,3 +99,64 @@ test("connecting a grouped connection updates it in place instead of adding a ro
     storage.restore();
   }
 });
+
+test("importing grouped dbx connections remaps exported layout to new connection ids", async () => {
+  const originalFetch = globalThis.fetch;
+  const storage = installMemoryStorage();
+  let savedConnections: ConnectionConfig[] = [];
+  let savedLayout: SidebarLayout | null = null;
+
+  globalThis.fetch = (async (input, init) => {
+    const url = String(input);
+    if (url === "/api/connection/list") {
+      return new Response(JSON.stringify(savedConnections), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    if (url === "/api/layout/sidebar") {
+      if (init?.method === "POST") {
+        savedLayout = JSON.parse(String(init.body ?? "null"));
+        return new Response("null", { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      return new Response(JSON.stringify(savedLayout), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    if (url === "/api/connection/save") {
+      savedConnections = JSON.parse(String(init?.body ?? "[]"));
+      return new Response("null", { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    return new Response("null", { status: 200, headers: { "Content-Type": "application/json" } });
+  }) as typeof fetch;
+
+  try {
+    setActivePinia(createPinia());
+    const store = useConnectionStore();
+    await store.initFromDisk();
+
+    const exportedLayout: SidebarLayout = {
+      groups: [{ id: "group-1", name: "Imported Group", collapsed: false }],
+      order: [{ type: "group", id: "group-1", connectionIds: ["old-conn-1", "old-conn-2"] }],
+    };
+    const content = JSON.stringify({
+      connections: [conn("old-conn-1", "Grouped A"), conn("old-conn-2", "Grouped B")],
+      layout: exportedLayout,
+    });
+
+    const result = await store.importConnectionsFromFile(content, null);
+    assert.equal(result.count, 2);
+    assert.ok(result.layout);
+    store.applySidebarLayout(result.layout!);
+
+    const group = store.treeNodes[0];
+    assert.equal(group.type, "connection-group");
+    assert.equal(group.label, "Imported Group");
+    assert.deepEqual(
+      group.children?.map((node) => node.label),
+      ["Grouped A", "Grouped B"],
+    );
+    assert.notDeepEqual(
+      group.children?.map((node) => node.id),
+      ["old-conn-1", "old-conn-2"],
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    storage.restore();
+  }
+});

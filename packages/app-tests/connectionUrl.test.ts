@@ -168,6 +168,50 @@ test("parses GBase 8s JDBC URLs", () => {
   assert.equal(parsed.urlParams, "GBASEDBTSERVER=gbase01;CLIENT_LOCALE=zh_cn.utf8");
 });
 
+test("parses Informix JDBC URLs with INFORMIXSERVER", () => {
+  const parsed = parseConnectionUrl("jdbc:informix-sqli://192.168.1.1:9088/mydb:INFORMIXSERVER=ol_informix");
+
+  assert.equal(parsed.dbType, "informix");
+  assert.equal(parsed.driverProfile, "informix");
+  assert.equal(parsed.driverLabel, "Informix");
+  assert.equal(parsed.host, "192.168.1.1");
+  assert.equal(parsed.port, 9088);
+  assert.equal(parsed.database, "mydb");
+  assert.equal(parsed.urlParams, "INFORMIXSERVER=ol_informix");
+});
+
+test("parses Informix JDBC URLs with multiple parameters", () => {
+  const parsed = parseConnectionUrl("jdbc:informix-sqli://192.168.1.1:9088/mydb:INFORMIXSERVER=ol_informix;DB_LOCALE=en_US.UTF8");
+
+  assert.equal(parsed.dbType, "informix");
+  assert.equal(parsed.host, "192.168.1.1");
+  assert.equal(parsed.port, 9088);
+  assert.equal(parsed.database, "mydb");
+  assert.equal(parsed.urlParams, "INFORMIXSERVER=ol_informix;DB_LOCALE=en_US.UTF8");
+});
+
+test("parses Informix JDBC URLs with credentials", () => {
+  const parsed = parseConnectionUrl("jdbc:informix-sqli://user:p%40ss@db.example.com:1533/testdb:INFORMIXSERVER=myserver");
+
+  assert.equal(parsed.dbType, "informix");
+  assert.equal(parsed.host, "db.example.com");
+  assert.equal(parsed.port, 1533);
+  assert.equal(parsed.username, "user");
+  assert.equal(parsed.password, "p@ss");
+  assert.equal(parsed.database, "testdb");
+  assert.equal(parsed.urlParams, "INFORMIXSERVER=myserver");
+});
+
+test("parses Informix JDBC URLs without extra parameters", () => {
+  const parsed = parseConnectionUrl("jdbc:informix-sqli://192.168.1.1:9088/mydb");
+
+  assert.equal(parsed.dbType, "informix");
+  assert.equal(parsed.host, "192.168.1.1");
+  assert.equal(parsed.port, 9088);
+  assert.equal(parsed.database, "mydb");
+  assert.equal(parsed.urlParams, "");
+});
+
 test("parses UCanAccess JDBC URLs as Access database files", () => {
   const parsed = parseConnectionUrl("jdbc:ucanaccess:///Users/me/data/Northwind.accdb;memory=false");
 
