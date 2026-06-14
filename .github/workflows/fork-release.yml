@@ -63,10 +63,10 @@ jobs:
           - os: macos-latest
             label: macos-arm64
             target: aarch64-apple-darwin
-          - os: windows-latest
+          - os: windows-2022
             label: windows-x64
             target: x86_64-pc-windows-msvc
-          - os: windows-latest
+          - os: windows-2022
             label: windows-arm64
             target: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
@@ -100,11 +100,6 @@ jobs:
         shell: bash
         run: |
           node -e "const fs=require('fs'); const p='src-tauri/tauri.conf.json'; const c=JSON.parse(fs.readFileSync(p,'utf8')); c.bundle.createUpdaterArtifacts=false; fs.writeFileSync(p, JSON.stringify(c, null, 2) + '\n');"
-
-      - name: Limit Windows Rust build parallelism
-        if: runner.os == 'Windows'
-        shell: bash
-        run: echo "CARGO_BUILD_JOBS=1" >> "$GITHUB_ENV"
 
       - name: Build Tauri app
         run: pnpm tauri build --target ${{ matrix.target }}
