@@ -310,11 +310,19 @@ async fn run_field_name_scan(state: Arc<WebState>, request: AuditScanRequest, jo
 
         for (schema_index, schema) in schemas.iter().enumerate() {
             let tables = if request.tables.is_empty() {
-                dbx_core::schema::list_tables_core(&state.app, &request.connection_id, database, schema, None, None)
-                    .await?
-                    .into_iter()
-                    .map(|table| table.name)
-                    .collect::<Vec<_>>()
+                dbx_core::schema::list_tables_core(
+                    &state.app,
+                    &request.connection_id,
+                    database,
+                    schema,
+                    None,
+                    None,
+                    None,
+                )
+                .await?
+                .into_iter()
+                .map(|table| table.name)
+                .collect::<Vec<_>>()
             } else {
                 requested_tables_for_schema(&request.tables, schema)
             };
