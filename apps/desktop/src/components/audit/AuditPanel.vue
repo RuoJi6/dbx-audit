@@ -8,6 +8,7 @@ import { DropdownMenu, DropdownMenuCheckboxItem, DropdownMenuContent, DropdownMe
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import * as api from "@/lib/api";
+import { auditTableResultRowCount, buildAuditTableHits, type AuditTableHit as TableHit } from "@/lib/auditAggregation";
 import { connectionIconType } from "@/lib/connectionPresentation";
 import { safeLocalStorageGet, safeLocalStorageRemove } from "@/lib/safeStorage";
 import { isTauriRuntime } from "@/lib/tauriRuntime";
@@ -68,20 +69,6 @@ type RiskTotals = {
   high: number;
   medium: number;
   low: number;
-};
-
-type TableHit = {
-  key: string;
-  connectionId?: string;
-  connectionName?: string;
-  dbType?: string;
-  sourceType?: string;
-  database: string;
-  schema?: string;
-  table: string;
-  columns: string[];
-  rowCount: number;
-  risk: "high" | "medium" | "low";
 };
 
 type FieldHit = {
@@ -794,7 +781,7 @@ const stats = computed(() => ({
 
 const detailFindings = computed(() => (selectedTask.value ? findingsWithConnectionMeta(selectedTask.value) : []));
 const detailTotals = computed(() => riskTotals(detailFindings.value));
-const detailTables = computed(() => tableHits(detailFindings.value));
+const detailTables = computed(() => buildAuditTableHits(detailFindings.value, selectedTask.value?.job?.tableResults || []));
 const detailFields = computed(() => fieldHits(detailFindings.value));
 const databaseFilterOptions = computed<DatabaseFilterOption[]>(() => {
   const options = new Map<string, DatabaseFilterOption>();
@@ -2390,33 +2377,6 @@ function findingsWithConnectionMeta(task: AuditTask): AuditFinding[] {
   });
 }
 
-function tableHits(findings: AuditFinding[]): TableHit[] {
-  const byTable = new Map<string, TableHit>();
-  for (const finding of findings) {
-    const key = `${finding.connectionId || finding.dbType || ""}/${finding.database}/${finding.schema || ""}/${finding.table}`;
-    const existing =
-      byTable.get(key) ||
-      ({
-        key,
-        connectionId: finding.connectionId,
-        connectionName: finding.connectionName,
-        dbType: finding.dbType,
-        sourceType: finding.sourceType,
-        database: finding.database,
-        schema: finding.schema,
-        table: finding.table,
-        columns: [],
-        rowCount: 0,
-        risk: "low",
-      } satisfies TableHit);
-    if (!existing.columns.includes(finding.column)) existing.columns.push(finding.column);
-    existing.rowCount += Number(finding.count || finding.samples?.length || 1);
-    existing.risk = highestRisk(existing.risk, finding.level as "high" | "medium" | "low");
-    byTable.set(key, existing);
-  }
-  return Array.from(byTable.values());
-}
-
 function fieldHits(findings: AuditFinding[]): FieldHit[] {
   return findings.map((finding, index) => ({
     key: `${finding.connectionId || finding.dbType || ""}/${finding.database}/${finding.table}/${finding.column}/${index}`,
@@ -2576,9 +2536,7 @@ function toggleConnectionResult(id: string) {
 }
 
 function connectionResultRowCount(tables: NonNullable<AuditJobState["tableResults"]>, findings: AuditFinding[]) {
-  const tableRows = tables.reduce((total, table) => total + Number(table.rowCount || 0), 0);
-  if (tableRows > 0) return tableRows;
-  return findings.reduce((total, finding) => total + Number(finding.count || 0), 0);
+  return auditTableResultRowCount(tables, findings);
 }
 
 function sampleGroupRowCount(group: SampleGroup) {
@@ -2621,12 +2579,6 @@ function openSampleGroup(group: SampleGroup) {
     schema: group.schema,
     tableName: group.table,
   });
-}
-
-function highestRisk(a: "high" | "medium" | "low", b: "high" | "medium" | "low") {
-  if (a === "high" || b === "high") return "high";
-  if (a === "medium" || b === "medium") return "medium";
-  return "low";
 }
 
 function riskClass(risk: string) {
