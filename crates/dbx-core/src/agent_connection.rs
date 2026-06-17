@@ -48,6 +48,7 @@ pub fn agent_connect_params(config: &ConnectionConfig, host: &str, port: u16, da
         "client_cert_path": config.client_cert_path,
         "client_key_path": config.client_key_path,
         "etcd_endpoints": etcd_endpoints,
+        "gbase_server": config.gbase_server,
         "jdbc_driver_class": config.jdbc_driver_class.as_deref().unwrap_or(""),
         "jdbc_driver_paths": &config.jdbc_driver_paths,
     })
@@ -187,6 +188,30 @@ pub fn mongo_legacy_error_with_auth_hint(err: &str) -> String {
     format!(
         "{err}\n\nCurrent authentication database: {source}. If this user was created in admin, set Authentication database to admin or add authSource=admin to URL params."
     )
+}
+
+pub fn mongo_uses_legacy_driver(config: &ConnectionConfig) -> bool {
+    config.driver_profile.as_deref().is_some_and(|profile| {
+        profile.eq_ignore_ascii_case("mongodb-legacy")
+            || profile.eq_ignore_ascii_case("mongodb_legacy")
+            || profile.eq_ignore_ascii_case("legacy")
+    })
+}
+
+pub fn should_retry_mongo_with_legacy_driver(err: &str) -> bool {
+    let normalized = err.to_lowercase();
+    if normalized.contains("wire version") {
+        return true;
+    }
+
+    let looks_like_handshake_io_error = normalized.contains("unexpected end of file")
+        || normalized.contains("connection reset by peer")
+        || normalized.contains("broken pipe");
+    looks_like_handshake_io_error
+        && (normalized.contains("server selection timeout")
+            || normalized.contains("no available servers")
+            || normalized.contains("topology:")
+            || normalized.contains("i/o error"))
 }
 
 pub fn oracle_error_with_driver_hint(config: &ConnectionConfig, err: &str) -> String {
@@ -497,8 +522,8 @@ fn append_agent_url_params(base: String, params: Option<&str>) -> String {
 mod tests {
     use super::*;
     use crate::models::connection::{
-        default_connect_timeout_secs, default_idle_timeout_secs, default_query_timeout_secs,
-        default_redis_key_separator,
+        default_connect_timeout_secs, default_idle_timeout_secs, default_keepalive_interval_secs,
+        default_query_timeout_secs, default_redis_key_separator,
     };
 
     fn config(db_type: DatabaseType, database: Option<&str>) -> ConnectionConfig {
@@ -521,6 +546,7 @@ mod tests {
             connect_timeout_secs: default_connect_timeout_secs(),
             query_timeout_secs: default_query_timeout_secs(),
             idle_timeout_secs: default_idle_timeout_secs(),
+            keepalive_interval_secs: default_keepalive_interval_secs(),
             ssl: false,
             ca_cert_path: String::new(),
             client_cert_path: String::new(),
@@ -537,6 +563,7 @@ mod tests {
             redis_cluster_nodes: String::new(),
             redis_key_separator: default_redis_key_separator(),
             etcd_endpoints: String::new(),
+            gbase_server: String::new(),
             external_config: None,
             jdbc_driver_class: None,
             jdbc_driver_paths: Vec::new(),

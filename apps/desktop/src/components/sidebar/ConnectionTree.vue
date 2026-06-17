@@ -46,10 +46,33 @@ watch(
 
     searchTimer = window.setTimeout(() => {
       deferredSearchQuery.value = normalized;
-    }, 120);
+    }, 300);
   },
   { flush: "sync" },
 );
+
+watch(deferredSearchQuery, (newQuery) => {
+  store.sidebarSearchQuery = newQuery;
+  const tasks: Promise<void>[] = [];
+  for (const root of store.treeNodes) {
+    findExpandedTableParents(root, tasks);
+  }
+  Promise.all(tasks).catch(() => {});
+});
+
+function findExpandedTableParents(node: TreeNode, tasks: Promise<void>[]) {
+  if (node.isExpanded && node.connectionId && (node.type === "database" || node.type === "schema")) {
+    const groupTypes = new Set(["group-tables", "group-views", "group-procedures", "group-functions", "group-sequences", "group-packages"]);
+    if (node.children?.some((child) => groupTypes.has(child.type))) {
+      tasks.push(store.loadObjectGroupChildren(node, { force: true }));
+    }
+  }
+  if (node.children) {
+    for (const child of node.children) {
+      findExpandedTableParents(child, tasks);
+    }
+  }
+}
 
 const isSearching = computed(() => !!deferredSearchQuery.value);
 const isFiltering = computed(() => !!searchQuery.value.trim() || hasSearchScopeFilter.value);
@@ -326,7 +349,9 @@ async function ensureTreeLoadedForTarget(target: ActiveTabSidebarTarget, opts?: 
   if (!dbNode) return;
   const targetSchema = "schema" in target ? target.schema : undefined;
   const databaseChildrenLoaded = !!dbNode.children && dbNode.children.length > 0;
-  const shouldLoadSchemaTables = target.type === "table" && !!targetSchema && usesTreeSchemaMode(config.db_type) && !connectionUsesDatabaseObjectTreeMode(config);
+  const effectiveDbType = effectiveDatabaseTypeForConnection(config);
+  const usesSchemaTree = usesTreeSchemaMode(effectiveDbType) && !connectionUsesDatabaseObjectTreeMode(config);
+  const shouldLoadSchemaTables = target.type === "table" && !!targetSchema && usesSchemaTree;
   if (!force && databaseChildrenLoaded && !shouldLoadSchemaTables) return;
 
   // Load database contents
@@ -335,7 +360,7 @@ async function ensureTreeLoadedForTarget(target: ActiveTabSidebarTarget, opts?: 
       if (force || !databaseChildrenLoaded) {
         await store.loadSqlServerDatabaseObjects(connId, target.database, loadOptions);
       }
-    } else if (usesTreeSchemaMode(config.db_type) && !connectionUsesDatabaseObjectTreeMode(config)) {
+    } else if (usesSchemaTree) {
       if (force || !databaseChildrenLoaded) {
         await store.loadSchemas(connId, target.database, loadOptions);
       }

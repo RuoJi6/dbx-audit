@@ -54,6 +54,11 @@ function getAny(values: Record<string, string>, keys: string[]) {
   return "";
 }
 
+function truthyNavicatFlag(value: string) {
+  const normalized = value.trim().toLowerCase();
+  return ["1", "true", "yes", "y", "on", "checked"].includes(normalized);
+}
+
 function hexToBytes(hex: string) {
   const clean = hex.trim();
   if (!clean || clean.length % 2 !== 0 || /[^0-9a-f]/i.test(clean)) return null;
@@ -161,6 +166,10 @@ async function parseConnection(node: ParsedNode): Promise<ConnectionConfig | nul
   const oracleConnectionType = profile.dbType === "oracle" && getAny(node.values, ["sid"]) ? "sid" : profile.dbType === "oracle" ? "service_name" : undefined;
   const username = getAny(node.values, ["user", "username", "userName", "uid"]) || profile.user;
   const password = await decryptNavicatPassword(getAny(node.values, ["password"]));
+  const keepaliveValue = Number(getAny(node.values, ["keepAliveInterval", "keepaliveInterval", "keepAliveTime", "keepaliveTime"]));
+  const keepaliveFlag = getAny(node.values, ["keepAlive", "keepalive", "useKeepAlive", "enableKeepAlive"]);
+  const keepaliveEnabled = !keepaliveFlag || truthyNavicatFlag(keepaliveFlag);
+  const keepaliveInterval = Number.isFinite(keepaliveValue) && keepaliveValue > 0 && keepaliveEnabled ? keepaliveValue : 0;
 
   const config: PartialConnection = {
     name,
@@ -177,6 +186,7 @@ async function parseConnection(node: ParsedNode): Promise<ConnectionConfig | nul
     transport_layers: [],
     connect_timeout_secs: 5,
     query_timeout_secs: 30,
+    keepalive_interval_secs: keepaliveInterval,
     ssl: false,
     oracle_connection_type: oracleConnectionType,
     connection_string: undefined,

@@ -2,7 +2,7 @@ import { defineStore } from "pinia";
 import { uuid } from "@/lib/utils";
 import { ref, computed, watch } from "vue";
 import type { ColumnInfo, ConnectionConfig, ForeignKeyInfo, ObjectInfo, SidebarLayout, TreeNode } from "@/types/database";
-import { applyPinnedTreeNodeState, orderPinnedFirst } from "@/lib/pinnedItems";
+import { applyPinnedTreeNodeState, updatePinnedTreeNodeInPlace } from "@/lib/pinnedItems";
 import {
   reconcileLayout,
   buildTreeNodesFromLayout,
@@ -109,6 +109,7 @@ export const useConnectionStore = defineStore("connection", () => {
   const completionDatabasesCache = ref<Record<string, string[]>>({});
   const elasticsearchCompletionIndicesCache = ref<Record<string, string[]>>({});
   const schemaListCache = ref<Record<string, string[]>>({});
+  const sidebarSearchQuery = ref("");
   const completionTableIndex = new Map<string, { touched: number; tables: SqlCompletionTable[] }>();
   const completionObjectIndex = new Map<string, { touched: number; objects: SqlCompletionObject[] }>();
   const completionColumnIndex = new Map<string, { touched: number; columns: SqlCompletionColumn[] }>();
@@ -130,6 +131,12 @@ export const useConnectionStore = defineStore("connection", () => {
     tableName?: string;
   } | null>(null);
   const tableImportSource = ref<{
+    connectionId: string;
+    database: string;
+    schema?: string;
+    tableName: string;
+  } | null>(null);
+  const tableDataGenerateSource = ref<{
     connectionId: string;
     database: string;
     schema?: string;
@@ -241,9 +248,11 @@ export const useConnectionStore = defineStore("connection", () => {
       elasticsearch: "Elasticsearch",
       doris: "Doris",
       starrocks: "StarRocks",
+      manticoresearch: "Manticore Search",
       redshift: "Redshift",
       dameng: "DM (Dameng)",
       gaussdb: "GaussDB",
+      questdb: "QuestDB",
       kwdb: "KWDB",
       kingbase: "KingBase",
       highgo: "瀚高 HighGo",
@@ -271,6 +280,8 @@ export const useConnectionStore = defineStore("connection", () => {
       dbType = "gaussdb" as ConnectionConfig["db_type"];
     } else if (profile === "kwdb" && dbType === "postgres") {
       dbType = "kwdb" as ConnectionConfig["db_type"];
+    } else if (profile === "questdb" && dbType === "postgres") {
+      dbType = "questdb" as ConnectionConfig["db_type"];
     } else if (profile === "redshift" && dbType === "postgres") {
       dbType = "redshift" as ConnectionConfig["db_type"];
     } else if (profile === "kingbase" && dbType === "postgres") {
@@ -294,6 +305,7 @@ export const useConnectionStore = defineStore("connection", () => {
       connect_timeout_secs: config.connect_timeout_secs || 5,
       query_timeout_secs: config.query_timeout_secs ?? 30,
       idle_timeout_secs: config.idle_timeout_secs ?? 60,
+      keepalive_interval_secs: config.keepalive_interval_secs ?? 0,
     };
   }
 
@@ -445,9 +457,12 @@ export const useConnectionStore = defineStore("connection", () => {
     if (!options.node.connectionId || !options.node.database) {
       return { children: [], objectCount: 0, hasMore: false, nextOffset: options.offset };
     }
-    const fetchLimit = options.pageSize + 1;
-    const tables = await api.listTables(options.node.connectionId, options.node.database, options.querySchema, undefined, fetchLimit, options.offset);
-    const hasMore = tables.length > options.pageSize;
+    const searchFilter = sidebarSearchQuery.value || undefined;
+    // When searching, fetch all matching tables (no pagination) — backend filter
+    // already narrows the result set, so client-side filtering is not needed.
+    const fetchLimit = searchFilter ? undefined : options.pageSize + 1;
+    const tables = await api.listTables(options.node.connectionId, options.node.database, options.querySchema, searchFilter, fetchLimit, searchFilter ? undefined : options.offset);
+    const hasMore = searchFilter ? false : tables.length > options.pageSize;
     const pageTables = hasMore ? tables.slice(0, options.pageSize) : tables;
     const objects = mergeTableInfosIntoObjects([], pageTables, options.effectiveSchema);
     const visibleObjectCount = objects.filter((object) => options.objectTypes.includes(normalizedObjectTreeKind(object.object_type))).length;
@@ -546,18 +561,8 @@ export const useConnectionStore = defineStore("connection", () => {
     pinnedTreeNodeIds.value = next;
     persistPinnedTreeNodeIds();
 
-    const node = findNode(treeNodes.value, id);
-    if (node) node.pinned = next.has(id);
-
-    const isConnectionOrGroup = !!findNode(treeNodes.value, id);
-    if (isConnectionOrGroup) {
-      rebuildTreeNodes();
-    } else {
-      const parent = findParentNode(treeNodes.value, id);
-      if (parent?.children) {
-        parent.children = orderPinnedFirst(parent.children, (child) => !!child.pinned);
-      }
-    }
+    const scope = updatePinnedTreeNodeInPlace(treeNodes.value, id, next.has(id));
+    if (scope === "root") rebuildTreeNodes();
   }
 
   async function addConnection(config: ConnectionConfig) {
@@ -914,10 +919,11 @@ export const useConnectionStore = defineStore("connection", () => {
         );
         const visibleNameSet = new Set(visibleNames);
         const visibleDatabases = databases.filter((database) => visibleNameSet.has(database.name));
+        const effectiveDbType = effectiveDatabaseTypeForConnection(config);
         const children = withSavedSqlRoot(
           connectionId,
           buildDatabaseTreeNodes(connectionId, visibleDatabases, {
-            includeDefaultWhenEmpty: usesTreeSchemaMode(config?.db_type) || shouldIncludeDefaultDatabaseNode(config, visibleDatabases),
+            includeDefaultWhenEmpty: usesTreeSchemaMode(effectiveDbType) || shouldIncludeDefaultDatabaseNode(config, visibleDatabases),
           }),
           node,
         );
@@ -1261,7 +1267,7 @@ export const useConnectionStore = defineStore("connection", () => {
       const querySchema = connectionObjectTreeQuerySchema(config, node.database, node.schema);
       const effectiveSchema = connectionObjectTreeNodeSchema(config, node.database, node.schema);
       const cacheKey = objectGroupCacheKey(node);
-      if (!options?.force) {
+      if (!options?.force && !sidebarSearchQuery.value) {
         const cached = await loadPersistedTreeChildren(node, cacheKey);
         if (cached.hit) {
           if (cached.isStale) refreshStaleTreeNode(node);
@@ -1281,7 +1287,7 @@ export const useConnectionStore = defineStore("connection", () => {
           offset: 0,
           pageSize: SIDEBAR_OBJECT_GROUP_PAGE_SIZE,
         });
-        children = page.hasMore ? [...page.children, buildLoadMoreNode(node, page.nextOffset, SIDEBAR_OBJECT_GROUP_PAGE_SIZE)] : page.children;
+        children = page.hasMore && !sidebarSearchQuery.value ? [...page.children, buildLoadMoreNode(node, page.nextOffset, SIDEBAR_OBJECT_GROUP_PAGE_SIZE)] : page.children;
         node.objectCount = page.objectCount;
       } else {
         const objects = await api.listObjects(node.connectionId, node.database, querySchema, objectTypes);
@@ -1295,7 +1301,9 @@ export const useConnectionStore = defineStore("connection", () => {
         node.objectCount = children.length;
       }
       setChildren(node, children);
-      await savePersistedTreeChildren(cacheKey, children);
+      if (!sidebarSearchQuery.value) {
+        await savePersistedTreeChildren(cacheKey, children);
+      }
       node.isExpanded = true;
     } catch (e) {
       recordMetadataLoadError(node.connectionId, e);
@@ -1587,9 +1595,10 @@ export const useConnectionStore = defineStore("connection", () => {
       await loadMongoCollections(node.connectionId, node.database);
     } else if (node.type === "database" && node.connectionId && hasTreeNodeDatabaseContext(node)) {
       const config = getConfig(node.connectionId);
+      const effectiveDbType = effectiveDatabaseTypeForConnection(config);
       if (config?.db_type === "sqlserver") {
         await loadSqlServerDatabaseObjects(node.connectionId, node.database, options);
-      } else if (usesTreeSchemaMode(config?.db_type) && !connectionUsesDatabaseObjectTreeMode(config)) {
+      } else if (usesTreeSchemaMode(effectiveDbType) && !connectionUsesDatabaseObjectTreeMode(config)) {
         await loadSchemas(node.connectionId, node.database, options);
       } else {
         await loadTables(node.connectionId, node.database, undefined, options);
@@ -2732,9 +2741,11 @@ export const useConnectionStore = defineStore("connection", () => {
     sqlFileSource,
     diagramSource,
     tableImportSource,
+    tableDataGenerateSource,
     fieldLineageSource,
     databaseSearchSource,
     databaseExportSource,
+    sidebarSearchQuery,
     createConnectionGroup(name: string, parentGroupId?: string | null) {
       const result = createGroupOp(sidebarLayout.value, name, parentGroupId);
       updateLayoutAndRebuild(result.layout);

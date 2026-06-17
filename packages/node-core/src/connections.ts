@@ -16,6 +16,7 @@ export interface ConnectionConfig {
   database?: string;
   url_params?: string;
   transport_layers?: TransportLayerConfig[];
+  keepalive_interval_secs?: number;
   ssl: boolean;
   ca_cert_path?: string;
   oracle_connection_type?: "service_name" | "sid";

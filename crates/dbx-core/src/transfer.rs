@@ -609,7 +609,7 @@ pub fn escape_value_typed(val: &serde_json::Value, db_type: &DatabaseType, colum
         serde_json::Value::Number(n) => match db_type {
             DatabaseType::Mysql | DatabaseType::Doris | DatabaseType::StarRocks => {
                 if column_type.is_some_and(is_mysql_bit_type) {
-                    format!("b'{}'", n.to_string())
+                    format!("b'{}'", n)
                 } else {
                     n.to_string()
                 }
@@ -1471,6 +1471,10 @@ pub fn pagination_sql(
                 "SELECT {col_list} FROM {full_table} ORDER BY (SELECT NULL) OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY"
             )
         }
+        DatabaseType::Questdb => {
+            let upper_bound = offset + limit as u64;
+            format!("SELECT {col_list} FROM {full_table} LIMIT {offset}, {upper_bound}")
+        }
         _ => {
             format!("SELECT {col_list} FROM {full_table} LIMIT {limit} OFFSET {offset}")
         }
@@ -1496,6 +1500,11 @@ pub fn pagination_sql_with_order(
             format!(
                 "SELECT {col_list} FROM {full_table} ORDER BY {order_by} OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY"
             )
+        }
+        DatabaseType::Questdb => {
+            let upper_bound = offset + limit as u64;
+            let order_by = order_expression.map(|value| format!(" ORDER BY {value}")).unwrap_or_default();
+            format!("SELECT {col_list} FROM {full_table}{order_by} LIMIT {offset}, {upper_bound}")
         }
         _ => {
             let order_by = order_expression.map(|value| format!(" ORDER BY {value}")).unwrap_or_default();
@@ -1532,6 +1541,11 @@ pub fn pagination_sql_with_filter_order(
             format!(
                 "SELECT {col_list} FROM {full_table}{where_clause} ORDER BY {order_by} OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY"
             )
+        }
+        DatabaseType::Questdb => {
+            let upper_bound = offset + limit as u64;
+            let order_by = order_expression.map(|value| format!(" ORDER BY {value}")).unwrap_or_default();
+            format!("SELECT {col_list} FROM {full_table}{where_clause}{order_by} LIMIT {offset}, {upper_bound}")
         }
         _ => {
             let order_by = order_expression.map(|value| format!(" ORDER BY {value}")).unwrap_or_default();
@@ -3314,6 +3328,7 @@ mod tests {
             connect_timeout_secs: 5,
             query_timeout_secs: 30,
             idle_timeout_secs: 60,
+            keepalive_interval_secs: 0,
             ssl: false,
             ca_cert_path: String::new(),
             client_cert_path: String::new(),
@@ -3330,6 +3345,7 @@ mod tests {
             redis_cluster_nodes: String::new(),
             redis_key_separator: default_redis_key_separator(),
             etcd_endpoints: String::new(),
+            gbase_server: String::new(),
             external_config: None,
             jdbc_driver_class: None,
             jdbc_driver_paths: Vec::new(),
@@ -3598,6 +3614,21 @@ mod tests {
         );
 
         assert_eq!(sql, "SELECT \"id\", \"name\" FROM \"public\".\"users\" ORDER BY \"id\" LIMIT 100 OFFSET 200");
+    }
+
+    #[test]
+    fn questdb_pagination_uses_stable_primary_key_order() {
+        let sql = pagination_sql_with_order(
+            &[String::from("id"), String::from("name")],
+            "users",
+            "public",
+            &DatabaseType::Questdb,
+            200,
+            100,
+            &[String::from("id")],
+        );
+
+        assert_eq!(sql, "SELECT `id`, `name` FROM `users` ORDER BY `id` LIMIT 200, 300");
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, NaiveTime};
-use deadpool_postgres::{ManagerConfig, Pool, RecyclingMethod, Runtime};
+use deadpool_postgres::{ManagerConfig, Pool, PoolError, RecyclingMethod, Runtime};
 use futures::{SinkExt, StreamExt};
 use percent_encoding::percent_decode_str;
 use rust_decimal::Decimal;
@@ -538,6 +538,15 @@ fn pg_value_to_json(row: &Row, idx: usize, type_name: &str) -> serde_json::Value
             .unwrap_or(serde_json::Value::Null);
     }
 
+    if upper == "TSVECTOR" {
+        return row
+            .try_get::<_, PgRawBytes>(idx)
+            .ok()
+            .and_then(|raw| decode_tsvector_bytes(&raw.0))
+            .map(serde_json::Value::String)
+            .unwrap_or(serde_json::Value::Null);
+    }
+
     if matches!(upper.as_str(), "OID" | "XID" | "CID") {
         return pg_system_u32_to_json(row, idx).unwrap_or(serde_json::Value::Null);
     }
@@ -602,8 +611,109 @@ fn pg_value_to_json(row: &Row, idx: usize, type_name: &str) -> serde_json::Value
         .unwrap_or(serde_json::Value::Null)
 }
 
+fn decode_tsvector_bytes(raw: &[u8]) -> Option<String> {
+    let mut cursor = 0;
+    let count = read_i32_be(raw, &mut cursor)?;
+    if count < 0 {
+        return None;
+    }
+
+    let mut entries = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let start = cursor;
+        while cursor < raw.len() && raw[cursor] != 0 {
+            cursor += 1;
+        }
+        if cursor >= raw.len() {
+            return None;
+        }
+        let lexeme = std::str::from_utf8(&raw[start..cursor]).ok()?;
+        cursor += 1;
+
+        let position_count = read_u16_be(raw, &mut cursor)? as usize;
+        let mut positions = Vec::with_capacity(position_count);
+        for _ in 0..position_count {
+            let encoded = read_u16_be(raw, &mut cursor)?;
+            let position = encoded & 0x3fff;
+            let weight = match encoded >> 14 {
+                3 => "A",
+                2 => "B",
+                1 => "C",
+                _ => "",
+            };
+            positions.push(format!("{position}{weight}"));
+        }
+
+        let mut entry = format!("'{}'", escape_tsvector_lexeme(lexeme));
+        if !positions.is_empty() {
+            entry.push(':');
+            entry.push_str(&positions.join(","));
+        }
+        entries.push(entry);
+    }
+
+    if cursor == raw.len() {
+        Some(entries.join(" "))
+    } else {
+        None
+    }
+}
+
+fn read_i32_be(raw: &[u8], cursor: &mut usize) -> Option<i32> {
+    let bytes: [u8; 4] = raw.get(*cursor..*cursor + 4)?.try_into().ok()?;
+    *cursor += 4;
+    Some(i32::from_be_bytes(bytes))
+}
+
+fn read_u16_be(raw: &[u8], cursor: &mut usize) -> Option<u16> {
+    let bytes: [u8; 2] = raw.get(*cursor..*cursor + 2)?.try_into().ok()?;
+    *cursor += 2;
+    Some(u16::from_be_bytes(bytes))
+}
+
+fn escape_tsvector_lexeme(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\'', "''")
+}
+
 fn pg_error_to_string(err: tokio_postgres::Error) -> String {
     err.as_db_error().map(ToString::to_string).unwrap_or_else(|| err.to_string())
+}
+
+fn pg_db_error_to_string(err: &tokio_postgres::error::DbError) -> String {
+    format!("{err} (SQLSTATE {})", err.code().code())
+}
+
+fn pg_error_from_sources(err: &(dyn std::error::Error + 'static)) -> Option<String> {
+    let mut current = Some(err);
+    while let Some(source) = current {
+        if let Some(pg_error) = source.downcast_ref::<tokio_postgres::Error>() {
+            if let Some(db_error) = pg_error.as_db_error() {
+                return Some(pg_db_error_to_string(db_error));
+            }
+        }
+        if let Some(db_error) = source.downcast_ref::<tokio_postgres::error::DbError>() {
+            return Some(pg_db_error_to_string(db_error));
+        }
+        current = source.source();
+    }
+    None
+}
+
+fn error_with_sources_to_string(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut messages = vec![err.to_string()];
+    let mut current = err.source();
+    while let Some(source) = current {
+        let message = source.to_string();
+        if !messages.iter().any(|existing| existing == &message) {
+            messages.push(message);
+        }
+        current = source.source();
+    }
+    messages.join(": ")
+}
+
+fn pg_pool_error_to_string(err: PoolError) -> String {
+    pg_error_from_sources(&err).unwrap_or_else(|| error_with_sources_to_string(&err))
 }
 
 fn should_retry_postgres_text_query(err: &tokio_postgres::Error) -> bool {
@@ -665,7 +775,7 @@ async fn execute_select_prepared(
 
     Ok(QueryResult {
         columns,
-        column_types: Vec::new(),
+        column_types,
         column_sortables: Vec::new(),
         rows: result_rows,
         affected_rows: 0,
@@ -772,7 +882,8 @@ pub async fn connect(url: &str, fallback_timeout: Duration) -> Result<Pool, Stri
 
         // Verify connectivity and set timezone. Only set timezone if the user
         // hasn't already specified one via connection parameters (e.g. options=-c timezone=...)
-        let client = pool.get().await.map_err(|e| format!("PostgreSQL connection failed: {e}"))?;
+        let client =
+            pool.get().await.map_err(|e| format!("PostgreSQL connection failed: {}", pg_pool_error_to_string(e)))?;
         if !pg_url_has_timezone_setting(url) {
             client
                 .execute(&format!("SET timezone = '{}'", tz.replace('\'', "''")), &[])
@@ -846,6 +957,15 @@ fn postgres_connection_url(url: &str) -> Result<PostgresConnectionUrl, String> {
                 ssl_files.sslkey = Some(decoded);
             } else {
                 ssl_files.sslrootcert = Some(decoded);
+            }
+        } else if key.eq_ignore_ascii_case("channel_binding") {
+            // channel_binding=require fails when the server does not offer
+            // SCRAM-SHA-256-PLUS (e.g. Neon). Normalize require→prefer so
+            // channel binding is used when available but does not cause a
+            // hard failure when the server doesn't support it.
+            match value.to_ascii_lowercase().as_str() {
+                "require" => kept_params.push("channel_binding=prefer".to_string()),
+                _ => kept_params.push(param.to_string()),
             }
         } else if key.eq_ignore_ascii_case("sslmode") {
             match value.to_ascii_lowercase().as_str() {
@@ -1284,7 +1404,7 @@ pub async fn list_schemas(pool: &Pool) -> Result<Vec<String>, String> {
 const POSTGRES_COLUMNS_SQL: &str = "SELECT a.attname AS column_name, \
              format_type(a.atttypid, a.atttypmod) AS full_type, \
              NOT a.attnotnull AS is_nullable, \
-             pg_get_expr(ad.adbin, ad.adrelid) AS column_default, \
+             CASE WHEN a.attgenerated <> '' THEN NULL ELSE pg_get_expr(ad.adbin, ad.adrelid) END AS column_default, \
              EXISTS ( \
                SELECT 1 FROM pg_constraint co \
                JOIN pg_index i ON i.indrelid = co.conrelid AND co.conindid = i.indexrelid \
@@ -1295,7 +1415,11 @@ const POSTGRES_COLUMNS_SQL: &str = "SELECT a.attname AS column_name, \
              CASE a.attidentity \
                WHEN 'd' THEN 'generated by default as identity' || CASE WHEN pseq.seqstart IS NOT NULL THEN format(' (start with %s increment by %s)', pseq.seqstart, pseq.seqincrement) ELSE '' END \
                WHEN 'a' THEN 'generated always as identity' || CASE WHEN pseq.seqstart IS NOT NULL THEN format(' (start with %s increment by %s)', pseq.seqstart, pseq.seqincrement) ELSE '' END \
-               ELSE NULL \
+               ELSE CASE a.attgenerated \
+                 WHEN 's' THEN 'generated always as (' || pg_get_expr(ad.adbin, ad.adrelid) || ') stored' \
+                 WHEN 'v' THEN 'generated always as (' || pg_get_expr(ad.adbin, ad.adrelid) || ') virtual' \
+                 ELSE NULL \
+               END \
              END AS column_extra, \
              CASE WHEN t.typname = 'numeric' AND a.atttypmod > 0 \
                THEN ((a.atttypmod - 4) >> 16) & 65535 ELSE NULL END AS numeric_precision, \
@@ -1884,6 +2008,21 @@ pub async fn execute_batch(pool: &Pool, statements: &[String]) -> Result<(), Str
     Ok(())
 }
 
+pub async fn terminate_current_user_database_backends(pool: &Pool, database: &str) -> Result<u64, String> {
+    let client = pool.get().await.map_err(|e| e.to_string())?;
+    client
+        .execute(
+            "SELECT pg_terminate_backend(pid) \
+             FROM pg_stat_activity \
+             WHERE datname = $1 \
+               AND pid <> pg_backend_pid() \
+               AND usename = current_user",
+            &[&database],
+        )
+        .await
+        .map_err(pg_error_to_string)
+}
+
 fn clear_postgres_caches_after_ddl(pool: &Pool, client: Option<&deadpool_postgres::Client>, sql: &str) {
     if !invalidates_postgres_statement_cache(sql) {
         return;
@@ -1977,6 +2116,16 @@ mod tests {
         assert_eq!(raw.0, vec![0x01, 0xAB, 0xFF]);
     }
 
+    #[test]
+    fn decodes_tsvector_binary_output() {
+        let raw = [
+            0, 0, 0, 2, b'b', b'a', b'c', b'k', b'\\', b's', b'l', b'a', b's', b'h', 0, 0, 1, 0x80, 0x03, b'o', b'\'',
+            b'c', b'l', b'o', b'c', b'k', 0, 0, 2, 0, 1, 0xc0, 0x02,
+        ];
+
+        assert_eq!(decode_tsvector_bytes(&raw).as_deref(), Some("'back\\\\slash':3B 'o''clock':1,2A"));
+    }
+
     fn decode_hex(hex: &str) -> Vec<u8> {
         assert_eq!(hex.len() % 2, 0, "hex input must have an even number of chars");
         (0..hex.len()).step_by(2).map(|idx| u8::from_str_radix(&hex[idx..idx + 2], 16).unwrap()).collect()
@@ -2049,7 +2198,7 @@ mod tests {
         let escaped = pg_quote_ident(malicious);
         // Double quotes should be doubled, not breaking out
         assert_eq!(escaped, r#""public""; DROP TABLE users; --""#);
-        assert!(escaped.matches('"').count() % 2 == 0, "quote count should be even");
+        assert!(escaped.matches('"').count().is_multiple_of(2), "quote count should be even");
     }
 
     // --- query_result_row_limit ---
@@ -2177,6 +2326,24 @@ mod tests {
         assert_eq!(parsed.url, "postgres://localhost/db?sslmode=require");
         assert!(!parsed.accepts_invalid_certs);
         assert!(!parsed.verifies_hostname);
+    }
+
+    #[test]
+    fn postgres_connection_url_normalizes_channel_binding_require_to_prefer() {
+        let parsed =
+            postgres_connection_url("postgres://localhost/db?sslmode=require&channel_binding=require").unwrap();
+
+        assert_eq!(parsed.url, "postgres://localhost/db?sslmode=require&channel_binding=prefer");
+        // The sanitized URL must be parseable by the driver
+        tokio_postgres::Config::from_str(&parsed.url).unwrap();
+    }
+
+    #[test]
+    fn postgres_connection_url_keeps_channel_binding_prefer() {
+        let parsed = postgres_connection_url("postgres://localhost/db?channel_binding=prefer").unwrap();
+
+        assert_eq!(parsed.url, "postgres://localhost/db?channel_binding=prefer");
+        tokio_postgres::Config::from_str(&parsed.url).unwrap();
     }
 
     #[test]
@@ -2350,14 +2517,14 @@ mod tests {
 
     #[tokio::test]
     async fn execute_batch_whitespace_only_is_filtered() {
-        let statements = vec!["  ".to_string(), "\t\n".to_string(), "".to_string()];
+        let statements = ["  ".to_string(), "\t\n".to_string(), "".to_string()];
         let combined = statements.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(";\n");
         assert!(combined.is_empty());
     }
 
     #[test]
     fn execute_batch_joins_with_semicolons() {
-        let statements = vec!["SELECT 1".to_string(), "SELECT 2".to_string()];
+        let statements = ["SELECT 1".to_string(), "SELECT 2".to_string()];
         let combined = statements.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(";\n");
         assert_eq!(combined, "SELECT 1;\nSELECT 2");
     }

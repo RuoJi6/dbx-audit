@@ -37,6 +37,7 @@ import { buildExecutableObjectSourceStatements, objectSourceSaveExecutionMode } 
 import { resolveExecutableSql, resolveExecutableSqlWithBackend } from "@/lib/sqlExecutionTarget";
 import { uuid } from "@/lib/utils";
 import { isTauriRuntime } from "@/lib/tauriRuntime";
+import { openQueryResultArchiveFile } from "@/lib/queryResultArchiveFile";
 import { sqlFileTitleFromPath } from "@/lib/sqlFileOpen";
 import type { ConnectionConfig, DatabaseType } from "@/types/database";
 import { parseConnectionDeepLink, type ConnectionDeepLinkDraft } from "@/lib/connectionDeepLink";
@@ -63,6 +64,7 @@ import { buildHistoryAiAnalysisPrompt } from "@/lib/historyAiAnalysis";
 import { countAvailableAgentDriverUpdates, type AgentDriverUpdateBadgeState } from "@/lib/agentDriverUpdateBadge";
 import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/safeStorage";
 import { rankSavedSqlHistory } from "@/lib/savedSqlHistory";
+import { isSchemaAware, isSingleDatabase } from "@/lib/databaseFeatureSupport";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -323,7 +325,10 @@ const saveSqlFolders = computed(() => {
     }
     return parts.join(" / ");
   };
-  return savedSqlStore.allFoldersTreeOrder.map((folder) => ({ ...folder, displayName: pathForFolder(folder.id) || folder.name }));
+  return savedSqlStore.allFoldersTreeOrder.map((folder) => ({
+    ...folder,
+    displayName: pathForFolder(folder.id) || folder.name,
+  }));
 });
 
 async function applyUiScale(scale: number) {
@@ -368,7 +373,11 @@ watch(
   () => queryStore.activeTabId,
   (id, previousId) => {
     if (previousId && previousId !== id && typeof window !== "undefined") {
-      window.dispatchEvent(new CustomEvent("dbx:before-tab-switch", { detail: { tabId: id, fromTabId: previousId } }));
+      window.dispatchEvent(
+        new CustomEvent("dbx:before-tab-switch", {
+          detail: { tabId: id, fromTabId: previousId },
+        }),
+      );
     }
     if (id) newQueryContextSource.value = "tab";
     selectedSql.value = "";
@@ -574,7 +583,10 @@ async function openSqlFile() {
   try {
     if (isTauriRuntime()) {
       const { open } = await import("@tauri-apps/plugin-dialog");
-      const path = await open({ filters: [{ name: "SQL", extensions: ["sql"] }], multiple: false });
+      const path = await open({
+        filters: [{ name: "SQL", extensions: ["sql"] }],
+        multiple: false,
+      });
       if (path) {
         const content = await api.readExternalSqlFile(path as string);
         queryStore.updateSql(tab.id, content);
@@ -598,6 +610,22 @@ async function openSqlFile() {
     }
   } catch (e: any) {
     toast(t("toolbar.sqlOpenFailed", { message: e?.message || String(e) }), 5000);
+  }
+}
+
+async function importResultArchive() {
+  try {
+    const bytes = await openQueryResultArchiveFile();
+    if (!bytes) return;
+    const tabId = await queryStore.importResultArchive(bytes);
+    if (!tabId) {
+      toast(t("tabs.resultArchiveImportInvalid"), 5000);
+      return;
+    }
+    activeOutputView.value = "result";
+    toast(t("tabs.resultArchiveImported"), 2500);
+  } catch (e: any) {
+    toast(t("tabs.resultArchiveImportFailed", { message: e?.message || String(e) }), 5000);
   }
 }
 
@@ -705,7 +733,12 @@ async function openConnectionDeepLink(url: string) {
     connectionDialogPrefill.value = draft;
     showConnectionDialog.value = true;
   } catch (e: any) {
-    toast(t("connection.parseConnectionUrlFailed", { message: e?.message || String(e) }), 5000);
+    toast(
+      t("connection.parseConnectionUrlFailed", {
+        message: e?.message || String(e),
+      }),
+      5000,
+    );
   }
 }
 
@@ -746,7 +779,12 @@ async function newQuery() {
       queryStore.updateDatabase(tabId, resolveDefaultDatabase(conn, options));
     }
   } catch (e: any) {
-    toast(t("connection.connectFailed", { message: translateBackendError(t, e?.message || String(e)) }), 5000);
+    toast(
+      t("connection.connectFailed", {
+        message: translateBackendError(t, e?.message || String(e)),
+      }),
+      5000,
+    );
   }
 }
 
@@ -760,7 +798,12 @@ async function openConnectionQuery(connectionId: string) {
     const options = await getDatabaseOptions(connectionId);
     queryStore.updateDatabase(tabId, resolveDefaultDatabase(connection, options));
   } catch (e: any) {
-    toast(t("connection.connectFailed", { message: translateBackendError(t, e?.message || String(e)) }), 5000);
+    toast(
+      t("connection.connectFailed", {
+        message: translateBackendError(t, e?.message || String(e)),
+      }),
+      5000,
+    );
   }
 }
 
@@ -777,20 +820,28 @@ async function onClickTable(tableName: string) {
   const tab = activeTab.value;
   if (!tab) return;
   const connectionId = tab.connectionId;
-  const database = tab.database;
+  let database = tab.database;
+  let schema = tab.schema;
 
-  // Parse schema.table if needed
-  const [schema, rawTableName] = tableName.includes(".") ? tableName.split(".") : [database, tableName];
+  const parts = tableName.split(".").filter(Boolean);
+  const rawTableName = parts[parts.length - 1] || tableName;
+  if (parts.length >= 3) {
+    database = parts[parts.length - 3] || database;
+    schema = parts[parts.length - 2];
+  } else if (parts.length === 2) {
+    const dbType = connectionStore.getConfig(connectionId)?.db_type;
+    if (dbType && !isSchemaAware(dbType) && !isSingleDatabase(dbType)) {
+      database = parts[0] || database;
+      schema = undefined;
+    } else {
+      schema = parts[0];
+    }
+  }
 
   try {
-    await connectionStore.ensureConnected(connectionId);
-    const ddl = await api.getTableDdl(connectionId, database, schema || database, rawTableName);
-
-    // Create a new tab with the DDL
-    const tabId = queryStore.createTab(connectionId, database, `DDL - ${rawTableName}`);
-    queryStore.updateSql(tabId, ddl);
+    await openTableTarget({ connectionId, database, schema, tableName: rawTableName }, { tableInfoTab: "ddl" });
   } catch (e: any) {
-    toast(`Failed to get table DDL: ${e?.message || String(e)}`, 5000);
+    toast(t("connection.connectFailed", { message: translateBackendError(t, e?.message || String(e)) }), 5000);
   }
 }
 
@@ -806,7 +857,12 @@ async function changeActiveConnection(connectionId: string) {
     const options = await getDatabaseOptions(connectionId);
     queryStore.updateDatabase(tab.id, resolveDefaultDatabase(connection, options));
   } catch (e: any) {
-    toast(t("connection.connectFailed", { message: translateBackendError(t, e?.message || String(e)) }), 5000);
+    toast(
+      t("connection.connectFailed", {
+        message: translateBackendError(t, e?.message || String(e)),
+      }),
+      5000,
+    );
   }
 }
 
@@ -882,6 +938,15 @@ function onAiRequestAutoExecuteSql(sql: string) {
     dangerSql.value = sql;
     pendingDangerSql.value = sql;
     showDangerDialog.value = true;
+  });
+}
+
+function onAiOpenExplainPlan(sql: string) {
+  const tabId = ensureQueryTab();
+  queryStore.updateSql(tabId, sql);
+  selectedSql.value = "";
+  nextTick(() => {
+    void tryExplain(sql);
   });
 }
 
@@ -998,7 +1063,7 @@ function initApp() {
     })
     .then(() => {
       console.log(`[STARTUP]   connectionStore.initFromDisk: ${(performance.now() - t0).toFixed(0)}ms`);
-      reconnectRestoredTabs();
+      restoreActiveConnectionContext();
     })
     .catch((e: any) => {
       toast(t("connection.loadFailed", { message: e?.message || String(e) }), 5000);
@@ -1006,13 +1071,10 @@ function initApp() {
   settingsStore.initAiConfig();
 }
 
-async function reconnectRestoredTabs() {
+function restoreActiveConnectionContext() {
   const activeConnectionId = activeTab.value?.connectionId || connectionStore.activeConnectionId;
   if (activeConnectionId && connectionStore.getConfig(activeConnectionId)) {
     connectionStore.activeConnectionId = activeConnectionId;
-    try {
-      await connectionStore.ensureConnected(activeConnectionId);
-    } catch {}
   }
 }
 
@@ -1093,6 +1155,15 @@ onMounted(async () => {
   if (isDesktop) {
     document.addEventListener("contextmenu", handleContextMenu);
   }
+  // macOS: Ctrl+click fires both click and contextmenu.
+  // Intercept click in capture phase to prevent unwanted navigation.
+  document.addEventListener(
+    "click",
+    (e) => {
+      if (e.ctrlKey) e.stopPropagation();
+    },
+    true,
+  );
   if (!isDesktop) {
     try {
       const res = await fetch("/api/auth/check");
@@ -1210,6 +1281,7 @@ onUnmounted(() => {
                   @format-sql="formatActiveSql"
                   @save-sql="void openSaveSqlDialog()"
                   @open-sql="openSqlFile"
+                  @import-result-archive="importResultArchive"
                   @change-connection="changeActiveConnection"
                   @change-database="changeActiveDatabase"
                   @change-schema="changeActiveSchema"
@@ -1297,7 +1369,7 @@ onUnmounted(() => {
           <div v-if="showAiPanel" :class="isClassicLayout ? 'h-full shrink-0 relative z-30 isolate bg-background' : 'h-full shrink-0 relative z-30 isolate rounded-md border border-border/80 bg-background'" :style="{ width: aiPanelWidth + 'px' }">
             <div class="panel-resize-handle panel-resize-handle--left" @mousedown="startAiPanelResize" />
             <div class="h-full min-h-0 overflow-hidden">
-              <AiAssistant v-if="aiPanelReady" ref="aiAssistantRef" :tab="activeTab" :connection="activeConnection" @replace-sql="onAiReplaceSql" @execute-sql="onAiExecuteSql" @request-auto-execute-sql="onAiRequestAutoExecuteSql" @close="toggleAiPanel" />
+              <AiAssistant v-if="aiPanelReady" ref="aiAssistantRef" :tab="activeTab" :connection="activeConnection" @replace-sql="onAiReplaceSql" @execute-sql="onAiExecuteSql" @request-auto-execute-sql="onAiRequestAutoExecuteSql" @open-explain-plan="onAiOpenExplainPlan" @close="toggleAiPanel" />
             </div>
           </div>
 
@@ -1329,7 +1401,15 @@ onUnmounted(() => {
           @danger-confirm="onDangerConfirm"
           @connect-started="(name: string) => toast(t('connection.connecting', { name }), 30000)"
           @connect-succeeded="(name: string) => toast(t('connection.connectSuccess', { name }), 2000)"
-          @connect-failed="(msg: string) => toast(t('connection.connectFailed', { message: translateBackendError(t, msg) }), 5000)"
+          @connect-failed="
+            (msg: string) =>
+              toast(
+                t('connection.connectFailed', {
+                  message: translateBackendError(t, msg),
+                }),
+                5000,
+              )
+          "
           @open-driver-store="
             setConnectionDialogOpen(false);
             showDriverStore = true;
@@ -1349,12 +1429,14 @@ onUnmounted(() => {
           @download-and-install="downloadAndInstallUpdate"
           @restart="restartApp"
         />
+      </div>
+      <Teleport to="body">
         <Transition name="toast">
-          <div v-if="toastVisible" class="fixed bottom-6 left-1/2 -translate-x-1/2 z-100 px-4 py-2 rounded-lg bg-foreground text-background text-sm shadow-lg">
+          <div v-if="toastVisible" class="fixed bottom-6 left-1/2 -translate-x-1/2 z-99999 px-4 py-2 rounded-lg bg-foreground text-background text-sm shadow-lg select-text">
             {{ toastMessage }}
           </div>
         </Transition>
-      </div>
+      </Teleport>
 
       <Dialog
         :open="showSaveSqlDialog"
