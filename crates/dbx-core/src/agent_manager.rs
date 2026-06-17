@@ -214,7 +214,7 @@ mod tests {
         assert_eq!(AgentManager::db_type_to_agent_key(&DatabaseType::Oracle, Some("oracle-legacy")), Some("oracle"));
         assert_eq!(AgentManager::db_type_to_agent_key(&DatabaseType::Oracle, None), Some("oracle"));
         assert_eq!(AgentManager::db_type_to_agent_key(&DatabaseType::Gbase, Some("gbase8s")), Some("gbase8s"));
-        assert_eq!(AgentManager::db_type_to_agent_key(&DatabaseType::Gbase, None), Some("gbase"));
+        assert_eq!(AgentManager::db_type_to_agent_key(&DatabaseType::Gbase, None), Some("gbase8a"));
         manager.stop_daemon_by_key("oracle-legacy").await;
         manager.stop_daemon_by_key("oracle-10g").await;
         manager.stop_daemon_by_key("gbase8s").await;
@@ -751,6 +751,18 @@ impl AgentManager {
         crate::agent_runtime::call_daemon(self, db_type, driver_profile, method, params).await
     }
 
+    pub async fn call_daemon_with_timeout<T: serde::de::DeserializeOwned + Send + 'static>(
+        &self,
+        db_type: &DatabaseType,
+        driver_profile: Option<&str>,
+        method: &str,
+        params: serde_json::Value,
+        timeout_duration: Option<std::time::Duration>,
+    ) -> Result<T, String> {
+        crate::agent_runtime::call_daemon_with_timeout(self, db_type, driver_profile, method, params, timeout_duration)
+            .await
+    }
+
     pub async fn call_daemon_method<T: serde::de::DeserializeOwned + Send + 'static>(
         &self,
         db_type: &DatabaseType,
@@ -759,6 +771,25 @@ impl AgentManager {
         params: serde_json::Value,
     ) -> Result<T, String> {
         crate::agent_runtime::call_daemon_method(self, db_type, driver_profile, method, params).await
+    }
+
+    pub async fn call_daemon_method_with_timeout<T: serde::de::DeserializeOwned + Send + 'static>(
+        &self,
+        db_type: &DatabaseType,
+        driver_profile: Option<&str>,
+        method: AgentMethod,
+        params: serde_json::Value,
+        timeout_duration: Option<std::time::Duration>,
+    ) -> Result<T, String> {
+        crate::agent_runtime::call_daemon_method_with_timeout(
+            self,
+            db_type,
+            driver_profile,
+            method,
+            params,
+            timeout_duration,
+        )
+        .await
     }
 
     pub async fn download_file(url: &str, dest: &Path) -> Result<(), String> {

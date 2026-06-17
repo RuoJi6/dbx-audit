@@ -87,7 +87,7 @@ function setCanvasNumericVariant(ctx: CanvasRenderingContext2D, value: "normal" 
 }
 
 function canvasTabularFontFamily(fontFamily: string): string {
-  return `"Geist Variable Tabular", ${fontFamily}`;
+  return fontFamily.replace(/"Geist Variable"/g, '"Geist Variable Tabular"');
 }
 
 const FIT_CANVAS_TEXT_CACHE_MAX = 10000;
@@ -157,12 +157,12 @@ function crispCanvasLine(value: number, dpr: number): number {
 }
 
 function resolveCanvasRenderState(canvas: HTMLCanvasElement, isDark: boolean, styleKey?: string): CanvasRenderState {
-  const cacheKey = `${styleKey ?? "default"}:${isDark ? "dark" : "light"}`;
+  const canvasStyle = getComputedStyle(canvas);
+  const cacheKey = `${styleKey ?? "default"}:${isDark ? "dark" : "light"}:${canvasStyle.fontFamily}:${canvasStyle.fontSize}`;
   const cached = canvasRenderStateCache.get(canvas);
   if (cached?.cacheKey === cacheKey) return cached;
 
-  const canvasStyle = getComputedStyle(canvas);
-  const fontFamily = canvasStyle.fontFamily || `"Geist Variable", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif`;
+  const fontFamily = canvasStyle.fontFamily || `"Geist Variable Tabular", "Geist Variable", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif`;
   const fontSize = Number.parseFloat(canvasStyle.fontSize) || 12;
   const lineHeight = canvasStyle.lineHeight;
   const normalFont = canvasFont({
@@ -362,8 +362,8 @@ export function drawCanvasDataGrid(options: DrawCanvasDataGridOptions) {
         const value = item.data[actualColIdx];
         ctx.textAlign = "left";
         ctx.fillStyle = value === null ? theme.mutedForeground : theme.foreground;
-        ctx.font = value === null ? italicFont : typeof value === "number" ? tabularFont : normalFont;
-        setCanvasNumericVariant(ctx, typeof value === "number" ? "tabular-nums" : "normal");
+        ctx.font = value === null ? italicFont : tabularFont;
+        setCanvasNumericVariant(ctx, value === null ? "normal" : "tabular-nums");
         const textLeft = alignCanvasPixel(x + 12, dpr);
         const paddedMaxWidth = Math.max(0, x + colWidth - textLeft - 12);
         const isEditingThisCell = editingCell?.rowId === item.id && editingCell.col === actualColIdx;

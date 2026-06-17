@@ -2,12 +2,14 @@ use std::sync::Arc;
 use tauri::State;
 
 pub use dbx_core::agent_connection::{
-    agent_connect_params, mongo_legacy_error_with_auth_hint, oracle_alternate_connect_config,
-    oracle_auth_fallback_profiles, oracle_error_with_driver_hint, should_retry_oracle_with_10g_driver,
+    agent_connect_params, mongo_legacy_error_with_auth_hint, mongo_uses_legacy_driver, oracle_alternate_connect_config,
+    oracle_auth_fallback_profiles, oracle_error_with_driver_hint, should_retry_mongo_with_legacy_driver,
+    should_retry_oracle_with_10g_driver,
 };
 pub use dbx_core::connection::{
-    connect_bare_metadata_pool, connect_mysql_metadata_pool, connection_url_for_endpoint, metadata_connection_config,
-    probe_connection_endpoint, redacted_connection_url_for_endpoint, AppState, MysqlMode, PoolKind,
+    agent_connect_timeout, connect_bare_metadata_pool, connect_mysql_metadata_pool, connection_url_for_endpoint,
+    metadata_connection_config, probe_connection_endpoint, redacted_connection_url_for_endpoint, AppState, MysqlMode,
+    PoolKind,
 };
 use dbx_core::database_capabilities;
 use dbx_core::db;
@@ -30,11 +32,12 @@ async fn test_agent_connection(
     let connect_params = agent_connect_params(config, host, port, config.database.as_deref().unwrap_or(""));
     let result = state
         .agent_manager
-        .call_daemon_method::<serde_json::Value>(
+        .call_daemon_method_with_timeout::<serde_json::Value>(
             &config.db_type,
             config.driver_profile.as_deref(),
             AgentMethod::TestConnection,
             connect_params.clone(),
+            Some(agent_connect_timeout(config)),
         )
         .await;
 
@@ -42,7 +45,7 @@ async fn test_agent_connection(
         if let Some(alternate_config) = oracle_alternate_connect_config(config, &err) {
             state
                 .agent_manager
-                .call_daemon_method::<serde_json::Value>(
+                .call_daemon_method_with_timeout::<serde_json::Value>(
                     &alternate_config.db_type,
                     alternate_config.driver_profile.as_deref(),
                     AgentMethod::TestConnection,
@@ -52,6 +55,7 @@ async fn test_agent_connection(
                         port,
                         alternate_config.database.as_deref().unwrap_or(""),
                     ),
+                    Some(agent_connect_timeout(&alternate_config)),
                 )
                 .await
                 .map_err(|alternate_err| {
@@ -63,11 +67,12 @@ async fn test_agent_connection(
             for profile in oracle_auth_fallback_profiles(config, &err) {
                 match state
                     .agent_manager
-                    .call_daemon_method::<serde_json::Value>(
+                    .call_daemon_method_with_timeout::<serde_json::Value>(
                         &config.db_type,
                         Some(profile),
                         AgentMethod::TestConnection,
                         connect_params.clone(),
+                        Some(agent_connect_timeout(config)),
                     )
                     .await
                 {
@@ -100,12 +105,18 @@ async fn connect_agent_pool(
 ) -> Result<PoolKind, String> {
     let connect_params = agent_connect_params(config, host, port, config.effective_database().unwrap_or(""));
     let mut client = state.agent_manager.spawn(&config.db_type, config.driver_profile.as_deref()).await?;
-    let connect_result = client.call_method::<serde_json::Value>(AgentMethod::Connect, connect_params.clone()).await;
+    let connect_result = client
+        .call_method_with_timeout::<serde_json::Value>(
+            AgentMethod::Connect,
+            connect_params.clone(),
+            Some(agent_connect_timeout(config)),
+        )
+        .await;
 
     if let Err(err) = connect_result {
         if let Some(alternate_config) = oracle_alternate_connect_config(config, &err) {
             client
-                .call_method::<serde_json::Value>(
+                .call_method_with_timeout::<serde_json::Value>(
                     AgentMethod::Connect,
                     agent_connect_params(
                         &alternate_config,
@@ -113,6 +124,7 @@ async fn connect_agent_pool(
                         port,
                         alternate_config.effective_database().unwrap_or(""),
                     ),
+                    Some(agent_connect_timeout(&alternate_config)),
                 )
                 .await
                 .map_err(|alternate_err| {
@@ -125,7 +137,11 @@ async fn connect_agent_pool(
                 match state.agent_manager.spawn(&config.db_type, Some(profile)).await {
                     Ok(mut fallback_client) => {
                         match fallback_client
-                            .call_method::<serde_json::Value>(AgentMethod::Connect, connect_params.clone())
+                            .call_method_with_timeout::<serde_json::Value>(
+                                AgentMethod::Connect,
+                                connect_params.clone(),
+                                Some(agent_connect_timeout(config)),
+                            )
                             .await
                         {
                             Ok(_) => {
@@ -174,6 +190,7 @@ mod tests {
             connect_timeout_secs: dbx_core::models::connection::default_connect_timeout_secs(),
             query_timeout_secs: dbx_core::models::connection::default_query_timeout_secs(),
             idle_timeout_secs: dbx_core::models::connection::default_idle_timeout_secs(),
+            keepalive_interval_secs: dbx_core::models::connection::default_keepalive_interval_secs(),
             ssl: false,
             ca_cert_path: String::new(),
             client_cert_path: String::new(),
@@ -192,6 +209,7 @@ mod tests {
             redis_cluster_nodes: String::new(),
             redis_key_separator: dbx_core::models::connection::default_redis_key_separator(),
             etcd_endpoints: String::new(),
+            gbase_server: String::new(),
             external_config: None,
             jdbc_driver_class: None,
             jdbc_driver_paths: Vec::new(),
@@ -273,7 +291,7 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
                     Err(e) => Err(e),
                 }
             }
-            DatabaseType::Doris | DatabaseType::StarRocks => {
+            DatabaseType::Doris | DatabaseType::StarRocks | DatabaseType::ManticoreSearch => {
                 match db::mysql::connect_bare(&url, connect_timeout).await {
                     Ok(pool) => {
                         let _ = pool.disconnect().await;
@@ -286,6 +304,7 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
             | DatabaseType::Redshift
             | DatabaseType::Gaussdb
             | DatabaseType::Kwdb
+            | DatabaseType::Questdb
             | DatabaseType::OpenGauss => match db::postgres::connect(&url, connect_timeout).await {
                 Ok(pool) => {
                     pool.close();
@@ -331,6 +350,17 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
             #[cfg(not(feature = "duckdb-bundled"))]
             DatabaseType::DuckDb => Err("DuckDB support not compiled (enable duckdb-bundled feature)".to_string()),
             DatabaseType::MongoDb => {
+                if mongo_uses_legacy_driver(&config) {
+                    let am = &state.agent_manager;
+                    let mut client = am.spawn(&config.db_type, config.driver_profile.as_deref()).await?;
+                    client
+                        .connect(mongo_legacy_connect_params(&config, &host, port))
+                        .await
+                        .map_err(|err| mongo_legacy_error_with_auth_hint(&err))?;
+                    client.disconnect().await.ok();
+                    return Ok("Connection successful (via legacy driver)".to_string());
+                }
+
                 let native_err = match db::mongo_driver::connect(&url, connect_timeout, idle_timeout).await {
                     Ok(client) => {
                         match db::mongo_driver::test_connection(&client, connect_timeout, config.effective_database())
@@ -342,13 +372,15 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
                     }
                     Err(e) => e,
                 };
-                if native_err.contains("wire version") {
+                if should_retry_mongo_with_legacy_driver(&native_err) {
                     let am = &state.agent_manager;
-                    let mut client = am.spawn(&config.db_type, config.driver_profile.as_deref()).await?;
-                    client
-                        .connect(mongo_legacy_connect_params(&config, &host, port))
-                        .await
-                        .map_err(|err| mongo_legacy_error_with_auth_hint(&err))?;
+                    let mut client = am.spawn(&config.db_type, Some("mongodb-legacy")).await?;
+                    client.connect(mongo_legacy_connect_params(&config, &host, port)).await.map_err(|err| {
+                        format!(
+                            "{native_err}\n\nFallback with MongoDB (Legacy) driver failed: {}",
+                            mongo_legacy_error_with_auth_hint(&err)
+                        )
+                    })?;
                     client.disconnect().await.ok();
                     Ok("Connection successful (via legacy driver)".to_string())
                 } else {
@@ -488,7 +520,7 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
                 connect_mysql_metadata_pool(&config, &db_config, &host, port, connect_timeout, 3).await?;
             PoolKind::Mysql(pool, mode)
         }
-        DatabaseType::Doris | DatabaseType::StarRocks => PoolKind::Mysql(
+        DatabaseType::Doris | DatabaseType::StarRocks | DatabaseType::ManticoreSearch => PoolKind::Mysql(
             connect_bare_metadata_pool(&db_config, &host, port, connect_timeout, 3).await?,
             MysqlMode::Bare,
         ),
@@ -496,6 +528,7 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
         | DatabaseType::Redshift
         | DatabaseType::Gaussdb
         | DatabaseType::Kwdb
+        | DatabaseType::Questdb
         | DatabaseType::OpenGauss => PoolKind::Postgres(db::postgres::connect(&url, connect_timeout).await?),
         DatabaseType::Sqlite => {
             let extensions = db::sqlite::sqlite_extension_specs_from_url_params(db_config.url_params.as_deref())
@@ -539,29 +572,46 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
         #[cfg(not(feature = "duckdb-bundled"))]
         DatabaseType::DuckDb => return Err("DuckDB support not compiled (enable duckdb-bundled feature)".to_string()),
         DatabaseType::MongoDb => {
-            let native_err = match db::mongo_driver::connect(&url, connect_timeout, idle_timeout).await {
-                Ok(client) => {
-                    match db::mongo_driver::test_connection(&client, connect_timeout, db_config.effective_database())
-                        .await
-                    {
-                        Ok(()) => {
-                            state.configs.write().await.insert(id.clone(), config);
-                            state.connections.write().await.insert(id.clone(), PoolKind::MongoDb(client));
-                            return Ok(id);
-                        }
-                        Err(e) => e,
-                    }
-                }
-                Err(e) => e,
-            };
-            if native_err.contains("wire version") {
-                log::info!("Native MongoDB driver failed ({native_err}), falling back to agent driver");
-                let mut client =
-                    state.agent_manager.spawn(&db_config.db_type, db_config.driver_profile.as_deref()).await?;
-                client.connect(mongo_legacy_connect_params(&db_config, &host, port)).await?;
+            if mongo_uses_legacy_driver(&db_config) {
+                let mut client = state.agent_manager.spawn(&db_config.db_type, Some("mongodb-legacy")).await?;
+                client
+                    .connect(mongo_legacy_connect_params(&db_config, &host, port))
+                    .await
+                    .map_err(|err| mongo_legacy_error_with_auth_hint(&err))?;
                 PoolKind::Agent(std::sync::Arc::new(tokio::sync::Mutex::new(client)))
             } else {
-                return Err(native_err);
+                let native_err = match db::mongo_driver::connect(&url, connect_timeout, idle_timeout).await {
+                    Ok(client) => {
+                        match db::mongo_driver::test_connection(
+                            &client,
+                            connect_timeout,
+                            db_config.effective_database(),
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                state.configs.write().await.insert(id.clone(), config);
+                                state.insert_connection_pool(id.clone(), PoolKind::MongoDb(client), &db_config).await;
+                                return Ok(id);
+                            }
+                            Err(e) => e,
+                        }
+                    }
+                    Err(e) => e,
+                };
+                if should_retry_mongo_with_legacy_driver(&native_err) {
+                    log::info!("Native MongoDB driver failed ({native_err}), falling back to agent driver");
+                    let mut client = state.agent_manager.spawn(&db_config.db_type, Some("mongodb-legacy")).await?;
+                    client.connect(mongo_legacy_connect_params(&db_config, &host, port)).await.map_err(|err| {
+                        format!(
+                            "{native_err}\n\nFallback with MongoDB (Legacy) driver failed: {}",
+                            mongo_legacy_error_with_auth_hint(&err)
+                        )
+                    })?;
+                    PoolKind::Agent(std::sync::Arc::new(tokio::sync::Mutex::new(client)))
+                } else {
+                    return Err(native_err);
+                }
             }
         }
         DatabaseType::ClickHouse => {
@@ -658,7 +708,7 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
         db_type => return Err(format!("Unsupported database type: {db_type:?}")),
     };
 
-    state.connections.write().await.insert(id.clone(), pool);
+    state.insert_connection_pool(id.clone(), pool, &db_config).await;
     state.configs.write().await.insert(id.clone(), config);
 
     Ok(id)
@@ -684,15 +734,7 @@ pub async fn connection_final_proxy_port(
 
 #[tauri::command]
 pub async fn disconnect_db(state: State<'_, Arc<AppState>>, connection_id: String) -> Result<(), String> {
-    let mut conns = state.connections.write().await;
-    let keys_to_remove: Vec<String> =
-        conns.keys().filter(|k| *k == &connection_id || k.starts_with(&format!("{connection_id}:"))).cloned().collect();
-    for key in keys_to_remove {
-        if let Some(pool) = conns.remove(&key) {
-            dbx_core::connection::close_pool_kind(pool).await;
-        }
-    }
-    drop(conns);
+    state.remove_connection_pools_detached(&connection_id).await;
     state.reset_connection_transport(&connection_id).await;
     if connection_id.starts_with("__visible_draft_") {
         state.configs.write().await.remove(&connection_id);

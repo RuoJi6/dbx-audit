@@ -49,12 +49,7 @@ pub async fn test_connection(
 
     // Clean up any pool keys created for the temporary connection, including
     // database-scoped keys like "__test_uuid:database".
-    let mut connections = app.connections.write().await;
-    let temp_keys: Vec<String> = connections.keys().filter(|key| key.starts_with(&temp_id)).cloned().collect();
-    for key in temp_keys {
-        connections.remove(&key);
-    }
-    drop(connections);
+    app.remove_connection_pools(&temp_id).await;
     app.configs.write().await.remove(&temp_id);
 
     match result {
@@ -101,16 +96,8 @@ pub async fn disconnect_db(
     Json(body): Json<DisconnectRequest>,
 ) -> Result<Json<()>, AppError> {
     let app = &state.app;
-    let mut connections = app.connections.write().await;
 
-    let pool_prefix = format!("{}:", body.connection_id);
-    let keys_to_remove: Vec<String> =
-        connections.keys().filter(|k| *k == &body.connection_id || k.starts_with(&pool_prefix)).cloned().collect();
-    for key in keys_to_remove {
-        connections.remove(&key);
-    }
-    drop(connections);
-
+    app.remove_connection_pools(&body.connection_id).await;
     app.reset_connection_transport(&body.connection_id).await;
     if body.connection_id.starts_with("__visible_draft_") {
         app.configs.write().await.remove(&body.connection_id);
@@ -183,6 +170,7 @@ mod tests {
             connect_timeout_secs: dbx_core::models::connection::default_connect_timeout_secs(),
             query_timeout_secs: dbx_core::models::connection::default_query_timeout_secs(),
             idle_timeout_secs: dbx_core::models::connection::default_idle_timeout_secs(),
+            keepalive_interval_secs: dbx_core::models::connection::default_keepalive_interval_secs(),
             ssl: false,
             ca_cert_path: String::new(),
             client_cert_path: String::new(),
@@ -199,6 +187,7 @@ mod tests {
             redis_cluster_nodes: String::new(),
             redis_key_separator: dbx_core::models::connection::default_redis_key_separator(),
             etcd_endpoints: String::new(),
+            gbase_server: String::new(),
             external_config: None,
             jdbc_driver_class: None,
             jdbc_driver_paths: Vec::new(),
@@ -215,6 +204,7 @@ mod tests {
         let state = Arc::new(WebState {
             app,
             data_dir: dir.clone(),
+            password_disabled: false,
             password_hash: RwLock::new(None),
             sessions: RwLock::new(HashSet::new()),
             sse_channels: RwLock::new(HashMap::new()),
