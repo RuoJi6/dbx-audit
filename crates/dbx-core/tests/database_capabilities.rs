@@ -188,6 +188,7 @@ fn skips_tcp_probe_for_local_file_plugin_and_agent_types() {
     assert!(skips_tcp_probe(&DatabaseType::Gbase));
     assert!(skips_tcp_probe(&DatabaseType::Databend));
     assert!(skips_tcp_probe(&DatabaseType::InfluxDb));
+    assert!(skips_tcp_probe(&DatabaseType::MessageQueue));
     assert!(!skips_tcp_probe(&DatabaseType::Postgres));
     assert!(!skips_tcp_probe(&DatabaseType::Mysql));
     assert!(!skips_tcp_probe(&DatabaseType::Gaussdb));
@@ -293,4 +294,10 @@ fn driver_manifest_declares_expected_product_capabilities() {
     assert_eq!(redis.support_level, "connect");
     assert!(!redis.capabilities.object_browser);
     assert!(!redis.capabilities.sql_file_execution);
+
+    let mq = find_driver(DatabaseType::MessageQueue);
+    assert_eq!(mq.support_level, "browse");
+    assert!(mq.capabilities.metadata_browse);
+    assert!(!mq.capabilities.query_execution);
+    assert!(!mq.capabilities.object_browser);
 }

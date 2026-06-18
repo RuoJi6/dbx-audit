@@ -1471,10 +1471,10 @@
       "metadataConnectionScoped": false,
       "skipTcpProbe": true,
       "defaultPort": 8080,
-      "supportLevel": "connect",
+      "supportLevel": "browse",
       "capabilities": {
         "queryExecution": false,
-        "metadataBrowse": false,
+        "metadataBrowse": true,
         "objectBrowser": false,
         "objectSource": false,
         "schemaSearch": false,
