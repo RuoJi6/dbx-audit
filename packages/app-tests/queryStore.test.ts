@@ -82,6 +82,30 @@ test("renames query tab titles", () => {
   assert.equal(tab?.customTitle, true);
 });
 
+test("marked-clean object source tabs close without unsaved confirmation", () => {
+  setActivePinia(createPinia());
+  const store = useQueryStore();
+  const tabId = store.createTab("conn-1", "db", "Source - refresh_orders");
+  store.updateSql(tabId, "CREATE PROCEDURE refresh_orders() SELECT 1;");
+  store.setObjectSource(tabId, {
+    schema: "public",
+    name: "refresh_orders",
+    objectType: "PROCEDURE",
+  });
+
+  const tab = store.tabs.find((item) => item.id === tabId);
+  assert.ok(tab);
+  assert.equal(store.isTabDirty(tab), true);
+
+  store.markTabClean(tab);
+  assert.equal(store.isTabDirty(tab), false);
+
+  store.closeTab(tabId);
+
+  assert.equal(store.showCloseConfirm, false);
+  assert.equal(store.tabs.some((item) => item.id === tabId), false);
+});
+
 test("editing query sql preserves the displayed result editability state", () => {
   setActivePinia(createPinia());
   const store = useQueryStore();

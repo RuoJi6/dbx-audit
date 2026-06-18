@@ -1488,6 +1488,7 @@ function viewObjectSource() {
           objectType,
         });
       }
+      queryStore.markTabClean(queryStore.tabs.find((tab) => tab.id === tabId));
     })
     .catch((e: any) => {
       toast(e?.message || String(e), 5000);
