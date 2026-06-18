@@ -861,6 +861,10 @@ export async function buildExecutableObjectSourceSql(input: BuildEditableObjectS
   return invoke("build_executable_object_source_sql", { input });
 }
 
+export async function buildEditableObjectSource(input: BuildEditableObjectSourceSqlInput): Promise<string> {
+  return invoke("build_editable_object_source", { input });
+}
+
 export async function buildRoutineRenameObjectSourceStatements(input: BuildRoutineRenameObjectSourceInput): Promise<string[]> {
   return invoke("build_routine_rename_object_source_statements", { input });
 }
@@ -1937,3 +1941,5 @@ export async function auditLoadTaskStore(): Promise<unknown | null> {
 export async function auditSaveTaskStore(store: unknown): Promise<void> {
   return invoke("audit_save_task_store", { store });
 }
+
+export * from "./mq-tauri";

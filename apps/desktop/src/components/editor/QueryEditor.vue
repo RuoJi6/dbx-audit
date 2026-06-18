@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted, onBeforeUnmount, onActivated, onDeactivated, watch, shallowRef, computed, nextTick } from "vue";
-import { Play, Copy, TextSelect } from "@lucide/vue";
+import { Play, Copy, Table2, TextSelect } from "@lucide/vue";
 import { useI18n } from "vue-i18n";
 import type { CompletionContext } from "@codemirror/autocomplete";
 import type { EditorView as EditorViewType } from "@codemirror/view";
@@ -8,7 +8,7 @@ import { search as cmSearch } from "@codemirror/search";
 import EditorSearchPanel from "./EditorSearchPanel.vue";
 import CustomContextMenu, { type ContextMenuItem } from "@/components/ui/CustomContextMenu.vue";
 import { copyToClipboard } from "@/lib/clipboard";
-import { resolveExecutableSql } from "@/lib/sqlExecutionTarget";
+import { resolveExecutableSql, type SqlExecutionSnapshot } from "@/lib/sqlExecutionTarget";
 import { formatSqlText, type SqlFormatDialect } from "@/lib/sqlFormatter";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useSettingsStore } from "@/stores/settingsStore";
@@ -35,9 +35,11 @@ import { normalizeShortcutSettings, shortcutToCodeMirrorKey } from "@/lib/shortc
 import { trimmedSelectionLayer } from "@/lib/codemirrorTrimmedSelectionLayer";
 import { selectionMatchOccurrences } from "@/lib/codemirrorSelectionMatches";
 import { isSchemaAware, isSingleDatabase } from "@/lib/databaseFeatureSupport";
+import { qualifiedTableNameAtSqlPosition } from "@/lib/queryCursorTableTarget";
 import * as api from "@/lib/api";
 import { areSqlSemanticDiagnosticsEqual, buildSqlParserErrorDiagnostic, buildSqlSemanticDiagnostics, shouldRunSqlSemanticDiagnostics, type SqlSemanticDiagnostic } from "@/lib/sqlSemanticDiagnostics";
 import { buildRedisSyntaxDiagnostics, shouldRunRedisDiagnostics } from "@/lib/redisSyntaxDiagnostics";
+import { buildRedisCompletionItemsFromContext, getRedisCompletionContext, getRedisCompletionResultValidFor, shouldAutoOpenRedisCompletion, takesKeyArgument, type RedisCompletionItem } from "@/lib/redisCompletion";
 import type { SqlCompletionColumn, SqlCompletionForeignKey, SqlCompletionItem, SqlCompletionObject } from "@/lib/sqlCompletion";
 import type { DatabaseType, SqlReferenceAnalysis, SqlTableReference, SqlTextSpan } from "@/types/database";
 
@@ -62,9 +64,10 @@ const emit = defineEmits<{
   selectionChange: [value: string];
   cursorChange: [pos: number];
   formatError: [message: string];
-  execute: [sql: string];
+  execute: [snapshot: SqlExecutionSnapshot];
   save: [];
   clickTable: [tableName: string];
+  viewTableData: [tableName: string];
   clickColumn: [columns: Array<{ name: string; table: string; schema?: string }>, error?: string | undefined];
   closeColumnPanel: [];
   viewportChange: [viewport: { scrollTop: number; scrollLeft: number }];
@@ -140,6 +143,7 @@ const isGestureZooming = ref(false);
 const searchPanelRef = ref<InstanceType<typeof EditorSearchPanel>>();
 const selectedSql = ref("");
 const executableSql = ref("");
+const contextTableName = ref<string | null>(null);
 
 const hasSelectedSql = computed(() => selectedSql.value.trim().length > 0);
 const canCopySelectedSql = computed(() => selectedSql.value.length > 0);
@@ -284,13 +288,19 @@ function handleTab(view: EditorViewType): boolean {
 }
 
 function executeCurrentSql() {
-  if (view.value) emit("execute", executableSqlFromView(view.value));
+  if (view.value) emit("execute", sqlExecutionSnapshotFromView(view.value));
   return true;
 }
 
 function syncContextMenuState(currentView: EditorViewType) {
   selectedSql.value = selectedSqlFromView(currentView);
   executableSql.value = executableSqlFromView(currentView);
+}
+
+function syncContextMenuStateAtEvent(currentView: EditorViewType, event: MouseEvent) {
+  syncContextMenuState(currentView);
+  const pos = currentView.posAtCoords({ x: event.clientX, y: event.clientY });
+  contextTableName.value = pos == null ? null : qualifiedTableNameAtSqlPosition(currentView.state.doc.toString(), pos);
 }
 
 function focusEditor() {
@@ -351,6 +361,12 @@ function selectAllSqlFromContextMenu() {
   focusEditor();
 }
 
+function openTableFromContextMenu() {
+  if (!contextTableName.value) return;
+  emit("viewTableData", contextTableName.value);
+  focusEditor();
+}
+
 function selectSqlLineFromGutter(currentView: EditorViewType, line: { from: number; to: number }, event: Event): boolean {
   if (!(event instanceof MouseEvent) || event.button !== 0) return false;
   event.preventDefault();
@@ -369,6 +385,12 @@ const contextMenuItems = computed<ContextMenuItem[]>(() => [
     action: executeFromContextMenu,
     disabled: !canExecuteContextSql.value,
     icon: Play,
+  },
+  {
+    label: t("contextMenu.viewData"),
+    action: openTableFromContextMenu,
+    disabled: !contextTableName.value,
+    icon: Table2,
   },
   { label: "", separator: true },
   {
@@ -437,6 +459,14 @@ function selectedSqlFromView(currentView: EditorViewType): string {
 
 function executableSqlFromView(currentView: EditorViewType): string {
   return resolveExecutableSql(currentView.state.doc.toString(), selectedSqlFromView(currentView));
+}
+
+function sqlExecutionSnapshotFromView(currentView: EditorViewType): SqlExecutionSnapshot {
+  return {
+    fullSql: currentView.state.doc.toString(),
+    selectedSql: selectedSqlFromView(currentView),
+    cursorPos: currentView.state.selection.main.head,
+  };
 }
 
 function identifierRangeAt(sql: string, pos: number): { from: number; to: number; text: string } | null {
@@ -874,7 +904,7 @@ function unregisterTableReferenceDropListener() {
 let completionEpoch = 0;
 let completionDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 
-type QueryCompletionItem = SqlCompletionItem | ElasticsearchCompletionItem;
+type QueryCompletionItem = SqlCompletionItem | ElasticsearchCompletionItem | RedisCompletionItem;
 
 function buildCompletionResult(items: QueryCompletionItem[], from: number, validFor?: RegExp) {
   if (items.length === 0) return null;
@@ -969,6 +999,38 @@ async function provideElasticsearchCompletions(currentState: import("@codemirror
   return buildCompletionResult(items, completionContext.from, getElasticsearchCompletionResultValidFor());
 }
 
+async function provideRedisCompletions(currentState: import("@codemirror/state").EditorState, position: number, explicit: boolean) {
+  if (!props.connectionId) return null;
+  const epoch = ++completionEpoch;
+  const fullDoc = currentState.doc.toString();
+  if (!explicit && !shouldAutoOpenRedisCompletion(fullDoc, position)) return null;
+
+  const completionContext = getRedisCompletionContext(fullDoc, position);
+  // Key-name completion needs a reliable db index; props.database may briefly be "" on
+  // the New Query path before the active db resolves, and only key-argument commands warrant it.
+  let keys: string[] = [];
+  if (completionContext.mode === "argument" && props.database && takesKeyArgument(completionContext.mainCommand)) {
+    try {
+      keys = await connectionStore.listRedisCompletionKeys(props.connectionId, props.database);
+    } catch {
+      keys = [];
+    }
+  }
+  if (epoch !== completionEpoch) return null;
+
+  const items = buildRedisCompletionItemsFromContext(completionContext, { keys });
+  if (items.length === 0) return null;
+  // Use the built-in filter (the default) so typing narrows the list and moves
+  // the selection synchronously. `filter: false` + `validFor` are mutually
+  // exclusive (the latter is ignored), which would leave the menu frozen while
+  // typing — hence we build the result here instead of via buildCompletionResult.
+  return {
+    from: completionContext.from,
+    options: items.map((item) => completionOptionForItem(item)),
+    validFor: getRedisCompletionResultValidFor(),
+  };
+}
+
 async function provideSqlCompletions(currentState: import("@codemirror/state").EditorState, position: number, explicit: boolean) {
   if (imeCompositionActive || view.value?.compositionStarted || view.value?.composing) return null;
   if (!props.connectionId) return null;
@@ -977,6 +1039,9 @@ async function provideSqlCompletions(currentState: import("@codemirror/state").E
     if (!isSqlLikeCompletionStatement(fullDoc, position)) {
       return provideElasticsearchCompletions(currentState, position, explicit);
     }
+  }
+  if (props.databaseType === "redis") {
+    return provideRedisCompletions(currentState, position, explicit);
   }
   const hasDatabase = props.database != null;
 
@@ -2169,7 +2234,7 @@ defineExpose({ openSearch, openReplace, scrollCursorIntoView });
         class="h-full w-full overflow-hidden"
         @contextmenu="
           (e: MouseEvent) => {
-            if (view) syncContextMenuState(view);
+            if (view) syncContextMenuStateAtEvent(view, e);
             onContextMenu(e);
           }
         "

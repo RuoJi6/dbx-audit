@@ -641,7 +641,7 @@ pub fn agent_close_query_session_params(session_id: &str) -> serde_json::Value {
 
 pub fn is_connection_error(err: &str) -> bool {
     let lower = err.to_lowercase();
-    if is_dbx_query_timeout_error(&lower) {
+    if is_dbx_query_timeout_error(&lower) || is_agent_rpc_timeout_error(&lower) {
         return false;
     }
     lower.contains("connection")
@@ -656,12 +656,31 @@ pub fn is_connection_error(err: &str) -> bool {
         || lower.contains("not connected")
         || lower.contains("end-of-file")
         || lower.contains("idle")
+        || lower.contains("agent stdin not available")
+        || lower.contains("agent stdout not available")
+        || lower.contains("failed to write to agent stdin")
+        || lower.contains("failed to flush agent stdin")
         || lower.contains("communicating with the server")
         || is_os_connection_error(&lower)
 }
 
 fn is_dbx_query_timeout_error(lower: &str) -> bool {
     lower.starts_with("query timed out after ")
+}
+
+fn is_agent_rpc_timeout_error(lower: &str) -> bool {
+    lower.starts_with("agent rpc call timed out ")
+}
+
+fn should_discard_agent_pool_after_error(err: &str) -> bool {
+    let lower = err.to_lowercase();
+    is_dbx_query_timeout_error(&lower)
+        || is_agent_rpc_timeout_error(&lower)
+        || lower.contains("agent stdin not available")
+        || lower.contains("agent stdout not available")
+        || lower.contains("failed to write to agent stdin")
+        || lower.contains("failed to flush agent stdin")
+        || lower.contains("agent rpc task failed")
 }
 
 fn is_os_connection_error(lower: &str) -> bool {
@@ -905,6 +924,7 @@ pub async fn do_execute(
         }
         PoolKind::Redis(_) => Err("Use Redis-specific commands".to_string()),
         PoolKind::MongoDb(_) => Err("Use MongoDB-specific commands".to_string()),
+        PoolKind::MessageQueue => Err("Use Message Queue-specific commands".to_string()),
         PoolKind::InfluxDb(client) => {
             let client = client.clone();
             let database = pool_key.split(':').nth(1).unwrap_or("default").to_string();
@@ -922,7 +942,7 @@ pub async fn do_execute(
             let max_rows = options.max_rows;
             let rpc_timeout = query_timeout;
             drop(connections);
-            wait_for_query_opt(cancel_token, query_timeout, async move {
+            let result = wait_for_query_opt(cancel_token, query_timeout, async move {
                 let mut client = client.lock().await;
                 if let Some(session_id) = options.result_session_id.as_deref() {
                     let params = agent_fetch_query_page_params(session_id, options.page_size.unwrap_or(MAX_ROWS));
@@ -936,7 +956,11 @@ pub async fn do_execute(
                 }
             })
             .await
-            .map(|result| normalize_query_result_for_js(truncate_result_with_max_rows(result, max_rows)))
+            .map(|result| normalize_query_result_for_js(truncate_result_with_max_rows(result, max_rows)));
+            if matches!(result.as_ref(), Err(err) if should_discard_agent_pool_after_error(err)) {
+                state.remove_pool_by_key(pool_key).await;
+            }
+            result
         }
         #[cfg(feature = "duckdb-bundled")]
         PoolKind::ExternalTabular(ext_pool) => {
@@ -1562,6 +1586,7 @@ pub async fn execute_statements_in_transaction(
             | PoolKind::Turso(_)
             | PoolKind::SqlServer(_)
             | PoolKind::Agent(_) => TxPath::Explicit,
+            PoolKind::MessageQueue => TxPath::None,
             #[cfg(feature = "duckdb-bundled")]
             PoolKind::DuckDb(_)
             | PoolKind::Redis(_)
@@ -2364,6 +2389,21 @@ mod tests {
         let params = agent_close_query_session_params("session-1");
 
         assert_eq!(params["sessionId"], "session-1");
+    }
+
+    #[test]
+    fn agent_timeout_discards_pool_but_does_not_retry_same_query() {
+        assert!(should_discard_agent_pool_after_error("Query timed out after 30 seconds"));
+        assert!(should_discard_agent_pool_after_error("Agent RPC call timed out (30s)"));
+        assert!(!is_connection_error("Agent RPC call timed out (30s)"));
+    }
+
+    #[test]
+    fn unavailable_agent_pipes_are_reconnectable_errors() {
+        assert!(should_discard_agent_pool_after_error("Agent stdin not available"));
+        assert!(should_discard_agent_pool_after_error("Agent stdout not available"));
+        assert!(is_connection_error("Agent stdin not available"));
+        assert!(is_connection_error("Agent stdout not available"));
     }
 
     #[test]
