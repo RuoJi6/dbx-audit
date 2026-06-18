@@ -482,6 +482,9 @@ pub async fn get_explain_info(
     State(state): State<Arc<WebState>>,
     Json(req): Json<GetExplainInfoRequest>,
 ) -> Result<Json<String>, AppError> {
+    let database_for_pool = req.database.as_deref().filter(|database| !database.trim().is_empty());
+    state.app.get_or_create_pool(&req.connection_id, database_for_pool).await.map_err(AppError)?;
+
     let client = {
         let connections = state.app.connections.read().await;
         let pool = connections.get(&req.connection_id).ok_or_else(|| AppError("Connection not found".to_string()))?;
@@ -610,6 +613,10 @@ pub async fn build_executable_object_source_sql(
     Json(req): Json<BuildExecutableObjectSourceRequest>,
 ) -> Result<Json<String>, AppError> {
     dbx_core::object_source_sql::build_executable_object_source_sql(req.input).map(Json).map_err(AppError)
+}
+
+pub async fn build_editable_object_source(Json(req): Json<BuildExecutableObjectSourceRequest>) -> Json<String> {
+    Json(dbx_core::object_source_sql::build_editable_object_source(req.input))
 }
 
 pub async fn build_routine_rename_object_source_statements(

@@ -31,10 +31,11 @@ import "@/i18n";
 import { translateBackendError } from "@/i18n/backend-errors";
 import * as api from "@/lib/api";
 import { connectionRedactedNameLabel } from "@/lib/connectionPresentation";
+import { quickConnectionOpenTarget } from "@/lib/connectionOpenTarget";
 import { resolveDefaultDatabase } from "@/lib/defaultDatabase";
 import { findTreeNodeById, resolveNewQueryTarget } from "@/lib/newQueryContext";
 import { buildExecutableObjectSourceStatements, objectSourceSaveExecutionMode } from "@/lib/objectSourceEditor";
-import { resolveExecutableSql, resolveExecutableSqlWithBackend } from "@/lib/sqlExecutionTarget";
+import { resolveExecutableSql, resolveExecutableSqlWithBackend, type SqlExecutionSnapshot } from "@/lib/sqlExecutionTarget";
 import { uuid } from "@/lib/utils";
 import { isTauriRuntime } from "@/lib/tauriRuntime";
 import { openQueryResultArchiveFile } from "@/lib/queryResultArchiveFile";
@@ -186,12 +187,12 @@ const executableSql = computed(() => {
     : "";
 });
 
-async function resolveActiveExecutableSql() {
+async function resolveActiveExecutableSql(snapshot?: SqlExecutionSnapshot) {
   const tab = activeTab.value;
   return tab
-    ? await resolveExecutableSqlWithBackend(tab.sql, selectedSql.value, {
+    ? await resolveExecutableSqlWithBackend(snapshot?.fullSql ?? tab.sql, snapshot?.selectedSql ?? selectedSql.value, {
         mode: settingsStore.editorSettings.executeMode,
-        cursorPos: cursorPos.value,
+        cursorPos: snapshot?.cursorPos ?? cursorPos.value,
         databaseType: activeConnection.value?.db_type,
       })
     : "";
@@ -382,7 +383,6 @@ watch(
     if (id) newQueryContextSource.value = "tab";
     selectedSql.value = "";
     activeOutputView.value = "result";
-    showDriverStore.value = false;
     if (id) queryStore.reloadEvictedTab(id);
   },
 );
@@ -655,7 +655,7 @@ async function openPendingSqlFiles() {
   }
 }
 
-const DB_EXTENSIONS = [".db", ".sqlite", ".sqlite3", ".duckdb"];
+const DB_EXTENSIONS = [".db", ".db3", ".sqlite", ".sqlite3", ".duckdb"];
 
 function getDbTypeFromPath(path: string): "sqlite" | "duckdb" | null {
   const lower = path.toLowerCase();
@@ -792,11 +792,19 @@ async function openConnectionQuery(connectionId: string) {
   const connection = connectionStore.getConfig(connectionId);
   if (!connection) return;
   connectionStore.activeConnectionId = connectionId;
-  const tabId = queryStore.createTab(connectionId, resolveDefaultDatabase(connection, []));
+  const initialTarget = quickConnectionOpenTarget(connection);
+  if (initialTarget.kind === "mq-admin") {
+    queryStore.openMqAdmin(connectionId);
+    return;
+  }
+  const tabId = queryStore.createTab(connectionId, initialTarget.database);
   try {
     await connectionStore.ensureConnected(connectionId);
     const options = await getDatabaseOptions(connectionId);
-    queryStore.updateDatabase(tabId, resolveDefaultDatabase(connection, options));
+    const target = quickConnectionOpenTarget(connection, options);
+    if (target.kind === "query") {
+      queryStore.updateDatabase(tabId, target.database);
+    }
   } catch (e: any) {
     toast(
       t("connection.connectFailed", {
@@ -816,9 +824,9 @@ function openSavedSqlFromWelcome(fileId: string) {
   toast(t("welcome.fileOpened", { name: file.name }), 2000);
 }
 
-async function onClickTable(tableName: string) {
+function tableTargetFromActiveTab(tableName: string) {
   const tab = activeTab.value;
-  if (!tab) return;
+  if (!tab) return null;
   const connectionId = tab.connectionId;
   let database = tab.database;
   let schema = tab.schema;
@@ -838,8 +846,24 @@ async function onClickTable(tableName: string) {
     }
   }
 
+  return { connectionId, database, schema, tableName: rawTableName };
+}
+
+async function onClickTable(tableName: string) {
+  const target = tableTargetFromActiveTab(tableName);
+  if (!target) return;
   try {
-    await openTableTarget({ connectionId, database, schema, tableName: rawTableName }, { tableInfoTab: "ddl" });
+    await openTableTarget(target, { tableInfoTab: "ddl" });
+  } catch (e: any) {
+    toast(t("connection.connectFailed", { message: translateBackendError(t, e?.message || String(e)) }), 5000);
+  }
+}
+
+async function onViewTableData(tableName: string) {
+  const target = tableTargetFromActiveTab(tableName);
+  if (!target) return;
+  try {
+    await openTableTarget(target);
   } catch (e: any) {
     toast(t("connection.connectFailed", { message: translateBackendError(t, e?.message || String(e)) }), 5000);
   }
@@ -1275,7 +1299,7 @@ onUnmounted(() => {
                   :block-dangerous-redis-commands="blockDangerousRedisCommands"
                   @update:explain-mode="(m: 'explain' | 'autotrace') => (explainMode = m)"
                   @update:block-dangerous-redis-commands="(v: boolean) => (blockDangerousRedisCommands = v)"
-                  @execute="tryExecute()"
+                  @execute="tryExecute($event)"
                   @cancel="cancelActiveExecution()"
                   @explain="tryExplain()"
                   @format-sql="formatActiveSql"
@@ -1301,7 +1325,7 @@ onUnmounted(() => {
                     :cursor-pos="cursorPos"
                     @update:active-output-view="activeOutputView = $event"
                     @fix-with-ai="fixWithAi"
-                    @execute="tryExecute()"
+                    @execute="tryExecute($event)"
                     @cancel="cancelActiveExecution()"
                     @explain="tryExplain()"
                     @editor-update="(tabId: string, v: string) => queryStore.updateSql(tabId, v)"
@@ -1317,6 +1341,7 @@ onUnmounted(() => {
                     @execute-sql="onExecuteSql"
                     @click-table="onClickTable"
                     @open-audit-sample-target="openAuditSampleTarget"
+                    @view-table-data="onViewTableData"
                     @open-object-table="
                       (target) =>
                         activeTab &&

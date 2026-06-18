@@ -52,7 +52,8 @@ export type DatabaseType =
   | "etcd"
   | "iris"
   | "influxdb"
-  | "jdbc";
+  | "jdbc"
+  | "mq";
 
 export interface SqlSnippet {
   id: string;
@@ -100,6 +101,7 @@ export interface ConnectionConfig {
   redis_key_separator?: string;
   etcd_endpoints?: string;
   gbase_server?: string;
+  external_config?: unknown;
   one_time?: boolean;
   read_only?: boolean;
 }
@@ -211,7 +213,7 @@ export interface TableInfo {
   parent_name?: string | null;
 }
 
-export type DatabaseObjectType = "TABLE" | "VIEW" | "PROCEDURE" | "FUNCTION" | "SEQUENCE" | "PACKAGE" | "PACKAGE_BODY";
+export type DatabaseObjectType = "TABLE" | "VIEW" | "MATERIALIZED_VIEW" | "PROCEDURE" | "FUNCTION" | "SEQUENCE" | "PACKAGE" | "PACKAGE_BODY";
 
 export interface ObjectInfo {
   name: string;
@@ -224,7 +226,7 @@ export interface ObjectInfo {
   parent_name?: string | null;
 }
 
-export type ObjectSourceKind = "VIEW" | "PROCEDURE" | "FUNCTION" | "SEQUENCE" | "PACKAGE" | "PACKAGE_BODY";
+export type ObjectSourceKind = "VIEW" | "MATERIALIZED_VIEW" | "PROCEDURE" | "FUNCTION" | "SEQUENCE" | "PACKAGE" | "PACKAGE_BODY";
 
 export interface ObjectSource {
   name: string;
@@ -390,6 +392,7 @@ export type TreeNodeType =
   | "schema"
   | "table"
   | "view"
+  | "materialized_view"
   | "procedure"
   | "function"
   | "sequence"
@@ -401,6 +404,7 @@ export type TreeNodeType =
   | "group-triggers"
   | "group-tables"
   | "group-views"
+  | "group-materialized-views"
   | "group-procedures"
   | "group-functions"
   | "group-sequences"
@@ -417,6 +421,7 @@ export type TreeNodeType =
   | "fkey"
   | "trigger"
   | "redis-db"
+  | "mq-tenant"
   | "etcd-root"
   | "mongo-db"
   | "mongo-collection"
@@ -445,6 +450,7 @@ export interface TreeNode {
   pinned?: boolean;
   connectionId?: string;
   database?: string;
+  mqTenant?: string;
   schema?: string;
   tableName?: string;
   comment?: string | null;
@@ -515,7 +521,8 @@ export interface QueryTab {
   executionId?: string;
   isExplaining?: boolean;
   explainExecutionId?: string;
-  mode: "data" | "query" | "redis" | "mongo" | "etcd" | "objects" | "structure" | "users" | "audit";
+  mode: "data" | "query" | "redis" | "mongo" | "etcd" | "mq" | "objects" | "structure" | "users" | "audit";
+  mqTenant?: string;
   structureTableName?: string;
   objectBrowser?: {
     schema?: string;

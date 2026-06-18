@@ -655,6 +655,10 @@ export async function buildExecutableObjectSourceSql(input: BuildEditableObjectS
   return post("/api/query/build-executable-object-source-sql", { input });
 }
 
+export async function buildEditableObjectSource(input: BuildEditableObjectSourceSqlInput): Promise<string> {
+  return post("/api/query/build-editable-object-source", { input });
+}
+
 export async function buildRoutineRenameObjectSourceStatements(input: BuildRoutineRenameObjectSourceInput): Promise<string[]> {
   return post("/api/query/build-routine-rename-object-source-statements", { input });
 }
@@ -1512,7 +1516,7 @@ export async function loadSidebarLayout(): Promise<SidebarLayout | null> {
 }
 
 export async function refreshConnections(): Promise<void> {
-  // Web mode doesn't maintain persistent connection pools 鈥?no-op
+  // Web mode doesn't maintain persistent connection pools - no-op
 }
 
 export async function auditStartScan(request: import("./tauri").AuditScanRequest): Promise<string> {
@@ -1550,3 +1554,5 @@ export async function auditLoadTaskStore(): Promise<unknown | null> {
 export async function auditSaveTaskStore(store: unknown): Promise<void> {
   await post("/api/audit/task-store", { store });
 }
+
+export * from "./mq-http";

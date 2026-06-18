@@ -348,6 +348,13 @@ pub fn build_executable_object_source_sql(
 }
 
 #[tauri::command]
+pub fn build_editable_object_source(
+    input: dbx_core::object_source_sql::EditableObjectSourceSqlInput,
+) -> Result<String, String> {
+    Ok(dbx_core::object_source_sql::build_editable_object_source(input))
+}
+
+#[tauri::command]
 pub fn build_routine_rename_object_source_statements(
     input: dbx_core::object_source_sql::RoutineRenameObjectSourceInput,
 ) -> Result<Vec<String>, String> {
@@ -462,6 +469,9 @@ pub async fn get_explain_info(
     sql: String,
     mode: Option<String>,
 ) -> Result<String, String> {
+    let database_for_pool = database.as_deref().filter(|database| !database.trim().is_empty());
+    state.get_or_create_pool(&connection_id, database_for_pool).await?;
+
     let client = {
         let connections = state.connections.read().await;
         let pool = connections.get(&connection_id).ok_or_else(|| "Connection not found".to_string())?;

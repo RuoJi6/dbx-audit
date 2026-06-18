@@ -1596,6 +1596,14 @@ fn pg_ident(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
 
+fn sqlserver_ident(value: &str) -> String {
+    format!("[{}]", value.replace(']', "]]"))
+}
+
+fn sqlserver_n_string(value: &str) -> String {
+    format!("N'{}'", value.replace('\'', "''"))
+}
+
 fn mysql_ident(value: &str) -> String {
     format!("`{}`", value.replace('`', "``"))
 }
@@ -2047,6 +2055,20 @@ mod ddl_tests {
     }
 
     #[test]
+    fn sqlserver_table_ddl_includes_column_comments() {
+        let mut display_name = column("display]name", "nvarchar(100)");
+        display_name.comment = Some("User's display name".to_string());
+        let columns = vec![display_name];
+
+        let ddl = render_sqlserver_table_ddl("dbo", "users", &columns, &[], &[]);
+
+        assert!(ddl.contains("CREATE TABLE [dbo].[users] (\n  [display]]name] nvarchar(100)\n);"));
+        assert!(ddl.contains(
+            "EXEC sys.sp_addextendedproperty @name=N'MS_Description', @value=N'User''s display name', @level0type=N'SCHEMA', @level0name=N'dbo', @level1type=N'TABLE', @level1name=N'users', @level2type=N'COLUMN', @level2name=N'display]name';"
+        ));
+    }
+
+    #[test]
     fn opengauss_table_ddl_uses_native_tabledef_function() {
         assert_eq!(
             opengauss_table_ddl_sql("tenant's schema", "active users"),
@@ -2194,11 +2216,22 @@ pub async fn build_sqlserver_ddl(
     let indexes = db::sqlserver::list_indexes(client, schema, table).await?;
     let fkeys = db::sqlserver::list_foreign_keys(client, schema, table).await?;
 
-    let mut ddl = format!("CREATE TABLE [{schema}].[{table}] (\n");
+    Ok(render_sqlserver_table_ddl(schema, table, &columns, &indexes, &fkeys))
+}
+
+pub fn render_sqlserver_table_ddl(
+    schema: &str,
+    table: &str,
+    columns: &[db::ColumnInfo],
+    indexes: &[db::IndexInfo],
+    fkeys: &[db::ForeignKeyInfo],
+) -> String {
+    let table_name = format!("{}.{}", sqlserver_ident(schema), sqlserver_ident(table));
+    let mut ddl = format!("CREATE TABLE {table_name} (\n");
     let col_lines: Vec<String> = columns
         .iter()
         .map(|c| {
-            let mut line = format!("  [{}] {}", c.name, c.data_type);
+            let mut line = format!("  {} {}", sqlserver_ident(&c.name), c.data_type);
             if !c.is_nullable {
                 line.push_str(" NOT NULL");
             }
@@ -2214,35 +2247,52 @@ pub async fn build_sqlserver_ddl(
     if !pks.is_empty() {
         ddl.push_str(&format!(
             ",\n  PRIMARY KEY ({})",
-            pks.iter().map(|k| format!("[{k}]")).collect::<Vec<_>>().join(", ")
+            pks.iter().map(|k| sqlserver_ident(k)).collect::<Vec<_>>().join(", ")
         ));
     }
-    for fk in &fkeys {
+    for fk in fkeys {
         ddl.push_str(&format!(
-            ",\n  CONSTRAINT [{}] FOREIGN KEY ([{}]) REFERENCES [{}]([{}])",
-            fk.name, fk.column, fk.ref_table, fk.ref_column
+            ",\n  CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {}({})",
+            sqlserver_ident(&fk.name),
+            sqlserver_ident(&fk.column),
+            sqlserver_ident(&fk.ref_table),
+            sqlserver_ident(&fk.ref_column)
         ));
     }
     ddl.push_str("\n);\n");
 
-    for idx in &indexes {
+    for column in columns {
+        if let Some(comment) = column.comment.as_deref().map(str::trim).filter(|comment| !comment.is_empty()) {
+            ddl.push_str(&format!(
+                "\nEXEC sys.sp_addextendedproperty @name=N'MS_Description', @value={}, @level0type=N'SCHEMA', @level0name={}, @level1type=N'TABLE', @level1name={}, @level2type=N'COLUMN', @level2name={};",
+                sqlserver_n_string(comment),
+                sqlserver_n_string(schema),
+                sqlserver_n_string(table),
+                sqlserver_n_string(&column.name)
+            ));
+        }
+    }
+
+    for idx in indexes {
         if idx.is_primary {
             continue;
         }
         let unique = if idx.is_unique { "UNIQUE " } else { "" };
         let idx_type = idx.index_type.as_deref().map(|t| format!("{t} ")).unwrap_or_default();
-        let cols = idx.columns.iter().map(|c| format!("[{c}]")).collect::<Vec<_>>().join(", ");
+        let cols = idx.columns.iter().map(|c| sqlserver_ident(c)).collect::<Vec<_>>().join(", ");
         let include = idx
             .included_columns
             .as_deref()
             .filter(|c| !c.is_empty())
-            .map(|cols| format!(" INCLUDE ({})", cols.iter().map(|c| format!("[{c}]")).collect::<Vec<_>>().join(", ")))
+            .map(|cols| {
+                format!(" INCLUDE ({})", cols.iter().map(|c| sqlserver_ident(c)).collect::<Vec<_>>().join(", "))
+            })
             .unwrap_or_default();
         let filter = idx.filter.as_deref().map(|f| format!(" WHERE {f}")).unwrap_or_default();
         ddl.push_str(&format!(
-            "\nCREATE {unique}{idx_type}INDEX [{}] ON [{schema}].[{table}] ({cols}){include}{filter};",
-            idx.name
+            "\nCREATE {unique}{idx_type}INDEX {} ON {table_name} ({cols}){include}{filter};",
+            sqlserver_ident(&idx.name)
         ));
     }
-    Ok(ddl)
+    ddl
 }

@@ -24,6 +24,7 @@ import {
 } from "@/lib/mongoShellCommand";
 import { redisCommandResultToQueryResult } from "@/lib/redisQueryResult";
 import { nextRedisCommandDb } from "@/lib/redisCommandSession";
+import { isRedisMutatingCommand } from "@/lib/redisCommandTable";
 import { supportsDatabaseFeature } from "@/lib/databaseCapabilities";
 import { editablePrimaryKeys } from "@/lib/tableEditing";
 import { TABLE_DATA_EXPORT_PAGE_SIZE } from "@/lib/tableDataExport";
@@ -502,6 +503,33 @@ export const useQueryStore = defineStore("query", () => {
     return id;
   }
 
+  function openMqAdmin(connectionId: string, target?: { tenant?: string }) {
+    const existing = tabs.value.find((tab) => tab.mode === "mq" && tab.connectionId === connectionId);
+    if (existing) {
+      if (target?.tenant) existing.mqTenant = target.tenant;
+      activeTabId.value = existing.id;
+      return existing.id;
+    }
+
+    const conn = useConnectionStore().getConfig(connectionId);
+    const id = uuid();
+    const tab: QueryTab = {
+      id,
+      title: `${conn?.name || "Message Queue"} Admin`,
+      connectionId,
+      database: conn?.database || "",
+      sql: "",
+      isExecuting: false,
+      isCancelling: false,
+      isExplaining: false,
+      mode: "mq",
+      mqTenant: target?.tenant,
+    };
+    tabs.value.push(tab);
+    activeTabId.value = id;
+    return id;
+  }
+
   function openTableStructure(connectionId: string, database: string, schema?: string, tableName?: string) {
     const resolvedTableName = tableName || "";
     if (resolvedTableName) {
@@ -664,6 +692,7 @@ export const useQueryStore = defineStore("query", () => {
       isExplaining: false,
       explainExecutionId: undefined,
       mode: original.mode,
+      mqTenant: original.mqTenant,
       structureTableName: original.structureTableName,
       objectBrowser: original.objectBrowser ? { ...original.objectBrowser } : undefined,
       objectSource: original.objectSource ? { ...original.objectSource } : undefined,
@@ -1191,12 +1220,19 @@ export const useQueryStore = defineStore("query", () => {
 
         const allResults: QueryResult[] = [];
         const skipSafety = options?.skipRedisSafetyCheck;
+        let hadMutatingCommand = false;
         for (const command of commands) {
           try {
             const result = await api.redisExecuteCommand(tab.connectionId, currentDb, command, skipSafety);
             allResults.push(markQueryResultRowsRaw(redisCommandResultToQueryResult(result.value, performance.now() - startedAt, result.command)));
             // Track db switches from SELECT N so later commands in the same batch run on the right db.
             currentDb = nextRedisCommandDb(currentDb, command, result.value);
+            // Write commands (SET/DEL/...) mutate the key set — drop the cached key-name completion
+            // for the db this command ran on so the next autocomplete fetch reflects the new keys.
+            if (isRedisMutatingCommand(command)) {
+              hadMutatingCommand = true;
+              connStore.invalidateCompletionCache(tab.connectionId, String(currentDb));
+            }
           } catch (e: any) {
             allResults.push({ columns: ["Error"], rows: [[e?.message ?? String(e)]], affected_rows: 0, execution_time_ms: 0 });
           }
@@ -1229,6 +1265,12 @@ export const useQueryStore = defineStore("query", () => {
           if (current.database !== String(currentDb)) {
             current.database = String(currentDb);
           }
+        }
+        // Refresh the sidebar db key counts (INFO keyspace) when at least one command in
+        // this batch mutated the key set, so `dbN (count)` stays accurate without a manual
+        // refresh. Fire-and-forget: never block result display.
+        if (hadMutatingCommand) {
+          void connStore.refreshRedisDbKeyCounts(tab.connectionId);
         }
         return;
       }
@@ -1972,6 +2014,7 @@ export const useQueryStore = defineStore("query", () => {
     openObjectBrowser,
     openUserAdmin,
     openAuditTab,
+    openMqAdmin,
     openTableStructure,
     linkSavedSql,
     openSavedSql,

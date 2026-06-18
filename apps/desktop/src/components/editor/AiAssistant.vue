@@ -346,10 +346,14 @@ function agentEventToStep(event: AgentEvent, index: number): AiAgentStepItem | u
 
   if (event.type !== "tool_call_start" && event.type !== "tool_call_end") return undefined;
 
+  const isExecuteQuery = event.tool_name === "execute_query";
+  const labelKey = event.type === "tool_call_start" ? "ai.agentSteps.callingTool" : isExecuteQuery ? (event.is_error ? "ai.agentSteps.executeBlocked" : "ai.agentSteps.executeSafe") : event.is_error ? "ai.agentSteps.toolError" : "ai.agentSteps.toolDone";
+  const tone = (event.type === "tool_call_start" ? "active" : event.is_error ? "danger" : "success") as AiAgentStepTone;
+
   return {
     key: `${event.tool_call_id || ""}-${event.type}`,
-    labelKey: event.type === "tool_call_start" ? "ai.agentSteps.callingTool" : event.is_error ? "ai.agentSteps.toolError" : "ai.agentSteps.toolDone",
-    tone: (event.type === "tool_call_start" ? "active" : event.is_error ? "danger" : "success") as AiAgentStepTone,
+    labelKey,
+    tone,
     titleKey: undefined,
     titleParams: { tool: event.tool_name || "" },
     toolName: event.tool_name,
