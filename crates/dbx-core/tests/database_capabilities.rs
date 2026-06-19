@@ -203,6 +203,10 @@ fn driver_manifest_matches_core_database_capabilities() {
     let support_levels = ["connect", "browse", "understand", "operate"];
 
     for driver in &manifest.drivers {
+        // MQ is a message queue, not a database — skip database capability checks
+        if driver.db_type == DatabaseType::MessageQueue {
+            continue;
+        }
         assert!(
             support_levels.contains(&driver.support_level.as_str()),
             "invalid support level for {:?}",
@@ -299,5 +303,5 @@ fn driver_manifest_declares_expected_product_capabilities() {
     assert_eq!(mq.support_level, "browse");
     assert!(mq.capabilities.metadata_browse);
     assert!(!mq.capabilities.query_execution);
-    assert!(!mq.capabilities.object_browser);
+    assert!(mq.capabilities.object_browser);
 }

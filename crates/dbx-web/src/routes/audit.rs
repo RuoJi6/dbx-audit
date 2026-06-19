@@ -318,6 +318,7 @@ async fn run_field_name_scan(state: Arc<WebState>, request: AuditScanRequest, jo
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await?
                 .into_iter()
