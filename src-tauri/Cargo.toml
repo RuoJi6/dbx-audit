@@ -1,6 +1,6 @@
 [package]
 name = "dbx-audit"
-version = "0.5.34"
+version = "0.5.35"
 description = "Database management tool with sensitive field audit"
 authors = ["skyler"]
 license = "Apache-2.0"

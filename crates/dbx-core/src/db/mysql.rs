@@ -992,7 +992,9 @@ pub async fn list_tables(pool: &MySqlPool, database: &str) -> Result<Vec<TableIn
             (!name.is_empty()).then_some(TableInfo {
                 name,
                 table_type: get_str_by_name(row, "TABLE_TYPE"),
-                comment: get_opt_str(row, "TABLE_COMMENT").filter(|s| !s.is_empty()),
+                comment: get_opt_str(row, "TABLE_COMMENT")
+                    .map(|s| fix_potential_double_encoding(&s))
+                    .filter(|s| !s.is_empty()),
                 parent_schema: None,
                 parent_name: None,
             })
@@ -1029,7 +1031,9 @@ async fn list_table_status_show(pool: &MySqlPool, database: &str) -> Result<Hash
             (
                 get_str_by_name(row, "Name"),
                 TableStatusMeta {
-                    comment: get_opt_metadata_string(row, "Comment").filter(|s| !s.is_empty()),
+                    comment: get_opt_metadata_string(row, "Comment")
+                        .map(|s| fix_potential_double_encoding(&s))
+                        .filter(|s| !s.is_empty()),
                     created_at: get_opt_metadata_string(row, "Create_time"),
                     updated_at: get_opt_metadata_string(row, "Update_time"),
                 },
@@ -1152,7 +1156,9 @@ fn row_to_object(row: &mysql_async::Row, database: &str) -> ObjectInfo {
         name: get_str_by_name(row, "object_name"),
         object_type: get_str_by_name(row, "object_type"),
         schema: Some(database.to_string()),
-        comment: get_opt_str(row, "object_comment").filter(|s| !s.is_empty()),
+        comment: get_opt_str(row, "object_comment")
+            .map(|s| fix_potential_double_encoding(&s))
+            .filter(|s| !s.is_empty()),
         created_at: get_opt_str(row, "created_at"),
         updated_at: get_opt_str(row, "updated_at"),
         parent_schema: get_opt_str(row, "parent_schema"),
@@ -1468,7 +1474,11 @@ fn mysql_top_level_limit(sql: &str) -> Option<usize> {
         if depth == 0 && mysql_keyword_at(sql, i, "LIMIT") {
             return parse_mysql_limit_value(sql, i + "LIMIT".len());
         }
+        // Move to next byte, but ensure we stay on a UTF-8 boundary
         i += 1;
+        while i < bytes.len() && !sql.is_char_boundary(i) {
+            i += 1;
+        }
     }
 
     None
@@ -1497,13 +1507,20 @@ fn parse_usize_token(sql: &str, i: &mut usize) -> Option<usize> {
     if *i == start {
         return None;
     }
-    sql[start..*i].parse().ok()
+    // Ensure the slice is valid UTF-8 before parsing
+    std::str::from_utf8(&bytes[start..*i]).ok()?.parse().ok()
 }
 
 fn mysql_keyword_at(sql: &str, i: usize, keyword: &str) -> bool {
     let end = i + keyword.len();
-    end <= sql.len()
-        && sql[i..end].eq_ignore_ascii_case(keyword)
+    if end > sql.len() {
+        return false;
+    }
+    // Ensure indices are on UTF-8 boundaries before slicing
+    if !sql.is_char_boundary(i) || !sql.is_char_boundary(end) {
+        return false;
+    }
+    sql[i..end].eq_ignore_ascii_case(keyword)
         && (i == 0 || !is_mysql_identifier_byte(sql.as_bytes()[i - 1]))
         && (end == sql.len() || !is_mysql_identifier_byte(sql.as_bytes()[end]))
 }
