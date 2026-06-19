@@ -303,5 +303,5 @@ fn driver_manifest_declares_expected_product_capabilities() {
     assert_eq!(mq.support_level, "browse");
     assert!(mq.capabilities.metadata_browse);
     assert!(!mq.capabilities.query_execution);
-    assert!(!mq.capabilities.object_browser);
+    assert!(mq.capabilities.object_browser);
 }
