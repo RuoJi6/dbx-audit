@@ -127,6 +127,8 @@ export function connectionUrlPlaceholder(dbType: DatabaseType): string {
       return "oracle://user:password@host:port/service_name";
 
     case "elasticsearch":
+    case "qdrant":
+    case "milvus":
       return "http://user:password@host:port";
 
     case "dameng":

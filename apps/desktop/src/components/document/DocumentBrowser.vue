@@ -832,11 +832,14 @@ function resetTableSearchSplitWidth() {
               {{ t("grid.noSearchResults") }}
             </div>
           </div>
-          <div class="flex items-center justify-between gap-2 border-t bg-muted/30 px-2 py-1.5">
-            <span class="text-[11px] text-muted-foreground">{{ t("grid.columnVisibilityHint") }}</span>
-            <div class="flex items-center gap-1">
+          <div class="flex flex-col gap-1 border-t bg-muted/30 px-2 py-1.5">
+            <span class="text-[11px] leading-4 text-muted-foreground">{{ t("grid.columnVisibilityHint") }}</span>
+            <div class="flex items-center justify-end gap-1">
               <Button variant="ghost" size="sm" class="h-7 px-2 text-xs" :disabled="(dataGridRef?.displayableColumnCount ?? 0) <= 1" @click="dataGridRef?.invertColumnVisibility()">
                 {{ t("grid.invertColumnVisibility") }}
+              </Button>
+              <Button variant="ghost" size="sm" class="h-7 px-2 text-xs" :disabled="!dataGridRef?.hasCustomColumnOrder" @click="dataGridRef?.resetColumnOrder()">
+                {{ t("grid.resetColumnOrder") }}
               </Button>
               <Button variant="ghost" size="sm" class="h-7 px-2 text-xs" :disabled="(dataGridRef?.hiddenColumnCount ?? 0) === 0" @click="dataGridRef?.showAllColumns()">
                 {{ t("grid.showAllColumns") }}

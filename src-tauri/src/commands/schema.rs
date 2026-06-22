@@ -107,6 +107,16 @@ pub async fn list_objects(
 }
 
 #[tauri::command]
+pub async fn list_object_statistics(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    database: String,
+    schema: String,
+) -> Result<Vec<db::ObjectStatistics>, String> {
+    dbx_core::schema::list_object_statistics_core(&state, &connection_id, &database, &schema).await
+}
+
+#[tauri::command]
 pub async fn list_completion_objects(
     state: State<'_, Arc<AppState>>,
     connection_id: String,

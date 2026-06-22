@@ -1,14 +1,8 @@
-use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::sync::LazyLock;
 
 use crate::models::connection::DatabaseType;
 use crate::sql::find_statement_at_cursor;
-use crate::sql_dialect::{quote_table_identifier, uses_fetch_first};
-
-static LIMIT_OFFSET_STRIP_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(\s+LIMIT\s+\d+(\s+OFFSET\s+\d+)?|\s+LIMIT\s+\d+(\s*,\s*\d+)?|\s+OFFSET\s+\d+(\s+LIMIT\s+\d+)?|\s+OFFSET\s+\d+\s+ROWS?\s+FETCH\s+(?:FIRST|NEXT)\s+\d+\s+ROWS?\s+ONLY|\s+FETCH\s+(?:FIRST|NEXT)\s+\d+\s+ROWS?\s+ONLY)\s*$").unwrap()
-});
+use crate::sql_dialect::{pagination_strategy, quote_table_identifier, PaginationContext, TablePaginationStrategy};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -167,21 +161,6 @@ pub fn build_paginated_query_sql(options: PaginatedQuerySqlOptions) -> QuerySqlB
     let safe_limit = options.limit.max(1);
     let safe_offset = options.offset;
 
-    if options.database_type == Some(DatabaseType::SqlServer) {
-        if safe_offset > 0 {
-            return err("unsupported");
-        }
-        return ok(add_sql_server_top(&statement, safe_limit));
-    }
-
-    if options.database_type == Some(DatabaseType::Mysql) {
-        return ok(add_mysql_limit(&statement, safe_limit, safe_offset));
-    }
-
-    if options.database_type == Some(DatabaseType::Questdb) {
-        return ok(add_questdb_limit(&statement, safe_limit, safe_offset));
-    }
-
     if options.database_type == Some(DatabaseType::Elasticsearch) {
         // If the user wrote their own LIMIT, leave the SQL alone — they
         // explicitly bounded the result set and the front-end will paginate
@@ -195,24 +174,26 @@ pub fn build_paginated_query_sql(options: PaginatedQuerySqlOptions) -> QuerySqlB
         return ok(format!("{statement} LIMIT {safe_limit} OFFSET {safe_offset};"));
     }
 
-    if options.database_type == Some(DatabaseType::Oracle) {
-        return ok(format!("{statement};"));
+    match pagination_strategy(options.database_type, PaginationContext::UserQuery) {
+        TablePaginationStrategy::SqlServerTop => {
+            if safe_offset > 0 {
+                err("unsupported")
+            } else {
+                ok(add_sql_server_top(&statement, safe_limit))
+            }
+        }
+        TablePaginationStrategy::QuestDbLimit => ok(add_questdb_limit(&statement, safe_limit, safe_offset)),
+        TablePaginationStrategy::InformixFirst => ok(add_informix_first_limit(&statement, safe_limit, safe_offset)),
+        TablePaginationStrategy::Db2FetchFirst | TablePaginationStrategy::FetchFirst => {
+            ok(add_fetch_first_limit(&statement, safe_limit, safe_offset))
+        }
+        TablePaginationStrategy::Rownum => ok(add_rownum_limit(&statement, safe_limit, safe_offset)),
+        TablePaginationStrategy::AgentMaxRows | TablePaginationStrategy::Unbounded => ok(format!("{statement};")),
+        TablePaginationStrategy::IrisTop => ok(add_iris_top_limit(&statement, safe_limit)),
+        TablePaginationStrategy::LimitOffset => {
+            ok(add_standard_limit(&statement, options.database_type, safe_limit, safe_offset))
+        }
     }
-
-    if options.database_type == Some(DatabaseType::Informix) {
-        return ok(add_informix_first_limit(&statement, safe_limit, safe_offset));
-    }
-
-    if options.database_type.is_some_and(uses_fetch_first) {
-        return ok(add_fetch_first_limit(&statement, safe_limit, safe_offset));
-    }
-
-    // JDBC connections avoid SQL-level LIMIT; the agent truncates rows while reading.
-    if options.database_type == Some(DatabaseType::Jdbc) {
-        return ok(format!("{statement};"));
-    }
-
-    ok(add_standard_limit(&statement, safe_limit, safe_offset))
 }
 
 pub fn build_count_query_sql(options: CountQuerySqlOptions) -> QuerySqlBuildResult {
@@ -227,8 +208,6 @@ pub fn build_count_query_sql(options: CountQuerySqlOptions) -> QuerySqlBuildResu
     if options.database_type == Some(DatabaseType::Elasticsearch) {
         return err("unsupported");
     }
-
-    let statement = LIMIT_OFFSET_STRIP_RE.replace(&statement, "").to_string();
 
     let alias = quote_table_identifier(options.database_type, "dbx_count");
     let wrapped_sql = if options.database_type == Some(DatabaseType::SqlServer) {
@@ -411,14 +390,6 @@ fn sql_server_statement_for_derived_table(statement: &str) -> String {
     statement[..order_by].trim_end().to_string()
 }
 
-fn add_mysql_limit(statement: &str, limit: usize, offset: usize) -> String {
-    if has_top_level_limit(statement) {
-        return format!("{statement};");
-    }
-    let offset_sql = if offset > 0 { format!(" OFFSET {offset}") } else { String::new() };
-    format!("{statement} LIMIT {limit}{offset_sql};")
-}
-
 fn add_informix_first_limit(statement: &str, limit: usize, offset: usize) -> String {
     if has_top_level_informix_row_limit(statement) {
         return format!("{statement};");
@@ -440,8 +411,23 @@ fn add_informix_first_limit(statement: &str, limit: usize, offset: usize) -> Str
     format!("SELECT {row_limit} * FROM ({statement}) dbx_page;")
 }
 
+fn add_iris_top_limit(statement: &str, limit: usize) -> String {
+    if has_top_level_select_top(statement) {
+        return format!("{statement};");
+    }
+    if statement.len() >= 6 && statement[..6].eq_ignore_ascii_case("SELECT") {
+        let rest = &statement[6..];
+        format!("SELECT TOP {limit}{rest};")
+    } else {
+        format!("SELECT TOP {limit} * FROM ({statement}) dbx_page;")
+    }
+}
+
 fn add_questdb_limit(statement: &str, limit: usize, offset: usize) -> String {
     if has_top_level_limit(statement) {
+        if offset > 0 {
+            return add_outer_standard_limit(statement, Some(DatabaseType::Questdb), limit, offset);
+        }
         return format!("{statement};");
     }
     if offset > 0 {
@@ -478,6 +464,10 @@ fn has_top_level_fetch_first(sql: &str) -> bool {
     tokens.windows(2).any(|w| w[0].text == "FETCH" && w[1].text == "FIRST")
 }
 
+fn has_top_level_rownum(sql: &str) -> bool {
+    top_level_sql_tokens(sql).iter().any(|token| token.text == "ROWNUM")
+}
+
 fn has_top_level_offset_fetch_next(sql: &str) -> bool {
     let tokens = top_level_sql_tokens(sql);
     let has_offset = tokens.iter().any(|token| token.text == "OFFSET");
@@ -487,18 +477,48 @@ fn has_top_level_offset_fetch_next(sql: &str) -> bool {
 
 fn add_fetch_first_limit(statement: &str, limit: usize, offset: usize) -> String {
     if has_top_level_fetch_first(statement) {
+        if offset > 0 {
+            let alias = quote_table_identifier(None, "dbx_page");
+            return format!("SELECT * FROM ({statement}) {alias} OFFSET {offset} ROWS FETCH FIRST {limit} ROWS ONLY;");
+        }
         return format!("{statement};");
     }
     let offset_sql = if offset > 0 { format!(" OFFSET {offset} ROWS") } else { String::new() };
     format!("{statement}{offset_sql} FETCH FIRST {limit} ROWS ONLY;")
 }
 
-fn add_standard_limit(statement: &str, limit: usize, offset: usize) -> String {
+fn add_rownum_limit(statement: &str, limit: usize, offset: usize) -> String {
+    if has_top_level_rownum(statement) {
+        return format!("{statement};");
+    }
+    if offset == 0 {
+        return format!("SELECT * FROM ({statement}) WHERE ROWNUM <= {limit};");
+    }
+    let end = offset + limit;
+    format!(
+        "SELECT * FROM (SELECT dbx_inner.*, ROWNUM AS \"__dbx_row_num\" FROM ({statement}) dbx_inner WHERE ROWNUM <= {end}) WHERE \"__dbx_row_num\" > {offset};"
+    )
+}
+
+fn add_standard_limit(statement: &str, database_type: Option<DatabaseType>, limit: usize, offset: usize) -> String {
     if has_top_level_limit(statement) {
+        if offset > 0 {
+            return add_outer_standard_limit(statement, database_type, limit, offset);
+        }
         return format!("{statement};");
     }
     let offset_sql = if offset > 0 { format!(" OFFSET {offset}") } else { String::new() };
     format!("{statement} LIMIT {limit}{offset_sql};")
+}
+
+fn add_outer_standard_limit(
+    statement: &str,
+    database_type: Option<DatabaseType>,
+    limit: usize,
+    offset: usize,
+) -> String {
+    let alias = quote_table_identifier(database_type, "dbx_page");
+    format!("SELECT * FROM ({statement}) {alias} LIMIT {limit} OFFSET {offset};")
 }
 
 fn find_top_level_trailing_order_by(sql: &str) -> Option<usize> {
@@ -883,6 +903,33 @@ mod tests {
     }
 
     #[test]
+    fn oceanbase_oracle_pagination_wraps_with_rownum() {
+        let result = build_paginated_query_sql(PaginatedQuerySqlOptions {
+            original_sql: "SELECT id FROM users ORDER BY id".to_string(),
+            database_type: Some(DatabaseType::OceanbaseOracle),
+            limit: 100,
+            offset: 0,
+        });
+
+        assert_eq!(result.sql.unwrap(), "SELECT * FROM (SELECT id FROM users ORDER BY id) WHERE ROWNUM <= 100;");
+    }
+
+    #[test]
+    fn oceanbase_oracle_pagination_wraps_offset_with_rownum_bounds() {
+        let result = build_paginated_query_sql(PaginatedQuerySqlOptions {
+            original_sql: "SELECT id FROM users ORDER BY id".to_string(),
+            database_type: Some(DatabaseType::OceanbaseOracle),
+            limit: 100,
+            offset: 200,
+        });
+
+        assert_eq!(
+            result.sql.unwrap(),
+            "SELECT * FROM (SELECT dbx_inner.*, ROWNUM AS \"__dbx_row_num\" FROM (SELECT id FROM users ORDER BY id) dbx_inner WHERE ROWNUM <= 300) WHERE \"__dbx_row_num\" > 200;"
+        );
+    }
+
+    #[test]
     fn uses_fetch_first_pagination_for_db2() {
         let result = build_paginated_query_sql(PaginatedQuerySqlOptions {
             original_sql: "SELECT id FROM users".to_string(),
@@ -958,6 +1005,36 @@ mod tests {
     }
 
     #[test]
+    fn mysql_pagination_wraps_existing_limit_for_later_pages() {
+        let result = build_paginated_query_sql(PaginatedQuerySqlOptions {
+            original_sql: "SELECT * FROM dy_promotion_item WHERE create_time < '2026-06-01' LIMIT 10000;".to_string(),
+            database_type: Some(DatabaseType::Mysql),
+            limit: 1000,
+            offset: 1000,
+        });
+
+        assert_eq!(
+            result.sql.unwrap(),
+            "SELECT * FROM (SELECT * FROM dy_promotion_item WHERE create_time < '2026-06-01' LIMIT 10000) `dbx_page` LIMIT 1000 OFFSET 1000;"
+        );
+    }
+
+    #[test]
+    fn standard_pagination_wraps_existing_limit_for_later_pages() {
+        let result = build_paginated_query_sql(PaginatedQuerySqlOptions {
+            original_sql: "SELECT id FROM users LIMIT 20;".to_string(),
+            database_type: Some(DatabaseType::Postgres),
+            limit: 5,
+            offset: 10,
+        });
+
+        assert_eq!(
+            result.sql.unwrap(),
+            "SELECT * FROM (SELECT id FROM users LIMIT 20) \"dbx_page\" LIMIT 5 OFFSET 10;"
+        );
+    }
+
+    #[test]
     fn rejects_multiple_statements_for_pagination() {
         let result = build_paginated_query_sql(PaginatedQuerySqlOptions {
             original_sql: "SELECT 1; SELECT 2;".to_string(),
@@ -991,6 +1068,32 @@ mod tests {
         assert_eq!(
             result.sql.unwrap(),
             "SELECT COUNT(*) AS dbx_total_rows FROM (WITH cte AS (SELECT 1 AS id) SELECT * FROM cte) `dbx_count`;"
+        );
+    }
+
+    #[test]
+    fn count_query_preserves_user_limit() {
+        let result = build_count_query_sql(CountQuerySqlOptions {
+            original_sql: "SELECT * FROM dy_promotion_item WHERE create_time < '2026-06-01' LIMIT 10000".to_string(),
+            database_type: Some(DatabaseType::Mysql),
+        });
+
+        assert_eq!(
+            result.sql.unwrap(),
+            "SELECT COUNT(*) AS dbx_total_rows FROM (SELECT * FROM dy_promotion_item WHERE create_time < '2026-06-01' LIMIT 10000) `dbx_count`;"
+        );
+    }
+
+    #[test]
+    fn count_query_preserves_user_limit_offset() {
+        let result = build_count_query_sql(CountQuerySqlOptions {
+            original_sql: "SELECT * FROM users WHERE active = 1 LIMIT 100 OFFSET 50".to_string(),
+            database_type: Some(DatabaseType::Postgres),
+        });
+
+        assert_eq!(
+            result.sql.unwrap(),
+            "SELECT COUNT(*) AS dbx_total_rows FROM (SELECT * FROM users WHERE active = 1 LIMIT 100 OFFSET 50) \"dbx_count\";"
         );
     }
 

@@ -34,6 +34,14 @@ pub struct ObjectInfo {
     pub parent_name: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObjectStatistics {
+    pub name: String,
+    pub schema: Option<String>,
+    pub estimated_rows: Option<i64>,
+    pub total_bytes: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ObjectSourceKind {

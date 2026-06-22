@@ -20,6 +20,8 @@ export const BRIDGE_REQUIRED_TYPES = [
   "sqlserver",
   "oracle",
   "elasticsearch",
+  "qdrant",
+  "milvus",
   "etcd",
   "dameng",
   "kingbase",

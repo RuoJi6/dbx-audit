@@ -2,6 +2,7 @@ use crate::connection::{AppState, PoolKind};
 use crate::db::agent_driver::mongo_document_id_params;
 use crate::db::elasticsearch_driver;
 use crate::db::mongo_driver::{self, MongoDocumentResult};
+use crate::db::vector_driver;
 
 fn sort_names(mut names: Vec<String>) -> Vec<String> {
     names.sort_by(|left, right| {
@@ -28,7 +29,7 @@ pub async fn mongo_list_databases_core(state: &AppState, connection_id: &str) ->
             }
             Err(error) => Err(error),
         },
-        PoolKind::Elasticsearch(_) => Ok(vec!["default".to_string()]),
+        PoolKind::Elasticsearch(_) | PoolKind::VectorDb(_) => Ok(vec!["default".to_string()]),
         PoolKind::Agent(client) => {
             let mut client = client.lock().await;
             match client.mongo_list_databases::<Vec<serde_json::Value>>().await {
@@ -41,7 +42,7 @@ pub async fn mongo_list_databases_core(state: &AppState, connection_id: &str) ->
                 Err(error) => Err(error),
             }
         }
-        _ => Err("Not a MongoDB/Elasticsearch connection".to_string()),
+        _ => Err("Not a MongoDB/Elasticsearch/vector connection".to_string()),
     }
 }
 
@@ -69,11 +70,47 @@ pub async fn mongo_list_collections_core(
     match connections.get(connection_id).ok_or("Not found")? {
         PoolKind::MongoDb(client) => mongo_driver::list_collections(client, database).await.map(sort_names),
         PoolKind::Elasticsearch(client) => elasticsearch_driver::list_indices(client).await.map(sort_names),
+        PoolKind::VectorDb(client) => vector_driver::list_collections(client).await.map(sort_names),
         PoolKind::Agent(client) => {
             let mut client = client.lock().await;
             client.mongo_list_collections(database).await.map(sort_names)
         }
-        _ => Err("Not a MongoDB/Elasticsearch connection".to_string()),
+        _ => Err("Not a MongoDB/Elasticsearch/vector connection".to_string()),
+    }
+}
+
+pub async fn mongo_create_database_core(state: &AppState, connection_id: &str, database: &str) -> Result<(), String> {
+    ensure_document_pool(state, connection_id).await?;
+    let connections = state.connections.read().await;
+    match connections.get(connection_id).ok_or("Not found")? {
+        PoolKind::MongoDb(client) => mongo_driver::create_database(client, database).await,
+        PoolKind::Agent(_) => Err("MongoDB legacy agent does not support create database".to_string()),
+        _ => Err("Not a MongoDB connection".to_string()),
+    }
+}
+
+pub async fn mongo_drop_database_core(state: &AppState, connection_id: &str, database: &str) -> Result<(), String> {
+    ensure_document_pool(state, connection_id).await?;
+    let connections = state.connections.read().await;
+    match connections.get(connection_id).ok_or("Not found")? {
+        PoolKind::MongoDb(client) => mongo_driver::drop_database(client, database).await,
+        PoolKind::Agent(_) => Err("MongoDB legacy agent does not support drop database".to_string()),
+        _ => Err("Not a MongoDB connection".to_string()),
+    }
+}
+
+pub async fn mongo_drop_collection_core(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    collection: &str,
+) -> Result<(), String> {
+    ensure_document_pool(state, connection_id).await?;
+    let connections = state.connections.read().await;
+    match connections.get(connection_id).ok_or("Not found")? {
+        PoolKind::MongoDb(client) => mongo_driver::drop_collection(client, database, collection).await,
+        PoolKind::Agent(_) => Err("MongoDB legacy agent does not support drop collection".to_string()),
+        _ => Err("Not a MongoDB connection".to_string()),
     }
 }
 
@@ -99,6 +136,12 @@ pub async fn document_find_documents_core(
             drop(connections);
             elasticsearch_driver::find_documents(&client, collection, skip, limit, filter, sort).await
         }
+        PoolKind::VectorDb(client) => {
+            let client = client.clone();
+            drop(connections);
+            let _ = (database, filter, sort);
+            vector_driver::find_documents(&client, collection, skip, limit).await
+        }
         PoolKind::Agent(client) => {
             let mut client = client.lock().await;
             client
@@ -112,7 +155,7 @@ pub async fn document_find_documents_core(
                 }))
                 .await
         }
-        _ => Err("Not a MongoDB/Elasticsearch connection".to_string()),
+        _ => Err("Not a MongoDB/Elasticsearch/vector connection".to_string()),
     }
 }
 

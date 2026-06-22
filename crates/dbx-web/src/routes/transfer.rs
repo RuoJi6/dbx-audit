@@ -27,6 +27,7 @@ pub async fn start_transfer(
     Json(body): Json<StartTransferRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let req = body.request;
+    transfer::validate_transfer_target_table_names(&req).map_err(AppError)?;
 
     // Reject transfer early if the target connection is read-only
     if let Some(name) = dbx_core::query::connection_readonly_name(&state.app, &req.target_connection_id).await {

@@ -130,6 +130,13 @@ async function applyDriverStoreDir(kind: DriverStoreDirKind, newDir: string | nu
     settingsStore.desktopSettings.driver_store_dir = result.driver_store_dir;
     settingsStore.desktopSettings.plugin_store_dir = result.plugin_store_dir;
     settingsStore.desktopSettings.agent_store_dir = result.agent_store_dir;
+    currentDriverStorePath.value = {
+      driver_store_dir: result.driver_store_dir,
+      plugin_store_dir: result.plugin_store_dir,
+      agent_store_dir: result.agent_store_dir,
+      plugins_dir: result.plugins_dir,
+      agents_dir: result.agents_dir,
+    };
     toast(t("driverStore.driverStoreDirSuccess", { target }));
     // Restart the app to use the new paths
     const { relaunch } = await import("@tauri-apps/plugin-process");

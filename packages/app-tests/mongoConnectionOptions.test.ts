@@ -29,6 +29,12 @@ test("adds a MongoDB URL encoding hint for reserved password characters", () => 
   assert.match(mongodbAuthFailureHint(message), /@ becomes %40/);
 });
 
+test("adds a MongoDB directConnection multi-host hint", () => {
+  const message = "MongoDB connection failed: Kind: An invalid argument was provided: cannot specify multiple seeds with directConnection=true";
+
+  assert.match(mongodbAuthFailureHint(message), /Remove directConnection=true when using a multi-host replica set URL/);
+});
+
 test("adds a MongoDB SRV DNS hint for IP endpoints", () => {
   const message = 'MongoDB connection failed: Kind: An error occurred during DNS resolution: DNS error: no records found for Query { name: Name("_mongodb._tcp.172.17.0.1."), query_type: SRV }';
 

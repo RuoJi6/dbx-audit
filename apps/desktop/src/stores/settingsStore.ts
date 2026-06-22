@@ -11,9 +11,10 @@ import type { SqlSnippet } from "@/types/database";
 import { DEFAULT_SQL_SNIPPETS } from "@/lib/sqlCompletion";
 import { setDebugLoggingEnabled } from "@/lib/debugLog";
 
-export type AiProvider = "claude" | "openai" | "gemini" | "deepseek" | "qwen" | "ollama" | "openai-compatible" | "custom";
+export type AiProvider = "claude" | "openai" | "gemini" | "deepseek" | "qwen" | "ollama" | "openai-compatible" | "codex-cli" | "custom";
 export type AiApiStyle = "completions" | "responses";
 export type AiAuthMethod = "api-key" | "bearer";
+export type AiReasoningLevel = "default" | "minimal" | "low" | "medium" | "high";
 
 export interface AiConfig {
   provider: AiProvider;
@@ -25,7 +26,9 @@ export interface AiConfig {
   proxyEnabled?: boolean;
   proxyUrl?: string;
   enableThinking?: boolean;
+  reasoningLevel?: AiReasoningLevel;
   contextWindow?: number;
+  codexCliPath?: string | null;
 }
 
 export interface AiTestConnectionResult {
@@ -39,6 +42,8 @@ export interface AiTestConnectionResult {
 export interface DesktopSettings {
   show_tray_icon: boolean;
   icon_theme: DesktopIconTheme;
+  quit_on_close: boolean;
+  close_action_prompted: boolean;
   debug_logging_enabled: boolean;
   saved_sql_sync_dir?: string | null;
   driver_store_dir?: string | null;
@@ -56,6 +61,8 @@ export const DEFAULT_SIDEBAR_TABLE_PAGE_SIZE = 1000;
 export const DEFAULT_DESKTOP_SETTINGS: DesktopSettings = {
   show_tray_icon: true,
   icon_theme: "default",
+  quit_on_close: false,
+  close_action_prompted: false,
   debug_logging_enabled: false,
   saved_sql_sync_dir: null,
   driver_store_dir: null,
@@ -70,6 +77,8 @@ function normalizeDesktopSettings(settings: Partial<DesktopSettings> | null | un
   return {
     show_tray_icon: settings?.show_tray_icon ?? DEFAULT_DESKTOP_SETTINGS.show_tray_icon,
     icon_theme: iconTheme,
+    quit_on_close: settings?.quit_on_close ?? DEFAULT_DESKTOP_SETTINGS.quit_on_close,
+    close_action_prompted: settings?.close_action_prompted ?? DEFAULT_DESKTOP_SETTINGS.close_action_prompted,
     debug_logging_enabled: settings?.debug_logging_enabled ?? DEFAULT_DESKTOP_SETTINGS.debug_logging_enabled,
     saved_sql_sync_dir: settings?.saved_sql_sync_dir?.trim() || DEFAULT_DESKTOP_SETTINGS.saved_sql_sync_dir,
     driver_store_dir: settings?.driver_store_dir?.trim() || DEFAULT_DESKTOP_SETTINGS.driver_store_dir,
@@ -156,6 +165,16 @@ export const AI_PROVIDER_PRESETS: Record<AiProvider, AiProviderPreset> = {
     authMethod: "bearer",
     requiresApiKey: true,
   },
+  "codex-cli": {
+    label: "Codex CLI",
+    iconSlug: "codex",
+    provider: "codex-cli",
+    endpoint: "",
+    model: "default",
+    apiStyle: "completions",
+    authMethod: "bearer",
+    requiresApiKey: false,
+  },
   custom: {
     label: "Custom",
     provider: "custom",
@@ -174,6 +193,12 @@ const defaultConfigs: Record<AiProvider, Omit<AiConfig, "apiKey">> = Object.from
   }),
 ) as Record<AiProvider, Omit<AiConfig, "apiKey">>;
 
+const AI_REASONING_LEVELS: AiReasoningLevel[] = ["default", "minimal", "low", "medium", "high"];
+
+function normalizeAiReasoningLevel(value: unknown): AiReasoningLevel {
+  return typeof value === "string" && AI_REASONING_LEVELS.includes(value as AiReasoningLevel) ? (value as AiReasoningLevel) : "default";
+}
+
 export function normalizeAiConfig(config: Partial<AiConfig> | null | undefined): AiConfig {
   const provider = config?.provider && config.provider in AI_PROVIDER_PRESETS ? config.provider : inferAiProviderFromConfig(config);
   return {
@@ -186,7 +211,9 @@ export function normalizeAiConfig(config: Partial<AiConfig> | null | undefined):
     proxyEnabled: !!config?.proxyEnabled,
     proxyUrl: config?.proxyUrl ?? "",
     enableThinking: config?.enableThinking ?? true,
+    reasoningLevel: normalizeAiReasoningLevel(config?.reasoningLevel),
     contextWindow: config?.contextWindow ?? undefined,
+    codexCliPath: config?.codexCliPath?.trim() || undefined,
   };
 }
 
@@ -669,6 +696,7 @@ export const useSettingsStore = defineStore("settings", () => {
 
   function isConfigured(): boolean {
     const preset = AI_PROVIDER_PRESETS[aiConfig.value.provider];
+    if (aiConfig.value.provider === "codex-cli") return true;
     return !!aiConfig.value.endpoint && !!aiConfig.value.model && (!preset.requiresApiKey || !!aiConfig.value.apiKey);
   }
 

@@ -76,6 +76,8 @@ const assetIcons: Record<string, string> = {
   xugu: "xugu.png",
   iotdb: "iotdb",
   etcd: "etcd",
+  qdrant: "qdrant",
+  milvus: "milvus.png",
   mq: "pulsar",
   pulsar: "pulsar",
   iris: "iris.png",

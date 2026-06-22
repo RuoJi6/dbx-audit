@@ -1,9 +1,10 @@
-﻿import type {
+import type {
   ConnectionConfig,
   DatabaseInfo,
   LinkedServerInfo,
   TableInfo,
   ObjectInfo,
+  ObjectStatistics,
   ObjectSource,
   ObjectSourceKind,
   ColumnInfo,
@@ -48,6 +49,8 @@ import type {
   RedisValue,
   RedisScanResult,
   RedisCommandResult,
+  RedisSlowlogEntry,
+  RedisNodeEndpoint,
   KvValue,
   KvListPrefixResponse,
   KvGetResponse,
@@ -101,6 +104,8 @@ const DESKTOP_SETTINGS_STORAGE_KEY = "dbx-desktop-settings";
 const DEFAULT_DESKTOP_SETTINGS: DesktopSettings = {
   show_tray_icon: true,
   icon_theme: "default",
+  quit_on_close: false,
+  close_action_prompted: false,
   debug_logging_enabled: false,
   saved_sql_sync_dir: null,
   driver_store_dir: null,
@@ -451,6 +456,10 @@ export async function listObjects(connectionId: string, database: string, schema
       object_types: objectTypes?.join(","),
     })}`,
   );
+}
+
+export async function listObjectStatistics(connectionId: string, database: string, schema: string): Promise<ObjectStatistics[]> {
+  return get(`/api/schema/object-statistics?${qs({ connection_id: connectionId, database, schema })}`);
 }
 
 export async function listCompletionObjects(connectionId: string, database: string, schema: string): Promise<ObjectInfo[]> {
@@ -906,6 +915,8 @@ export interface DriverStoreMigrationResult {
   driver_store_dir: string | null;
   plugin_store_dir: string | null;
   agent_store_dir: string | null;
+  plugins_dir: string;
+  agents_dir: string;
   migrated_plugins: boolean;
   migrated_agents: boolean;
 }
@@ -962,28 +973,28 @@ export interface WebDavPasswordStatus {
   hasSavedPassword: boolean;
 }
 
-export async function webdavSyncTest(_config: WebDavConfig): Promise<void> {
-  throw new Error("WebDAV sync is only available in the desktop app.");
+export async function webdavSyncTest(config: WebDavConfig): Promise<void> {
+  return post("/api/cloud-sync/webdav/test", { config });
 }
 
-export async function webdavPasswordStatus(_config: WebDavConfig): Promise<WebDavPasswordStatus> {
-  return { hasSavedPassword: false };
+export async function webdavPasswordStatus(config: WebDavConfig): Promise<WebDavPasswordStatus> {
+  return post("/api/cloud-sync/webdav/password-status", { config });
 }
 
-export async function saveWebdavSavedPassword(_config: WebDavConfig, _password: string): Promise<void> {
-  throw new Error("WebDAV sync is only available in the desktop app.");
+export async function saveWebdavSavedPassword(config: WebDavConfig, password: string): Promise<void> {
+  return post("/api/cloud-sync/webdav/save-password", { config, password });
 }
 
-export async function forgetWebdavSavedPassword(_config: WebDavConfig): Promise<void> {
-  throw new Error("WebDAV sync is only available in the desktop app.");
+export async function forgetWebdavSavedPassword(config: WebDavConfig): Promise<void> {
+  return post("/api/cloud-sync/webdav/forget-password", { config });
 }
 
-export async function webdavSyncUpload(_config: WebDavConfig, _editorSettings?: unknown, _secretsPassphrase?: string): Promise<WebDavSyncSummary> {
-  throw new Error("WebDAV sync is only available in the desktop app.");
+export async function webdavSyncUpload(config: WebDavConfig, editorSettings?: unknown, secretsPassphrase?: string): Promise<WebDavSyncSummary> {
+  return post("/api/cloud-sync/webdav/upload", { config, editorSettings, secretsPassphrase });
 }
 
-export async function webdavSyncDownload(_config: WebDavConfig, _secretsPassphrase?: string): Promise<WebDavDownloadResult> {
-  throw new Error("WebDAV sync is only available in the desktop app.");
+export async function webdavSyncDownload(config: WebDavConfig, secretsPassphrase?: string): Promise<WebDavDownloadResult> {
+  return post("/api/cloud-sync/webdav/download", { config, secretsPassphrase });
 }
 
 export async function loadPinnedTreeNodeIds(): Promise<string[]> {
@@ -1179,6 +1190,11 @@ export async function exportDatabaseSql(request: DatabaseExportRequest, onProgre
       onProgress(progress);
       if (progress.status === "Done" || progress.status === "Error" || progress.status === "Cancelled") {
         es.close();
+        if (progress.status === "Done") {
+          // Trigger browser download; filename is decided by the server's
+          // Content-Disposition header.
+          downloadDatabaseExportFile(request.exportId);
+        }
         resolve();
       }
     };
@@ -1187,6 +1203,12 @@ export async function exportDatabaseSql(request: DatabaseExportRequest, onProgre
       reject(new Error("Export SSE connection failed"));
     };
   });
+}
+
+function downloadDatabaseExportFile(exportId: string): void {
+  const a = document.createElement("a");
+  a.href = `/api/export/database/download/${exportId}`;
+  a.click();
 }
 
 export async function cancelDatabaseExport(exportId: string): Promise<void> {
@@ -1287,6 +1309,21 @@ export async function exportQueryResultXlsx(filePath: string, sheetName: string 
     columns,
     rows,
   });
+  const fileName = filePath.split(/[\\/]/).pop() || "export.xlsx";
+  const blob = new Blob([new Uint8Array(workbook)], {
+    type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = fileName;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+export async function exportQueryResultsXlsx(filePath: string, worksheets: readonly { sheetName?: string; columns: string[]; rows: readonly (readonly XlsxCellValue[])[] }[]): Promise<void> {
+  const { buildXlsxWorkbookMulti } = await import("./xlsxExport");
+  const workbook = buildXlsxWorkbookMulti(worksheets);
   const fileName = filePath.split(/[\\/]/).pop() || "export.xlsx";
   const blob = new Blob([new Uint8Array(workbook)], {
     type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1413,6 +1450,14 @@ export async function redisPubSubPublish(connectionId: string, db: number, chann
   return post("/api/redis/pubsub/publish", { connectionId, db, channel, message });
 }
 
+export async function redisSlowlogGet(connectionId: string, count: number, nodeHost?: string, nodePort?: number): Promise<RedisSlowlogEntry[]> {
+  return post("/api/redis/slowlog-get", { connectionId, count, nodeHost, nodePort });
+}
+
+export async function redisClusterMasterNodes(connectionId: string): Promise<RedisNodeEndpoint[]> {
+  return post("/api/redis/cluster-master-nodes", { connectionId });
+}
+
 // ---------------------------------------------------------------------------
 // etcd
 // ---------------------------------------------------------------------------
@@ -1445,7 +1490,23 @@ export async function mongoListCollections(connectionId: string, database: strin
   return post("/api/mongo/list-collections", { connectionId, database });
 }
 
+export async function mongoCreateDatabase(connectionId: string, database: string): Promise<void> {
+  await post("/api/mongo/create-database", { connectionId, database });
+}
+
+export async function mongoDropDatabase(connectionId: string, database: string): Promise<void> {
+  await post("/api/mongo/drop-database", { connectionId, database });
+}
+
+export async function mongoDropCollection(connectionId: string, database: string, collection: string): Promise<void> {
+  await post("/api/mongo/drop-collection", { connectionId, database, collection });
+}
+
 export async function elasticsearchListIndices(connectionId: string): Promise<string[]> {
+  return mongoListCollections(connectionId, "default");
+}
+
+export async function vectorListCollections(connectionId: string): Promise<string[]> {
   return mongoListCollections(connectionId, "default");
 }
 

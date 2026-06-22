@@ -1,6 +1,6 @@
 import { ref, onMounted, onUnmounted } from "vue";
 import { isTauriRuntime } from "@/lib/tauriRuntime";
-import { isMacOS } from "@/lib/platform";
+import { isMacOS, isWindows } from "@/lib/platform";
 
 export function shouldReserveMacTrafficLightInset(isMac: boolean, isFullscreen: boolean, isDesktop = true): boolean {
   return isDesktop && isMac && !isFullscreen;
@@ -11,7 +11,7 @@ export function useWindowControls() {
   const isFullscreen = ref(false);
   const isMac = isMacOS();
   const isDesktop = isTauriRuntime();
-  const showControls = isDesktop && !isMac;
+  const showControls = isDesktop && isWindows();
 
   let unlisten: (() => void) | null = null;
 

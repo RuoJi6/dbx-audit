@@ -41,14 +41,33 @@ pub(crate) fn value_to_csv_text(value: &Value) -> String {
     }
 }
 
-pub fn format_csv(columns: &[String], rows: &[Vec<Value>]) -> String {
+fn value_to_query_result_csv_text(value: &Value) -> String {
+    match value {
+        Value::Null => "NULL".to_string(),
+        other => value_to_csv_text(other),
+    }
+}
+
+fn format_csv_with_value_formatter(
+    columns: &[String],
+    rows: &[Vec<Value>],
+    value_formatter: fn(&Value) -> String,
+) -> String {
     let header = columns.iter().map(|col| escape_csv(col)).collect::<Vec<_>>().join(",");
     let body = rows
         .iter()
-        .map(|row| row.iter().map(|cell| escape_csv(&value_to_csv_text(cell))).collect::<Vec<_>>().join(","))
+        .map(|row| row.iter().map(|cell| escape_csv(&value_formatter(cell))).collect::<Vec<_>>().join(","))
         .collect::<Vec<_>>()
         .join("\n");
     format!("{header}\n{body}")
+}
+
+pub fn format_csv(columns: &[String], rows: &[Vec<Value>]) -> String {
+    format_csv_with_value_formatter(columns, rows, value_to_csv_text)
+}
+
+pub fn format_query_result_csv(columns: &[String], rows: &[Vec<Value>]) -> String {
+    format_csv_with_value_formatter(columns, rows, value_to_query_result_csv_text)
 }
 
 fn write_csv_row(writer: &mut impl Write, values: impl IntoIterator<Item = String>) -> Result<(), String> {
@@ -143,7 +162,7 @@ pub async fn export_table_data_csv_core(state: &AppState, options: TableCsvExpor
 
 #[cfg(test)]
 mod tests {
-    use super::format_csv;
+    use super::{format_csv, format_query_result_csv};
     use serde_json::json;
 
     #[test]
@@ -156,6 +175,12 @@ mod tests {
     fn formats_null_as_empty_cell() {
         let out = format_csv(&["id".to_string(), "note".to_string()], &[vec![json!(1), Value::Null]]);
         assert_eq!(out, "\"id\",\"note\"\n\"1\",\"\"");
+    }
+
+    #[test]
+    fn formats_query_result_null_as_null_text() {
+        let out = format_query_result_csv(&["id".to_string(), "note".to_string()], &[vec![json!(1), Value::Null]]);
+        assert_eq!(out, "\"id\",\"note\"\n\"1\",\"NULL\"");
     }
 
     use serde_json::Value;

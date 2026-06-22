@@ -10,7 +10,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { useConnectionStore } from "@/stores/connectionStore";
 import DatabaseIcon from "@/components/icons/DatabaseIcon.vue";
 import * as api from "@/lib/api";
-import type { TransferProgress, TransferMode } from "@/lib/api";
+import type { TransferProgress, TransferMode, TransferTableNameCase } from "@/lib/api";
 import type { DatabaseType } from "@/types/database";
 import { isSchemaAware, supportsTransfer } from "@/lib/databaseCapabilities";
 import { databaseOptionsForConnection } from "@/composables/useDatabaseOptions";
@@ -50,6 +50,7 @@ const targetSchema = ref("");
 // Options
 const createTable = ref(true);
 const transferMode = ref<TransferMode>("append");
+const targetTableNameCase = ref<TransferTableNameCase>("preserve");
 const batchSize = ref(1000);
 
 // Transfer state
@@ -249,6 +250,7 @@ function resetState() {
   targetSchema.value = "";
   createTable.value = true;
   transferMode.value = "append";
+  targetTableNameCase.value = "preserve";
   batchSize.value = 1000;
   isTransferring.value = false;
   transferProgress.value.clear();
@@ -281,6 +283,7 @@ async function startTransfer() {
     tables: [...selectedTables.value],
     createTable: createTable.value,
     mode: transferMode.value,
+    targetTableNameCase: targetTableNameCase.value,
     batchSize: batchSize.value,
   };
 
@@ -521,6 +524,19 @@ const overallRowsLabel = computed(() => (knownTotalRows.value > 0 ? `${formatRow
                   <SelectItem value="append">{{ t("transfer.modeAppend") }}</SelectItem>
                   <SelectItem value="overwrite">{{ t("transfer.modeOverwrite") }}</SelectItem>
                   <SelectItem value="upsert">{{ t("transfer.modeUpsert") }}</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div class="flex items-center gap-3">
+              <Label class="text-xs shrink-0">{{ t("transfer.targetTableNameCase") }}</Label>
+              <Select v-model="targetTableNameCase">
+                <SelectTrigger class="h-7 text-xs">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="preserve">{{ t("transfer.tableNameCasePreserve") }}</SelectItem>
+                  <SelectItem value="lower">{{ t("transfer.tableNameCaseLower") }}</SelectItem>
+                  <SelectItem value="upper">{{ t("transfer.tableNameCaseUpper") }}</SelectItem>
                 </SelectContent>
               </Select>
             </div>

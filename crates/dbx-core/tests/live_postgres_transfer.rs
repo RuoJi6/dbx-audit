@@ -4,7 +4,7 @@ use dbx_core::models::connection::{ConnectionConfig, DatabaseType};
 use dbx_core::storage::Storage;
 use dbx_core::transfer::{
     get_db_type, transfer_postgres_schema_dependencies, transfer_postgres_schema_objects, transfer_table, TransferMode,
-    TransferRequest,
+    TransferRequest, TransferTableNameCase,
 };
 use serde_json::json;
 
@@ -190,6 +190,7 @@ async fn live_postgres_transfer_preserves_data_and_schema_objects() {
         tables: vec!["users".to_string(), "audit_logs".to_string()],
         create_table: true,
         mode: TransferMode::Append,
+        target_table_name_case: TransferTableNameCase::Preserve,
         batch_size: 100,
     };
 

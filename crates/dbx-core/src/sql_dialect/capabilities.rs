@@ -1,5 +1,26 @@
 use crate::models::connection::DatabaseType;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TablePaginationStrategy {
+    LimitOffset,
+    FetchFirst,
+    Db2FetchFirst,
+    SqlServerTop,
+    IrisTop,
+    InformixFirst,
+    Rownum,
+    QuestDbLimit,
+    Unbounded,
+    AgentMaxRows,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaginationContext {
+    TablePreview,
+    BoundedRead,
+    UserQuery,
+}
+
 pub fn is_schema_aware(database_type: DatabaseType) -> bool {
     matches!(
         database_type,
@@ -38,6 +59,30 @@ pub fn is_schema_aware(database_type: DatabaseType) -> bool {
 
 pub fn uses_fetch_first(database_type: DatabaseType) -> bool {
     matches!(database_type, DatabaseType::Oracle | DatabaseType::Dameng | DatabaseType::Db2)
+}
+
+pub fn pagination_strategy(database_type: Option<DatabaseType>, context: PaginationContext) -> TablePaginationStrategy {
+    match database_type {
+        Some(DatabaseType::Jdbc) => TablePaginationStrategy::AgentMaxRows,
+        Some(DatabaseType::Oracle)
+            if matches!(context, PaginationContext::TablePreview | PaginationContext::UserQuery) =>
+        {
+            TablePaginationStrategy::Unbounded
+        }
+        Some(DatabaseType::Oracle) => TablePaginationStrategy::FetchFirst,
+        Some(DatabaseType::Dameng) => TablePaginationStrategy::FetchFirst,
+        Some(DatabaseType::Db2) => TablePaginationStrategy::Db2FetchFirst,
+        Some(DatabaseType::SqlServer) => TablePaginationStrategy::SqlServerTop,
+        Some(DatabaseType::Iris) => TablePaginationStrategy::IrisTop,
+        Some(DatabaseType::Informix) => TablePaginationStrategy::InformixFirst,
+        Some(DatabaseType::OceanbaseOracle) => TablePaginationStrategy::Rownum,
+        Some(DatabaseType::Questdb) => TablePaginationStrategy::QuestDbLimit,
+        _ => TablePaginationStrategy::LimitOffset,
+    }
+}
+
+pub fn table_pagination_strategy(database_type: Option<DatabaseType>) -> TablePaginationStrategy {
+    pagination_strategy(database_type, PaginationContext::TablePreview)
 }
 
 pub(super) fn is_simple_informix_identifier(name: &str) -> bool {

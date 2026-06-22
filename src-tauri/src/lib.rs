@@ -6,9 +6,9 @@ mod window_state_guard;
 
 use commands::connection::AppState;
 use dbx_core::storage::{DesktopIconTheme, DesktopSettings, Storage};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
-#[cfg(target_os = "macos")]
 use tauri::RunEvent;
 use tauri::{
     menu::MenuBuilder,
@@ -19,6 +19,33 @@ use tauri::{Emitter, Manager};
 use tauri_plugin_deep_link::DeepLinkExt;
 
 const DESKTOP_TRAY_ID: &str = "main-tray";
+
+pub struct CloseBehaviorState {
+    quit_on_close: AtomicBool,
+    prompted: AtomicBool,
+}
+
+impl CloseBehaviorState {
+    fn new(settings: &DesktopSettings) -> Self {
+        Self {
+            quit_on_close: AtomicBool::new(settings.quit_on_close),
+            prompted: AtomicBool::new(settings.close_action_prompted),
+        }
+    }
+
+    fn apply(&self, settings: &DesktopSettings) {
+        self.quit_on_close.store(settings.quit_on_close, Ordering::Relaxed);
+        self.prompted.store(settings.close_action_prompted, Ordering::Relaxed);
+    }
+
+    fn quit_on_close(&self) -> bool {
+        self.quit_on_close.load(Ordering::Relaxed)
+    }
+
+    fn prompted(&self) -> bool {
+        self.prompted.load(Ordering::Relaxed)
+    }
+}
 #[cfg(target_os = "macos")]
 const MACOS_TRAY_ICON: tauri::image::Image<'_> = tauri::include_image!("icons/tray-macos-template.png");
 const BLACK_APP_ICON: tauri::image::Image<'_> = tauri::include_image!("icons/icon-black.png");
@@ -37,6 +64,20 @@ fn should_setup_desktop_tray(target_os: &str, show_tray_icon: bool) -> bool {
 
 fn should_show_main_window_after_setup() -> bool {
     true
+}
+
+fn should_disable_native_window_decorations(target_os: &str) -> bool {
+    matches!(target_os, "windows")
+}
+
+#[cfg(target_os = "linux")]
+fn apply_linux_webkit_rendering_workarounds() {
+    const DISABLE_DMABUF_RENDERER: &str = "WEBKIT_DISABLE_DMABUF_RENDERER";
+    if std::env::var_os(DISABLE_DMABUF_RENDERER).is_none() {
+        // WebKitGTK's DMABUF renderer can produce a blank AppImage window on
+        // Fedora/Wayland/NVIDIA systems. This must be set before WebKit starts.
+        std::env::set_var(DISABLE_DMABUF_RENDERER, "1");
+    }
 }
 
 fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
@@ -158,6 +199,9 @@ fn apply_desktop_tray_icon_theme(app: &tauri::AppHandle, icon_theme: DesktopIcon
 
 pub(crate) fn apply_desktop_settings(app: &tauri::AppHandle, desktop_settings: &DesktopSettings) -> tauri::Result<()> {
     apply_debug_log_level(desktop_settings.debug_logging_enabled);
+    if let Some(state) = app.try_state::<CloseBehaviorState>() {
+        state.apply(desktop_settings);
+    }
     apply_desktop_icon_theme(app, desktop_settings.icon_theme)?;
     if matches!(std::env::consts::OS, "macos" | "windows") {
         if let Some(tray) = app.tray_by_id(DESKTOP_TRAY_ID) {
@@ -173,7 +217,10 @@ pub(crate) fn apply_desktop_settings(app: &tauri::AppHandle, desktop_settings: &
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use super::{should_hide_window_on_close, should_setup_desktop_tray, should_show_main_window_after_setup};
+    use super::{
+        should_disable_native_window_decorations, should_hide_window_on_close, should_setup_desktop_tray,
+        should_show_main_window_after_setup,
+    };
 
     #[test]
     fn hides_window_on_close_for_windows_and_macos() {
@@ -199,11 +246,20 @@ mod tests {
     fn shows_main_window_after_regular_startup_setup() {
         assert!(should_show_main_window_after_setup());
     }
+
+    #[test]
+    fn disables_native_window_decorations_only_on_windows() {
+        assert!(should_disable_native_window_decorations("windows"));
+        assert!(!should_disable_native_window_decorations("linux"));
+        assert!(!should_disable_native_window_decorations("macos"));
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     rustls::crypto::aws_lc_rs::default_provider().install_default().expect("Failed to install rustls crypto provider");
+    #[cfg(target_os = "linux")]
+    apply_linux_webkit_rendering_workarounds();
 
     let startup_begin = Instant::now();
 
@@ -261,19 +317,12 @@ pub fn run() {
             apply_debug_log_level(desktop_settings.debug_logging_enabled);
             eprintln!("[STARTUP] storage ready in {:?}", t.elapsed());
 
-            let legacy_driver_base = desktop_settings.driver_store_dir.as_ref().map(std::path::PathBuf::from);
-            let plugin_dir = desktop_settings
-                .plugin_store_dir
-                .as_ref()
-                .map(std::path::PathBuf::from)
-                .or_else(|| legacy_driver_base.as_ref().map(|base| base.join("plugins")))
-                .unwrap_or_else(|| data_dir.join("plugins"));
-            let agent_dir = desktop_settings
-                .agent_store_dir
-                .as_ref()
-                .map(std::path::PathBuf::from)
-                .or_else(|| legacy_driver_base.as_ref().map(|base| base.join("agents")))
-                .or_else(|| data_dir::uses_custom_data_dir().then(|| data_dir.join("agents")));
+            let default_agent_dir = data_dir::uses_custom_data_dir().then(|| data_dir.join("agents"));
+            let (plugin_dir, agent_dir) = commands::app_settings::resolve_driver_store_dirs_from_settings(
+                &desktop_settings,
+                &data_dir,
+                default_agent_dir,
+            );
 
             let state = if let Some(agent_dir) = agent_dir {
                 Arc::new(AppState::new_with_plugin_and_agent_dir_and_app_version(
@@ -291,6 +340,7 @@ pub fn run() {
             app.manage(commands::external_sql::ExternalSqlOpenState::default());
             app.manage(commands::external_db::ExternalDbOpenState::default());
             app.manage(commands::deep_link::DeepLinkOpenState::default());
+            app.manage(CloseBehaviorState::new(&desktop_settings));
             let startup_links = commands::deep_link::connection_deep_links_from_args(std::env::args().skip(1));
             open_connection_deep_links(app.handle(), startup_links);
 
@@ -298,8 +348,7 @@ pub fn run() {
             commands::mcp_bridge::start(app_handle, state);
             eprintln!("[STARTUP] setup complete in {:?} (total {:?})", setup_start.elapsed(), startup_begin.elapsed());
 
-            #[cfg(not(target_os = "macos"))]
-            {
+            if should_disable_native_window_decorations(std::env::consts::OS) {
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.set_decorations(false);
                 }
@@ -319,10 +368,26 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                if should_hide_window_on_close(std::env::consts::OS) {
+                if !should_hide_window_on_close(std::env::consts::OS) {
+                    return;
+                }
+                let app = window.app_handle();
+                let Some(state) = app.try_state::<CloseBehaviorState>() else {
                     let _ = window.hide();
                     api.prevent_close();
+                    return;
+                };
+                if !state.prompted() {
+                    api.prevent_close();
+                    let _ = app.emit("dbx-close-action-prompt", ());
+                    return;
                 }
+                if state.quit_on_close() {
+                    app.exit(0);
+                    return;
+                }
+                let _ = window.hide();
+                api.prevent_close();
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -389,6 +454,7 @@ pub fn run() {
             commands::schema::list_sqlserver_linked_server_tables,
             commands::schema::list_tables,
             commands::schema::list_objects,
+            commands::schema::list_object_statistics,
             commands::schema::list_completion_objects,
             commands::schema::get_object_source,
             commands::schema::list_schemas,
@@ -501,6 +567,8 @@ pub fn run() {
             commands::redis_cmd::redis_execute_command,
             commands::redis_cmd::redis_load_more,
             commands::redis_cmd::redis_pubsub_publish,
+            commands::redis_cmd::redis_slowlog_get,
+            commands::redis_cmd::redis_cluster_master_nodes,
             commands::etcd_cmd::etcd_list_prefix,
             commands::etcd_cmd::etcd_get,
             commands::etcd_cmd::etcd_put,
@@ -517,6 +585,9 @@ pub fn run() {
             commands::sqlite_backup::backup_sqlite_database,
             commands::mongo_cmd::mongo_list_databases,
             commands::mongo_cmd::mongo_list_collections,
+            commands::mongo_cmd::mongo_create_database,
+            commands::mongo_cmd::mongo_drop_database,
+            commands::mongo_cmd::mongo_drop_collection,
             commands::mongo_cmd::document_find_documents,
             commands::mongo_cmd::mongo_find_documents,
             commands::mongo_cmd::mongo_aggregate_documents,
@@ -623,6 +694,7 @@ pub fn run() {
             commands::csv_export::export_query_result_csv,
             commands::csv_export::export_table_data_csv,
             commands::xlsx_export::export_query_result_xlsx,
+            commands::xlsx_export::export_query_results_xlsx,
             commands::text_export::export_query_result_json,
             commands::text_export::export_query_result_markdown,
             commands::agents::list_installed_agents,
@@ -700,6 +772,15 @@ pub fn run() {
                 if !has_visible_windows {
                     show_main_window(app_handle);
                 }
+                let app_handle = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Some(state) = app_handle.try_state::<AppState>() {
+                        state.refresh_connections().await;
+                    }
+                });
+            }
+
+            if let RunEvent::Resumed = &event {
                 let app_handle = app_handle.clone();
                 tauri::async_runtime::spawn(async move {
                     if let Some(state) = app_handle.try_state::<AppState>() {

@@ -25,6 +25,7 @@ pub async fn start_transfer(
     // Validate connections exist
     let source_db_type = get_db_type(&state, &request.source_connection_id).await?;
     let target_db_type = get_db_type(&state, &request.target_connection_id).await?;
+    dbx_core::transfer::validate_transfer_target_table_names(&request)?;
 
     // Ensure pools
     let source_pool_key =

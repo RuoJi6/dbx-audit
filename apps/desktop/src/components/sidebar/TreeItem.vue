@@ -52,6 +52,7 @@ import {
   HardDriveDownload,
   FilePlus,
   SquarePen,
+  ListX,
 } from "@lucide/vue";
 import CustomContextMenu, { type ContextMenuItem } from "@/components/ui/CustomContextMenu.vue";
 import { useConnectionStore } from "@/stores/connectionStore";
@@ -65,7 +66,8 @@ import * as api from "@/lib/api";
 import { uuid } from "@/lib/utils";
 import { resolveDefaultDatabase } from "@/lib/defaultDatabase";
 import { canTreeNodeShowExpander, treeItemPaddingLeft, usesFullWidthTreeLabel } from "@/lib/sidebarTreeItemLayout";
-import { buildTableSelectSql, quoteTableIdentifier, qualifiedTableName } from "@/lib/tableSelectSql";
+import { buildTableSelectSql } from "@/lib/tableSelectSql";
+import { buildTableDeleteTemplate, buildTableInsertTemplate, buildTableSelectTemplate, buildTableUpdateTemplate } from "@/lib/tableSqlTemplates";
 import { connectionFilePath, defaultSqliteBackupFileName, isMemorySqlitePath, sqliteBackupSourcePath } from "@/lib/connectionFile";
 import { revealPathInFileManager } from "@/lib/tauri";
 import { clearActiveTableReferencePayload, createTableReferencePayload, createTableReferenceDropEvent, setActiveTableReferencePayload, type QueryEditorTableReferencePayload } from "@/lib/queryEditorTableDrop";
@@ -247,6 +249,8 @@ function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
       return { icon: Database, colorClass: "text-yellow-500" };
     case "mongo-collection":
       return { icon: Table, colorClass: "text-green-400" };
+    case "vector-collection":
+      return { icon: TableProperties, colorClass: "text-cyan-400" };
     case "elasticsearch-index":
       return { icon: Table, colorClass: "text-emerald-400" };
     case "procedure":
@@ -283,7 +287,7 @@ function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
 }
 
 const groupTypes: Set<TreeNodeType> = new Set(["group-columns", "group-indexes", "group-fkeys", "group-triggers", "group-tables", "group-views", "group-materialized-views", "group-procedures", "group-functions", "group-sequences", "group-packages", "group-partitions"]);
-const pinnableTypes: Set<TreeNodeType> = new Set(["connection-group", "database", "linked-server", "linked-server-catalog", "linked-server-schema", "schema", "table", "view", "materialized_view", "redis-db", "mongo-db", "mongo-collection", "elasticsearch-index"]);
+const pinnableTypes: Set<TreeNodeType> = new Set(["connection-group", "database", "linked-server", "linked-server-catalog", "linked-server-schema", "schema", "table", "view", "materialized_view", "redis-db", "mongo-db", "mongo-collection", "vector-collection", "elasticsearch-index"]);
 
 function isGroupLabel(node: TreeNode): boolean {
   return groupTypes.has(node.type);
@@ -299,7 +303,7 @@ function displayLabel(node: TreeNode): string {
 }
 
 function visibleLabel(node: TreeNode): string {
-  if (node.type === "table" || node.type === "view" || node.type === "materialized_view" || node.type === "mongo-collection" || node.type === "elasticsearch-index") {
+  if (node.type === "table" || node.type === "view" || node.type === "materialized_view" || node.type === "mongo-collection" || node.type === "vector-collection" || node.type === "elasticsearch-index") {
     return sidebarDisplayTableName(node.label, settingsStore.editorSettings.sidebarHiddenTablePrefixes);
   }
   return displayLabel(node);
@@ -335,6 +339,8 @@ function connectionTooltipScheme(config: Pick<ConnectionConfig, "db_type" | "ssl
     case "sqlserver":
       return "mssql";
     case "elasticsearch":
+    case "qdrant":
+    case "milvus":
     case "rqlite":
     case "turso":
     case "mq":
@@ -455,6 +461,8 @@ async function toggle() {
         await connectionStore.loadMongoDatabases(node.connectionId);
       } else if (config?.db_type === "elasticsearch") {
         await connectionStore.loadElasticsearchIndices(node.connectionId);
+      } else if (config?.db_type === "qdrant" || config?.db_type === "milvus") {
+        await connectionStore.loadVectorCollections(node.connectionId);
       } else if (config?.db_type === "mq") {
         await connectionStore.loadMqTenants(node.connectionId);
       } else {
@@ -478,6 +486,9 @@ async function toggle() {
       queryStore.updateSql(tab, node.label);
     } else if (node.type === "elasticsearch-index" && node.connectionId) {
       const tab = queryStore.createTab(node.connectionId, node.database || "default", node.label, "mongo");
+      queryStore.updateSql(tab, node.label);
+    } else if (node.type === "vector-collection" && node.connectionId) {
+      const tab = queryStore.createTab(node.connectionId, node.database || "default", node.label, "vector");
       queryStore.updateSql(tab, node.label);
     } else if (node.type === "database" && node.connectionId && hasTreeNodeDatabaseContext(node)) {
       const config = connectionStore.getConfig(node.connectionId);
@@ -736,6 +747,14 @@ function requestDeleteSelectedNode(): boolean {
     dropDatabase();
     return true;
   }
+  if (canDropMongoDatabase.value) {
+    dropDatabase();
+    return true;
+  }
+  if (canDropMongoCollection.value) {
+    dropMongoCollection();
+    return true;
+  }
   if (canDropSchema.value) {
     dropSchema();
     return true;
@@ -937,15 +956,11 @@ async function newQuery() {
     await connectionStore.ensureConnected(node.connectionId);
     connectionStore.activeConnectionId = node.connectionId;
     if (hasTreeNodeDatabaseContext(node)) {
-      const tabId = queryStore.createTab(node.connectionId, node.database, undefined, "query", node.schema);
-      // For table/view nodes, generate SELECT * FROM table_name SQL
       if (node.type === "table" || node.type === "view" || node.type === "materialized_view") {
-        const config = connectionStore.getConfig(node.connectionId);
-        const dbType = config ? effectiveDatabaseTypeForConnection(config) : undefined;
-        const tableSchema = node.schema || node.database;
-        const tableName = qualifiedTableName({ databaseType: dbType, schema: tableSchema, tableName: node.label });
-        queryStore.updateSql(tabId, `SELECT * FROM ${tableName};`);
+        await newSelectTemplate();
+        return;
       }
+      queryStore.createTab(node.connectionId, node.database, undefined, "query", node.schema);
       return;
     }
     const connection = connectionStore.getConfig(node.connectionId);
@@ -960,206 +975,138 @@ async function newQuery() {
   }
 }
 
-// ---- SQL template helpers ----
-
-/**
- * Detect whether a column value is auto-generated by the database
- * (auto-increment, identity, serial, computed/virtual, etc.).
- * Such columns should be omitted from INSERT templates.
- */
-function isAutoGeneratedColumn(column: ColumnInfo, _dbType?: DatabaseType): boolean {
-  const extra = (column.extra ?? "").toLowerCase().trim();
-  const colDefault = (column.column_default ?? "").toLowerCase().trim();
-  const dataType = (column.data_type ?? "").trim();
-
-  if (typeLooksPostgresTextSearchVector(dataType)) return true;
-
-  // MySQL / MariaDB: extra contains "auto_increment"
-  if (extra.includes("auto_increment")) return true;
-
-  // SQLite: extra contains "autoincrement"
-  if (extra.includes("autoincrement")) return true;
-
-  // SQL Server: extra contains "identity"
-  if (extra.includes("identity")) return true;
-
-  // PostgreSQL 10+ / GaussDB / Kingbase / etc.: GENERATED … AS IDENTITY
-  if (extra.includes("generated") && (extra.includes("as identity") || extra.includes("always as"))) return true;
-
-  // PostgreSQL legacy SERIAL / Oracle sequences: column_default contains nextval
-  if (colDefault.includes("nextval(")) return true;
-  if (colDefault.includes(".nextval")) return true;
-
-  // Virtual / computed columns (MySQL, MariaDB, etc.)
-  if ((extra.includes("virtual") || extra.includes("computed")) && extra.includes("generated")) return true;
-
-  return false;
-}
-
-function typeLooksNumeric(dataType: string): boolean {
-  return /^(tinyint|smallint|mediumint|int\d*|integer\d*|bigint|smallserial|serial\d*|bigserial|number|numeric|decimal|dec|float\d*|double|real|double\s+precision|money|smallmoney|fixed)/i.test(dataType.trim());
-}
-
-function typeLooksBoolean(dataType: string): boolean {
-  return /^(bool|boolean|bit\s*\(\s*1\s*\))$/i.test(dataType.trim());
-}
-
-function typeLooksDateOnly(dataType: string): boolean {
-  return /^date$/i.test(dataType.trim());
-}
-
-function typeLooksTimeOnly(dataType: string): boolean {
-  return /^time\b(?!stamp|stamptz|with|without)/i.test(dataType.trim());
-}
-
-function typeLooksTimestamp(dataType: string): boolean {
-  return /^(datetime|timestamp|timestamptz|timestamp\s+with\s+time\s+zone|timestamp\s+without\s+time\s+zone|smalldatetime|datetime2|datetimeoffset)/i.test(dataType.trim());
-}
-
-function typeLooksJson(dataType: string): boolean {
-  return /^(json|jsonb)$/i.test(dataType.trim());
-}
-
-function typeLooksBinary(dataType: string): boolean {
-  return /^(bytea|blob|binary|varbinary|image|raw|longblob|mediumblob|tinyblob|long\s+raw|bfile)$/i.test(dataType.trim());
-}
-
-function typeLooksUuid(dataType: string): boolean {
-  return /^uuid$/i.test(dataType.trim());
-}
-
-function typeLooksXml(dataType: string): boolean {
-  return /^xml$/i.test(dataType.trim());
-}
-
-function typeLooksSpatial(dataType: string): boolean {
-  return /^(geometry|geography|point|polygon|linestring|box|circle|path|line|lseg)/i.test(dataType.trim());
-}
-
-function typeLooksArray(dataType: string): boolean {
-  return /^(array|vector|_float\d*|_int\d*|_text|_varchar|_bool|_uuid)/i.test(dataType.trim());
-}
-
-function typeLooksPostgresTextSearchVector(dataType: string): boolean {
-  const normalized = dataType
-    .trim()
-    .replace(/^"+|"+$/g, "")
-    .toLowerCase();
-  return normalized === "tsvector" || normalized.endsWith(".tsvector");
-}
-
-/**
- * Return a type-appropriate placeholder value for a template column.
- * Inspects column.data_type and database type to produce the right
- * literal so the user can execute the template immediately after
- * replacing placeholders.
- */
-function columnPlaceholderValue(column: ColumnInfo, dbType?: DatabaseType): string {
-  const dataType = (column.data_type ?? "").trim();
-  const colName = column.name;
-
-  if (typeLooksNumeric(dataType)) return "0";
-  if (typeLooksBoolean(dataType)) return dbType === "mysql" || dbType === "sqlite" || dbType === "rqlite" ? "1" : "TRUE";
-  if (typeLooksDateOnly(dataType)) return "'2024-01-01'";
-  if (typeLooksTimeOnly(dataType)) return "'12:00:00'";
-  if (typeLooksTimestamp(dataType)) return "CURRENT_TIMESTAMP";
-  if (typeLooksJson(dataType)) return dbType === "postgres" || dbType === "redshift" ? "'{}'::jsonb" : "'{}'";
-  if (typeLooksBinary(dataType)) return "''";
-  if (typeLooksUuid(dataType)) return dbType === "postgres" || dbType === "redshift" ? "'00000000-0000-0000-0000-000000000000'::uuid" : "'00000000-0000-0000-0000-000000000000'";
-  if (typeLooksXml(dataType)) return "'<root/>'";
-  if (typeLooksSpatial(dataType)) return "NULL";
-  if (typeLooksArray(dataType)) return "'{}'";
-
-  // Fallback: quoted column-name placeholder so user knows what to fill
-  return `'${colName}_value'`;
-}
-
+// SQL template helpers have been extracted to @/lib/tableSqlTemplates.ts
 // ---- Template actions ----
 
-async function newInsertTemplate() {
+async function loadTemplateContext(allowView = false) {
   const node = props.node;
-  if (!node.connectionId || !hasTreeNodeDatabaseContext(node)) return;
-  if (node.type !== "table" && node.type !== "view") return;
-  try {
-    await connectionStore.ensureConnected(node.connectionId);
-    connectionStore.activeConnectionId = node.connectionId;
-    const config = connectionStore.getConfig(node.connectionId);
-    const dbType = config ? effectiveDatabaseTypeForConnection(config) : undefined;
-    const tableSchema = node.schema || node.database;
+  if (!node.connectionId || !hasTreeNodeDatabaseContext(node)) return null;
+  const isTableNode = node.type === "table";
+  const isReadableObject = isTableNode || (allowView && (node.type === "view" || node.type === "materialized_view"));
+  if (!isReadableObject) return null;
 
-    let columns: ColumnInfo[] = [];
+  await connectionStore.ensureConnected(node.connectionId);
+  connectionStore.activeConnectionId = node.connectionId;
+  const config = connectionStore.getConfig(node.connectionId);
+  const dbType = config ? effectiveDatabaseTypeForConnection(config) : undefined;
+  const tableSchema = node.schema || node.database;
+  let columns: ColumnInfo[] = [];
+  try {
+    const querySchema = connectionObjectTreeQuerySchema(config, node.database, tableSchema);
+    columns = await api.getColumns(node.connectionId, node.database, querySchema, node.label);
+  } catch (e) {
+    console.warn("[DBX][tableSqlTemplate:getColumns:error]", e);
+  }
+
+  let tableType = node.tableType;
+  if (dbType === "tdengine") {
     try {
       const querySchema = connectionObjectTreeQuerySchema(config, node.database, tableSchema);
-      columns = await api.getColumns(node.connectionId, node.database, querySchema, node.label);
+      const tables = await api.listTables(node.connectionId, node.database, querySchema, node.label, 200);
+      const matched = tables.find((table) => table.name.toLowerCase() === node.label.toLowerCase());
+      if (matched?.table_type) tableType = matched.table_type;
     } catch (e) {
-      console.warn("[DBX][newInsertTemplate:getColumns:error]", e);
+      console.warn("[DBX][tableSqlTemplate:listTables:error]", e);
     }
+  }
 
-    const tableName = qualifiedTableName({ databaseType: dbType, schema: tableSchema, tableName: node.label });
+  return { node, dbType, tableSchema, columns, tableType };
+}
 
-    // Omit auto-generated columns (auto_increment, identity, serial, computed, etc.)
-    const insertColumns = columns.filter((c) => !isAutoGeneratedColumn(c, dbType));
+function openSqlTemplateTab(connectionId: string, database: string, schema: string | undefined, sql: string, title?: string) {
+  const tabId = queryStore.createTab(connectionId, database, title, "query", schema);
+  queryStore.updateSql(tabId, sql);
+}
 
-    let sql: string;
-    if (insertColumns.length === 0) {
-      sql = `INSERT INTO ${tableName}\n/* TODO: add column values */\nVALUES ();`;
-    } else {
-      const colNames = insertColumns.map((c) => quoteTableIdentifier(dbType, c.name));
-      const placeholders = insertColumns.map((c) => columnPlaceholderValue(c, dbType));
-      sql = `INSERT INTO ${tableName} (${colNames.join(", ")})\nVALUES (${placeholders.join(", ")});`;
-    }
+async function newSelectTemplate() {
+  try {
+    const context = await loadTemplateContext(true);
+    if (!context) return;
+    const sql = buildTableSelectTemplate({
+      databaseType: context.dbType,
+      schema: context.tableSchema,
+      tableName: context.node.label,
+      columns: context.columns,
+    });
+    openSqlTemplateTab(context.node.connectionId!, context.node.database!, context.node.schema, sql);
+  } catch (e: any) {
+    toast(t("connection.connectFailed", { message: translateBackendError(t, e?.message || String(e)) }), 5000);
+  }
+}
 
-    const tabId = queryStore.createTab(node.connectionId, node.database, undefined, "query", node.schema);
-    queryStore.updateSql(tabId, sql);
+async function newInsertTemplate() {
+  try {
+    const context = await loadTemplateContext(false);
+    if (!context) return;
+    const sql = buildTableInsertTemplate({
+      databaseType: context.dbType,
+      schema: context.tableSchema,
+      tableName: context.node.label,
+      columns: context.columns,
+      tableType: context.tableType,
+    });
+    openSqlTemplateTab(context.node.connectionId!, context.node.database!, context.node.schema, sql);
   } catch (e: any) {
     toast(t("connection.connectFailed", { message: translateBackendError(t, e?.message || String(e)) }), 5000);
   }
 }
 
 async function newUpdateTemplate() {
+  try {
+    const context = await loadTemplateContext(false);
+    if (!context) return;
+    const sql = buildTableUpdateTemplate({
+      databaseType: context.dbType,
+      schema: context.tableSchema,
+      tableName: context.node.label,
+      columns: context.columns,
+    });
+    openSqlTemplateTab(context.node.connectionId!, context.node.database!, context.node.schema, sql);
+  } catch (e: any) {
+    toast(t("connection.connectFailed", { message: translateBackendError(t, e?.message || String(e)) }), 5000);
+  }
+}
+
+async function newDeleteTemplate() {
+  try {
+    const context = await loadTemplateContext(false);
+    if (!context) return;
+    const sql = buildTableDeleteTemplate({
+      databaseType: context.dbType,
+      schema: context.tableSchema,
+      tableName: context.node.label,
+      columns: context.columns,
+    });
+    openSqlTemplateTab(context.node.connectionId!, context.node.database!, context.node.schema, sql);
+  } catch (e: any) {
+    toast(t("connection.connectFailed", { message: translateBackendError(t, e?.message || String(e)) }), 5000);
+  }
+}
+
+async function generateDdlTemplate() {
   const node = props.node;
   if (!node.connectionId || !hasTreeNodeDatabaseContext(node)) return;
-  if (node.type !== "table" && node.type !== "view") return;
+  if (node.type !== "table" && node.type !== "view" && node.type !== "materialized_view") return;
   try {
     await connectionStore.ensureConnected(node.connectionId);
     connectionStore.activeConnectionId = node.connectionId;
-    const config = connectionStore.getConfig(node.connectionId);
-    const dbType = config ? effectiveDatabaseTypeForConnection(config) : undefined;
-    const tableSchema = node.schema || node.database;
-
-    let columns: ColumnInfo[] = [];
-    let primaryKeys: string[] = [];
-    try {
-      const querySchema = connectionObjectTreeQuerySchema(config, node.database, tableSchema);
-      columns = await api.getColumns(node.connectionId, node.database, querySchema, node.label);
-      primaryKeys = columns.filter((c) => c.is_primary_key).map((c) => c.name);
-    } catch (e) {
-      console.warn("[DBX][newUpdateTemplate:getColumns:error]", e);
-    }
-
-    const tableName = qualifiedTableName({ databaseType: dbType, schema: tableSchema, tableName: node.label });
-
-    // SET clause: non-PK columns only (updating PKs is unusual and dangerous)
-    const pkNameSet = new Set(primaryKeys);
-    const updateColumns = columns.filter((c) => !pkNameSet.has(c.name));
-    const setClauses = updateColumns.map((c) => `${quoteTableIdentifier(dbType, c.name)} = ${columnPlaceholderValue(c, dbType)}`);
-
-    // WHERE clause: use primary keys to target a single row
-    let whereClause: string;
-    if (primaryKeys.length > 0) {
-      const pkColumns = columns.filter((c) => pkNameSet.has(c.name));
-      const pkConditions = pkColumns.map((c) => `${quoteTableIdentifier(dbType, c.name)} = ${columnPlaceholderValue(c, dbType)}`);
-      whereClause = `WHERE ${pkConditions.join(" AND ")}`;
+    const schema = node.schema || node.database;
+    let ddl: string;
+    if (node.type === "table") {
+      ddl = await api.getTableDdl(node.connectionId, node.database, schema, node.label);
     } else {
-      whereClause = `WHERE /* TODO: add WHERE clause */`;
+      const objectType = node.type === "materialized_view" ? "MATERIALIZED_VIEW" : "VIEW";
+      const result = await api.getObjectSource(node.connectionId, node.database, schema, node.label, objectType);
+      ddl = await buildViewDdl({
+        databaseType: currentDatabaseType(),
+        schema,
+        name: node.label,
+        source: result.source,
+      });
     }
-
-    const sql = `UPDATE ${tableName}\nSET ${setClauses.join(",\n    ")}\n${whereClause};`;
-
-    const tabId = queryStore.createTab(node.connectionId, node.database, undefined, "query", node.schema);
-    queryStore.updateSql(tabId, sql);
+    openSqlTemplateTab(node.connectionId, node.database, node.schema, ddl, `DDL - ${node.label}`);
   } catch (e: any) {
-    toast(t("connection.connectFailed", { message: translateBackendError(t, e?.message || String(e)) }), 5000);
+    toast(e?.message || String(e), 5000);
   }
 }
 
@@ -1337,6 +1284,8 @@ const createDatabaseCharset = ref("utf8mb4");
 const createDatabaseCollation = ref("utf8mb4_unicode_ci");
 const showDropDatabaseConfirm = ref(false);
 const dropDatabaseLoading = ref(false);
+const showDropMongoCollectionConfirm = ref(false);
+const dropMongoCollectionLoading = ref(false);
 const showFlushRedisDbConfirm = ref(false);
 const showCreateSchemaDialog = ref(false);
 const createSchemaName = ref("");
@@ -1806,7 +1755,7 @@ const canCreateTable = computed(() => {
 
 const canCreateDatabase = computed(() => {
   const config = props.node.connectionId ? connectionStore.getConfig(props.node.connectionId) : undefined;
-  return props.node.type === "connection" && (supportsDatabaseCreation(config?.db_type) || config?.db_type === "duckdb");
+  return props.node.type === "connection" && (supportsDatabaseCreation(config?.db_type) || config?.db_type === "duckdb" || (config?.db_type === "mongodb" && config.driver_profile !== "mongodb-legacy"));
 });
 
 const isDuckDbConnection = computed(() => {
@@ -1822,6 +1771,16 @@ const canSetCreateDatabaseCharset = computed(() => {
 const canDropDatabase = computed(() => {
   const config = props.node.connectionId ? connectionStore.getConfig(props.node.connectionId) : undefined;
   return props.node.type === "database" && !isSqlServerLinkedNode(props.node) && supportsDatabaseCreation(config?.db_type);
+});
+
+const canDropMongoDatabase = computed(() => {
+  const config = props.node.connectionId ? connectionStore.getConfig(props.node.connectionId) : undefined;
+  return props.node.type === "mongo-db" && !!props.node.database && config?.driver_profile !== "mongodb-legacy";
+});
+
+const canDropMongoCollection = computed(() => {
+  const config = props.node.connectionId ? connectionStore.getConfig(props.node.connectionId) : undefined;
+  return props.node.type === "mongo-collection" && !!props.node.database && config?.driver_profile !== "mongodb-legacy";
 });
 
 const canCreateSchema = computed(() => {
@@ -1918,6 +1877,10 @@ async function confirmTruncateTable() {
 }
 
 async function refreshDropDatabasePreviewSql() {
+  if (props.node.type === "mongo-db") {
+    dropDatabasePreviewSql.value = `db.getSiblingDB(${JSON.stringify(props.node.label)}).dropDatabase();`;
+    return;
+  }
   dropDatabasePreviewSql.value = "";
   dropDatabasePreviewSql.value = await buildDropDatabaseSql({
     databaseType: currentDatabaseType(),
@@ -2000,6 +1963,12 @@ async function confirmCreateDatabase() {
   try {
     await connectionStore.ensureConnected(node.connectionId);
     const config = connectionStore.getConfig(node.connectionId);
+    if (config?.db_type === "mongodb") {
+      await api.mongoCreateDatabase(node.connectionId, name);
+      toast(t("contextMenu.createDatabaseSuccess", { name }), 3000);
+      await connectionStore.loadMongoDatabases(node.connectionId);
+      return;
+    }
     const sql = await buildCreateDatabaseSql({
       databaseType: config?.db_type,
       driverProfile: config?.driver_profile,
@@ -2019,6 +1988,11 @@ function dropDatabase() {
   void refreshDropDatabasePreviewSql();
   dropDatabaseLoading.value = false;
   showDropDatabaseConfirm.value = true;
+}
+
+function dropMongoCollection() {
+  dropMongoCollectionLoading.value = false;
+  showDropMongoCollectionConfirm.value = true;
 }
 
 function flushRedisDb() {
@@ -2049,6 +2023,13 @@ async function confirmDropDatabase() {
   dropDatabaseLoading.value = true;
   try {
     await connectionStore.ensureConnected(node.connectionId);
+    if (node.type === "mongo-db" && node.database) {
+      await api.mongoDropDatabase(node.connectionId, node.database);
+      toast(t("contextMenu.dropDatabaseSuccess", { name: node.label }), 3000);
+      await connectionStore.loadMongoDatabases(node.connectionId);
+      showDropDatabaseConfirm.value = false;
+      return;
+    }
     const sql =
       dropDatabasePreviewSql.value ||
       (await buildDropDatabaseSql({
@@ -2063,6 +2044,23 @@ async function confirmDropDatabase() {
     toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), 5000);
   } finally {
     dropDatabaseLoading.value = false;
+  }
+}
+
+async function confirmDropMongoCollection() {
+  const node = props.node;
+  if (node.type !== "mongo-collection" || !node.connectionId || !node.database || dropMongoCollectionLoading.value) return;
+  dropMongoCollectionLoading.value = true;
+  try {
+    await connectionStore.ensureConnected(node.connectionId);
+    await api.mongoDropCollection(node.connectionId, node.database, node.label);
+    toast(t("contextMenu.dropCollectionSuccess", { name: node.label }), 3000);
+    await connectionStore.loadMongoCollections(node.connectionId, node.database);
+    showDropMongoCollectionConfirm.value = false;
+  } catch (e: any) {
+    toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), 5000);
+  } finally {
+    dropMongoCollectionLoading.value = false;
   }
 }
 
@@ -2722,7 +2720,9 @@ const hasTypeMenu = computed(() => {
   return t === "connection" || t === "database" || t === "schema" || t === "table" || t === "view" || t === "column" || t === "procedure" || t === "function" || t === "package" || t === "package-body" || isGroupLabel(props.node);
 });
 const columnComment = computed(() => (!settingsStore.editorSettings.sidebarHideTableComments && props.node.type === "column" && props.node.meta && "comment" in props.node.meta ? (props.node.meta as any).comment : null));
-const tableComment = computed(() => (!settingsStore.editorSettings.sidebarHideTableComments && (props.node.type === "table" || props.node.type === "view" || props.node.type === "mongo-collection" || props.node.type === "elasticsearch-index") && props.node.comment ? props.node.comment : null));
+const tableComment = computed(() =>
+  !settingsStore.editorSettings.sidebarHideTableComments && (props.node.type === "table" || props.node.type === "view" || props.node.type === "mongo-collection" || props.node.type === "vector-collection" || props.node.type === "elasticsearch-index") && props.node.comment ? props.node.comment : null,
+);
 const paddingLeft = computed(() => treeItemPaddingLeft(props.depth));
 const isConnected = computed(() => props.node.type === "connection" && !!props.node.connectionId && connectionStore.connectedIds.has(props.node.connectionId));
 const isConnectionReadonly = computed(() => props.node.type === "connection" && !!props.node.connectionId && (connectionStore.getConfig(props.node.connectionId)?.read_only ?? false));
@@ -2735,7 +2735,7 @@ const nodeIconClass = computed(() => {
 const canConfigureVisibleDatabases = computed(() => {
   if (props.node.type !== "connection" || !props.node.connectionId) return false;
   const dbType = connectionStore.getConfig(props.node.connectionId)?.db_type;
-  return dbType !== "elasticsearch" && dbType !== "etcd" && dbType !== "mq";
+  return dbType !== "elasticsearch" && dbType !== "qdrant" && dbType !== "milvus" && dbType !== "etcd" && dbType !== "mq";
 });
 const canCopyFinalProxyPort = computed(() => {
   if (props.node.type !== "connection" || !props.node.connectionId) return false;
@@ -3322,10 +3322,26 @@ function treeItemMenuItems(): ContextMenuItem[] {
       items.push({ label: "", separator: true });
       items.push({ label: t("redis.flushDb"), action: flushRedisDb, icon: Eraser, variant: "destructive" as const });
     }
+    if (canDropMongoDatabase.value) {
+      items.push({ label: "", separator: true });
+      items.push({ label: t("contextMenu.dropDatabase"), action: dropDatabase, icon: Trash2, shortcut: shortcutDelete, variant: "destructive" as const });
+    }
     return items;
   }
 
-  if (node.type === "elasticsearch-index") {
+  if (node.type === "mongo-collection") {
+    items.push({ label: t("contextMenu.copyName"), action: copyName, icon: Copy, shortcut: shortcutCopyName.value });
+    items.push({ label: "", separator: true });
+    items.push({ label: t("contextMenu.viewData"), action: toggle, icon: TableProperties });
+    items.push({ label: t("contextMenu.newQuery"), action: newQuery, icon: TerminalSquare });
+    if (canDropMongoCollection.value) {
+      items.push({ label: "", separator: true });
+      items.push({ label: t("contextMenu.dropCollection"), action: dropMongoCollection, icon: Trash2, shortcut: shortcutDelete, variant: "destructive" as const });
+    }
+    return items;
+  }
+
+  if (node.type === "elasticsearch-index" || node.type === "vector-collection") {
     items.push({ label: t("contextMenu.copyName"), action: copyName, icon: Copy, shortcut: shortcutCopyName.value });
     items.push({ label: "", separator: true });
     items.push({ label: t("contextMenu.viewData"), action: toggle, icon: TableProperties });
@@ -3373,19 +3389,22 @@ function treeItemMenuItems(): ContextMenuItem[] {
         variant: "destructive" as const,
       });
     }
-    if (isTableNotView.value) {
-      items.push({
-        label: t("contextMenu.newSql"),
-        icon: FilePlus,
-        children: [
-          { label: t("contextMenu.newQuery"), action: newQuery, icon: TerminalSquare },
-          { label: t("contextMenu.newInsert"), action: newInsertTemplate, icon: FilePlus },
-          { label: t("contextMenu.newUpdate"), action: newUpdateTemplate, icon: SquarePen },
-        ],
-      });
-    } else {
-      items.push({ label: t("contextMenu.newQuery"), action: newQuery, icon: TerminalSquare });
-    }
+    items.push({
+      label: t("contextMenu.generateSql"),
+      icon: FilePlus,
+      children: isTableNotView.value
+        ? [
+            { label: "SELECT", action: newSelectTemplate, icon: TerminalSquare },
+            { label: "INSERT", action: newInsertTemplate, icon: FilePlus },
+            { label: "UPDATE", action: newUpdateTemplate, icon: SquarePen },
+            { label: "DELETE", action: newDeleteTemplate, icon: ListX },
+            { label: "DDL", action: generateDdlTemplate, icon: FileCode },
+          ]
+        : [
+            { label: "SELECT", action: newSelectTemplate, icon: TerminalSquare },
+            { label: "DDL", action: generateDdlTemplate, icon: FileCode },
+          ],
+    });
     const sqlHistoryMenu = savedSqlHistorySubmenu();
     if (sqlHistoryMenu) items.push(sqlHistoryMenu);
     if (canOpenDiagram.value) {
@@ -3833,6 +3852,16 @@ function treeItemMenuItems(): ContextMenuItem[] {
     :loading="dropDatabaseLoading"
     :close-on-confirm="false"
     @confirm="confirmDropDatabase"
+  />
+
+  <DangerConfirmDialog
+    v-model:open="showDropMongoCollectionConfirm"
+    :title="t('contextMenu.confirmDropCollectionTitle')"
+    :message="t('contextMenu.confirmDropCollectionMessage', { name: node.label })"
+    :confirm-label="t('contextMenu.dropCollection')"
+    :loading="dropMongoCollectionLoading"
+    :close-on-confirm="false"
+    @confirm="confirmDropMongoCollection"
   />
 
   <DangerConfirmDialog v-model:open="showFlushRedisDbConfirm" :title="t('redis.flushDb')" :message="t('redis.flushDbMessage')" :details="t('redis.flushDbDetails', { db: node.database })" :confirm-label="t('redis.flushDbConfirm')" @confirm="confirmFlushRedisDb" />

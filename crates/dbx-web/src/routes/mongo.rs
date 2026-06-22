@@ -58,6 +58,14 @@ pub struct MongoCollectionRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct MongoCollectionNameRequest {
+    pub connection_id: String,
+    pub database: String,
+    pub collection: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MongoFindRequest {
     pub connection_id: String,
     pub database: String,
@@ -155,6 +163,39 @@ pub async fn list_collections(
         .await
         .map_err(AppError)?;
     Ok(Json(result))
+}
+
+pub async fn create_database(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<MongoCollectionRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    ensure_writable(&state.app, &req.connection_id, "Create database").await?;
+    dbx_core::mongo_ops::mongo_create_database_core(&state.app, &req.connection_id, &req.database)
+        .await
+        .map_err(AppError)?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+pub async fn drop_database(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<MongoCollectionRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    ensure_writable(&state.app, &req.connection_id, "Drop database").await?;
+    dbx_core::mongo_ops::mongo_drop_database_core(&state.app, &req.connection_id, &req.database)
+        .await
+        .map_err(AppError)?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+pub async fn drop_collection(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<MongoCollectionNameRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    ensure_writable(&state.app, &req.connection_id, "Drop collection").await?;
+    dbx_core::mongo_ops::mongo_drop_collection_core(&state.app, &req.connection_id, &req.database, &req.collection)
+        .await
+        .map_err(AppError)?;
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 pub async fn find_documents(

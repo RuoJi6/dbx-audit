@@ -9,7 +9,10 @@ use crate::data_grid_sql::{format_grid_sql_literal as format_data_grid_sql_liter
 use crate::models::connection::DatabaseType;
 use crate::query::{execute_sql_statement_with_options, QueryExecutionOptions};
 use crate::schema::get_columns_core;
-use crate::sql_dialect::{build_count_table_sql, qualified_table_name, quote_table_identifier, uses_fetch_first};
+use crate::sql_dialect::{
+    build_count_table_sql, pagination_strategy, qualified_table_name, quote_table_identifier, PaginationContext,
+    TablePaginationStrategy,
+};
 use crate::transfer::{generate_comment_ddl, generate_create_table_ddl};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -770,30 +773,78 @@ fn build_data_compare_select_sql(
             .join(", ")
     };
 
-    if uses_fetch_first(database_type) {
-        let offset_sql = if offset > 0 { format!(" OFFSET {offset} ROWS") } else { String::new() };
-        return format!("SELECT {select_columns} FROM {table}{order_by}{offset_sql} FETCH FIRST {row_limit} ROWS ONLY");
-    }
-
-    if database_type == DatabaseType::SqlServer {
-        if offset == 0 {
-            return format!("SELECT TOP ({row_limit}) {select_columns} FROM {table}{order_by}");
+    match pagination_strategy(Some(database_type), PaginationContext::BoundedRead) {
+        TablePaginationStrategy::Db2FetchFirst | TablePaginationStrategy::FetchFirst => {
+            let offset_sql = if offset > 0 { format!(" OFFSET {offset} ROWS") } else { String::new() };
+            format!("SELECT {select_columns} FROM {table}{order_by}{offset_sql} FETCH FIRST {row_limit} ROWS ONLY")
         }
-        let page_alias = quote_table_identifier(Some(DatabaseType::SqlServer), "dbx_page");
-        let row_number_alias = quote_table_identifier(Some(DatabaseType::SqlServer), "__dbx_row_num");
-        let end = offset + row_limit;
-        return format!(
-            "WITH {page_alias} AS (SELECT {select_columns}, ROW_NUMBER() OVER (ORDER BY {order_expression}) AS {row_number_alias} FROM {table}) SELECT {select_columns} FROM {page_alias} WHERE {row_number_alias} > {offset} AND {row_number_alias} <= {end} ORDER BY {row_number_alias}"
-        );
+        TablePaginationStrategy::Rownum => build_rownum_data_compare_select_sql(
+            database_type,
+            &table,
+            &select_columns,
+            &order_by,
+            columns,
+            row_limit,
+            offset,
+        ),
+        TablePaginationStrategy::SqlServerTop => {
+            if offset == 0 {
+                return format!("SELECT TOP ({row_limit}) {select_columns} FROM {table}{order_by}");
+            }
+            let page_alias = quote_table_identifier(Some(DatabaseType::SqlServer), "dbx_page");
+            let row_number_alias = quote_table_identifier(Some(DatabaseType::SqlServer), "__dbx_row_num");
+            let end = offset + row_limit;
+            format!(
+                "WITH {page_alias} AS (SELECT {select_columns}, ROW_NUMBER() OVER (ORDER BY {order_expression}) AS {row_number_alias} FROM {table}) SELECT {select_columns} FROM {page_alias} WHERE {row_number_alias} > {offset} AND {row_number_alias} <= {end} ORDER BY {row_number_alias}"
+            )
+        }
+        TablePaginationStrategy::IrisTop => format!("SELECT TOP {row_limit} {select_columns} FROM {table}{order_by}"),
+        TablePaginationStrategy::InformixFirst => {
+            let row_limit_clause =
+                if offset > 0 { format!("SKIP {offset} FIRST {row_limit}") } else { format!("FIRST {row_limit}") };
+            format!("SELECT {row_limit_clause} {select_columns} FROM {table}{order_by}")
+        }
+        TablePaginationStrategy::AgentMaxRows => format!("SELECT {select_columns} FROM {table}{order_by};"),
+        TablePaginationStrategy::Unbounded => format!("SELECT {select_columns} FROM {table}{order_by}"),
+        TablePaginationStrategy::QuestDbLimit => {
+            if offset > 0 {
+                let upper_bound = offset + row_limit;
+                format!("SELECT {select_columns} FROM {table}{order_by} LIMIT {offset}, {upper_bound}")
+            } else {
+                format!("SELECT {select_columns} FROM {table}{order_by} LIMIT {row_limit}")
+            }
+        }
+        TablePaginationStrategy::LimitOffset => {
+            let offset_sql = if offset > 0 { format!(" OFFSET {offset}") } else { String::new() };
+            format!("SELECT {select_columns} FROM {table}{order_by} LIMIT {row_limit}{offset_sql};")
+        }
+    }
+}
+
+fn build_rownum_data_compare_select_sql(
+    database_type: DatabaseType,
+    table: &str,
+    select_columns: &str,
+    order_by: &str,
+    columns: &[String],
+    row_limit: usize,
+    offset: usize,
+) -> String {
+    let base = format!("SELECT {select_columns} FROM {table}{order_by}");
+    if offset == 0 {
+        return format!("SELECT {select_columns} FROM ({base}) WHERE ROWNUM <= {row_limit}");
     }
 
-    // JDBC connections avoid SQL-level LIMIT; the agent truncates rows while reading.
-    if database_type == DatabaseType::Jdbc {
-        return format!("SELECT {select_columns} FROM {table}{order_by};");
-    }
-
-    let offset_sql = if offset > 0 { format!(" OFFSET {offset}") } else { String::new() };
-    format!("SELECT {select_columns} FROM {table}{order_by} LIMIT {row_limit}{offset_sql};")
+    let row_number_alias = quote_table_identifier(Some(database_type), "__dbx_row_num");
+    let end = offset + row_limit;
+    let outer_columns = if columns.is_empty() {
+        "*".to_string()
+    } else {
+        columns.iter().map(|column| quote_table_identifier(Some(database_type), column)).collect::<Vec<_>>().join(", ")
+    };
+    format!(
+        "SELECT {outer_columns} FROM (SELECT dbx_inner.*, ROWNUM AS {row_number_alias} FROM ({base}) dbx_inner WHERE ROWNUM <= {end}) WHERE {row_number_alias} > {offset}"
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1180,6 +1231,34 @@ mod tests {
                 0,
             ),
             "SELECT TOP (50) [id], [name] FROM [dbo].[users] ORDER BY [id] ASC"
+        );
+    }
+
+    #[test]
+    fn builds_backend_table_select_sql_for_oceanbase_oracle_rownum_pages() {
+        assert_eq!(
+            build_data_compare_select_sql(
+                DatabaseType::OceanbaseOracle,
+                "APP",
+                "EVENTS",
+                &["ID".to_string(), "NAME".to_string()],
+                &["ID".to_string()],
+                25,
+                0,
+            ),
+            "SELECT \"ID\", \"NAME\" FROM (SELECT \"ID\", \"NAME\" FROM \"APP\".\"EVENTS\" ORDER BY \"ID\" ASC) WHERE ROWNUM <= 25"
+        );
+        assert_eq!(
+            build_data_compare_select_sql(
+                DatabaseType::OceanbaseOracle,
+                "APP",
+                "EVENTS",
+                &["ID".to_string(), "NAME".to_string()],
+                &["ID".to_string()],
+                25,
+                50,
+            ),
+            "SELECT \"ID\", \"NAME\" FROM (SELECT dbx_inner.*, ROWNUM AS \"__dbx_row_num\" FROM (SELECT \"ID\", \"NAME\" FROM \"APP\".\"EVENTS\" ORDER BY \"ID\" ASC) dbx_inner WHERE ROWNUM <= 75) WHERE \"__dbx_row_num\" > 50"
         );
     }
 

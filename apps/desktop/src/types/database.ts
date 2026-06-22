@@ -11,6 +11,8 @@ export type DatabaseType =
   | "mongodb"
   | "oracle"
   | "elasticsearch"
+  | "qdrant"
+  | "milvus"
   | "doris"
   | "starrocks"
   | "manticoresearch"
@@ -235,6 +237,13 @@ export interface ObjectInfo {
   parent_name?: string | null;
 }
 
+export interface ObjectStatistics {
+  name: string;
+  schema?: string | null;
+  estimated_rows?: number | null;
+  total_bytes?: number | null;
+}
+
 export type ObjectSourceKind = "VIEW" | "MATERIALIZED_VIEW" | "PROCEDURE" | "FUNCTION" | "SEQUENCE" | "PACKAGE" | "PACKAGE_BODY";
 
 export interface ObjectSource {
@@ -438,6 +447,7 @@ export type TreeNodeType =
   | "etcd-root"
   | "mongo-db"
   | "mongo-collection"
+  | "vector-collection"
   | "elasticsearch-index";
 
 export interface ConnectionGroup {
@@ -469,6 +479,7 @@ export interface TreeNode {
   mqTenant?: string;
   schema?: string;
   tableName?: string;
+  tableType?: string;
   comment?: string | null;
   objectCount?: number;
   loadedKeyCount?: number;
@@ -540,7 +551,7 @@ export interface QueryTab {
   executionId?: string;
   isExplaining?: boolean;
   explainExecutionId?: string;
-  mode: "data" | "query" | "redis" | "mongo" | "etcd" | "mq" | "objects" | "structure" | "users" | "audit";
+  mode: "data" | "query" | "redis" | "mongo" | "vector" | "etcd" | "mq" | "objects" | "structure" | "users" | "audit";
   mqTenant?: string;
   structureTableName?: string;
   objectBrowser?: {

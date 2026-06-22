@@ -1,6 +1,6 @@
 use crate::models::connection::DatabaseType;
 
-use super::capabilities::uses_fetch_first;
+use super::capabilities::{table_pagination_strategy, uses_fetch_first, TablePaginationStrategy};
 use super::identifiers::{normalize_where_input, qualified_table_name, quote_table_identifier};
 use super::types::{
     TableDataSelectSqlOptions, TableSelectSqlOptions, DBX_NEO4J_ELEMENT_ID_COLUMN, DBX_ROWID_COLUMN,
@@ -62,71 +62,68 @@ pub fn build_table_data_select_sql(options: TableDataSelectSqlOptions) -> String
         table
     };
 
-    if database_type == Some(DatabaseType::Iris) {
-        return format!("SELECT TOP {limit} {select_columns} FROM {table_alias}{where_clause}{order}");
-    }
-
-    if database_type == Some(DatabaseType::Informix) {
-        let row_limit = informix_row_limit_clause(limit, options.offset.unwrap_or(0));
-        return format!("SELECT {row_limit} {select_columns} FROM {table_alias}{where_clause}{order}");
-    }
-
-    if database_type == Some(DatabaseType::Db2) && options.offset.is_some_and(|offset| offset > 0) {
-        return build_db2_table_select_page_sql(
-            &table_alias,
-            &where_clause,
-            order_by,
-            &options.columns,
-            limit,
-            options.offset.unwrap_or(0),
-        );
-    }
-
-    if database_type == Some(DatabaseType::Oracle) {
-        return format!("SELECT {select_columns} FROM {table_alias}{where_clause}{order}");
-    }
-
-    if database_type.is_some_and(uses_fetch_first) {
-        let offset = options
-            .offset
-            .filter(|offset| *offset > 0)
-            .map(|offset| format!(" OFFSET {offset} ROWS"))
-            .unwrap_or_default();
-        return format!(
-            "SELECT {select_columns} FROM {table_alias}{where_clause}{order}{offset} FETCH FIRST {limit} ROWS ONLY"
-        );
-    }
-
-    if database_type == Some(DatabaseType::SqlServer) {
-        return build_sqlserver_table_select_sql(
+    match table_pagination_strategy(database_type) {
+        TablePaginationStrategy::IrisTop => {
+            format!("SELECT TOP {limit} {select_columns} FROM {table_alias}{where_clause}{order}")
+        }
+        TablePaginationStrategy::InformixFirst => {
+            let row_limit = informix_row_limit_clause(limit, options.offset.unwrap_or(0));
+            format!("SELECT {row_limit} {select_columns} FROM {table_alias}{where_clause}{order}")
+        }
+        TablePaginationStrategy::Db2FetchFirst if options.offset.is_some_and(|offset| offset > 0) => {
+            build_db2_table_select_page_sql(
+                &table_alias,
+                &where_clause,
+                order_by,
+                &options.columns,
+                limit,
+                options.offset.unwrap_or(0),
+            )
+        }
+        TablePaginationStrategy::Db2FetchFirst | TablePaginationStrategy::FetchFirst => {
+            let offset = options
+                .offset
+                .filter(|offset| *offset > 0)
+                .map(|offset| format!(" OFFSET {offset} ROWS"))
+                .unwrap_or_default();
+            format!(
+                "SELECT {select_columns} FROM {table_alias}{where_clause}{order}{offset} FETCH FIRST {limit} ROWS ONLY"
+            )
+        }
+        TablePaginationStrategy::Rownum => {
+            build_rownum_table_select_sql(&table_alias, &where_clause, &order, &select_columns, limit)
+        }
+        TablePaginationStrategy::Unbounded => {
+            format!("SELECT {select_columns} FROM {table_alias}{where_clause}{order}")
+        }
+        TablePaginationStrategy::SqlServerTop => build_sqlserver_table_select_sql(
             &table_alias,
             &where_clause,
             order_by.unwrap_or("(SELECT NULL)"),
             &options.columns,
             limit,
             options.offset.unwrap_or(0),
-        );
-    }
-
-    if database_type == Some(DatabaseType::Questdb) {
-        return build_questdb_table_select_sql(
+        ),
+        TablePaginationStrategy::QuestDbLimit => build_questdb_table_select_sql(
             &table_alias,
             &where_clause,
             &order,
             &options.columns,
             limit,
             options.offset.unwrap_or(0),
-        );
+        ),
+        TablePaginationStrategy::AgentMaxRows => {
+            format!("SELECT {select_columns} FROM {table_alias}{where_clause}{order};")
+        }
+        TablePaginationStrategy::LimitOffset => {
+            let offset = options
+                .offset
+                .filter(|offset| *offset > 0)
+                .map(|offset| format!(" OFFSET {offset}"))
+                .unwrap_or_default();
+            format!("SELECT {select_columns} FROM {table_alias}{where_clause}{order} LIMIT {limit}{offset};")
+        }
     }
-
-    let offset =
-        options.offset.filter(|offset| *offset > 0).map(|offset| format!(" OFFSET {offset}")).unwrap_or_default();
-    // JDBC connections avoid SQL-level LIMIT because it is not universally
-    // supported across all JDBC drivers; the agent truncates rows while reading.
-    if database_type == Some(DatabaseType::Jdbc) {
-        return format!("SELECT {select_columns} FROM {table_alias}{where_clause}{order};");
-    }
-    format!("SELECT {select_columns} FROM {table_alias}{where_clause}{order} LIMIT {limit}{offset};")
 }
 
 pub fn build_table_select_sql(options: TableSelectSqlOptions<'_>) -> String {
@@ -157,28 +154,24 @@ pub fn build_table_select_sql(options: TableSelectSqlOptions<'_>) -> String {
     };
     let limit = options.limit;
 
-    if database_type == Some(DatabaseType::Iris) {
-        return format!("SELECT TOP {limit} {select_columns} FROM {table}{order_by}");
+    match table_pagination_strategy(database_type) {
+        TablePaginationStrategy::IrisTop => format!("SELECT TOP {limit} {select_columns} FROM {table}{order_by}"),
+        TablePaginationStrategy::InformixFirst => {
+            format!("SELECT FIRST {limit} {select_columns} FROM {table}{order_by}")
+        }
+        TablePaginationStrategy::Rownum => build_rownum_table_select_sql(&table, "", &order_by, &select_columns, limit),
+        TablePaginationStrategy::Db2FetchFirst | TablePaginationStrategy::FetchFirst => {
+            format!("SELECT {select_columns} FROM {table}{order_by} FETCH FIRST {limit} ROWS ONLY")
+        }
+        TablePaginationStrategy::SqlServerTop => {
+            format!("SELECT TOP ({limit}) {select_columns} FROM {table}{order_by}")
+        }
+        TablePaginationStrategy::AgentMaxRows => format!("SELECT {select_columns} FROM {table}{order_by};"),
+        TablePaginationStrategy::Unbounded => format!("SELECT {select_columns} FROM {table}{order_by}"),
+        TablePaginationStrategy::QuestDbLimit | TablePaginationStrategy::LimitOffset => {
+            format!("SELECT {select_columns} FROM {table}{order_by} LIMIT {limit};")
+        }
     }
-
-    if database_type == Some(DatabaseType::Informix) {
-        return format!("SELECT FIRST {limit} {select_columns} FROM {table}{order_by}");
-    }
-
-    if database_type.is_some_and(uses_fetch_first) {
-        return format!("SELECT {select_columns} FROM {table}{order_by} FETCH FIRST {limit} ROWS ONLY");
-    }
-
-    if database_type == Some(DatabaseType::SqlServer) {
-        return format!("SELECT TOP ({limit}) {select_columns} FROM {table}{order_by}");
-    }
-
-    // JDBC connections avoid SQL-level LIMIT; the agent truncates rows while reading.
-    if database_type == Some(DatabaseType::Jdbc) {
-        return format!("SELECT {select_columns} FROM {table}{order_by};");
-    }
-
-    format!("SELECT {select_columns} FROM {table}{order_by} LIMIT {limit};")
 }
 
 fn informix_row_limit_clause(limit: usize, offset: usize) -> String {
@@ -187,6 +180,17 @@ fn informix_row_limit_clause(limit: usize, offset: usize) -> String {
     } else {
         format!("FIRST {limit}")
     }
+}
+
+fn build_rownum_table_select_sql(
+    table: &str,
+    where_clause: &str,
+    order: &str,
+    select_columns: &str,
+    limit: usize,
+) -> String {
+    let inner_select = format!("SELECT {select_columns} FROM {table}{where_clause}{order}");
+    format!("SELECT {select_columns} FROM ({inner_select}) WHERE ROWNUM <= {limit}")
 }
 
 pub(super) fn is_oracle_row_id(database_type: Option<DatabaseType>, name: &str) -> bool {

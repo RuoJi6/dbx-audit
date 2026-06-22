@@ -11,3 +11,7 @@ export function getPlatform(): Platform {
 export function isMacOS(): boolean {
   return getPlatform() === "macos";
 }
+
+export function isWindows(): boolean {
+  return getPlatform() === "windows";
+}

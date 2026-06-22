@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
 import { test } from "vitest";
-import { buildObjectBrowserRows, filterObjectBrowserRows, formatObjectBrowserTimestamp, sortObjectBrowserRows } from "../../apps/desktop/src/lib/objectBrowserRows.ts";
+import { buildObjectBrowserRows, filterObjectBrowserRows, formatObjectBrowserBytes, formatObjectBrowserCount, formatObjectBrowserTimestamp, sortObjectBrowserRows } from "../../apps/desktop/src/lib/objectBrowserRows.ts";
 
 test("builds unique row ids for overloaded routines with the same visible name", () => {
   const rows = buildObjectBrowserRows({
@@ -119,6 +119,38 @@ test("object browser rows preserve table timestamps and sort recent updates firs
     ["orders", "users", "active_users"],
   );
   assert.equal(formatObjectBrowserTimestamp(rows[0].created_at), "2026-05-20 09:30:00");
+});
+
+test("object browser rows sort estimated rows and table size with empty values last", () => {
+  const rows = buildObjectBrowserRows({
+    objects: [
+      { name: "empty_stats", object_type: "TABLE", schema: "public" },
+      { name: "small_table", object_type: "TABLE", schema: "public" },
+      { name: "large_table", object_type: "TABLE", schema: "public" },
+    ],
+    database: "app",
+    fallbackSchema: "public",
+    needsSchema: true,
+  });
+  rows.find((row) => row.name === "small_table")!.estimatedRows = 12;
+  rows.find((row) => row.name === "large_table")!.estimatedRows = 1200;
+  rows.find((row) => row.name === "small_table")!.totalBytes = 4096;
+  rows.find((row) => row.name === "large_table")!.totalBytes = 8192;
+
+  assert.deepEqual(
+    sortObjectBrowserRows(rows, "estimatedRows", "desc").map((row) => row.name),
+    ["large_table", "small_table", "empty_stats"],
+  );
+  assert.deepEqual(
+    sortObjectBrowserRows(rows, "totalBytes", "asc").map((row) => row.name),
+    ["small_table", "large_table", "empty_stats"],
+  );
+});
+
+test("object browser formats statistics for compact table cells", () => {
+  assert.equal(formatObjectBrowserCount(1234567), "1,234,567");
+  assert.equal(formatObjectBrowserBytes(1536), "1.50 KB");
+  assert.equal(formatObjectBrowserBytes(null), "");
 });
 
 test("object browser name sort keeps base-prefixed tables before prefixed variants", () => {

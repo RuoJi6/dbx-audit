@@ -129,6 +129,18 @@ pub async fn list_objects(
     Ok(Json(serde_json::to_value(result).map_err(|e| AppError(e.to_string()))?))
 }
 
+pub async fn list_object_statistics(
+    State(state): State<Arc<WebState>>,
+    Query(q): Query<SchemaQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let database = q.database.as_deref().unwrap_or("");
+    let schema = q.schema.as_deref().unwrap_or("");
+    let result = dbx_core::schema::list_object_statistics_core(&state.app, &q.connection_id, database, schema)
+        .await
+        .map_err(AppError)?;
+    Ok(Json(serde_json::to_value(result).map_err(|e| AppError(e.to_string()))?))
+}
+
 pub async fn list_completion_objects(
     State(state): State<Arc<WebState>>,
     Query(q): Query<SchemaQuery>,
