@@ -44,7 +44,7 @@ import CustomContextMenu, { type ContextMenuItem } from "@/components/ui/CustomC
 import DangerConfirmDialog from "@/components/editor/DangerConfirmDialog.vue";
 import ProcedureExecutionDialog from "@/components/objects/ProcedureExecutionDialog.vue";
 import * as api from "@/lib/api";
-import type { ConnectionConfig, ForeignKeyInfo, ObjectInfo, ObjectSourceKind } from "@/types/database";
+import type { ConnectionConfig, ForeignKeyInfo, ObjectInfo, ObjectSourceKind, ObjectStatistics } from "@/types/database";
 import { sortTablesByFkDependency, type TableWithFk } from "@/lib/tableDependencySort";
 import { isSchemaAware } from "@/lib/databaseCapabilities";
 import { supportsSchemaDiagram, supportsTableImport, supportsTableStructureEditing, supportsTableTruncate } from "@/lib/databaseFeatureSupport";
@@ -69,7 +69,18 @@ import DdlViewDialog from "./DdlViewDialog.vue";
 import type { SqlFormatDialect } from "@/lib/sqlFormatter";
 import { isCancelSearchShortcut } from "@/lib/keyboardShortcuts";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { buildObjectBrowserRows, filterObjectBrowserRows, formatObjectBrowserTimestamp, initialObjectBrowserSortDirection, sortObjectBrowserRows, type ObjectBrowserRow, type ObjectBrowserSortDirection, type ObjectBrowserSortKey } from "@/lib/objectBrowserRows";
+import {
+  buildObjectBrowserRows,
+  filterObjectBrowserRows,
+  formatObjectBrowserBytes,
+  formatObjectBrowserCount,
+  formatObjectBrowserTimestamp,
+  initialObjectBrowserSortDirection,
+  sortObjectBrowserRows,
+  type ObjectBrowserRow,
+  type ObjectBrowserSortDirection,
+  type ObjectBrowserSortKey,
+} from "@/lib/objectBrowserRows";
 
 type ObjectFilter = "all" | "tables" | "views" | "procedures" | "functions" | "sequences" | "packages";
 
@@ -189,14 +200,13 @@ const objectFilters = computed<ObjectFilter[]>(() =>
     .map(([filter]) => filter),
 );
 const showObjectFilter = computed(() => objectFilters.value.length > 2);
-const hasComments = computed(() => rows.value.some((row) => row.comment?.trim()));
 const hasCreatedAt = computed(() => rows.value.some((row) => row.created_at?.trim()));
 const hasUpdatedAt = computed(() => rows.value.some((row) => row.updated_at?.trim()));
 const gridTemplateColumns = computed(() => {
-  const columns = ["34px", "minmax(0,1fr)", "120px"];
+  const columns = ["34px", "minmax(160px,1fr)", "110px", "110px", "100px"];
   if (hasCreatedAt.value) columns.push("150px");
   if (hasUpdatedAt.value) columns.push("150px");
-  if (hasComments.value) columns.push("minmax(160px,0.7fr)");
+  columns.push("minmax(160px,0.7fr)");
   return columns.join(" ");
 });
 const partitionRowsByParentId = computed(() => {
@@ -1042,6 +1052,7 @@ async function loadObjects() {
     const availableTableIds = new Set(rows.value.filter((row) => row.type === "TABLE").map((row) => row.id));
     setSelectedTableIds(new Set([...selectedTableIds.value].filter((id) => availableTableIds.has(id))));
     expandedPartitionParentIds.value = new Set([...expandedPartitionParentIds.value].filter((id) => rows.value.some((row) => row.id === id && row.partitionCount)));
+    void loadObjectStatistics(id, schema);
   } catch (e: any) {
     if (id !== loadId) return;
     error.value = e?.message || String(e);
@@ -1053,6 +1064,39 @@ async function loadObjects() {
       }
     }
   }
+}
+
+async function loadObjectStatistics(id: number, schema: string) {
+  if (!rows.value.some((row) => row.type === "TABLE")) return;
+  try {
+    const stats = await api.listObjectStatistics(props.connection.id, props.database, schema);
+    if (id !== loadId || stats.length === 0) return;
+    mergeObjectStatistics(stats, schema);
+  } catch (e) {
+    console.debug("[ObjectBrowser] table statistics unavailable", e);
+  }
+}
+
+function mergeObjectStatistics(stats: ObjectStatistics[], fallbackSchema: string) {
+  const statsByKey = new Map(stats.map((stat) => [objectStatisticKey(stat.schema || fallbackSchema, stat.name), stat]));
+  rows.value = rows.value.map((row) => {
+    if (row.type !== "TABLE") return row;
+    const stat = statsByKey.get(objectStatisticKey(row.schema || fallbackSchema, row.name));
+    if (!stat) return row;
+    return {
+      ...row,
+      estimatedRows: normalizeStatisticNumber(stat.estimated_rows),
+      totalBytes: normalizeStatisticNumber(stat.total_bytes),
+    };
+  });
+}
+
+function objectStatisticKey(schema: string | undefined, name: string) {
+  return `${schema || ""}\0${name}`.toLowerCase();
+}
+
+function normalizeStatisticNumber(value: number | null | undefined): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
 async function reload() {
@@ -1310,7 +1354,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
       {{ t("objects.empty") }}
     </div>
     <div v-else class="flex min-h-0 flex-1 flex-col">
-      <div class="grid h-8 shrink-0 items-center gap-3 border-b bg-muted/40 px-3 text-xs font-medium text-muted-foreground" :style="{ gridTemplateColumns }">
+      <div class="grid h-7 shrink-0 items-center gap-3 border-b bg-muted/40 px-3 text-xs font-medium text-muted-foreground" :style="{ gridTemplateColumns }">
         <button class="flex h-6 w-6 items-center justify-center rounded-sm hover:bg-accent" type="button" :disabled="visibleSelectableRows.length === 0" @click="toggleVisibleTableSelection">
           <CheckSquare v-if="allVisibleTablesSelected" class="h-3.5 w-3.5 text-primary" />
           <Square v-else class="h-3.5 w-3.5" />
@@ -1323,6 +1367,14 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
           <span class="truncate">{{ t("objects.type") }}</span>
           <component :is="sortIconFor('type')" v-if="sortIconFor('type')" class="h-3 w-3 shrink-0" />
         </button>
+        <button class="flex min-w-0 items-center justify-end gap-1 truncate text-right" type="button" :title="t('objects.statisticsHint')" @click="toggleSort('estimatedRows')">
+          <span class="truncate">{{ t("objects.rows") }}</span>
+          <component :is="sortIconFor('estimatedRows')" v-if="sortIconFor('estimatedRows')" class="h-3 w-3 shrink-0" />
+        </button>
+        <button class="flex min-w-0 items-center justify-end gap-1 truncate text-right" type="button" :title="t('objects.statisticsHint')" @click="toggleSort('totalBytes')">
+          <span class="truncate">{{ t("objects.size") }}</span>
+          <component :is="sortIconFor('totalBytes')" v-if="sortIconFor('totalBytes')" class="h-3 w-3 shrink-0" />
+        </button>
         <button v-if="hasCreatedAt" class="flex min-w-0 items-center gap-1 truncate text-left" type="button" @click="toggleSort('created_at')">
           <span class="truncate">{{ t("objects.createdAt") }}</span>
           <component :is="sortIconFor('created_at')" v-if="sortIconFor('created_at')" class="h-3 w-3 shrink-0" />
@@ -1331,16 +1383,16 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
           <span class="truncate">{{ t("objects.updatedAt") }}</span>
           <component :is="sortIconFor('updated_at')" v-if="sortIconFor('updated_at')" class="h-3 w-3 shrink-0" />
         </button>
-        <button v-if="hasComments" class="flex min-w-0 items-center gap-1 truncate text-left" type="button" @click="toggleSort('comment')">
+        <button class="flex min-w-0 items-center gap-1 truncate text-left" type="button" @click="toggleSort('comment')">
           <span class="truncate">{{ t("objects.comment") }}</span>
           <component :is="sortIconFor('comment')" v-if="sortIconFor('comment')" class="h-3 w-3 shrink-0" />
         </button>
       </div>
-      <RecycleScroller class="object-browser-scroller min-h-0 flex-1" :items="filteredRows" :item-size="38" :buffer="600" :skip-hover="true" key-field="id">
+      <RecycleScroller class="object-browser-scroller min-h-0 flex-1" :items="filteredRows" :item-size="34" :buffer="600" :skip-hover="true" key-field="id">
         <template #default="{ item }">
           <CustomContextMenu :items="getObjectBrowserMenuItems(item)" v-slot="{ onContextMenu }">
             <div
-              class="grid h-[38px] cursor-pointer items-center gap-3 border-b px-3 hover:bg-accent/50"
+              class="grid h-[34px] cursor-pointer items-center gap-3 border-b px-3 hover:bg-accent/50"
               :class="{
                 'bg-accent/40': sourceRow?.id === item.id,
                 'bg-primary/5': selectedTableIds.has(item.id),
@@ -1372,13 +1424,19 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
                 </span>
               </div>
               <div class="truncate text-xs text-muted-foreground">{{ typeLabel(item.type) }}</div>
+              <div class="truncate text-right text-xs tabular-nums text-muted-foreground" :title="item.estimatedRows == null ? '' : formatObjectBrowserCount(item.estimatedRows)">
+                {{ formatObjectBrowserCount(item.estimatedRows) }}
+              </div>
+              <div class="truncate text-right text-xs tabular-nums text-muted-foreground" :title="item.totalBytes == null ? '' : formatObjectBrowserCount(item.totalBytes)">
+                {{ formatObjectBrowserBytes(item.totalBytes) }}
+              </div>
               <div v-if="hasCreatedAt" class="truncate text-xs tabular-nums text-muted-foreground" :title="formatObjectBrowserTimestamp(item.created_at)">
                 {{ formatObjectBrowserTimestamp(item.created_at) }}
               </div>
               <div v-if="hasUpdatedAt" class="truncate text-xs tabular-nums text-muted-foreground" :title="formatObjectBrowserTimestamp(item.updated_at)">
                 {{ formatObjectBrowserTimestamp(item.updated_at) }}
               </div>
-              <div v-if="hasComments" class="truncate text-xs text-muted-foreground" :title="item.comment || ''">
+              <div class="truncate text-xs text-muted-foreground" :title="item.comment || ''">
                 {{ item.comment || "" }}
               </div>
             </div>

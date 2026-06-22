@@ -37,6 +37,10 @@ pub struct DesktopSettings {
     pub show_tray_icon: bool,
     pub icon_theme: DesktopIconTheme,
     #[serde(default)]
+    pub quit_on_close: bool,
+    #[serde(default)]
+    pub close_action_prompted: bool,
+    #[serde(default)]
     pub debug_logging_enabled: bool,
     #[serde(default)]
     pub saved_sql_sync_dir: Option<String>,
@@ -59,6 +63,8 @@ impl Default for DesktopSettings {
         Self {
             show_tray_icon: true,
             icon_theme: DesktopIconTheme::Default,
+            quit_on_close: false,
+            close_action_prompted: false,
             debug_logging_enabled: false,
             saved_sql_sync_dir: None,
             driver_store_dir: None,
@@ -557,6 +563,11 @@ impl Storage {
             "icon_theme".to_string(),
             serde_json::to_value(desktop_settings.icon_theme).map_err(|e| e.to_string())?,
         );
+        settings.insert("quit_on_close".to_string(), serde_json::Value::Bool(desktop_settings.quit_on_close));
+        settings.insert(
+            "close_action_prompted".to_string(),
+            serde_json::Value::Bool(desktop_settings.close_action_prompted),
+        );
         settings.insert(
             "debug_logging_enabled".to_string(),
             serde_json::Value::Bool(desktop_settings.debug_logging_enabled),
@@ -609,6 +620,14 @@ impl Storage {
                 .or_else(|| settings.get("run_in_background").and_then(|value| value.as_bool()))
                 .unwrap_or_else(|| DesktopSettings::default().show_tray_icon),
             icon_theme: DesktopIconTheme::from_settings_value(settings.get("icon_theme")),
+            quit_on_close: settings
+                .get("quit_on_close")
+                .and_then(|value| value.as_bool())
+                .unwrap_or_else(|| DesktopSettings::default().quit_on_close),
+            close_action_prompted: settings
+                .get("close_action_prompted")
+                .and_then(|value| value.as_bool())
+                .unwrap_or_else(|| DesktopSettings::default().close_action_prompted),
             debug_logging_enabled: settings
                 .get("debug_logging_enabled")
                 .and_then(|value| value.as_bool())
@@ -2095,6 +2114,8 @@ mod tests {
             .save_desktop_settings(&DesktopSettings {
                 show_tray_icon: false,
                 icon_theme: DesktopIconTheme::Black,
+                quit_on_close: true,
+                close_action_prompted: false,
                 debug_logging_enabled: true,
                 saved_sql_sync_dir: None,
                 driver_store_dir: Some("/tmp/dbx-drivers".to_string()),
@@ -2111,6 +2132,8 @@ mod tests {
             DesktopSettings {
                 show_tray_icon: false,
                 icon_theme: DesktopIconTheme::Black,
+                quit_on_close: true,
+                close_action_prompted: false,
                 debug_logging_enabled: true,
                 saved_sql_sync_dir: None,
                 driver_store_dir: Some("/tmp/dbx-drivers".to_string()),

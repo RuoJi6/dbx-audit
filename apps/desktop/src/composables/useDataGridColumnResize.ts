@@ -1,4 +1,4 @@
-import { ref, computed, type ComputedRef, type Ref } from "vue";
+import { ref, computed, watch, type ComputedRef, type Ref } from "vue";
 import { useElementSize } from "@vueuse/core";
 import { calculateDataGridColumnWidth, DATA_GRID_COL_MIN_WIDTH, DATA_GRID_SAMPLE_ROWS } from "@/lib/dataGridColumnWidth";
 
@@ -20,6 +20,7 @@ export function useDataGridColumnResize(options: UseDataGridColumnResizeOptions)
   const columnWidths = ref<number[]>([]);
   const { width: gridWidth } = useElementSize(gridRef);
   let isResizing = false;
+  let previousColumnIndexes: number[] = [];
 
   function sampleColumnValues(visibleColIdx: number): CellValue[] {
     const actualColIdx = columnIndexes.value[visibleColIdx];
@@ -33,14 +34,23 @@ export function useDataGridColumnResize(options: UseDataGridColumnResizeOptions)
   }
 
   function initColumnWidths() {
-    if (columnWidths.value.length !== columns.value.length) {
+    const previousWidthsByColumnIndex = new Map<number, number>();
+    previousColumnIndexes.forEach((columnIndex, visibleIndex) => {
+      const width = columnWidths.value[visibleIndex];
+      if (width !== undefined) previousWidthsByColumnIndex.set(columnIndex, width);
+    });
+    const nextColumnIndexes = [...columnIndexes.value];
+    if (columnWidths.value.length !== columns.value.length || previousColumnIndexes.join("\0") !== nextColumnIndexes.join("\0")) {
       columnWidths.value = columns.value.map((colName, colIdx) => {
+        const existingWidth = previousWidthsByColumnIndex.get(nextColumnIndexes[colIdx]);
+        if (existingWidth !== undefined) return existingWidth;
         return calculateDataGridColumnWidth({
           columnName: colName,
           sampleValues: sampleColumnValues(colIdx),
         });
       });
     }
+    previousColumnIndexes = nextColumnIndexes;
   }
 
   function onResizeStart(colIdx: number, event: MouseEvent) {
@@ -100,6 +110,8 @@ export function useDataGridColumnResize(options: UseDataGridColumnResizeOptions)
   function getIsResizing() {
     return isResizing;
   }
+
+  watch(() => columnIndexes.value.join("\0"), initColumnWidths);
 
   return {
     columnWidths,

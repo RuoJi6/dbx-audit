@@ -16,6 +16,11 @@ export type ActiveTabSidebarTarget =
       collectionName: string;
     }
   | {
+      type: "vector-collection";
+      connectionId: string;
+      collectionName: string;
+    }
+  | {
       type: "etcd-root";
       connectionId: string;
     }
@@ -61,6 +66,16 @@ export function activeTabSidebarTarget(tab: QueryTab | undefined | null): Active
     };
   }
 
+  if (tab.mode === "vector") {
+    const collectionName = tab.sql || tab.title;
+    if (!collectionName) return null;
+    return {
+      type: "vector-collection",
+      connectionId: tab.connectionId,
+      collectionName,
+    };
+  }
+
   if (tab.mode === "etcd") {
     return { type: "etcd-root", connectionId: tab.connectionId };
   }
@@ -97,6 +112,10 @@ export function matchesTarget(node: TreeNode, target: ActiveTabSidebarTarget): b
       return node.connectionId === target.connectionId && node.label === target.collectionName;
     }
     return node.type === "mongo-collection" && node.connectionId === target.connectionId && node.database === target.database && node.label === target.collectionName;
+  }
+
+  if (target.type === "vector-collection") {
+    return node.type === "vector-collection" && node.connectionId === target.connectionId && node.label === target.collectionName;
   }
 
   if (target.type === "query-context") {

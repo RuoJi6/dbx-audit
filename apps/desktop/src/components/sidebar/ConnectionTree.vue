@@ -83,7 +83,7 @@ const SEARCH_SCOPE_TO_NODE_TYPES: Record<SearchScope, TreeNodeType[]> = {
   connection: ["connection"],
   database: ["database", "redis-db", "mq-tenant", "mongo-db"],
   schema: ["schema"],
-  table: ["table", "mongo-collection", "elasticsearch-index"],
+  table: ["table", "mongo-collection", "vector-collection", "elasticsearch-index"],
   view: ["view"],
 };
 
@@ -336,6 +336,8 @@ async function ensureTreeLoadedForTarget(target: ActiveTabSidebarTarget, opts?: 
         await store.loadMongoDatabases(connId);
       } else if (config.db_type === "elasticsearch") {
         await store.loadElasticsearchIndices(connId);
+      } else if (config.db_type === "qdrant" || config.db_type === "milvus") {
+        await store.loadVectorCollections(connId);
       } else if (config.db_type === "mq") {
         await store.loadMqTenants(connId, loadOptions);
       } else {

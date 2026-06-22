@@ -1951,7 +1951,7 @@ export const useQueryStore = defineStore("query", () => {
     });
   }
 
-  async function fetchTabResultForExport(id: string): Promise<QueryResult | undefined> {
+  async function fetchTabResultForExport(id: string, onProgress?: (info: { rowsExported: number; totalRows: number | null }) => void): Promise<QueryResult | undefined> {
     const tab = tabs.value.find((t) => t.id === id);
     if (!tab?.result) return undefined;
 
@@ -1962,6 +1962,9 @@ export const useQueryStore = defineStore("query", () => {
       const tableMeta = tableMetaForDataTab(tab);
       if (!tableMeta?.tableName) return tab.result;
 
+      // Use the already-computed total row count as a progress estimate so the
+      // export dialog shows a moving bar instead of a stuck 0 while paginating.
+      const totalRows = typeof tab.resultTotalRowCount === "number" ? tab.resultTotalRowCount : null;
       const pageLimit = TABLE_DATA_EXPORT_PAGE_SIZE;
       const effectiveDbType = effectiveDatabaseTypeForConnection(conn);
       const primaryKeys = tab.tableMeta ? editablePrimaryKeys(effectiveDbType, tab.tableMeta.columns, tab.tableMeta.tableType) : tableMeta.primaryKeys;
@@ -1997,6 +2000,7 @@ export const useQueryStore = defineStore("query", () => {
         if (columns.length === 0) columns = result.columns;
         rows.push(...result.rows);
         executionTimeMs += result.execution_time_ms ?? 0;
+        onProgress?.({ rowsExported: rows.length, totalRows });
         if (result.rows.length < pageLimit) break;
         offset += result.rows.length;
       }
@@ -2023,6 +2027,9 @@ export const useQueryStore = defineStore("query", () => {
     const queryTimeoutSecs = queryTimeoutSecsForConnection(conn);
     const useAgentCursor = conn?.db_type === "jdbc" || supportsDatabaseFeature(conn?.db_type, "driverManagement");
     const queryBaseSql = tab.resultBaseSql ?? sql;
+    // Use the already-computed total row count as a progress estimate so the
+    // export dialog shows a moving bar instead of a stuck 0 while paginating.
+    const totalRows = typeof tab.resultTotalRowCount === "number" ? tab.resultTotalRowCount : null;
     const pageLimit = Math.max(tab.resultPageLimit ?? 0, TABLE_DATA_EXPORT_PAGE_SIZE);
     const rows: QueryResult["rows"] = [];
     let columns: string[] = [];
@@ -2056,6 +2063,7 @@ export const useQueryStore = defineStore("query", () => {
         if (columns.length === 0) columns = result.columns;
         rows.push(...result.rows);
         executionTimeMs += result.execution_time_ms ?? 0;
+        onProgress?.({ rowsExported: rows.length, totalRows });
         sessionId = result.session_id ?? undefined;
         const shouldFetchNextPage = plan.useAgentResultSession ? result.has_more === true : result.rows.length >= plan.pageLimit;
         if (!shouldFetchNextPage) break;

@@ -79,6 +79,22 @@ function normalizeSheetName(value?: string): string {
   return name.slice(0, 31);
 }
 
+function normalizeUniqueSheetNames(sheets: readonly XlsxWorksheetData[]): string[] {
+  const names: string[] = [];
+  sheets.forEach((sheet, index) => {
+    const base = normalizeSheetName(sheet.sheetName || `Sheet${index + 1}`);
+    let candidate = base;
+    let suffix = 2;
+    while (names.includes(candidate)) {
+      const suffixText = ` (${suffix})`;
+      candidate = `${base.slice(0, 31 - suffixText.length)}${suffixText}`;
+      suffix += 1;
+    }
+    names.push(candidate);
+  });
+  return names;
+}
+
 function estimateColumnWidths(columns: readonly string[], rows: readonly (readonly XlsxCellValue[])[]): number[] {
   return columns.map((column, colIndex) => {
     const values = rows.slice(0, 100).map((row) => row[colIndex]);
@@ -127,13 +143,14 @@ function worksheetXml(data: XlsxWorksheetData): string {
 </worksheet>`;
 }
 
-function contentTypesXml(): string {
+function contentTypesXml(sheetCount = 1): string {
+  const worksheetOverrides = Array.from({ length: sheetCount }, (_, index) => `  <Override PartName="/xl/worksheets/sheet${index + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`).join("\n");
   return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
   <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
   <Default Extension="xml" ContentType="application/xml"/>
   <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
-  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+${worksheetOverrides}
   <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
 </Types>`;
 }
@@ -145,18 +162,20 @@ function rootRelsXml(): string {
 </Relationships>`;
 }
 
-function workbookXml(sheetName: string): string {
+function workbookXml(sheetNames: readonly string[]): string {
+  const sheets = sheetNames.map((sheetName, index) => `<sheet name="${escapeXml(sheetName)}" sheetId="${index + 1}" r:id="rId${index + 1}"/>`).join("");
   return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
-  <sheets><sheet name="${escapeXml(sheetName)}" sheetId="1" r:id="rId1"/></sheets>
+  <sheets>${sheets}</sheets>
 </workbook>`;
 }
 
-function workbookRelsXml(): string {
+function workbookRelsXml(sheetCount = 1): string {
+  const worksheetRels = Array.from({ length: sheetCount }, (_, index) => `  <Relationship Id="rId${index + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${index + 1}.xml"/>`).join("\n");
   return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
-  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+${worksheetRels}
+  <Relationship Id="rId${sheetCount + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
 </Relationships>`;
 }
 
@@ -227,13 +246,18 @@ function createZip(files: Array<{ path: string; content: string }>): Uint8Array 
 }
 
 export function buildXlsxWorkbook(data: XlsxWorksheetData): Uint8Array {
-  const sheetName = normalizeSheetName(data.sheetName);
+  return buildXlsxWorkbookMulti([data]);
+}
+
+export function buildXlsxWorkbookMulti(sheets: readonly XlsxWorksheetData[]): Uint8Array {
+  if (sheets.length === 0) throw new Error("At least one worksheet is required");
+  const sheetNames = normalizeUniqueSheetNames(sheets);
   return createZip([
-    { path: "[Content_Types].xml", content: contentTypesXml() },
+    { path: "[Content_Types].xml", content: contentTypesXml(sheets.length) },
     { path: "_rels/.rels", content: rootRelsXml() },
-    { path: "xl/workbook.xml", content: workbookXml(sheetName) },
-    { path: "xl/_rels/workbook.xml.rels", content: workbookRelsXml() },
+    { path: "xl/workbook.xml", content: workbookXml(sheetNames) },
+    { path: "xl/_rels/workbook.xml.rels", content: workbookRelsXml(sheets.length) },
     { path: "xl/styles.xml", content: stylesXml() },
-    { path: "xl/worksheets/sheet1.xml", content: worksheetXml(data) },
+    ...sheets.map((sheet, index) => ({ path: `xl/worksheets/sheet${index + 1}.xml`, content: worksheetXml(sheet) })),
   ]);
 }

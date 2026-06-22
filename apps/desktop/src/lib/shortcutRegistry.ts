@@ -20,6 +20,7 @@ export type ShortcutActionId =
   | "openSettings"
   | "closeTab"
   | "focusSearch"
+  | "quickOpen"
   | "zoomInUi"
   | "zoomOutUi"
   | "resetUiZoom"
@@ -167,6 +168,12 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     labelKey: "settings.shortcutFocusSearch",
     scope: "global",
     defaultShortcut: "Mod+F",
+  },
+  {
+    id: "quickOpen",
+    labelKey: "settings.shortcutQuickOpen",
+    scope: "global",
+    defaultShortcut: "Mod+P",
   },
   {
     id: "zoomInUi",

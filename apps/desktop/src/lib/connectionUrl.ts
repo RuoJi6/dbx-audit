@@ -39,6 +39,8 @@ const SCHEME_PROFILES: Record<string, ConnectionProfile> = {
   mssql: { type: "sqlserver", profile: "sqlserver", label: "SQL Server", defaultPort: 1433 },
   oracle: { type: "oracle", profile: "oracle", label: "Oracle", defaultPort: 1521 },
   elasticsearch: { type: "elasticsearch", profile: "elasticsearch", label: "Elasticsearch", defaultPort: 9200 },
+  qdrant: { type: "qdrant", profile: "qdrant", label: "Qdrant", defaultPort: 6333 },
+  milvus: { type: "milvus", profile: "milvus", label: "Milvus", defaultPort: 19530 },
   dm: { type: "dameng", profile: "dm", label: "DM (Dameng)", defaultPort: 5236 },
   dameng: { type: "dameng", profile: "dm", label: "DM (Dameng)", defaultPort: 5236 },
   gaussdb: { type: "gaussdb", profile: "gaussdb", label: "GaussDB", defaultPort: 5432 },
@@ -59,6 +61,8 @@ const SCHEME_PROFILES: Record<string, ConnectionProfile> = {
 const HTTP_SELECTED_PROFILES: Record<string, ConnectionProfile> = {
   clickhouse: SCHEME_PROFILES.clickhouse,
   elasticsearch: SCHEME_PROFILES.elasticsearch,
+  qdrant: SCHEME_PROFILES.qdrant,
+  milvus: SCHEME_PROFILES.milvus,
 };
 
 function decodeUrlPart(value: string): string {

@@ -1243,9 +1243,11 @@ mod tests {
             vec!["protocolVersion", "agentProtocolVersion", "capabilities"]
         );
         assert_eq!(
-            string_array(&contract["capabilities"]),
+            string_array(&contract["allCapabilities"]),
             AgentCapability::ALL.iter().map(|method| method.as_str()).collect::<Vec<_>>()
         );
+        assert_eq!(string_array(&contract["capabilities"]), default_sql_capabilities());
+        assert_eq!(string_array(&contract["defaultSqlCapabilities"]), default_sql_capabilities());
         assert_eq!(
             string_array(&contract["commonMethods"]),
             AgentMethod::ALL.iter().map(|method| method.as_str()).collect::<Vec<_>>()
@@ -1297,5 +1299,20 @@ mod tests {
 
     fn string_array(value: &serde_json::Value) -> Vec<&str> {
         value.as_array().unwrap().iter().map(|item| item.as_str().unwrap()).collect()
+    }
+
+    fn default_sql_capabilities() -> Vec<&'static str> {
+        [
+            AgentCapability::Connect,
+            AgentCapability::TestConnection,
+            AgentCapability::Metadata,
+            AgentCapability::Query,
+            AgentCapability::PagedQuery,
+            AgentCapability::Transaction,
+            AgentCapability::Ddl,
+        ]
+        .iter()
+        .map(|capability| capability.as_str())
+        .collect()
     }
 }

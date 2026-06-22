@@ -138,8 +138,16 @@ pub fn start_pubsub_server(state: Arc<AppState>) {
     tauri::async_runtime::spawn(async move {
         let port: u16 = std::env::var("DBX_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(4224);
         let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
-        let listener = tokio::net::TcpListener::bind(addr).await.expect("Failed to bind PubSub server");
+        let listener = match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => listener,
+            Err(error) => {
+                log::warn!("Failed to bind PubSub server on {addr}: {error}");
+                return;
+            }
+        };
         log::info!("PubSub WebSocket server listening on {addr}");
-        axum::serve(listener, router).await.expect("PubSub server error");
+        if let Err(error) = axum::serve(listener, router).await {
+            log::warn!("PubSub server stopped with error: {error}");
+        }
     });
 }

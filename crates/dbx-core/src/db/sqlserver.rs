@@ -1,7 +1,8 @@
 use crate::query::MAX_ROWS;
 use crate::sql::starts_with_executable_sql_keyword;
 use crate::types::{
-    ColumnInfo, DatabaseInfo, ForeignKeyInfo, IndexInfo, LinkedServerInfo, QueryResult, TableInfo, TriggerInfo,
+    ColumnInfo, DatabaseInfo, ForeignKeyInfo, IndexInfo, LinkedServerInfo, ObjectStatistics, QueryResult, TableInfo,
+    TriggerInfo,
 };
 use futures::{FutureExt, TryStreamExt};
 use rust_decimal::Decimal;
@@ -579,9 +580,12 @@ pub async fn list_databases(client: &mut SqlServerClient) -> Result<Vec<Database
 }
 
 pub async fn test_connection(client: &mut SqlServerClient) -> Result<(), String> {
-    let stream = client.simple_query("SELECT 1").await.map_err(|e| e.to_string())?;
-    let _ = stream.into_first_result().await.map_err(|e| e.to_string())?;
-    Ok(())
+    crate::db::with_connection_timeout("SQL Server", crate::db::connection_timeout(), async {
+        let stream = client.simple_query("SELECT 1").await.map_err(|e| e.to_string())?;
+        let _ = stream.into_first_result().await.map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await
 }
 
 pub async fn list_linked_servers(client: &mut SqlServerClient) -> Result<Vec<LinkedServerInfo>, String> {
@@ -929,6 +933,44 @@ fn sqlserver_list_objects_sql(schema: &str) -> String {
     )
 }
 
+pub async fn list_object_statistics(
+    client: &mut SqlServerClient,
+    schema: &str,
+) -> Result<Vec<ObjectStatistics>, String> {
+    let s = schema.replace('\'', "''");
+    let sql = format!(
+        "SELECT o.name, \
+                SUM(CASE WHEN ps.index_id IN (0, 1) THEN ps.row_count ELSE 0 END) AS estimated_rows, \
+                SUM(ps.reserved_page_count) * 8192 AS total_bytes \
+         FROM sys.objects o \
+         JOIN sys.schemas s ON s.schema_id = o.schema_id \
+         JOIN sys.dm_db_partition_stats ps ON ps.object_id = o.object_id \
+         WHERE s.name = '{s}' AND o.type = 'U' AND o.is_ms_shipped = 0 \
+         GROUP BY o.object_id, o.name \
+         ORDER BY o.name"
+    );
+    let stream = client.query(&*sql, &[]).await.map_err(|e| e.to_string())?;
+    let rows = stream.into_first_result().await.map_err(|e| e.to_string())?;
+    Ok(rows
+        .iter()
+        .map(|row| ObjectStatistics {
+            name: row.get::<&str, _>(0).unwrap_or("").to_string(),
+            schema: Some(schema.to_string()),
+            estimated_rows: row
+                .try_get::<i64, _>(1)
+                .ok()
+                .flatten()
+                .or_else(|| row.try_get::<i32, _>(1).ok().flatten().map(i64::from)),
+            total_bytes: row
+                .try_get::<i64, _>(2)
+                .ok()
+                .flatten()
+                .or_else(|| row.try_get::<i32, _>(2).ok().flatten().map(i64::from)),
+        })
+        .filter(|stat| !stat.name.is_empty())
+        .collect())
+}
+
 pub async fn get_columns(client: &mut SqlServerClient, schema: &str, table: &str) -> Result<Vec<ColumnInfo>, String> {
     let sql = sqlserver_columns_sql(schema, table);
     let stream = client.query(&*sql, &[]).await.map_err(|e| e.to_string())?;
@@ -1222,6 +1264,21 @@ pub async fn execute_batch_with_max_rows(
     max_rows: Option<usize>,
 ) -> Result<Vec<QueryResult>, String> {
     let start = Instant::now();
+    if sqlserver_batch_can_use_execute(sql) {
+        let result = sqlserver_driver_result(client.execute(sql, &[])).await?;
+        return Ok(vec![QueryResult {
+            columns: vec![],
+            column_types: Vec::new(),
+            column_sortables: vec![],
+            rows: vec![],
+            affected_rows: result.rows_affected().iter().sum::<u64>(),
+            execution_time_ms: start.elapsed().as_millis(),
+            truncated: false,
+            session_id: None,
+            has_more: false,
+        }]);
+    }
+
     if is_single_sqlserver_select(sql) {
         if let Ok(Some(query_sql)) = spatial_safe_sqlserver_query(client, sql).await {
             let stream = sqlserver_driver_result(client.query(query_sql.as_str(), &[])).await?;
@@ -1248,6 +1305,17 @@ pub async fn execute_batch_with_max_rows(
     }
 
     Ok(results)
+}
+
+fn sqlserver_batch_can_use_execute(sql: &str) -> bool {
+    !requires_simple_query_batch(sql)
+        && !starts_with_executable_sql_keyword(sql, &["SELECT", "EXEC", "WITH", "TABLE"])
+        && !sqlserver_dml_output_returns_rows(sql)
+}
+
+fn sqlserver_dml_output_returns_rows(sql: &str) -> bool {
+    starts_with_executable_sql_keyword(sql, &["INSERT", "UPDATE", "DELETE", "MERGE"])
+        && first_sql_tokens(sql, 64).iter().any(|token| token.eq_ignore_ascii_case("OUTPUT"))
 }
 
 fn is_transaction_control(sql: &str) -> bool {
@@ -1328,7 +1396,8 @@ fn first_sql_tokens(sql: &str, limit: usize) -> Vec<String> {
 mod tests {
     use super::{
         build_spatial_safe_sqlserver_query, is_sqlserver_spatial_column, requires_simple_query_batch,
-        sqlserver_cell_to_json, sqlserver_columns_sql, sqlserver_indexes_sql, sqlserver_list_objects_sql,
+        sqlserver_batch_can_use_execute, sqlserver_cell_to_json, sqlserver_columns_sql,
+        sqlserver_dml_output_returns_rows, sqlserver_indexes_sql, sqlserver_list_objects_sql,
         sqlserver_table_comment_sql, SqlServerDescribedColumn, SqlServerResultSet,
     };
     use chrono::NaiveDate;
@@ -1382,6 +1451,25 @@ mod tests {
         assert!(!requires_simple_query_batch("ALTER TABLE dbo.t ADD name NVARCHAR(20);"));
         assert!(!requires_simple_query_batch("CREATE TABLE dbo.t(id INT);"));
         assert!(!requires_simple_query_batch("UPDATE dbo.t SET id = 1;"));
+    }
+
+    #[test]
+    fn sqlserver_cud_batches_use_execute_for_affected_rows() {
+        assert!(sqlserver_batch_can_use_execute("UPDATE dbo.users SET active = 0 WHERE id = 1;"));
+        assert!(sqlserver_batch_can_use_execute("INSERT INTO dbo.users(id) VALUES (1);"));
+        assert!(sqlserver_batch_can_use_execute("DELETE FROM dbo.users WHERE id = 1;"));
+        assert!(sqlserver_batch_can_use_execute(
+            "MERGE dbo.t AS t USING dbo.s AS s ON t.id = s.id WHEN MATCHED THEN UPDATE SET name = s.name;"
+        ));
+    }
+
+    #[test]
+    fn sqlserver_result_returning_batches_keep_simple_query_path() {
+        assert!(!sqlserver_batch_can_use_execute("SELECT * FROM dbo.users;"));
+        assert!(!sqlserver_batch_can_use_execute("EXEC dbo.list_users;"));
+        assert!(!sqlserver_batch_can_use_execute("WITH cte AS (SELECT 1 AS id) SELECT * FROM cte;"));
+        assert!(!sqlserver_batch_can_use_execute("UPDATE dbo.users SET active = 0 OUTPUT inserted.id WHERE id = 1;"));
+        assert!(sqlserver_dml_output_returns_rows("DELETE FROM dbo.users OUTPUT deleted.id WHERE id = 1;"));
     }
 
     #[test]

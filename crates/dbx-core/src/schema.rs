@@ -678,6 +678,10 @@ async fn list_tables_once(
             .await
             .map(|names| collection_names_to_tables(names, "INDEX"))
             .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types)),
+        PoolKind::VectorDb(client) => db::vector_driver::list_collections(client)
+            .await
+            .map(|names| collection_names_to_tables(names, "COLLECTION"))
+            .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types)),
         _ => Ok(vec![]),
     }
 }
@@ -1000,6 +1004,18 @@ pub async fn list_objects_core(
     .await
 }
 
+pub async fn list_object_statistics_core(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    schema: &str,
+) -> Result<Vec<db::ObjectStatistics>, String> {
+    retry_metadata_connection(state, connection_id, Some(database), || {
+        list_object_statistics_once(state, connection_id, database, schema)
+    })
+    .await
+}
+
 pub async fn list_completion_objects_core(
     state: &AppState,
     connection_id: &str,
@@ -1010,6 +1026,31 @@ pub async fn list_completion_objects_core(
         list_completion_objects_once(state, connection_id, database, schema)
     })
     .await
+}
+
+async fn list_object_statistics_once(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    schema: &str,
+) -> Result<Vec<db::ObjectStatistics>, String> {
+    let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
+    let db_config = connection_config(state, connection_id).await;
+    let connections = state.connections.read().await;
+    try_sqlserver!(connections, &pool_key, list_object_statistics, schema);
+    let pool = connections.get(&pool_key).ok_or("Pool not found")?;
+    match pool {
+        PoolKind::Mysql(p, mode) => {
+            if *mode == MysqlMode::OceanBaseOracle || db_config.as_ref().is_some_and(is_manticoresearch_config) {
+                Ok(vec![])
+            } else {
+                db::mysql::list_object_statistics(p, database).await
+            }
+        }
+        PoolKind::Postgres(p) if db_config.as_ref().is_some_and(is_questdb_config) => Ok(vec![]),
+        PoolKind::Postgres(p) => db::postgres::list_object_statistics(p, schema).await,
+        _ => Ok(vec![]),
+    }
 }
 
 async fn list_objects_once(
@@ -1298,156 +1339,159 @@ pub async fn get_columns_core(
     schema: &str,
     table: &str,
 ) -> Result<Vec<db::ColumnInfo>, String> {
-    let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
-    #[cfg(feature = "duckdb-bundled")]
-    let duckdb_attached_names = duckdb_attached_database_names(state, connection_id).await;
-    let db_config = connection_config(state, connection_id).await;
+    retry_metadata_connection(state, connection_id, Some(database), || async {
+        let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
+        #[cfg(feature = "duckdb-bundled")]
+        let duckdb_attached_names = duckdb_attached_database_names(state, connection_id).await;
+        let db_config = connection_config(state, connection_id).await;
 
-    {
-        let connections = state.connections.read().await;
-        #[cfg(feature = "duckdb-bundled")]
-        if let Some(ext_pool) = extract_pool!(&connections, &pool_key, ExternalTabular) {
-            drop(connections);
-            let cache = ext_pool.cache.clone();
-            let table = table.to_string();
-            return tokio::task::spawn_blocking(move || {
-                let con = cache.lock().map_err(|e| e.to_string())?;
-                duckdb_query_columns(&con, &table)
-            })
-            .await
-            .map_err(|e| e.to_string())?;
-        }
-        if let Some(PoolKind::ExternalDriver { config, session, .. }) = connections.get(&pool_key) {
-            let config = config.clone();
-            let session = session.clone();
-            drop(connections);
-            let columns = session
-                .invoke::<Vec<db::ColumnInfo>>(
-                    "getColumns",
-                    serde_json::json!({
-                        "connection": config.as_ref(),
-                        "database": database,
-                        "schema": schema,
-                        "table": table,
-                    }),
-                )
-                .await?;
-            return Ok(deduplicate_column_infos(columns));
-        }
-        #[cfg(feature = "duckdb-bundled")]
-        if let Some(con) = extract_pool!(&connections, &pool_key, DuckDb) {
-            drop(connections);
-            let con = con.lock().map_err(|e| e.to_string())?;
-            return duckdb_query_columns_in_database_with_attached(
-                &con,
-                database,
-                schema,
-                table,
-                &duckdb_attached_names,
-            );
-        }
-        if let Some(client) = extract_pool!(&connections, &pool_key, ClickHouse) {
-            drop(connections);
-            return db::clickhouse_driver::get_columns(&client, clickhouse_metadata_database(database, schema), table)
+        {
+            let connections = state.connections.read().await;
+            #[cfg(feature = "duckdb-bundled")]
+            if let Some(ext_pool) = extract_pool!(&connections, &pool_key, ExternalTabular) {
+                drop(connections);
+                let cache = ext_pool.cache.clone();
+                let table = table.to_string();
+                return tokio::task::spawn_blocking(move || {
+                    let con = cache.lock().map_err(|e| e.to_string())?;
+                    duckdb_query_columns(&con, &table)
+                })
                 .await
-                .map(deduplicate_column_infos);
-        }
-        if let Some(client) = extract_pool!(&connections, &pool_key, InfluxDb) {
-            drop(connections);
-            return db::influxdb_driver::get_columns(&client, database, table).await.map(deduplicate_column_infos);
-        }
-        if let Some(linked) = crate::sql_dialect::parse_sqlserver_linked_schema_ref(schema) {
-            if let Some(client) = extract_pool!(&connections, &pool_key, SqlServer) {
+                .map_err(|e| e.to_string())?;
+            }
+            if let Some(PoolKind::ExternalDriver { config, session, .. }) = connections.get(&pool_key) {
+                let config = config.clone();
+                let session = session.clone();
+                drop(connections);
+                let columns = session
+                    .invoke::<Vec<db::ColumnInfo>>(
+                        "getColumns",
+                        serde_json::json!({
+                            "connection": config.as_ref(),
+                            "database": database,
+                            "schema": schema,
+                            "table": table,
+                        }),
+                    )
+                    .await?;
+                return Ok(deduplicate_column_infos(columns));
+            }
+            #[cfg(feature = "duckdb-bundled")]
+            if let Some(con) = extract_pool!(&connections, &pool_key, DuckDb) {
+                drop(connections);
+                let con = con.lock().map_err(|e| e.to_string())?;
+                return duckdb_query_columns_in_database_with_attached(
+                    &con,
+                    database,
+                    schema,
+                    table,
+                    &duckdb_attached_names,
+                );
+            }
+            if let Some(client) = extract_pool!(&connections, &pool_key, ClickHouse) {
+                drop(connections);
+                return db::clickhouse_driver::get_columns(&client, clickhouse_metadata_database(database, schema), table)
+                    .await
+                    .map(deduplicate_column_infos);
+            }
+            if let Some(client) = extract_pool!(&connections, &pool_key, InfluxDb) {
+                drop(connections);
+                return db::influxdb_driver::get_columns(&client, database, table).await.map(deduplicate_column_infos);
+            }
+            if let Some(linked) = crate::sql_dialect::parse_sqlserver_linked_schema_ref(schema) {
+                if let Some(client) = extract_pool!(&connections, &pool_key, SqlServer) {
+                    drop(connections);
+                    let mut client = client.lock().await;
+                    return db::sqlserver::get_linked_server_columns(
+                        &mut client,
+                        &linked.server,
+                        &linked.catalog,
+                        &linked.schema,
+                        table,
+                    )
+                    .await
+                    .map(deduplicate_column_infos);
+                }
+            }
+            try_sqlserver!(connections, &pool_key, get_columns, schema, table);
+            if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
+                let fallback_config = db_config.clone();
                 drop(connections);
                 let mut client = client.lock().await;
-                return db::sqlserver::get_linked_server_columns(
-                    &mut client,
-                    &linked.server,
-                    &linked.catalog,
-                    &linked.schema,
-                    table,
-                )
-                .await
-                .map(deduplicate_column_infos);
-            }
-        }
-        try_sqlserver!(connections, &pool_key, get_columns, schema, table);
-        if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
-            let fallback_config = db_config.clone();
-            drop(connections);
-            let mut client = client.lock().await;
-            match client.get_columns::<Vec<db::ColumnInfo>>(database, schema, table).await {
-                Ok(columns) if !columns.is_empty() => return Ok(deduplicate_column_infos(columns)),
-                Ok(columns) => {
-                    if let Some(config) = fallback_config.as_ref() {
-                        match native_postgres_metadata_pool(state, connection_id, database, config).await {
-                            Ok(Some(pool)) => {
+                match client.get_columns::<Vec<db::ColumnInfo>>(database, schema, table).await {
+                    Ok(columns) if !columns.is_empty() => return Ok(deduplicate_column_infos(columns)),
+                    Ok(columns) => {
+                        if let Some(config) = fallback_config.as_ref() {
+                            match native_postgres_metadata_pool(state, connection_id, database, config).await {
+                                Ok(Some(pool)) => {
+                                    return db::postgres::get_columns(&pool, schema, table)
+                                        .await
+                                        .map(deduplicate_column_infos);
+                                }
+                                Ok(None) => return Ok(deduplicate_column_infos(columns)),
+                                Err(error) => {
+                                    log::warn!(
+                                        "[schema][agent:get_columns:fallback-failed] connection_id={} database={} schema={} table={} error={}",
+                                        connection_id,
+                                        database,
+                                        schema,
+                                        table,
+                                        error
+                                    );
+                                }
+                            }
+                        }
+                        return Ok(deduplicate_column_infos(columns));
+                    }
+                    Err(agent_error) => {
+                        if let Some(config) = fallback_config.as_ref() {
+                            if let Some(pool) =
+                                native_postgres_metadata_pool(state, connection_id, database, config).await?
+                            {
                                 return db::postgres::get_columns(&pool, schema, table)
                                     .await
-                                    .map(deduplicate_column_infos);
-                            }
-                            Ok(None) => return Ok(deduplicate_column_infos(columns)),
-                            Err(error) => {
-                                log::warn!(
-                                    "[schema][agent:get_columns:fallback-failed] connection_id={} database={} schema={} table={} error={}",
-                                    connection_id,
-                                    database,
-                                    schema,
-                                    table,
-                                    error
-                                );
+                                    .map(deduplicate_column_infos)
+                                    .map_err(|fallback_error| {
+                                        format!(
+                                            "{agent_error}\n\nNative PostgreSQL metadata fallback failed: {fallback_error}"
+                                        )
+                                    });
                             }
                         }
+                        return Err(agent_error);
                     }
-                    return Ok(deduplicate_column_infos(columns));
-                }
-                Err(agent_error) => {
-                    if let Some(config) = fallback_config.as_ref() {
-                        if let Some(pool) =
-                            native_postgres_metadata_pool(state, connection_id, database, config).await?
-                        {
-                            return db::postgres::get_columns(&pool, schema, table)
-                                .await
-                                .map(deduplicate_column_infos)
-                                .map_err(|fallback_error| {
-                                    format!(
-                                        "{agent_error}\n\nNative PostgreSQL metadata fallback failed: {fallback_error}"
-                                    )
-                                });
-                        }
-                    }
-                    return Err(agent_error);
                 }
             }
         }
-    }
 
-    let connections = state.connections.read().await;
-    let pool = connections.get(&pool_key).ok_or("Pool not found")?;
+        let connections = state.connections.read().await;
+        let pool = connections.get(&pool_key).ok_or("Pool not found")?;
 
-    match pool {
-        PoolKind::Mysql(p, _) if db_config.as_ref().is_some_and(is_manticoresearch_config) => {
-            let metadata_database = mysql_show_metadata_database_for_config(db_config.as_ref(), database);
-            db::manticoresearch::get_columns(p, metadata_database, table).await.map(deduplicate_column_infos)
+        match pool {
+            PoolKind::Mysql(p, _) if db_config.as_ref().is_some_and(is_manticoresearch_config) => {
+                let metadata_database = mysql_show_metadata_database_for_config(db_config.as_ref(), database);
+                db::manticoresearch::get_columns(p, metadata_database, table).await.map(deduplicate_column_infos)
+            }
+            PoolKind::Mysql(p, _) if db_config.as_ref().is_some_and(is_doris_family_config) => {
+                let metadata_database = mysql_show_metadata_database_for_config(db_config.as_ref(), database);
+                db::mysql::get_columns_show(p, metadata_database, table).await.map(deduplicate_column_infos)
+            }
+            PoolKind::Mysql(p, mode) => {
+                dispatch_mysql!(p, mode, db::mysql::get_columns, db::ob_oracle::get_columns, database, table)
+                    .map(deduplicate_column_infos)
+            }
+            PoolKind::Postgres(p) if db_config.as_ref().is_some_and(is_questdb_config) => {
+                db::questdb::get_columns(p, schema, table).await.map(deduplicate_column_infos)
+            }
+            PoolKind::Postgres(p) => db::postgres::get_columns(p, schema, table).await.map(deduplicate_column_infos),
+            PoolKind::Sqlite(p) => db::sqlite::get_columns(p, schema, table).await.map(deduplicate_column_infos),
+            PoolKind::Rqlite(client) => {
+                db::rqlite_driver::get_columns(client, schema, table).await.map(deduplicate_column_infos)
+            }
+            _ => Ok(vec![]),
         }
-        PoolKind::Mysql(p, _) if db_config.as_ref().is_some_and(is_doris_family_config) => {
-            let metadata_database = mysql_show_metadata_database_for_config(db_config.as_ref(), database);
-            db::mysql::get_columns_show(p, metadata_database, table).await.map(deduplicate_column_infos)
-        }
-        PoolKind::Mysql(p, mode) => {
-            dispatch_mysql!(p, mode, db::mysql::get_columns, db::ob_oracle::get_columns, database, table)
-                .map(deduplicate_column_infos)
-        }
-        PoolKind::Postgres(p) if db_config.as_ref().is_some_and(is_questdb_config) => {
-            db::questdb::get_columns(p, schema, table).await.map(deduplicate_column_infos)
-        }
-        PoolKind::Postgres(p) => db::postgres::get_columns(p, schema, table).await.map(deduplicate_column_infos),
-        PoolKind::Sqlite(p) => db::sqlite::get_columns(p, schema, table).await.map(deduplicate_column_infos),
-        PoolKind::Rqlite(client) => {
-            db::rqlite_driver::get_columns(client, schema, table).await.map(deduplicate_column_infos)
-        }
-        _ => Ok(vec![]),
-    }
+    })
+    .await
 }
 
 fn deduplicate_column_infos(columns: Vec<db::ColumnInfo>) -> Vec<db::ColumnInfo> {
@@ -1503,33 +1547,36 @@ pub async fn list_indexes_core(
     if crate::sql_dialect::parse_sqlserver_linked_schema_ref(schema).is_some() {
         return Ok(vec![]);
     }
-    let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
-    let db_config = connection_config(state, connection_id).await;
+    retry_metadata_connection(state, connection_id, Some(database), || async {
+        let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
+        let db_config = connection_config(state, connection_id).await;
 
-    {
+        {
+            let connections = state.connections.read().await;
+            try_sqlserver!(connections, &pool_key, list_indexes, schema, table);
+            try_agent!(connections, &pool_key, list_indexes, database, schema, table);
+        }
+
         let connections = state.connections.read().await;
-        try_sqlserver!(connections, &pool_key, list_indexes, schema, table);
-        try_agent!(connections, &pool_key, list_indexes, database, schema, table);
-    }
+        let pool = connections.get(&pool_key).ok_or("Pool not found")?;
 
-    let connections = state.connections.read().await;
-    let pool = connections.get(&pool_key).ok_or("Pool not found")?;
-
-    match pool {
-        PoolKind::Mysql(p, mode) => {
-            if db_config.as_ref().is_some_and(is_manticoresearch_config) {
-                return db::manticoresearch::list_indexes(p, table).await;
+        match pool {
+            PoolKind::Mysql(p, mode) => {
+                if db_config.as_ref().is_some_and(is_manticoresearch_config) {
+                    return db::manticoresearch::list_indexes(p, table).await;
+                }
+                dispatch_mysql!(p, mode, db::mysql::list_indexes, db::ob_oracle::list_indexes, schema, table)
             }
-            dispatch_mysql!(p, mode, db::mysql::list_indexes, db::ob_oracle::list_indexes, schema, table)
+            PoolKind::Postgres(p) if db_config.as_ref().is_some_and(is_questdb_config) => {
+                db::questdb::list_indexes(p, schema, table).await
+            }
+            PoolKind::Postgres(p) => db::postgres::list_indexes(p, schema, table).await,
+            PoolKind::Sqlite(p) => db::sqlite::list_indexes(p, schema, table).await,
+            PoolKind::Rqlite(client) => db::rqlite_driver::list_indexes(client, schema, table).await,
+            _ => Ok(vec![]),
         }
-        PoolKind::Postgres(p) if db_config.as_ref().is_some_and(is_questdb_config) => {
-            db::questdb::list_indexes(p, schema, table).await
-        }
-        PoolKind::Postgres(p) => db::postgres::list_indexes(p, schema, table).await,
-        PoolKind::Sqlite(p) => db::sqlite::list_indexes(p, schema, table).await,
-        PoolKind::Rqlite(client) => db::rqlite_driver::list_indexes(client, schema, table).await,
-        _ => Ok(vec![]),
-    }
+    })
+    .await
 }
 
 pub async fn list_foreign_keys_core(
@@ -1542,26 +1589,29 @@ pub async fn list_foreign_keys_core(
     if crate::sql_dialect::parse_sqlserver_linked_schema_ref(schema).is_some() {
         return Ok(vec![]);
     }
-    let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
+    retry_metadata_connection(state, connection_id, Some(database), || async {
+        let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
 
-    {
-        let connections = state.connections.read().await;
-        try_sqlserver!(connections, &pool_key, list_foreign_keys, schema, table);
-        try_agent!(connections, &pool_key, list_foreign_keys, database, schema, table);
-    }
-
-    let connections = state.connections.read().await;
-    let pool = connections.get(&pool_key).ok_or("Pool not found")?;
-
-    match pool {
-        PoolKind::Mysql(p, mode) => {
-            dispatch_mysql!(p, mode, db::mysql::list_foreign_keys, db::ob_oracle::list_foreign_keys, schema, table)
+        {
+            let connections = state.connections.read().await;
+            try_sqlserver!(connections, &pool_key, list_foreign_keys, schema, table);
+            try_agent!(connections, &pool_key, list_foreign_keys, database, schema, table);
         }
-        PoolKind::Postgres(p) => db::postgres::list_foreign_keys(p, schema, table).await,
-        PoolKind::Sqlite(p) => db::sqlite::list_foreign_keys(p, schema, table).await,
-        PoolKind::Rqlite(client) => db::rqlite_driver::list_foreign_keys(client, schema, table).await,
-        _ => Ok(vec![]),
-    }
+
+        let connections = state.connections.read().await;
+        let pool = connections.get(&pool_key).ok_or("Pool not found")?;
+
+        match pool {
+            PoolKind::Mysql(p, mode) => {
+                dispatch_mysql!(p, mode, db::mysql::list_foreign_keys, db::ob_oracle::list_foreign_keys, schema, table)
+            }
+            PoolKind::Postgres(p) => db::postgres::list_foreign_keys(p, schema, table).await,
+            PoolKind::Sqlite(p) => db::sqlite::list_foreign_keys(p, schema, table).await,
+            PoolKind::Rqlite(client) => db::rqlite_driver::list_foreign_keys(client, schema, table).await,
+            _ => Ok(vec![]),
+        }
+    })
+    .await
 }
 
 pub async fn list_triggers_core(
@@ -1574,26 +1624,29 @@ pub async fn list_triggers_core(
     if crate::sql_dialect::parse_sqlserver_linked_schema_ref(schema).is_some() {
         return Ok(vec![]);
     }
-    let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
+    retry_metadata_connection(state, connection_id, Some(database), || async {
+        let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
 
-    {
-        let connections = state.connections.read().await;
-        try_sqlserver!(connections, &pool_key, list_triggers, schema, table);
-        try_agent!(connections, &pool_key, list_triggers, database, schema, table);
-    }
-
-    let connections = state.connections.read().await;
-    let pool = connections.get(&pool_key).ok_or("Pool not found")?;
-
-    match pool {
-        PoolKind::Mysql(p, mode) => {
-            dispatch_mysql!(p, mode, db::mysql::list_triggers, db::ob_oracle::list_triggers, schema, table)
+        {
+            let connections = state.connections.read().await;
+            try_sqlserver!(connections, &pool_key, list_triggers, schema, table);
+            try_agent!(connections, &pool_key, list_triggers, database, schema, table);
         }
-        PoolKind::Postgres(p) => db::postgres::list_triggers(p, schema, table).await,
-        PoolKind::Sqlite(p) => db::sqlite::list_triggers(p, schema, table).await,
-        PoolKind::Rqlite(client) => db::rqlite_driver::list_triggers(client, schema, table).await,
-        _ => Ok(vec![]),
-    }
+
+        let connections = state.connections.read().await;
+        let pool = connections.get(&pool_key).ok_or("Pool not found")?;
+
+        match pool {
+            PoolKind::Mysql(p, mode) => {
+                dispatch_mysql!(p, mode, db::mysql::list_triggers, db::ob_oracle::list_triggers, schema, table)
+            }
+            PoolKind::Postgres(p) => db::postgres::list_triggers(p, schema, table).await,
+            PoolKind::Sqlite(p) => db::sqlite::list_triggers(p, schema, table).await,
+            PoolKind::Rqlite(client) => db::rqlite_driver::list_triggers(client, schema, table).await,
+            _ => Ok(vec![]),
+        }
+    })
+    .await
 }
 
 pub async fn list_functions_core(
@@ -1602,14 +1655,17 @@ pub async fn list_functions_core(
     database: &str,
     schema: &str,
 ) -> Result<Vec<db::FunctionInfo>, String> {
-    let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
-    let connections = state.connections.read().await;
-    let pool = connections.get(&pool_key).ok_or("Pool not found")?;
+    retry_metadata_connection(state, connection_id, Some(database), || async {
+        let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
+        let connections = state.connections.read().await;
+        let pool = connections.get(&pool_key).ok_or("Pool not found")?;
 
-    match pool {
-        PoolKind::Postgres(p) => db::postgres::list_functions(p, schema).await,
-        _ => Ok(vec![]),
-    }
+        match pool {
+            PoolKind::Postgres(p) => db::postgres::list_functions(p, schema).await,
+            _ => Ok(vec![]),
+        }
+    })
+    .await
 }
 
 pub async fn list_sequences_core(
@@ -1619,14 +1675,17 @@ pub async fn list_sequences_core(
     schema: &str,
     with_last_values: bool,
 ) -> Result<Vec<db::SequenceInfo>, String> {
-    let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
-    let connections = state.connections.read().await;
-    let pool = connections.get(&pool_key).ok_or("Pool not found")?;
+    retry_metadata_connection(state, connection_id, Some(database), || async {
+        let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
+        let connections = state.connections.read().await;
+        let pool = connections.get(&pool_key).ok_or("Pool not found")?;
 
-    match pool {
-        PoolKind::Postgres(p) => db::postgres::list_sequences(p, schema, with_last_values).await,
-        _ => Ok(vec![]),
-    }
+        match pool {
+            PoolKind::Postgres(p) => db::postgres::list_sequences(p, schema, with_last_values).await,
+            _ => Ok(vec![]),
+        }
+    })
+    .await
 }
 
 pub async fn list_rules_core(
@@ -1635,14 +1694,17 @@ pub async fn list_rules_core(
     database: &str,
     schema: &str,
 ) -> Result<Vec<db::RuleInfo>, String> {
-    let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
-    let connections = state.connections.read().await;
-    let pool = connections.get(&pool_key).ok_or("Pool not found")?;
+    retry_metadata_connection(state, connection_id, Some(database), || async {
+        let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
+        let connections = state.connections.read().await;
+        let pool = connections.get(&pool_key).ok_or("Pool not found")?;
 
-    match pool {
-        PoolKind::Postgres(p) => db::postgres::list_rules(p, schema).await,
-        _ => Ok(vec![]),
-    }
+        match pool {
+            PoolKind::Postgres(p) => db::postgres::list_rules(p, schema).await,
+            _ => Ok(vec![]),
+        }
+    })
+    .await
 }
 
 pub async fn list_owners_core(
@@ -1651,14 +1713,17 @@ pub async fn list_owners_core(
     database: &str,
     schema: &str,
 ) -> Result<Vec<db::OwnerInfo>, String> {
-    let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
-    let connections = state.connections.read().await;
-    let pool = connections.get(&pool_key).ok_or("Pool not found")?;
+    retry_metadata_connection(state, connection_id, Some(database), || async {
+        let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
+        let connections = state.connections.read().await;
+        let pool = connections.get(&pool_key).ok_or("Pool not found")?;
 
-    match pool {
-        PoolKind::Postgres(p) => db::postgres::list_owners(p, schema).await,
-        _ => Ok(vec![]),
-    }
+        match pool {
+            PoolKind::Postgres(p) => db::postgres::list_owners(p, schema).await,
+            _ => Ok(vec![]),
+        }
+    })
+    .await
 }
 
 pub async fn get_table_ddl_core(

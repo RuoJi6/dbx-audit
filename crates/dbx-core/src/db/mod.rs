@@ -19,6 +19,7 @@ pub mod sqlserver;
 pub mod ssh_tunnel;
 pub mod transport_layer_tunnel;
 pub mod turso_driver;
+pub mod vector_driver;
 pub mod wkb;
 
 use reqwest::ClientBuilder;

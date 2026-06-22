@@ -15,6 +15,10 @@ export function setMongoUrlParam(urlParams: string | undefined, key: string, val
 }
 
 export function mongodbAuthFailureHint(message: string): string {
+  if (message.includes("cannot specify multiple seeds with directConnection=true")) {
+    return `${message}\n\nMongoDB directConnection=true can only be used with a single host. Remove directConnection=true when using a multi-host replica set URL, or keep only one reachable host if you need a direct connection.`;
+  }
+
   if (message.includes("no records found") && message.includes("_mongodb._tcp.")) {
     return `${message}\n\nMongoDB SRV URLs require a DNS hostname with SRV records. For an IP address or normal host:port endpoint, use mongodb://host:port instead of mongodb+srv://host.`;
   }

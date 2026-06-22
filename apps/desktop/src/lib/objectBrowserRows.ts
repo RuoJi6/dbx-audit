@@ -14,9 +14,11 @@ export type ObjectBrowserRow = {
   partitionCount?: number;
   partitionParentSchema?: string;
   partitionParentName?: string;
+  estimatedRows?: number | null;
+  totalBytes?: number | null;
 };
 
-export type ObjectBrowserSortKey = "name" | "type" | "created_at" | "updated_at" | "comment";
+export type ObjectBrowserSortKey = "name" | "type" | "estimatedRows" | "totalBytes" | "created_at" | "updated_at" | "comment";
 export type ObjectBrowserSortDirection = "asc" | "desc";
 
 export function normalizeObjectBrowserType(type: string): ObjectBrowserRow["type"] {
@@ -115,7 +117,7 @@ export function sortObjectBrowserRows(rows: ObjectBrowserRow[], key: ObjectBrows
 }
 
 export function initialObjectBrowserSortDirection(key: ObjectBrowserSortKey): ObjectBrowserSortDirection {
-  return key === "created_at" || key === "updated_at" ? "desc" : "asc";
+  return key === "created_at" || key === "updated_at" || key === "estimatedRows" || key === "totalBytes" ? "desc" : "asc";
 }
 
 export function formatObjectBrowserTimestamp(value: string | null | undefined): string {
@@ -127,7 +129,28 @@ export function formatObjectBrowserTimestamp(value: string | null | undefined): 
     .replace(/(?:Z|[+-]\d{2}(?::?\d{2})?)$/, "");
 }
 
-function compareObjectBrowserValue(left: string | null | undefined, right: string | null | undefined, key: ObjectBrowserSortKey, direction: ObjectBrowserSortDirection): number {
+export function formatObjectBrowserCount(value: number | null | undefined): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "";
+  return new Intl.NumberFormat().format(value);
+}
+
+export function formatObjectBrowserBytes(value: number | null | undefined): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "";
+  const units = ["B", "KB", "MB", "GB", "TB", "PB"];
+  let size = Math.max(0, value);
+  let unitIndex = 0;
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024;
+    unitIndex++;
+  }
+  const fractionDigits = unitIndex === 0 || size >= 100 ? 0 : size >= 10 ? 1 : 2;
+  return `${size.toFixed(fractionDigits)} ${units[unitIndex]}`;
+}
+
+function compareObjectBrowserValue(left: string | number | null | undefined, right: string | number | null | undefined, key: ObjectBrowserSortKey, direction: ObjectBrowserSortDirection): number {
+  if (key === "estimatedRows" || key === "totalBytes") {
+    return compareObjectBrowserNumber(left, right, direction);
+  }
   const leftText = normalizeSortValue(left);
   const rightText = normalizeSortValue(right);
   if (!leftText && !rightText) return 0;
@@ -137,6 +160,23 @@ function compareObjectBrowserValue(left: string | null | undefined, right: strin
   return leftText.localeCompare(rightText, undefined, { numeric: true, sensitivity: "base" });
 }
 
-function normalizeSortValue(value: string | null | undefined): string {
+function compareObjectBrowserNumber(left: string | number | null | undefined, right: string | number | null | undefined, direction: ObjectBrowserSortDirection): number {
+  const leftNumber = normalizeSortNumber(left);
+  const rightNumber = normalizeSortNumber(right);
+  if (leftNumber === null && rightNumber === null) return 0;
+  if (leftNumber === null) return direction === "asc" ? 1 : -1;
+  if (rightNumber === null) return direction === "asc" ? -1 : 1;
+  return leftNumber - rightNumber;
+}
+
+function normalizeSortValue(value: string | number | null | undefined): string {
+  if (typeof value === "number") return String(value);
   return value?.trim() ?? "";
+}
+
+function normalizeSortNumber(value: string | number | null | undefined): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value !== "string" || !value.trim()) return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
 }

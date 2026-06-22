@@ -22,6 +22,7 @@ export function buildTableTreeNodes({ nodeId, connectionId, database, schema, ta
         includeSchemaInId: false,
         name,
         objectType,
+        tableType: table.table_type,
         comment: table.comment,
         parentSchema: table.parent_schema,
         parentName: table.parent_name,
@@ -49,6 +50,7 @@ function makeTableTreeEntry({
   includeSchemaInId,
   name,
   objectType,
+  tableType,
   comment,
   parentSchema,
   parentName,
@@ -60,6 +62,7 @@ function makeTableTreeEntry({
   includeSchemaInId?: boolean;
   name: string;
   objectType: DatabaseObjectTreeKind;
+  tableType?: string;
   comment?: string | null;
   parentSchema?: string | null;
   parentName?: string | null;
@@ -71,6 +74,7 @@ function makeTableTreeEntry({
     id: `${nodeId}:${nodeIdSchemaSuffix}${name}`,
     label: name,
     type: objectType === "VIEW" ? ("view" as const) : objectType === "MATERIALIZED_VIEW" ? ("materialized_view" as const) : ("table" as const),
+    tableType,
     comment,
     connectionId,
     database,
@@ -235,7 +239,9 @@ export function mergeTableInfosIntoObjects(objects: readonly ObjectInfo[], table
     seen.add(key);
     merged.push({
       name,
-      object_type: objectType,
+      // Keep original driver-reported type (e.g. TDengine STABLE) so
+      // downstream template strategies can distinguish special table kinds.
+      object_type: table.table_type,
       schema: tableSchema,
       comment: table.comment,
       created_at: undefined,
@@ -414,6 +420,7 @@ function buildObjectTreeEntries({ nodeId, connectionId, database, schema, object
         schema: childSchema,
         name,
         objectType,
+        tableType: obj.object_type,
         comment: obj.comment,
         parentSchema: obj.parent_schema,
         parentName: obj.parent_name,
@@ -450,6 +457,7 @@ export function buildSimpleObjectTreeNodes({ nodeId, connectionId, database, sch
       schema: childSchema,
       name,
       objectType,
+      tableType: obj.object_type,
       comment: obj.comment,
       parentSchema: obj.parent_schema,
       parentName: obj.parent_name,

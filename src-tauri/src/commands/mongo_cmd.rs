@@ -41,6 +41,37 @@ pub async fn mongo_list_collections(
 }
 
 #[tauri::command]
+pub async fn mongo_create_database(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    database: String,
+) -> Result<(), String> {
+    ensure_connection_writable(&state, &connection_id, "Create database").await?;
+    dbx_core::mongo_ops::mongo_create_database_core(&state, &connection_id, &database).await
+}
+
+#[tauri::command]
+pub async fn mongo_drop_database(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    database: String,
+) -> Result<(), String> {
+    ensure_connection_writable(&state, &connection_id, "Drop database").await?;
+    dbx_core::mongo_ops::mongo_drop_database_core(&state, &connection_id, &database).await
+}
+
+#[tauri::command]
+pub async fn mongo_drop_collection(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    database: String,
+    collection: String,
+) -> Result<(), String> {
+    ensure_connection_writable(&state, &connection_id, "Drop collection").await?;
+    dbx_core::mongo_ops::mongo_drop_collection_core(&state, &connection_id, &database, &collection).await
+}
+
+#[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn mongo_find_documents(
     state: State<'_, Arc<AppState>>,

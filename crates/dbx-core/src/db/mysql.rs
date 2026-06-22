@@ -13,7 +13,8 @@ use std::time::Instant;
 use crate::models::connection::DatabaseType;
 use crate::sql::starts_with_executable_sql_keyword;
 use crate::types::{
-    ColumnInfo, DatabaseInfo, ForeignKeyInfo, IndexInfo, ObjectInfo, QueryResult, TableInfo, TriggerInfo,
+    ColumnInfo, DatabaseInfo, ForeignKeyInfo, IndexInfo, ObjectInfo, ObjectStatistics, QueryResult, TableInfo,
+    TriggerInfo,
 };
 
 use super::file_validator::validate_file_path;
@@ -100,6 +101,17 @@ fn get_opt_i32(row: &mysql_async::Row, name: &str) -> Option<i32> {
             row_get::<Vec<u8>, _>(row, name)
                 .and_then(|b| String::from_utf8(b).ok())
                 .and_then(|v| numeric_metadata_str_to_i32(Some(v)))
+        })
+}
+
+fn get_opt_i64(row: &mysql_async::Row, name: &str) -> Option<i64> {
+    row_get::<i64, _>(row, name)
+        .or_else(|| row_get::<u64, _>(row, name).and_then(|value| i64::try_from(value).ok()))
+        .or_else(|| row_get::<String, _>(row, name).and_then(|value| value.parse::<i64>().ok()))
+        .or_else(|| {
+            row_get::<Vec<u8>, _>(row, name)
+                .and_then(|b| String::from_utf8(b).ok())
+                .and_then(|value| value.parse::<i64>().ok())
         })
 }
 
@@ -1195,6 +1207,31 @@ pub async fn list_objects(pool: &MySqlPool, database: &str) -> Result<Vec<Object
     Ok(objects)
 }
 
+pub async fn list_object_statistics(pool: &MySqlPool, database: &str) -> Result<Vec<ObjectStatistics>, String> {
+    let sql = format!(
+        "SELECT TABLE_NAME, TABLE_ROWS, COALESCE(DATA_LENGTH, 0) + COALESCE(INDEX_LENGTH, 0) AS TOTAL_BYTES \
+         FROM information_schema.TABLES \
+         WHERE TABLE_SCHEMA = {} AND TABLE_TYPE <> 'VIEW' \
+         ORDER BY TABLE_NAME",
+        quote_value(database),
+    );
+    let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
+    let result = conn.query_iter(&sql).await.map_err(|e| e.to_string())?;
+    let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
+    Ok(rows
+        .iter()
+        .filter_map(|row| {
+            let name = get_str_by_name(row, "TABLE_NAME").trim().to_string();
+            (!name.is_empty()).then_some(ObjectStatistics {
+                name,
+                schema: Some(database.to_string()),
+                estimated_rows: get_opt_i64(row, "TABLE_ROWS"),
+                total_bytes: get_opt_i64(row, "TOTAL_BYTES"),
+            })
+        })
+        .collect())
+}
+
 pub async fn list_table_objects_show(pool: &MySqlPool, database: &str) -> Result<Vec<ObjectInfo>, String> {
     let (tables, routines) =
         tokio::join!(list_tables_show_with_status(pool, database), list_routine_objects(pool, database));
@@ -1553,9 +1590,9 @@ fn skip_mysql_quoted(sql: &str, start: usize, quote: u8) -> usize {
 /// (e.g. after app was backgrounded), it tries again with a fresh connection.
 pub async fn get_conn_with_health_check(pool: &MySqlPool) -> Result<mysql_async::Conn, String> {
     let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
-    match conn.ping().await {
-        Ok(()) => Ok(conn),
-        Err(_) => {
+    match tokio::time::timeout(crate::db::connection_timeout(), conn.ping()).await {
+        Ok(Ok(())) => Ok(conn),
+        _ => {
             let _ = conn.disconnect().await;
             pool.get_conn().await.map_err(|e| e.to_string())
         }

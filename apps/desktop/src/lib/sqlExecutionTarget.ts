@@ -11,6 +11,28 @@ export interface SqlExecutionSnapshot {
 
 export type SqlExecutionOverride = string | SqlExecutionSnapshot;
 
+export type SqlExecutionTargetKind = "cursor" | "all";
+
+/**
+ * A candidate execution target surfaced by the execution target picker.
+ * `from`/`to` are offsets into the full document so the editor can highlight
+ * the corresponding range as a preview while the picker is open.
+ */
+export interface SqlExecutionCandidate {
+  kind: SqlExecutionTargetKind;
+  label: string;
+  sql: string;
+  from: number;
+  to: number;
+}
+
+export interface SqlExecutionChoiceRequest {
+  fullSql: string;
+  selectedSql: string;
+  cursorPos: number;
+  candidates: SqlExecutionCandidate[];
+}
+
 export function isSqlExecutionSnapshot(value: SqlExecutionOverride | undefined): value is SqlExecutionSnapshot {
   return typeof value === "object" && value !== null && typeof value.fullSql === "string" && typeof value.selectedSql === "string" && typeof value.cursorPos === "number";
 }

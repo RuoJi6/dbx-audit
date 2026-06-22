@@ -9,6 +9,7 @@ use tokio::sync::Notify;
 use crate::agent_events::{AgentEvent, ToolCall, ToolDefinition, ToolResult};
 use crate::agent_tools;
 use crate::ai::{self, AiCompletionRequest, AiConfig, AiMessage, AiProvider, AiStreamChunk};
+use crate::ai_cli_agent::CliAgentCommandSpec;
 use crate::connection::AppState;
 use crate::models::connection::DatabaseType;
 use crate::token_usage::TokenUsage;
@@ -27,6 +28,7 @@ pub struct AgentLoopContext {
     pub connection_id: String,
     pub database: String,
     pub db_type: DatabaseType,
+    pub cli_mcp_server_command: Option<CliAgentCommandSpec>,
 }
 
 /// Check if the provider supports function calling / tool use.
@@ -59,6 +61,31 @@ pub async fn run_agent_loop(
     temperature: Option<f32>,
     is_agent_mode: bool,
 ) -> Result<String, String> {
+    if matches!(config.provider, AiProvider::CodexCli) {
+        let connection_name = {
+            let configs = agent_ctx.state.configs.read().await;
+            configs
+                .get(&agent_ctx.connection_id)
+                .map(|config| config.name.clone())
+                .unwrap_or_else(|| agent_ctx.connection_id.clone())
+        };
+        let prompt = crate::ai_codex_cli::build_codex_prompt(system_prompt, messages);
+        return crate::ai_codex_cli::run_codex_agent(
+            config,
+            &prompt,
+            crate::ai_codex_cli::CodexRunOptions {
+                connection_id: agent_ctx.connection_id.clone(),
+                connection_name,
+                database: agent_ctx.database.clone(),
+                agent_mode: is_agent_mode,
+                mcp_server_command: agent_ctx.cli_mcp_server_command.clone(),
+            },
+            cancelled,
+            on_event,
+        )
+        .await;
+    }
+
     // Auto-degrade: providers without function calling fall back to text-only completion.
     if !provider_supports_function_calling(config) {
         return run_agent_loop_text_only(

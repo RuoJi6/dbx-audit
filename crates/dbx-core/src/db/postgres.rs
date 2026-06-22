@@ -20,8 +20,8 @@ use tokio_postgres::{Row, SimpleQueryMessage};
 use super::file_validator::validate_file_path;
 use crate::sql::starts_with_executable_sql_keyword;
 use crate::types::{
-    ColumnInfo, DatabaseInfo, ForeignKeyInfo, FunctionInfo, IndexInfo, ObjectInfo, OwnerInfo, QueryResult, RuleInfo,
-    SequenceInfo, TableInfo, TriggerInfo,
+    ColumnInfo, DatabaseInfo, ForeignKeyInfo, FunctionInfo, IndexInfo, ObjectInfo, ObjectStatistics, OwnerInfo,
+    QueryResult, RuleInfo, SequenceInfo, TableInfo, TriggerInfo,
 };
 
 fn pg_temporal_to_json_value(row: &Row, idx: usize) -> Option<serde_json::Value> {
@@ -420,6 +420,11 @@ fn should_retry_postgres_text_query(err: &tokio_postgres::Error) -> bool {
         || message.contains("cannot display a value of type")
 }
 
+fn should_retry_postgres_stale_cache(err: &tokio_postgres::Error) -> bool {
+    let message = err.as_db_error().map(ToString::to_string).unwrap_or_else(|| err.to_string()).to_ascii_lowercase();
+    message.contains("cached plan must not change result type")
+}
+
 async fn execute_select_prepared(
     client: &deadpool_postgres::Client,
     sql: &str,
@@ -542,6 +547,20 @@ async fn execute_select_query(
 ) -> Result<QueryResult, String> {
     match execute_select_prepared(client, sql, start, row_limit).await {
         Ok(result) => Ok(result),
+        Err(err) if should_retry_postgres_stale_cache(&err) => {
+            // The cached prepared statement is stale (e.g. the view or table
+            // schema changed since the statement was prepared). Evict the
+            // stale entry and retry with a fresh server-side prepare.
+            log::warn!("[postgres][select:stale_cache] evicting cached statement: {}", pg_error_to_string(err));
+            client.statement_cache.remove(sql, &[]);
+            match execute_select_prepared(client, sql, start, row_limit).await {
+                Ok(result) => Ok(result),
+                Err(err) if should_retry_postgres_text_query(&err) => {
+                    execute_select_text(client, sql, start, row_limit).await
+                }
+                Err(err) => Err(pg_error_to_string(err)),
+            }
+        }
         Err(err) if should_retry_postgres_text_query(&err) => execute_select_text(client, sql, start, row_limit).await,
         Err(err) => Err(pg_error_to_string(err)),
     }
@@ -1083,6 +1102,33 @@ pub async fn list_objects(pool: &Pool, schema: &str) -> Result<Vec<ObjectInfo>, 
         .collect())
 }
 
+pub async fn list_object_statistics(pool: &Pool, schema: &str) -> Result<Vec<ObjectStatistics>, String> {
+    let schema = if schema.is_empty() { "public" } else { schema };
+    let client = pool.get().await.map_err(|e| e.to_string())?;
+    let stmt = client
+        .prepare_cached(
+            "SELECT c.relname, \
+                    GREATEST(c.reltuples, 0)::bigint AS estimated_rows, \
+                    pg_catalog.pg_total_relation_size(c.oid)::bigint AS total_bytes \
+             FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 AND c.relkind IN ('r','m','f','p') \
+             ORDER BY c.relname",
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    let rows = client.query(&stmt, &[&schema]).await.map_err(|e| e.to_string())?;
+    Ok(rows
+        .iter()
+        .map(|row| ObjectStatistics {
+            name: row.get::<_, String>(0),
+            schema: Some(schema.to_string()),
+            estimated_rows: row.try_get::<_, i64>(1).ok(),
+            total_bytes: row.try_get::<_, i64>(2).ok(),
+        })
+        .collect())
+}
+
 pub async fn list_schemas(pool: &Pool) -> Result<Vec<String>, String> {
     let client = pool.get().await.map_err(|e| e.to_string())?;
     let stmt = client
@@ -1414,6 +1460,26 @@ const POSTGRES_INDEXES_COMPAT_SQL: &str = "SELECT i.relname AS index_name, \
              GROUP BY i.relname, i.oid, ix.indisunique, ix.indisprimary, ix.indpred, ix.indrelid, am.amname, ix.indkey \
              ORDER BY i.relname";
 
+const POSTGRES_OWNERS_SQL: &str =
+    "SELECT n.nspname, c.relname, c.relkind::text AS relkind, pg_get_userbyid(c.relowner) \
+     FROM pg_class c \
+     JOIN pg_namespace n ON n.oid = c.relnamespace \
+     WHERE n.nspname = $1 \
+       AND c.relkind IN ('r', 'v', 'm', 'S', 'f', 'p')";
+
+fn postgres_owner_object_type(relkind: &str) -> &str {
+    match relkind {
+        "r" => "TABLE",
+        "v" => "VIEW",
+        "m" => "MATERIALIZED_VIEW",
+        "S" => "SEQUENCE",
+        "f" => "FOREIGN TABLE",
+        "p" => "PARTITIONED TABLE",
+        "I" => "PARTITIONED INDEX",
+        _ => relkind,
+    }
+}
+
 async fn list_indexes_with_sql(
     client: &deadpool_postgres::Client,
     sql: &str,
@@ -1657,37 +1723,16 @@ pub async fn list_rules(pool: &Pool, schema: &str) -> Result<Vec<RuleInfo>, Stri
 
 pub async fn list_owners(pool: &Pool, schema: &str) -> Result<Vec<OwnerInfo>, String> {
     let client = pool.get().await.map_err(|e| e.to_string())?;
-    // Filter relkind to exclude indexes, toast tables, and other system objects
-    // for better performance on large databases
-    let stmt = client
-        .prepare_cached(
-            "SELECT n.nspname, c.relname, c.relkind, pg_get_userbyid(c.relowner) \
-             FROM pg_class c \
-             JOIN pg_namespace n ON n.oid = c.relnamespace \
-             WHERE n.nspname = $1 \
-               AND c.relkind IN ('r', 'v', 'm', 'S', 'f', 'p')",
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+    let stmt = client.prepare_cached(POSTGRES_OWNERS_SQL).await.map_err(|e| e.to_string())?;
     let rows = client.query(&stmt, &[&schema]).await.map_err(|e| e.to_string())?;
 
     Ok(rows
         .iter()
         .map(|row| {
             let relkind: String = row.get(2);
-            let object_type = match relkind.as_str() {
-                "r" => "TABLE",
-                "v" => "VIEW",
-                "m" => "MATERIALIZED_VIEW",
-                "S" => "SEQUENCE",
-                "f" => "FOREIGN TABLE",
-                "p" => "PARTITIONED TABLE",
-                "I" => "PARTITIONED INDEX",
-                _ => &relkind,
-            };
             OwnerInfo {
                 object_name: row.get::<_, String>(1),
-                object_type: object_type.to_string(),
+                object_type: postgres_owner_object_type(&relkind).to_string(),
                 owner: row.get::<_, String>(3),
             }
         })
@@ -2132,6 +2177,23 @@ mod tests {
         assert!(POSTGRES_INDEXES_SQL.contains("ix.indnkeyatts"));
         assert!(!POSTGRES_INDEXES_COMPAT_SQL.contains("ix.indnkeyatts"));
         assert!(POSTGRES_INDEXES_COMPAT_SQL.contains("NULL::smallint AS nkeyatts"));
+    }
+
+    #[test]
+    fn postgres_owner_metadata_casts_relkind_to_text() {
+        assert!(POSTGRES_OWNERS_SQL.contains("c.relkind::text AS relkind"));
+        assert!(POSTGRES_OWNERS_SQL.contains("c.relkind IN ('r', 'v', 'm', 'S', 'f', 'p')"));
+    }
+
+    #[test]
+    fn postgres_owner_object_type_maps_relkind_codes() {
+        assert_eq!(postgres_owner_object_type("r"), "TABLE");
+        assert_eq!(postgres_owner_object_type("v"), "VIEW");
+        assert_eq!(postgres_owner_object_type("m"), "MATERIALIZED_VIEW");
+        assert_eq!(postgres_owner_object_type("S"), "SEQUENCE");
+        assert_eq!(postgres_owner_object_type("f"), "FOREIGN TABLE");
+        assert_eq!(postgres_owner_object_type("p"), "PARTITIONED TABLE");
+        assert_eq!(postgres_owner_object_type("?"), "?");
     }
 
     #[test]

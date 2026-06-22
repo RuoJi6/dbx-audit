@@ -67,6 +67,7 @@ pub enum PoolKind {
     ClickHouse(db::clickhouse_driver::ChClient),
     SqlServer(Arc<tokio::sync::Mutex<db::sqlserver::SqlServerClient>>),
     Elasticsearch(db::elasticsearch_driver::EsClient),
+    VectorDb(db::vector_driver::VectorClient),
     InfluxDb(db::influxdb_driver::InfluxdbClient),
     Agent(Arc<tokio::sync::Mutex<db::agent_driver::AgentDriverClient>>),
     ExternalTabular(ExternalTabularHandle),
@@ -601,6 +602,23 @@ impl AppState {
                 db::elasticsearch_driver::test_connection(&mut client, connect_timeout).await?;
                 PoolKind::Elasticsearch(client)
             }
+            DatabaseType::Qdrant | DatabaseType::Milvus => {
+                let kind = match db_config.db_type {
+                    DatabaseType::Qdrant => db::vector_driver::VectorDbKind::Qdrant,
+                    DatabaseType::Milvus => db::vector_driver::VectorDbKind::Milvus,
+                    _ => unreachable!(),
+                };
+                let client = db::vector_driver::VectorClient::new(
+                    kind,
+                    &url,
+                    Some(&db_config.username),
+                    Some(&db_config.password),
+                    db_config.ssl,
+                    connect_timeout,
+                );
+                db::vector_driver::test_connection(&client, connect_timeout).await?;
+                PoolKind::VectorDb(client)
+            }
             DatabaseType::InfluxDb => {
                 let username = if db_config.username.is_empty() { None } else { Some(db_config.username.clone()) };
                 let password = if db_config.password.is_empty() { None } else { Some(db_config.password.clone()) };
@@ -893,6 +911,32 @@ impl AppState {
                         }
                     }
                 }
+                PoolKind::Postgres(pool) => {
+                    let pool = pool.clone();
+                    drop(connections);
+                    let timeout = crate::db::connection_timeout();
+                    match tokio::time::timeout(timeout, pool.get()).await {
+                        Ok(Ok(client)) => match tokio::time::timeout(timeout, client.simple_query("SELECT 1")).await {
+                            Ok(Ok(_)) => false,
+                            Ok(Err(err)) => {
+                                log::warn!("PostgreSQL connection pool '{pool_key}' is stale: {err}");
+                                true
+                            }
+                            Err(_) => {
+                                log::warn!("PostgreSQL connection pool '{pool_key}' is stale: health check timed out");
+                                true
+                            }
+                        },
+                        Ok(Err(err)) => {
+                            log::warn!("PostgreSQL connection pool '{pool_key}' is stale: {err}");
+                            true
+                        }
+                        Err(_) => {
+                            log::warn!("PostgreSQL connection pool '{pool_key}' is stale: get connection timed out");
+                            true
+                        }
+                    }
+                }
                 PoolKind::SqlServer(client) => {
                     let client = client.clone();
                     drop(connections);
@@ -933,7 +977,95 @@ impl AppState {
                         }
                     }
                 }
-                _ => false,
+                PoolKind::ClickHouse(client) => {
+                    let client = client.clone();
+                    drop(connections);
+                    let timeout = crate::db::connection_timeout();
+                    match db::clickhouse_driver::test_connection(&client, timeout).await {
+                        Ok(()) => false,
+                        Err(err) => {
+                            log::warn!("ClickHouse connection pool '{pool_key}' is stale: {err}");
+                            true
+                        }
+                    }
+                }
+                PoolKind::Elasticsearch(client) => {
+                    let mut client = client.clone();
+                    drop(connections);
+                    let timeout = crate::db::connection_timeout();
+                    match db::elasticsearch_driver::test_connection(&mut client, timeout).await {
+                        Ok(()) => false,
+                        Err(err) => {
+                            log::warn!("Elasticsearch connection pool '{pool_key}' is stale: {err}");
+                            true
+                        }
+                    }
+                }
+                PoolKind::VectorDb(client) => {
+                    let client = client.clone();
+                    drop(connections);
+                    let timeout = crate::db::connection_timeout();
+                    match db::vector_driver::test_connection(&client, timeout).await {
+                        Ok(()) => false,
+                        Err(err) => {
+                            log::warn!("VectorDB connection pool '{pool_key}' is stale: {err}");
+                            true
+                        }
+                    }
+                }
+                PoolKind::InfluxDb(client) => {
+                    let client = client.clone();
+                    drop(connections);
+                    let timeout = crate::db::connection_timeout();
+                    match db::influxdb_driver::test_connection(&client, timeout).await {
+                        Ok(()) => false,
+                        Err(err) => {
+                            log::warn!("InfluxDB connection pool '{pool_key}' is stale: {err}");
+                            true
+                        }
+                    }
+                }
+                PoolKind::Rqlite(client) => {
+                    let client = client.clone();
+                    drop(connections);
+                    let timeout = crate::db::connection_timeout();
+                    match db::rqlite_driver::test_connection(&client, timeout).await {
+                        Ok(()) => false,
+                        Err(err) => {
+                            log::warn!("rqlite connection pool '{pool_key}' is stale: {err}");
+                            true
+                        }
+                    }
+                }
+                PoolKind::Turso(client) => {
+                    let client = client.clone();
+                    drop(connections);
+                    let timeout = crate::db::connection_timeout();
+                    match db::turso_driver::test_connection(&client, timeout).await {
+                        Ok(()) => false,
+                        Err(err) => {
+                            log::warn!("Turso connection pool '{pool_key}' is stale: {err}");
+                            true
+                        }
+                    }
+                }
+                PoolKind::Agent(client) => {
+                    let client = client.clone();
+                    drop(connections);
+                    let mut agent = client.lock().await;
+                    match agent.test_connection(serde_json::json!({})).await {
+                        Ok(_) => false,
+                        Err(err) => {
+                            log::warn!("Agent connection pool '{pool_key}' is stale: {err}");
+                            true
+                        }
+                    }
+                }
+                PoolKind::Sqlite(_)
+                | PoolKind::DuckDb(_)
+                | PoolKind::ExternalTabular(_)
+                | PoolKind::ExternalDriver { .. }
+                | PoolKind::MessageQueue => false,
             }
         };
 
@@ -1152,16 +1284,24 @@ impl AppState {
     pub async fn refresh_connections(&self) {
         // Clone pool handles under a short-lived read lock, then release it
         // before performing I/O-heavy health checks to avoid blocking writers.
-        let checks: Vec<(String, PoolKind)> = {
+        // Redis pools are handled separately because RedisConnection cannot be cloned.
+        let (checks, redis_keys): (Vec<(String, PoolKind)>, Vec<String>) = {
             let conns = self.connections.read().await;
-            conns
-                .iter()
-                .filter(|(_, pool)| matches!(pool, PoolKind::Mysql(..) | PoolKind::Postgres(..)))
-                .map(|(key, pool)| (key.clone(), clone_pool_kind(pool)))
-                .collect()
+            let mut checks = Vec::with_capacity(conns.len());
+            let mut redis_keys = Vec::new();
+            for (key, pool) in conns.iter() {
+                match pool {
+                    PoolKind::Redis(_) => redis_keys.push(key.clone()),
+                    _ => checks.push((key.clone(), clone_pool_kind(pool))),
+                }
+            }
+            (checks, redis_keys)
         };
 
         let mut dead_keys = Vec::new();
+        let timeout = crate::db::connection_timeout();
+
+        // Check cloned pools (async I/O, no lock held)
         for (key, pool) in &checks {
             let healthy = match pool {
                 PoolKind::Mysql(p, _) => match db::mysql::get_conn_with_health_check(p).await {
@@ -1171,23 +1311,124 @@ impl AppState {
                         false
                     }
                 },
-                PoolKind::Postgres(p) => match p.get().await {
-                    Ok(client) => match client.simple_query("SELECT 1").await {
-                        Ok(_) => true,
-                        Err(e) => {
+                PoolKind::Postgres(p) => match tokio::time::timeout(timeout, p.get()).await {
+                    Ok(Ok(client)) => match tokio::time::timeout(timeout, client.simple_query("SELECT 1")).await {
+                        Ok(Ok(_)) => true,
+                        Ok(Err(e)) => {
                             log::warn!("PostgreSQL connection pool '{key}' is unhealthy: {e}");
                             false
                         }
+                        Err(_) => {
+                            log::warn!("PostgreSQL connection pool '{key}' is unhealthy: health check timed out");
+                            false
+                        }
                     },
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         log::warn!("PostgreSQL connection pool '{key}' is unhealthy: {e}");
                         false
                     }
+                    Err(_) => {
+                        log::warn!("PostgreSQL connection pool '{key}' is unhealthy: get connection timed out");
+                        false
+                    }
                 },
-                _ => true,
+                PoolKind::SqlServer(client) => {
+                    let mut client = client.lock().await;
+                    match db::sqlserver::test_connection(&mut client).await {
+                        Ok(()) => true,
+                        Err(e) => {
+                            log::warn!("SQL Server connection pool '{key}' is unhealthy: {e}");
+                            false
+                        }
+                    }
+                }
+                PoolKind::MongoDb(client) => match db::mongo_driver::test_connection(client, timeout, None).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        log::warn!("MongoDB connection pool '{key}' is unhealthy: {e}");
+                        false
+                    }
+                },
+                PoolKind::ClickHouse(client) => match db::clickhouse_driver::test_connection(client, timeout).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        log::warn!("ClickHouse connection pool '{key}' is unhealthy: {e}");
+                        false
+                    }
+                },
+                PoolKind::Elasticsearch(client) => {
+                    let mut client = client.clone();
+                    match db::elasticsearch_driver::test_connection(&mut client, timeout).await {
+                        Ok(()) => true,
+                        Err(e) => {
+                            log::warn!("Elasticsearch connection pool '{key}' is unhealthy: {e}");
+                            false
+                        }
+                    }
+                }
+                PoolKind::VectorDb(client) => match db::vector_driver::test_connection(client, timeout).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        log::warn!("VectorDB connection pool '{key}' is unhealthy: {e}");
+                        false
+                    }
+                },
+                PoolKind::InfluxDb(client) => match db::influxdb_driver::test_connection(client, timeout).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        log::warn!("InfluxDB connection pool '{key}' is unhealthy: {e}");
+                        false
+                    }
+                },
+                PoolKind::Rqlite(client) => match db::rqlite_driver::test_connection(client, timeout).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        log::warn!("rqlite connection pool '{key}' is unhealthy: {e}");
+                        false
+                    }
+                },
+                PoolKind::Turso(client) => match db::turso_driver::test_connection(client, timeout).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        log::warn!("Turso connection pool '{key}' is unhealthy: {e}");
+                        false
+                    }
+                },
+                PoolKind::Agent(client) => {
+                    let mut agent = client.lock().await;
+                    match agent.test_connection(serde_json::json!({})).await {
+                        Ok(_) => true,
+                        Err(e) => {
+                            log::warn!("Agent connection pool '{key}' is unhealthy: {e}");
+                            false
+                        }
+                    }
+                }
+                PoolKind::Sqlite(_)
+                | PoolKind::DuckDb(_)
+                | PoolKind::ExternalTabular(_)
+                | PoolKind::ExternalDriver { .. }
+                | PoolKind::MessageQueue => true,
+                PoolKind::Redis(_) => unreachable!("Redis handled separately"),
             };
             if !healthy {
                 dead_keys.push(key.clone());
+            }
+        }
+
+        // Check Redis pools (read lock held briefly, no cloning needed)
+        {
+            let conns = self.connections.read().await;
+            for key in &redis_keys {
+                if let Some(PoolKind::Redis(redis)) = conns.get(key) {
+                    match db::redis_driver::test_connection(redis).await {
+                        Ok(()) => {}
+                        Err(e) => {
+                            log::warn!("Redis connection pool '{key}' is unhealthy: {e}");
+                            dead_keys.push(key.clone());
+                        }
+                    }
+                }
             }
         }
 
@@ -1292,6 +1533,7 @@ enum KeepaliveTarget {
     ClickHouse(db::clickhouse_driver::ChClient),
     SqlServer(Arc<tokio::sync::Mutex<db::sqlserver::SqlServerClient>>),
     Elasticsearch(db::elasticsearch_driver::EsClient),
+    VectorDb(db::vector_driver::VectorClient),
     InfluxDb(db::influxdb_driver::InfluxdbClient),
 }
 
@@ -1308,6 +1550,7 @@ fn keepalive_target_from_pool(pool: &PoolKind, config: &ConnectionConfig) -> Opt
         PoolKind::ClickHouse(client) => Some(KeepaliveTarget::ClickHouse(client.clone())),
         PoolKind::SqlServer(client) => Some(KeepaliveTarget::SqlServer(client.clone())),
         PoolKind::Elasticsearch(client) => Some(KeepaliveTarget::Elasticsearch(client.clone())),
+        PoolKind::VectorDb(client) => Some(KeepaliveTarget::VectorDb(client.clone())),
         PoolKind::InfluxDb(client) => Some(KeepaliveTarget::InfluxDb(client.clone())),
         _ => None,
     }
@@ -1334,6 +1577,7 @@ async fn ping_keepalive_target(target: &mut KeepaliveTarget, timeout: Duration) 
             db::sqlserver::test_connection(&mut client).await
         }
         KeepaliveTarget::Elasticsearch(client) => db::elasticsearch_driver::test_connection(client, timeout).await,
+        KeepaliveTarget::VectorDb(client) => db::vector_driver::test_connection(client, timeout).await,
         KeepaliveTarget::InfluxDb(client) => db::influxdb_driver::test_connection(client, timeout).await,
     }
 }
@@ -1428,7 +1672,26 @@ fn clone_pool_kind(pool: &PoolKind) -> PoolKind {
     match pool {
         PoolKind::Mysql(p, mode) => PoolKind::Mysql(p.clone(), *mode),
         PoolKind::Postgres(p) => PoolKind::Postgres(p.clone()),
-        other => panic!("clone_pool_kind not supported for {:?}", std::mem::discriminant(other)),
+        PoolKind::Sqlite(p) => PoolKind::Sqlite(p.clone()),
+        PoolKind::Rqlite(client) => PoolKind::Rqlite(client.clone()),
+        PoolKind::Turso(client) => PoolKind::Turso(client.clone()),
+        #[cfg(feature = "duckdb-bundled")]
+        PoolKind::DuckDb(con) => PoolKind::DuckDb(con.clone()),
+        #[cfg(not(feature = "duckdb-bundled"))]
+        PoolKind::DuckDb(con) => PoolKind::DuckDb(con.clone()),
+        PoolKind::MongoDb(client) => PoolKind::MongoDb(client.clone()),
+        PoolKind::ClickHouse(client) => PoolKind::ClickHouse(client.clone()),
+        PoolKind::SqlServer(client) => PoolKind::SqlServer(client.clone()),
+        PoolKind::Elasticsearch(client) => PoolKind::Elasticsearch(client.clone()),
+        PoolKind::VectorDb(client) => PoolKind::VectorDb(client.clone()),
+        PoolKind::InfluxDb(client) => PoolKind::InfluxDb(client.clone()),
+        PoolKind::Agent(client) => PoolKind::Agent(client.clone()),
+        PoolKind::ExternalTabular(ext) => PoolKind::ExternalTabular(ext.clone()),
+        PoolKind::ExternalDriver { driver_id, config, session } => {
+            PoolKind::ExternalDriver { driver_id: driver_id.clone(), config: config.clone(), session: session.clone() }
+        }
+        PoolKind::MessageQueue => PoolKind::MessageQueue,
+        PoolKind::Redis(_) => panic!("clone_pool_kind not supported for Redis — handled separately"),
     }
 }
 
@@ -1441,18 +1704,33 @@ pub async fn close_pool_kind(pool: PoolKind) {
         PoolKind::Sqlite(_) => {}
         PoolKind::Rqlite(_) => {}
         PoolKind::Turso(_) => {}
-        PoolKind::Redis(_) => {}
+        PoolKind::Redis(conn) => {
+            drop(conn);
+        }
         #[cfg(feature = "duckdb-bundled")]
         PoolKind::DuckDb(con) => {
             crate::db::duckdb_driver::close_connection(con);
         }
         #[cfg(not(feature = "duckdb-bundled"))]
         PoolKind::DuckDb(_) => {}
-        PoolKind::MongoDb(_) => {}
-        PoolKind::ClickHouse(_) => {}
-        PoolKind::SqlServer(_) => {}
-        PoolKind::Elasticsearch(_) => {}
-        PoolKind::InfluxDb(_) => {}
+        PoolKind::MongoDb(client) => {
+            drop(client);
+        }
+        PoolKind::ClickHouse(client) => {
+            drop(client);
+        }
+        PoolKind::SqlServer(client) => {
+            drop(client);
+        }
+        PoolKind::Elasticsearch(client) => {
+            drop(client);
+        }
+        PoolKind::VectorDb(client) => {
+            drop(client);
+        }
+        PoolKind::InfluxDb(client) => {
+            drop(client);
+        }
         PoolKind::Agent(client) => {
             let mut client = client.lock().await;
             let _ = client.disconnect().await;
@@ -1510,7 +1788,8 @@ fn base_pool_key_for(
 ) -> String {
     let is_single_connection_pool = db_type.as_ref().is_some_and(|db_type| {
         let is_single = database_capabilities::is_single_connection_pool(db_type)
-            || (include_elasticsearch_single_pool && *db_type == DatabaseType::Elasticsearch);
+            || (include_elasticsearch_single_pool
+                && matches!(db_type, DatabaseType::Elasticsearch | DatabaseType::Qdrant | DatabaseType::Milvus));
         is_single && (!database_capabilities::is_agent_type(db_type) || shares_database_pool_with_connection(db_type))
     });
 

@@ -206,7 +206,7 @@ pub fn default_idle_timeout_secs() -> u64 {
 }
 
 pub fn default_keepalive_interval_secs() -> u64 {
-    0
+    60
 }
 
 fn default_proxy_port() -> u16 {
@@ -254,6 +254,10 @@ pub enum DatabaseType {
     Oracle,
     #[serde(rename = "elasticsearch")]
     Elasticsearch,
+    #[serde(rename = "qdrant")]
+    Qdrant,
+    #[serde(rename = "milvus")]
+    Milvus,
     Doris,
     #[serde(rename = "starrocks")]
     StarRocks,
@@ -709,10 +713,11 @@ impl ConnectionConfig {
             DatabaseType::MongoDb => {
                 let is_tunneled = host != self.host.as_str() || port != self.port;
                 if let Some(cs) = self.connection_string.as_deref().filter(|s| !s.is_empty()) {
+                    let cs = normalize_mongo_uri_direct_connection(cs);
                     if is_tunneled {
-                        return rewrite_mongo_uri_host(cs, &host, port);
+                        return rewrite_mongo_uri_host(&cs, &host, port);
                     }
-                    return cs.to_string();
+                    return cs;
                 }
                 let mut suffix = if params.is_empty() { String::new() } else { format!("?{params}") };
                 if is_tunneled && !suffix.contains("directConnection=") {
@@ -725,7 +730,7 @@ impl ConnectionConfig {
                 format!("mongodb://{host}:{port}{db_part}{suffix}")
             }
             DatabaseType::Oracle => format!("oracle://{host}:{port}{db_part}"),
-            DatabaseType::Elasticsearch => {
+            DatabaseType::Elasticsearch | DatabaseType::Qdrant | DatabaseType::Milvus => {
                 let scheme = if self.ssl { "https" } else { "http" };
                 format!("{scheme}://{host}:{port}")
             }
@@ -836,10 +841,11 @@ impl ConnectionConfig {
             DatabaseType::MongoDb => {
                 let is_tunneled = host != self.host.as_str() || port != self.port;
                 if let Some(cs) = self.connection_string.as_deref().filter(|s| !s.is_empty()) {
+                    let cs = normalize_mongo_uri_direct_connection(cs);
                     if is_tunneled {
-                        return rewrite_mongo_uri_host(cs, &host, port);
+                        return rewrite_mongo_uri_host(&cs, &host, port);
                     }
-                    return cs.to_string();
+                    return cs;
                 }
                 let mut suffix = if params.is_empty() { String::new() } else { format!("?{params}") };
                 if is_tunneled && !suffix.contains("directConnection=") {
@@ -858,7 +864,7 @@ impl ConnectionConfig {
             DatabaseType::Oracle => {
                 format!("oracle://{}:{}@{host}:{port}{db_part}", username, password)
             }
-            DatabaseType::Elasticsearch => {
+            DatabaseType::Elasticsearch | DatabaseType::Qdrant | DatabaseType::Milvus => {
                 let scheme = if self.ssl { "https" } else { "http" };
                 format!("{scheme}://{host}:{port}")
             }
@@ -1119,6 +1125,58 @@ fn normalize_mongo_url_params(value: &str, force_tls: bool) -> String {
     }
 
     parts.join("&")
+}
+
+fn normalize_mongo_uri_direct_connection(uri: &str) -> String {
+    if !mongo_uri_has_multiple_seeds(uri) || !mongo_uri_has_direct_connection_true(uri) {
+        return uri.to_string();
+    }
+
+    let (before_fragment, fragment) =
+        uri.split_once('#').map(|(base, fragment)| (base, Some(fragment))).unwrap_or((uri, None));
+    let Some((base, query)) = before_fragment.split_once('?') else {
+        return uri.to_string();
+    };
+    let params =
+        query.split('&').filter(|part| !mongo_url_param_is_direct_connection_true(part)).collect::<Vec<_>>().join("&");
+
+    let mut normalized = if params.is_empty() { base.to_string() } else { format!("{base}?{params}") };
+    if let Some(fragment) = fragment {
+        normalized.push('#');
+        normalized.push_str(fragment);
+    }
+    normalized
+}
+
+fn mongo_uri_has_multiple_seeds(uri: &str) -> bool {
+    mongo_uri_host_section(uri)
+        .map(|hosts| hosts.split(',').filter(|host| !host.trim().is_empty()).count() > 1)
+        .unwrap_or(false)
+}
+
+fn mongo_uri_host_section(uri: &str) -> Option<&str> {
+    let rest = uri.strip_prefix("mongodb://").or_else(|| uri.strip_prefix("mongodb+srv://"))?;
+    let authority = rest.split('/').next()?.split('?').next().unwrap_or(rest);
+    Some(match authority.rfind('@') {
+        Some(idx) => &authority[idx + 1..],
+        None => authority,
+    })
+}
+
+fn mongo_uri_has_direct_connection_true(uri: &str) -> bool {
+    uri.split_once('?')
+        .map(|(_, query)| {
+            query.split('#').next().unwrap_or("").split('&').any(mongo_url_param_is_direct_connection_true)
+        })
+        .unwrap_or(false)
+}
+
+fn mongo_url_param_is_direct_connection_true(part: &str) -> bool {
+    let Some((key, value)) = part.split_once('=') else {
+        return false;
+    };
+    percent_decode_str(key).decode_utf8_lossy().eq_ignore_ascii_case("directConnection")
+        && percent_decode_str(value).decode_utf8_lossy().eq_ignore_ascii_case("true")
 }
 
 fn normalize_postgres_url_params(value: &str, force_tls: bool) -> String {
@@ -2141,6 +2199,30 @@ mod tests {
         let url = config.connection_url();
 
         assert_eq!(url, "mongodb://read:pass@host1:27017,host2:27017/admin?replicaSet=rs0");
+    }
+
+    #[test]
+    fn mongodb_multi_seed_connection_string_removes_direct_connection_true() {
+        let mut config = mongodb_config("root", "secret", Some("admin"));
+        config.connection_string = Some(
+            "mongodb://read:pass@host1:27017,host2:27017/admin?directConnection=true&replicaSet=rs0&authSource=admin"
+                .to_string(),
+        );
+
+        let url = config.connection_url();
+
+        assert_eq!(url, "mongodb://read:pass@host1:27017,host2:27017/admin?replicaSet=rs0&authSource=admin");
+    }
+
+    #[test]
+    fn mongodb_single_seed_connection_string_keeps_direct_connection_true() {
+        let mut config = mongodb_config("root", "secret", Some("admin"));
+        config.connection_string =
+            Some("mongodb://read:pass@host1:27017/admin?directConnection=true&authSource=admin".to_string());
+
+        let url = config.connection_url();
+
+        assert_eq!(url, "mongodb://read:pass@host1:27017/admin?directConnection=true&authSource=admin");
     }
 
     #[test]

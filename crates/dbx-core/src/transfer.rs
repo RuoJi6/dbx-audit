@@ -29,6 +29,15 @@ pub enum TransferMode {
     Upsert,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum TransferTableNameCase {
+    #[default]
+    Preserve,
+    Lower,
+    Upper,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransferRequest {
@@ -43,7 +52,19 @@ pub struct TransferRequest {
     pub create_table: bool,
     #[serde(default)]
     pub mode: TransferMode,
+    #[serde(default)]
+    pub target_table_name_case: TransferTableNameCase,
     pub batch_size: usize,
+}
+
+impl TransferRequest {
+    pub fn target_table_name(&self, source_table: &str) -> String {
+        match self.target_table_name_case {
+            TransferTableNameCase::Preserve => source_table.to_string(),
+            TransferTableNameCase::Lower => source_table.to_lowercase(),
+            TransferTableNameCase::Upper => source_table.to_uppercase(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -75,6 +96,19 @@ pub fn quote_identifier(name: &str, db_type: &DatabaseType) -> String {
 
 pub fn qualified_table(table: &str, schema: &str, db_type: &DatabaseType) -> String {
     qualified_transfer_table(table, schema, db_type)
+}
+
+pub fn validate_transfer_target_table_names(request: &TransferRequest) -> Result<(), String> {
+    let mut targets: HashMap<String, String> = HashMap::new();
+    for source_table in &request.tables {
+        let target_table = request.target_table_name(source_table);
+        if let Some(first_source) = targets.insert(target_table.clone(), source_table.clone()) {
+            return Err(format!(
+                "Target table name collision after case conversion: '{first_source}' and '{source_table}' both map to '{target_table}'"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn quote_string_literal(value: &str) -> String {
@@ -632,7 +666,12 @@ pub fn escape_value_typed(val: &serde_json::Value, db_type: &DatabaseType, colum
             _ => n.to_string(),
         },
         serde_json::Value::String(s) => {
-            let escaped = format_literal_string(s, db_type, column_type).replace('\\', "\\\\").replace('\'', "''");
+            let literal = format_literal_string(s, db_type, column_type);
+            let escaped = if is_postgres_family_target(db_type) {
+                literal.replace('\'', "''")
+            } else {
+                literal.replace('\\', "\\\\").replace('\'', "''")
+            };
             match db_type {
                 DatabaseType::Mysql | DatabaseType::Doris | DatabaseType::StarRocks
                     if column_type.is_some_and(is_mysql_bit_type) =>
@@ -2597,6 +2636,7 @@ where
     F: FnMut(TransferProgress),
 {
     let total_tables = request.tables.len();
+    let target_table = request.target_table_name(table);
     let batch_size = if request.batch_size == 0 { 1000 } else { request.batch_size };
     let mut offset: u64 = 0;
     let mut total_transferred: u64 = 0;
@@ -2607,9 +2647,14 @@ where
     }
 
     if is_mongodb_transfer_type(target_db_type) && request.mode == TransferMode::Overwrite {
-        overwrite_mongo_collection_for_transfer(state, &request.target_connection_id, &request.target_database, table)
-            .await
-            .map_err(|e| format!("Failed to clear MongoDB collection '{table}': {e}"))?;
+        overwrite_mongo_collection_for_transfer(
+            state,
+            &request.target_connection_id,
+            &request.target_database,
+            &target_table,
+        )
+        .await
+        .map_err(|e| format!("Failed to clear MongoDB collection '{target_table}': {e}"))?;
     }
 
     let mut sql_target_column_names: Vec<String> = Vec::new();
@@ -2672,11 +2717,11 @@ where
                 state,
                 &request.target_connection_id,
                 &request.target_database,
-                table,
+                &target_table,
                 &documents,
             )
             .await
-            .map_err(|e| format!("Insert failed for MongoDB collection '{table}' at offset {offset}: {e}"))?;
+            .map_err(|e| format!("Insert failed for MongoDB collection '{target_table}' at offset {offset}: {e}"))?;
         } else {
             if !sql_target_prepared {
                 let mut sql_target_columns = mongo_columns_from_documents(&documents);
@@ -2701,7 +2746,7 @@ where
                 if request.create_table {
                     let ddl = generate_create_table_ddl(
                         &sql_target_columns,
-                        table,
+                        &target_table,
                         &request.source_schema,
                         &request.target_schema,
                         target_db_type,
@@ -2722,7 +2767,7 @@ where
                     if table_exists {
                         for stmt in generate_comment_ddl(
                             &sql_target_columns,
-                            table,
+                            &target_table,
                             &request.target_schema,
                             target_db_type,
                             None,
@@ -2730,7 +2775,7 @@ where
                             if let Err(e) = execute_on_pool(state, target_pool_key, &stmt).await {
                                 log::warn!(
                                     "[transfer] failed to set MongoDB transfer column comment for {}: {}",
-                                    table,
+                                    target_table,
                                     e
                                 );
                             }
@@ -2739,7 +2784,7 @@ where
                 }
 
                 if request.mode == TransferMode::Overwrite {
-                    let full_table = qualified_table(table, &request.target_schema, target_db_type);
+                    let full_table = qualified_table(&target_table, &request.target_schema, target_db_type);
                     let truncate_sql = match target_db_type {
                         DatabaseType::Sqlite | DatabaseType::DuckDb => format!("DELETE FROM {full_table}"),
                         _ => format!("TRUNCATE TABLE {full_table}"),
@@ -2762,7 +2807,7 @@ where
                 &sql_target_column_names,
                 &sql_target_column_types,
                 &rows,
-                table,
+                &target_table,
                 &request.target_schema,
                 target_db_type,
                 &[],
@@ -2770,7 +2815,7 @@ where
             for (statement_index, batch_sql) in write_statements.iter().enumerate() {
                 execute_on_pool(state, target_pool_key, batch_sql).await.map_err(|e| {
                     format!(
-                        "Insert failed for MongoDB collection '{table}' at offset {offset}, chunk {} of {}: {e}",
+                        "Insert failed for MongoDB collection '{target_table}' at offset {offset}, chunk {} of {}: {e}",
                         statement_index + 1,
                         write_statements.len()
                     )
@@ -2834,6 +2879,8 @@ where
 
     let total_tables = request.tables.len();
     let pg_compat_transfer = is_postgres_compat_transfer(source_db_type, target_db_type);
+    let target_table = request.target_table_name(table);
+    let preserves_target_table_name = target_table == table;
 
     // Get source columns (deduplicate by name)
     let columns = {
@@ -2882,7 +2929,7 @@ where
         &request.target_connection_id,
         &request.target_database,
         &request.target_schema,
-        Some(table),
+        Some(&target_table),
         Some(1),
         None,
         None,
@@ -2891,16 +2938,18 @@ where
     .map(|tables| !tables.is_empty())
     .unwrap_or(false);
 
-    let source_indexes = if request.create_table && pg_compat_transfer && !target_table_preexisting {
-        get_postgres_indexes_for_transfer(state, source_pool_key, &request.source_schema, table).await?
-    } else {
-        Vec::new()
-    };
-    let source_foreign_keys = if request.create_table && pg_compat_transfer && !target_table_preexisting {
-        get_postgres_foreign_keys_for_transfer(state, source_pool_key, &request.source_schema, table).await?
-    } else {
-        Vec::new()
-    };
+    let source_indexes =
+        if request.create_table && pg_compat_transfer && preserves_target_table_name && !target_table_preexisting {
+            get_postgres_indexes_for_transfer(state, source_pool_key, &request.source_schema, table).await?
+        } else {
+            Vec::new()
+        };
+    let source_foreign_keys =
+        if request.create_table && pg_compat_transfer && preserves_target_table_name && !target_table_preexisting {
+            get_postgres_foreign_keys_for_transfer(state, source_pool_key, &request.source_schema, table).await?
+        } else {
+            Vec::new()
+        };
 
     // Count source rows
     let total_rows = {
@@ -2928,10 +2977,11 @@ where
                 .await
                 .map_err(|e| format!("Failed to ensure schema exists: {e}"))?;
         }
-        let ddl = if (source_db_type == target_db_type)
-            || (is_mysql_family_target(source_db_type) && is_mysql_family_target(target_db_type))
-            || (is_postgres_family_target(source_db_type) && is_postgres_family_target(target_db_type))
-        {
+        let can_reuse_source_ddl = preserves_target_table_name
+            && ((source_db_type == target_db_type)
+                || (is_mysql_family_target(source_db_type) && is_mysql_family_target(target_db_type))
+                || (is_postgres_family_target(source_db_type) && is_postgres_family_target(target_db_type)));
+        let ddl = if can_reuse_source_ddl {
             crate::schema::get_table_ddl_core(
                 &state,
                 &request.source_connection_id,
@@ -2941,19 +2991,21 @@ where
                 None,
             )
             .await
-            .unwrap_or(generate_create_table_ddl(
-                &columns,
-                table,
-                &request.source_schema,
-                &request.target_schema,
-                target_db_type,
-                source_db_type,
-                table_comment.as_deref(),
-            ))
+            .unwrap_or_else(|_| {
+                generate_create_table_ddl(
+                    &columns,
+                    &target_table,
+                    &request.source_schema,
+                    &request.target_schema,
+                    target_db_type,
+                    source_db_type,
+                    table_comment.as_deref(),
+                )
+            })
         } else {
             generate_create_table_ddl(
                 &columns,
-                table,
+                &target_table,
                 &request.source_schema,
                 &request.target_schema,
                 target_db_type,
@@ -2974,11 +3026,16 @@ where
             }
         };
         if table_exists {
-            let comment_stmts =
-                generate_comment_ddl(&columns, table, &request.target_schema, target_db_type, table_comment.as_deref());
+            let comment_stmts = generate_comment_ddl(
+                &columns,
+                &target_table,
+                &request.target_schema,
+                target_db_type,
+                table_comment.as_deref(),
+            );
             for stmt in &comment_stmts {
                 if let Err(e) = execute_on_pool(state, target_pool_key, stmt).await {
-                    log::warn!("[transfer] failed to set column comment for {}: {}", table, e);
+                    log::warn!("[transfer] failed to set column comment for {}: {}", target_table, e);
                 }
             }
         }
@@ -2986,7 +3043,7 @@ where
 
     // Truncate target if overwrite mode
     if request.mode == TransferMode::Overwrite {
-        let full_table = qualified_table(table, &request.target_schema, target_db_type);
+        let full_table = qualified_table(&target_table, &request.target_schema, target_db_type);
         let truncate_sql = match target_db_type {
             DatabaseType::Sqlite | DatabaseType::DuckDb => format!("DELETE FROM {full_table}"),
             _ => format!("TRUNCATE TABLE {full_table}"),
@@ -3006,7 +3063,7 @@ where
                 &request.target_connection_id,
                 &request.target_database,
                 &request.target_schema,
-                table,
+                &target_table,
             )
             .await
             .unwrap_or_default();
@@ -3053,7 +3110,7 @@ where
             &col_names,
             &col_types,
             &result.rows,
-            table,
+            &target_table,
             &request.target_schema,
             target_db_type,
             &pk_columns,
@@ -3063,12 +3120,12 @@ where
                 let absolute_row = parse_mysql_row_error(&e).map(|row| offset + row);
                 match absolute_row {
                     Some(row) => format!(
-                        "Insert failed for table '{table}' at row {row} (chunk {} of {}): {e}",
+                        "Insert failed for table '{target_table}' at row {row} (chunk {} of {}): {e}",
                         statement_index + 1,
                         write_statements.len()
                     ),
                     None => format!(
-                        "Insert failed for table '{table}' at offset {offset}, chunk {} of {}: {e}",
+                        "Insert failed for table '{target_table}' at offset {offset}, chunk {} of {}: {e}",
                         statement_index + 1,
                         write_statements.len()
                     ),
@@ -3097,23 +3154,24 @@ where
     }
 
     if pg_compat_transfer {
-        for statement in generate_postgres_sequence_sync_sql(&columns, table, &request.target_schema) {
+        for statement in generate_postgres_sequence_sync_sql(&columns, &target_table, &request.target_schema) {
             execute_on_pool(state, target_pool_key, &statement)
                 .await
-                .map_err(|e| format!("Failed to sync PostgreSQL sequence for {table}: {e}"))?;
+                .map_err(|e| format!("Failed to sync PostgreSQL sequence for {target_table}: {e}"))?;
         }
     }
 
-    if request.create_table && pg_compat_transfer && !target_table_preexisting {
-        for statement in generate_postgres_index_ddl(&source_indexes, table, &request.target_schema) {
+    if request.create_table && pg_compat_transfer && preserves_target_table_name && !target_table_preexisting {
+        for statement in generate_postgres_index_ddl(&source_indexes, &target_table, &request.target_schema) {
             execute_on_pool(state, target_pool_key, &statement)
                 .await
-                .map_err(|e| format!("Failed to create PostgreSQL index for {table}: {e}"))?;
+                .map_err(|e| format!("Failed to create PostgreSQL index for {target_table}: {e}"))?;
         }
-        for statement in generate_postgres_foreign_key_ddl(&source_foreign_keys, table, &request.target_schema) {
+        for statement in generate_postgres_foreign_key_ddl(&source_foreign_keys, &target_table, &request.target_schema)
+        {
             execute_on_pool(state, target_pool_key, &statement)
                 .await
-                .map_err(|e| format!("Failed to create PostgreSQL foreign key for {table}: {e}"))?;
+                .map_err(|e| format!("Failed to create PostgreSQL foreign key for {target_table}: {e}"))?;
         }
     }
 
@@ -3522,6 +3580,63 @@ mod tests {
             numeric_scale: None,
             character_maximum_length: None,
         }
+    }
+
+    fn test_transfer_request(tables: Vec<&str>) -> TransferRequest {
+        TransferRequest {
+            transfer_id: "transfer-1".to_string(),
+            source_connection_id: "source".to_string(),
+            source_database: "source_db".to_string(),
+            source_schema: "source_schema".to_string(),
+            target_connection_id: "target".to_string(),
+            target_database: "target_db".to_string(),
+            target_schema: "target_schema".to_string(),
+            tables: tables.into_iter().map(str::to_string).collect(),
+            create_table: true,
+            mode: TransferMode::Append,
+            target_table_name_case: TransferTableNameCase::Preserve,
+            batch_size: 1000,
+        }
+    }
+
+    #[test]
+    fn transfer_request_defaults_preserve_table_name_case() {
+        let request: TransferRequest = serde_json::from_value(json!({
+            "transferId": "transfer-1",
+            "sourceConnectionId": "source",
+            "sourceDatabase": "source_db",
+            "sourceSchema": "source_schema",
+            "targetConnectionId": "target",
+            "targetDatabase": "target_db",
+            "targetSchema": "target_schema",
+            "tables": ["ORDERS"],
+            "createTable": true,
+            "mode": "append",
+            "batchSize": 1000
+        }))
+        .unwrap();
+
+        assert_eq!(request.target_table_name_case, TransferTableNameCase::Preserve);
+        assert_eq!(request.target_table_name("ORDERS"), "ORDERS");
+    }
+
+    #[test]
+    fn transfer_table_name_case_transforms_target_names() {
+        let mut request = test_transfer_request(vec!["ORDERS"]);
+        request.target_table_name_case = TransferTableNameCase::Lower;
+        assert_eq!(request.target_table_name("ORDERS"), "orders");
+
+        request.target_table_name_case = TransferTableNameCase::Upper;
+        assert_eq!(request.target_table_name("orders"), "ORDERS");
+    }
+
+    #[test]
+    fn transfer_table_name_case_detects_target_collisions() {
+        let mut request = test_transfer_request(vec!["ORDERS", "orders"]);
+        request.target_table_name_case = TransferTableNameCase::Lower;
+
+        let error = validate_transfer_target_table_names(&request).unwrap_err();
+        assert!(error.contains("both map to 'orders'"));
     }
 
     #[test]
@@ -4106,6 +4221,60 @@ mod tests {
         );
 
         assert_eq!(sql, "INSERT INTO [dbo].[customers] ([name], [note]) VALUES\n(N'Tiếng Việt', N'O''Brien')");
+    }
+
+    #[test]
+    fn postgres_insert_preserves_json_escape_sequences() {
+        let sql = generate_insert_typed(
+            &[String::from("payload")],
+            &[Some(String::from("jsonb"))],
+            &[vec![json!(r#"{"message":"hello\nworld"}"#)]],
+            "events",
+            "public",
+            &DatabaseType::Postgres,
+        );
+
+        assert_eq!(
+            sql,
+            r#"INSERT INTO "public"."events" ("payload") VALUES
+('{"message":"hello\nworld"}')"#
+        );
+    }
+
+    #[test]
+    fn postgres_insert_preserves_text_backslashes() {
+        let sql = generate_insert_typed(
+            &[String::from("path")],
+            &[Some(String::from("text"))],
+            &[vec![json!(r#"C:\tmp\file.txt"#)]],
+            "files",
+            "public",
+            &DatabaseType::Postgres,
+        );
+
+        assert_eq!(
+            sql,
+            r#"INSERT INTO "public"."files" ("path") VALUES
+('C:\tmp\file.txt')"#
+        );
+    }
+
+    #[test]
+    fn mysql_insert_keeps_backslash_escape_style() {
+        let sql = generate_insert_typed(
+            &[String::from("path")],
+            &[Some(String::from("varchar(255)"))],
+            &[vec![json!(r#"C:\tmp\file.txt"#)]],
+            "files",
+            "",
+            &DatabaseType::Mysql,
+        );
+
+        assert_eq!(
+            sql,
+            r#"INSERT INTO `files` (`path`) VALUES
+('C:\\tmp\\file.txt')"#
+        );
     }
 
     #[test]

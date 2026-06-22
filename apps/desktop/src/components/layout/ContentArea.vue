@@ -36,6 +36,7 @@ const DataGrid = defineAsyncComponent(loadDataGridComponent);
 const RedisKeyBrowser = defineAsyncComponent(() => import("@/components/redis/RedisKeyBrowser.vue"));
 const EtcdKeyBrowser = defineAsyncComponent(() => import("@/components/etcd/EtcdKeyBrowser.vue"));
 const DocumentBrowser = defineAsyncComponent(() => import("@/components/document/DocumentBrowser.vue"));
+const VectorBrowser = defineAsyncComponent(() => import("@/components/vector/VectorBrowser.vue"));
 const MqAdminConsole = defineAsyncComponent(() => import("@/components/mq/MqAdminConsole.vue"));
 const ObjectBrowser = defineAsyncComponent(() => import("@/components/objects/ObjectBrowser.vue"));
 const TableStructureEditor = defineAsyncComponent(() => import("@/components/structure/TableStructureEditor.vue"));
@@ -72,6 +73,8 @@ type DataGridHandle = {
   toggleColumnVisibility: (columnIndex: number) => void;
   showAllColumns: () => void;
   invertColumnVisibility: () => void;
+  hasCustomColumnOrder: boolean;
+  resetColumnOrder: () => void;
   nullColumnsHidden: boolean;
   allNullColumnCount: number;
   canToggleAllNullColumns: boolean;
@@ -239,6 +242,12 @@ const activeQueryError = computed(() => {
 });
 const hasQueryOutput = computed(() => !!props.activeTab.result || !!props.activeTab.explainPlan || !!props.activeTab.explainError || props.activeTab.isExecuting === true || props.activeTab.isExplaining === true);
 const tabularResults = computed(() => tabularResultItems(props.activeTab.results));
+const allResultExportSheets = computed(() =>
+  tabularResults.value.map((item) => ({
+    sheetName: t("tabs.resultN", { n: item.n }),
+    result: item.result,
+  })),
+);
 const resultRuns = computed(() => resultRunItems(props.activeTab));
 const activeResultRunItem = computed(() => resultRuns.value.find((run) => run.active));
 const activeResultGridCacheKey = computed(() => resultGridCacheKey(props.activeTab));
@@ -518,7 +527,11 @@ function handleModRTarget(target: Element): boolean {
   return false;
 }
 
-defineExpose({ focusSearch, refreshData, handleModRTarget });
+function requestQueryEditorExecute() {
+  return queryEditorRef.value?.requestExecute();
+}
+
+defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExecute });
 </script>
 
 <template>
@@ -775,7 +788,8 @@ defineExpose({ focusSearch, refreshData, handleModRTarget });
                 :total-row-count="activeTab.resultTotalRowCount"
                 :total-row-count-loading="activeTab.resultTotalRowCountLoading"
                 :on-execute-sql="async (sql: string) => emit('executeSql', sql)"
-                :full-export-result="() => queryStore.fetchTabResultForExport(activeTab.id)"
+                :full-export-result="(onProgress?: (info: { rowsExported: number; totalRows: number | null }) => void) => queryStore.fetchTabResultForExport(activeTab.id, onProgress)"
+                :all-export-results="allResultExportSheets"
                 @update:order-by-input="(v: string) => (activeTab.orderByInput = v)"
                 @reload="(sql?: string, searchText?: string, whereInput?: string, orderBy?: string, limit?: number, offset?: number) => emit('reload', sql, searchText, whereInput, orderBy, limit, offset)"
                 @paginate="(offset: number, limit: number, whereInput?: string, orderBy?: string) => emit('paginate', offset, limit, whereInput, orderBy)"
@@ -850,11 +864,14 @@ defineExpose({ focusSearch, refreshData, handleModRTarget });
                   {{ t("grid.noSearchResults") }}
                 </div>
               </div>
-              <div class="flex items-center justify-between gap-2 border-t bg-muted/30 px-2 py-1.5">
-                <span class="text-[11px] text-muted-foreground">{{ t("grid.columnVisibilityHint") }}</span>
-                <div class="flex items-center gap-1">
+              <div class="flex flex-col gap-1 border-t bg-muted/30 px-2 py-1.5">
+                <span class="text-[11px] leading-4 text-muted-foreground">{{ t("grid.columnVisibilityHint") }}</span>
+                <div class="flex items-center justify-end gap-1">
                   <Button variant="ghost" size="sm" class="h-7 px-2 text-xs" :disabled="(dataGridRef?.displayableColumnCount ?? 0) <= 1" @click="dataGridRef?.invertColumnVisibility()">
                     {{ t("grid.invertColumnVisibility") }}
+                  </Button>
+                  <Button variant="ghost" size="sm" class="h-7 px-2 text-xs" :disabled="!dataGridRef?.hasCustomColumnOrder" @click="dataGridRef?.resetColumnOrder()">
+                    {{ t("grid.resetColumnOrder") }}
                   </Button>
                   <Button variant="ghost" size="sm" class="h-7 px-2 text-xs" :disabled="(dataGridRef?.hiddenColumnCount ?? 0) === 0" @click="dataGridRef?.showAllColumns()">
                     {{ t("grid.showAllColumns") }}
@@ -962,7 +979,7 @@ defineExpose({ focusSearch, refreshData, handleModRTarget });
           :page-offset="activeTab.resultPageOffset"
           :page-limit="activeTab.resultPageLimit"
           :on-execute-sql="async (sql: string) => emit('executeSql', sql)"
-          :full-export-result="() => queryStore.fetchTabResultForExport(activeTab.id)"
+          :full-export-result="(onProgress?: (info: { rowsExported: number; totalRows: number | null }) => void) => queryStore.fetchTabResultForExport(activeTab.id, onProgress)"
           @update:where-input="(v: string) => (activeTab.whereInput = v)"
           @update:order-by-input="(v: string) => (activeTab.orderByInput = v)"
           @reload="(sql?: string, searchText?: string, whereInput?: string, orderBy?: string, limit?: number, offset?: number) => emit('reload', sql, searchText, whereInput, orderBy, limit, offset)"
@@ -1004,6 +1021,13 @@ defineExpose({ focusSearch, refreshData, handleModRTarget });
     <template v-else-if="activeTab.mode === 'mongo'">
       <div class="flex-1 min-h-0">
         <DocumentBrowser :key="activeTab.id" :connection-id="activeTab.connectionId" :database="activeTab.database" :collection="activeTab.sql" :database-type="activeEffectiveDatabaseType" />
+      </div>
+    </template>
+
+    <!-- Vector mode: Qdrant and Milvus collections -->
+    <template v-else-if="activeTab.mode === 'vector'">
+      <div class="flex-1 min-h-0">
+        <VectorBrowser :key="activeTab.id" :connection-id="activeTab.connectionId" :database="activeTab.database" :collection="activeTab.sql" :database-type="activeEffectiveDatabaseType" />
       </div>
     </template>
 

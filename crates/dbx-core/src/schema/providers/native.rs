@@ -58,6 +58,9 @@ pub(in crate::schema) async fn list_tables(
         PoolKind::Elasticsearch(client) => {
             db::elasticsearch_driver::list_indices(client).await.map(|names| collection_names_to_tables(names, "INDEX"))
         }
+        PoolKind::VectorDb(client) => {
+            db::vector_driver::list_collections(client).await.map(|names| collection_names_to_tables(names, "COLLECTION"))
+        }
         _ => Ok(vec![]),
     }
 }
@@ -136,6 +139,7 @@ pub(in crate::schema) async fn get_columns(
         PoolKind::Rqlite(client) => db::rqlite_driver::get_columns(client, schema, table).await,
         PoolKind::Turso(client) => db::turso_driver::get_columns(client, schema, table).await,
         PoolKind::Elasticsearch(client) => db::elasticsearch_driver::get_columns(client, table).await,
+        PoolKind::VectorDb(_) => Ok(vec![]),
         _ => Ok(vec![]),
     }
 }

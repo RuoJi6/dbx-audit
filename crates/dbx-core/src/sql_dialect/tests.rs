@@ -53,6 +53,29 @@ fn qualifies_schema_only_for_schema_aware_databases() {
 }
 
 #[test]
+fn maps_table_pagination_strategy_by_database_type() {
+    assert_eq!(table_pagination_strategy(Some(DatabaseType::Mysql)), TablePaginationStrategy::LimitOffset);
+    assert_eq!(table_pagination_strategy(Some(DatabaseType::Dameng)), TablePaginationStrategy::FetchFirst);
+    assert_eq!(table_pagination_strategy(Some(DatabaseType::Db2)), TablePaginationStrategy::Db2FetchFirst);
+    assert_eq!(table_pagination_strategy(Some(DatabaseType::SqlServer)), TablePaginationStrategy::SqlServerTop);
+    assert_eq!(table_pagination_strategy(Some(DatabaseType::Iris)), TablePaginationStrategy::IrisTop);
+    assert_eq!(table_pagination_strategy(Some(DatabaseType::Informix)), TablePaginationStrategy::InformixFirst);
+    assert_eq!(table_pagination_strategy(Some(DatabaseType::OceanbaseOracle)), TablePaginationStrategy::Rownum);
+    assert_eq!(table_pagination_strategy(Some(DatabaseType::Questdb)), TablePaginationStrategy::QuestDbLimit);
+    assert_eq!(table_pagination_strategy(Some(DatabaseType::Oracle)), TablePaginationStrategy::Unbounded);
+    assert_eq!(
+        pagination_strategy(Some(DatabaseType::Oracle), PaginationContext::BoundedRead),
+        TablePaginationStrategy::FetchFirst
+    );
+    assert_eq!(
+        pagination_strategy(Some(DatabaseType::Oracle), PaginationContext::UserQuery),
+        TablePaginationStrategy::Unbounded
+    );
+    assert_eq!(table_pagination_strategy(Some(DatabaseType::Jdbc)), TablePaginationStrategy::AgentMaxRows);
+    assert_eq!(table_pagination_strategy(None), TablePaginationStrategy::LimitOffset);
+}
+
+#[test]
 fn builds_select_sql_with_limit_syntax_for_database_type() {
     let columns = vec!["id".to_string(), "name".to_string()];
     let keys = vec!["id".to_string()];
@@ -89,6 +112,17 @@ fn builds_select_sql_with_limit_syntax_for_database_type() {
             limit: 100,
         }),
         "SELECT \"id\", \"name\" FROM \"DB2INST1\".\"USERS\" ORDER BY \"id\" ASC FETCH FIRST 100 ROWS ONLY"
+    );
+    assert_eq!(
+        build_table_select_sql(TableSelectSqlOptions {
+            database_type: Some(DatabaseType::OceanbaseOracle),
+            schema: Some("DBXTEST"),
+            table_name: "USERS",
+            columns: &columns,
+            order_columns: &keys,
+            limit: 100,
+        }),
+        "SELECT \"id\", \"name\" FROM (SELECT \"id\", \"name\" FROM \"DBXTEST\".\"USERS\" ORDER BY \"id\" ASC) WHERE ROWNUM <= 100"
     );
     // JDBC connections skip SQL-level row limiting — the JDBC agent handles
     // it via Statement.setMaxRows() which is universally supported.
@@ -268,6 +302,38 @@ fn builds_table_data_where_and_schema_queries() {
             include_row_id: false,
         }),
         "SELECT * FROM \"DB2INST1\".\"ORDERS\" WHERE (amount > 10) FETCH FIRST 50 ROWS ONLY"
+    );
+    assert_eq!(
+        build_table_data_select_sql(TableDataSelectSqlOptions {
+            database_type: Some(DatabaseType::OceanbaseOracle),
+            schema: Some("DBXTEST".to_string()),
+            table_name: "ORDERS".to_string(),
+            primary_keys: Vec::new(),
+            columns: Vec::new(),
+            fallback_order_columns: Vec::new(),
+            order_by: None,
+            limit: Some(100),
+            offset: None,
+            where_input: None,
+            include_row_id: false,
+        }),
+        "SELECT * FROM (SELECT * FROM \"DBXTEST\".\"ORDERS\") WHERE ROWNUM <= 100"
+    );
+    assert_eq!(
+        build_table_data_select_sql(TableDataSelectSqlOptions {
+            database_type: Some(DatabaseType::OceanbaseOracle),
+            schema: Some("DBXTEST".to_string()),
+            table_name: "ORDERS".to_string(),
+            primary_keys: vec!["ID".to_string()],
+            columns: Vec::new(),
+            fallback_order_columns: Vec::new(),
+            order_by: None,
+            limit: Some(50),
+            offset: None,
+            where_input: Some("WHERE amount > 10".to_string()),
+            include_row_id: false,
+        }),
+        "SELECT * FROM (SELECT * FROM \"DBXTEST\".\"ORDERS\" WHERE (amount > 10) ORDER BY \"ID\" ASC) WHERE ROWNUM <= 50"
     );
     assert_eq!(
             build_table_data_select_sql(TableDataSelectSqlOptions {

@@ -645,6 +645,24 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
                     .await
                     .map(|_| "Connection successful".to_string())
             }
+            DatabaseType::Qdrant | DatabaseType::Milvus => {
+                let kind = match config.db_type {
+                    DatabaseType::Qdrant => db::vector_driver::VectorDbKind::Qdrant,
+                    DatabaseType::Milvus => db::vector_driver::VectorDbKind::Milvus,
+                    _ => unreachable!(),
+                };
+                let client = db::vector_driver::VectorClient::new(
+                    kind,
+                    &url,
+                    Some(&config.username),
+                    Some(&config.password),
+                    config.ssl,
+                    connect_timeout,
+                );
+                db::vector_driver::test_connection(&client, connect_timeout)
+                    .await
+                    .map(|_| "Connection successful".to_string())
+            }
             DatabaseType::Rqlite => {
                 let client = db::rqlite_driver::RqliteClient::new(
                     &url,
@@ -885,6 +903,23 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
             );
             db::elasticsearch_driver::test_connection(&mut client, connect_timeout).await?;
             PoolKind::Elasticsearch(client)
+        }
+        DatabaseType::Qdrant | DatabaseType::Milvus => {
+            let kind = match db_config.db_type {
+                DatabaseType::Qdrant => db::vector_driver::VectorDbKind::Qdrant,
+                DatabaseType::Milvus => db::vector_driver::VectorDbKind::Milvus,
+                _ => unreachable!(),
+            };
+            let client = db::vector_driver::VectorClient::new(
+                kind,
+                &url,
+                Some(&db_config.username),
+                Some(&db_config.password),
+                db_config.ssl,
+                connect_timeout,
+            );
+            db::vector_driver::test_connection(&client, connect_timeout).await?;
+            PoolKind::VectorDb(client)
         }
         DatabaseType::Rqlite => {
             let client = db::rqlite_driver::RqliteClient::new(

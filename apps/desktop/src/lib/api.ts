@@ -112,6 +112,7 @@ export const deleteSchemaCachePrefix = forward("deleteSchemaCachePrefix");
 export const listSchemas = forward("listSchemas");
 export const listTables = forward("listTables");
 export const listObjects = forward("listObjects");
+export const listObjectStatistics = forward("listObjectStatistics");
 export const listCompletionObjects = forward("listCompletionObjects");
 export const getObjectSource = forward("getObjectSource");
 export const getColumns = forward("getColumns");
@@ -247,6 +248,7 @@ export const cancelDatabaseExport = forward("cancelDatabaseExport");
 export const exportQueryResultCsv = forward("exportQueryResultCsv");
 export const exportTableDataCsv = forward("exportTableDataCsv");
 export const exportQueryResultXlsx = forward("exportQueryResultXlsx");
+export const exportQueryResultsXlsx = forward("exportQueryResultsXlsx");
 export const exportQueryResultJson = forward("exportQueryResultJson");
 export const exportQueryResultMarkdown = forward("exportQueryResultMarkdown");
 export const startTableExport = forward("startTableExport");
@@ -278,6 +280,8 @@ export const redisFlushDb = forward("redisFlushDb");
 export const redisExecuteCommand = forward("redisExecuteCommand");
 export const redisLoadMore = forward("redisLoadMore");
 export const redisPubSubPublish = forward("redisPubSubPublish");
+export const redisSlowlogGet = forward("redisSlowlogGet");
+export const redisClusterMasterNodes = forward("redisClusterMasterNodes");
 
 export function redisPubSubConnect(connectionId: string): WebSocket {
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
@@ -335,6 +339,9 @@ export const mqRawRequest = forward("mqRawRequest");
 // MongoDB
 export const mongoListDatabases = forward("mongoListDatabases");
 export const mongoListCollections = forward("mongoListCollections");
+export const mongoCreateDatabase = forward("mongoCreateDatabase");
+export const mongoDropDatabase = forward("mongoDropDatabase");
+export const mongoDropCollection = forward("mongoDropCollection");
 export const documentFindDocuments = forward("documentFindDocuments");
 export const mongoFindDocuments = forward("mongoFindDocuments");
 export const mongoAggregateDocuments = forward("mongoAggregateDocuments");
@@ -347,6 +354,7 @@ export const mongoDeleteDocuments = forward("mongoDeleteDocuments");
 
 // Elasticsearch
 export const elasticsearchListIndices = forward("elasticsearchListIndices");
+export const vectorListCollections = forward("vectorListCollections");
 
 // History
 export const saveHistory = forward("saveHistory");
@@ -402,6 +410,8 @@ export type {
   RedisScanResult,
   RedisCommandSafety,
   RedisCommandResult,
+  RedisSlowlogEntry,
+  RedisNodeEndpoint,
   KvValueEncoding,
   KvValue,
   KvKeyMetadata,
@@ -419,6 +429,7 @@ export type {
   TransferRequest,
   TransferProgress,
   TransferMode,
+  TransferTableNameCase,
   TableImportMode,
   TableImportStatus,
   TableImportColumnMapping,

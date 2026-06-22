@@ -50,6 +50,8 @@ pub enum AiProvider {
     Ollama,
     #[serde(rename = "openai-compatible")]
     OpenaiCompatible,
+    #[serde(rename = "codex-cli")]
+    CodexCli,
     Custom,
 }
 
@@ -67,6 +69,29 @@ pub enum AiAuthMethod {
     #[default]
     ApiKey,
     Bearer,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum AiReasoningLevel {
+    #[default]
+    Default,
+    Minimal,
+    Low,
+    Medium,
+    High,
+}
+
+impl AiReasoningLevel {
+    pub fn as_codex_effort(&self) -> Option<&'static str> {
+        match self {
+            AiReasoningLevel::Default => None,
+            AiReasoningLevel::Minimal => Some("minimal"),
+            AiReasoningLevel::Low => Some("low"),
+            AiReasoningLevel::Medium => Some("medium"),
+            AiReasoningLevel::High => Some("high"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,7 +115,11 @@ pub struct AiConfig {
     #[serde(default = "default_enable_thinking")]
     pub enable_thinking: bool,
     #[serde(default)]
+    pub reasoning_level: AiReasoningLevel,
+    #[serde(default)]
     pub context_window: Option<u32>,
+    #[serde(default)]
+    pub codex_cli_path: Option<String>,
 }
 
 fn default_enable_thinking() -> bool {
@@ -234,6 +263,7 @@ pub fn resolve_endpoint(config: &AiConfig) -> String {
     }
     match config.provider {
         AiProvider::Claude => format!("{ep}/messages"),
+        AiProvider::CodexCli => unreachable!(),
         AiProvider::Openai
         | AiProvider::Deepseek
         | AiProvider::Qwen
@@ -395,10 +425,10 @@ fn is_kimi_model(model: &str) -> bool {
     if let Some(rest) = model.strip_prefix("kimi-k") {
         if rest.starts_with("2.") && rest.len() > 2 {
             // K2.x — the digit after "2." must be >= 5 (so K2.5+)
-            rest[2..].chars().next().map_or(false, |c| c.is_ascii_digit() && c >= '5')
+            rest[2..].chars().next().is_some_and(|c| c.is_ascii_digit() && c >= '5')
         } else {
             // K3+ — first char must be digit >= 3
-            rest.chars().next().map_or(false, |c| c.is_ascii_digit() && c >= '3')
+            rest.chars().next().is_some_and(|c| c.is_ascii_digit() && c >= '3')
         }
     } else {
         false
@@ -406,12 +436,13 @@ fn is_kimi_model(model: &str) -> bool {
 }
 
 pub fn supports_temperature(config: &AiConfig) -> bool {
-    !(is_openai_api_config(config) && is_openai_reasoning_model(&config.model)) && !is_kimi_model(&config.model)
+    !(is_kimi_model(&config.model) || is_openai_api_config(config) && is_openai_reasoning_model(&config.model))
 }
 
 pub fn add_temperature_if_supported(body: &mut serde_json::Value, request: &AiCompletionRequest) {
     if supports_temperature(&request.config) {
-        body["temperature"] = json!(request.temperature.unwrap_or(0.2));
+        let default_temp = if is_kimi_model(&request.config.model) { 1.0 } else { 0.2 };
+        body["temperature"] = json!(request.temperature.unwrap_or(default_temp));
     }
 }
 
@@ -465,6 +496,9 @@ pub fn build_responses_input(system_prompt: &str, messages: &[AiMessage]) -> ser
 // ---------------------------------------------------------------------------
 
 fn validate_config(config: &AiConfig) -> Result<(), String> {
+    if matches!(config.provider, AiProvider::CodexCli) {
+        return Ok(());
+    }
     if !matches!(config.provider, AiProvider::Ollama) && config.api_key.trim().is_empty() {
         return Err("API key is required".to_string());
     }
@@ -478,6 +512,9 @@ fn validate_config(config: &AiConfig) -> Result<(), String> {
 }
 
 fn validate_model_list_config(config: &AiConfig) -> Result<(), String> {
+    if matches!(config.provider, AiProvider::CodexCli) {
+        return Ok(());
+    }
     if !matches!(config.provider, AiProvider::Ollama) && config.api_key.trim().is_empty() {
         return Err("API key is required".to_string());
     }
@@ -611,6 +648,9 @@ async fn list_openai_compatible_models(
 }
 
 pub async fn list_models_core(config: &AiConfig) -> Result<Vec<AiModelInfo>, String> {
+    if matches!(config.provider, AiProvider::CodexCli) {
+        return crate::ai_codex_cli::list_codex_models(config).await;
+    }
     validate_model_list_config(config)?;
 
     let client = build_ai_http_client(config, 30)?;
@@ -623,6 +663,7 @@ pub async fn list_models_core(config: &AiConfig) -> Result<Vec<AiModelInfo>, Str
         | AiProvider::Ollama
         | AiProvider::OpenaiCompatible
         | AiProvider::Custom => list_openai_compatible_models(&client, config).await,
+        AiProvider::CodexCli => unreachable!(),
         AiProvider::Gemini => {
             Err("Model listing is only supported for OpenAI-compatible and Claude providers".to_string())
         }
@@ -844,6 +885,9 @@ fn claude_system_prompt(system_prompt: &str) -> &str {
 }
 
 pub async fn test_connection_core(config: &AiConfig) -> Result<AiTestConnectionResult, String> {
+    if matches!(config.provider, AiProvider::CodexCli) {
+        return crate::ai_codex_cli::test_codex_connection(config).await;
+    }
     validate_config(config)?;
 
     let client = build_ai_http_client(config, 15)?;
@@ -973,11 +1017,16 @@ fn classify_error(msg: &str) -> &'static str {
 pub async fn complete(request: &AiCompletionRequest) -> Result<String, String> {
     validate_config(&request.config)?;
 
+    if matches!(request.config.provider, AiProvider::CodexCli) {
+        return Err("Codex CLI provider is only supported in DBX AI agent mode".to_string());
+    }
+
     let client = build_ai_http_client(&request.config, 60)?;
 
     match request.config.provider {
         AiProvider::Claude => call_claude(&client, request.clone()).await,
         AiProvider::Gemini => call_gemini(&client, request.clone()).await,
+        AiProvider::CodexCli => unreachable!(),
         AiProvider::Openai
         | AiProvider::Deepseek
         | AiProvider::Qwen
@@ -1005,12 +1054,17 @@ pub async fn stream(
 ) -> Result<(), String> {
     validate_config(&request.config)?;
 
+    if matches!(request.config.provider, AiProvider::CodexCli) {
+        return Err("Codex CLI provider is only supported in DBX AI agent mode".to_string());
+    }
+
     let stream_timeout = if request.config.enable_thinking { 600 } else { 120 };
     let client = build_ai_http_client(&request.config, stream_timeout)?;
 
     match request.config.provider {
         AiProvider::Claude => stream_claude(&client, session_id, request, cancelled, &on_chunk).await,
         AiProvider::Gemini => stream_gemini(&client, session_id, request, cancelled, &on_chunk).await,
+        AiProvider::CodexCli => unreachable!(),
         AiProvider::Openai
         | AiProvider::Deepseek
         | AiProvider::Qwen
@@ -2025,7 +2079,7 @@ mod tests {
         build_ai_http_client, claude_headers, claude_system_prompt, gemini_text, is_kimi_model, openai_response_text,
         openai_stream_reasoning, openai_stream_text, parse_model_list_response, resolve_endpoint,
         resolve_model_list_endpoint, responses_max_output_tokens, responses_text, supports_temperature,
-        validate_config, AiApiStyle, AiAuthMethod, AiConfig, AiModelInfo, AiProvider, AUTHORIZATION,
+        validate_config, AiApiStyle, AiAuthMethod, AiConfig, AiModelInfo, AiProvider, AiReasoningLevel, AUTHORIZATION,
         CLAUDE_DEFAULT_SYSTEM,
     };
 
@@ -2058,7 +2112,9 @@ mod tests {
             proxy_enabled: true,
             proxy_url: "not a proxy url".to_string(),
             enable_thinking: true,
+            reasoning_level: AiReasoningLevel::Default,
             context_window: None,
+            codex_cli_path: None,
         };
 
         let err = build_ai_http_client(&config, 1).unwrap_err();
@@ -2078,7 +2134,9 @@ mod tests {
             proxy_enabled: true,
             proxy_url: "127.0.0.1:7890".to_string(),
             enable_thinking: true,
+            reasoning_level: AiReasoningLevel::Default,
             context_window: None,
+            codex_cli_path: None,
         };
 
         build_ai_http_client(&config, 1).unwrap();
@@ -2096,7 +2154,9 @@ mod tests {
             proxy_enabled: true,
             proxy_url: "not a proxy url".to_string(),
             enable_thinking: true,
+            reasoning_level: AiReasoningLevel::Default,
             context_window: None,
+            codex_cli_path: None,
         };
 
         build_ai_http_client(&config, 1).unwrap();
@@ -2114,7 +2174,9 @@ mod tests {
             proxy_enabled: false,
             proxy_url: String::new(),
             enable_thinking: true,
+            reasoning_level: AiReasoningLevel::Default,
             context_window: None,
+            codex_cli_path: None,
         };
 
         assert_eq!(
@@ -2132,7 +2194,9 @@ mod tests {
             proxy_enabled: false,
             proxy_url: String::new(),
             enable_thinking: true,
+            reasoning_level: AiReasoningLevel::Default,
             context_window: None,
+            codex_cli_path: None,
         };
 
         assert_eq!(resolve_endpoint(&ollama), "http://localhost:11434/v1/chat/completions");
@@ -2151,7 +2215,9 @@ mod tests {
             proxy_enabled: false,
             proxy_url: String::new(),
             enable_thinking: true,
+            reasoning_level: AiReasoningLevel::Default,
             context_window: None,
+            codex_cli_path: None,
         };
         assert_eq!(resolve_model_list_endpoint(&openai).unwrap(), "https://api.openai.com/v1/models");
 
@@ -2165,7 +2231,9 @@ mod tests {
             proxy_enabled: false,
             proxy_url: String::new(),
             enable_thinking: true,
+            reasoning_level: AiReasoningLevel::Default,
             context_window: None,
+            codex_cli_path: None,
         };
         assert_eq!(resolve_model_list_endpoint(&claude).unwrap(), "https://api.anthropic.com/v1/models");
     }
@@ -2183,7 +2251,9 @@ mod tests {
             proxy_enabled: false,
             proxy_url: String::new(),
             enable_thinking: true,
+            reasoning_level: AiReasoningLevel::Default,
             context_window: None,
+            codex_cli_path: None,
         };
         assert_eq!(resolve_endpoint(&config), "https://api.example.com/v1/chat/completions");
         assert_eq!(resolve_model_list_endpoint(&config).unwrap(), "https://api.example.com/v1/models");
@@ -2236,7 +2306,9 @@ mod tests {
             proxy_enabled: false,
             proxy_url: String::new(),
             enable_thinking: true,
+            reasoning_level: AiReasoningLevel::Default,
             context_window: None,
+            codex_cli_path: None,
         };
 
         let api_key_headers = claude_headers(&config).unwrap();
@@ -2305,7 +2377,9 @@ mod tests {
             proxy_enabled: false,
             proxy_url: String::new(),
             enable_thinking: true,
+            reasoning_level: AiReasoningLevel::Default,
             context_window: None,
+            codex_cli_path: None,
         };
 
         assert!(!supports_temperature(&config));
