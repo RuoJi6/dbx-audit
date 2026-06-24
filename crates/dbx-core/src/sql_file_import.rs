@@ -4,11 +4,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::connection::AppState;
 use crate::models::connection::DatabaseType;
-use crate::query::execute_sql_statement;
+use crate::query::{execute_sql_statement_with_options, QueryExecutionOptions};
 use crate::sql::{
     optimize_sql_file_import_statements, statement_summary, SqlFileImportStatement, SqlFileImportStatementKind,
     SqlFileProgress, SqlFileRequest, SqlFileStatus, SqlParsingOptions, SqlStatementSplitter,
 };
+use crate::types::QueryResult;
 
 #[derive(Debug, Clone)]
 struct SqlFileImportTarget {
@@ -205,16 +206,7 @@ async fn execute_statement_with_progress(
         None,
     ));
 
-    match execute_sql_statement(
-        state,
-        &request.connection_id,
-        &request.database,
-        &statement.sql,
-        None,
-        Some(token.clone()),
-    )
-    .await
-    {
+    match execute_sql_file_statement(state, request, &statement.sql, token, statement_index).await {
         Ok(result) => {
             *success_count += statement.source_statement_count;
             *affected_rows += result.affected_rows;
@@ -313,16 +305,7 @@ async fn execute_merged_statement_fallback_with_progress(
             None,
         ));
 
-        match execute_sql_statement(
-            state,
-            &request.connection_id,
-            &request.database,
-            source_sql,
-            None,
-            Some(token.clone()),
-        )
-        .await
-        {
+        match execute_sql_file_statement(state, request, source_sql, token, statement_index).await {
             Ok(result) => {
                 *success_count += 1;
                 *affected_rows += result.affected_rows;
@@ -364,6 +347,45 @@ async fn execute_merged_statement_fallback_with_progress(
     }
 
     Ok(false)
+}
+
+async fn execute_sql_file_statement(
+    state: &AppState,
+    request: &SqlFileRequest,
+    sql: &str,
+    token: &CancellationToken,
+    statement_index: usize,
+) -> Result<QueryResult, String> {
+    let execution_id = sql_file_statement_execution_id(&request.execution_id, statement_index);
+    let registered = state.running_queries.register(execution_id.clone());
+    let child_token = registered.token();
+    let cancel_task = {
+        let parent_token = token.clone();
+        let running_queries = state.running_queries.clone();
+        let execution_id = execution_id.clone();
+        tokio::spawn(async move {
+            parent_token.cancelled().await;
+            running_queries.cancel(&execution_id);
+        })
+    };
+
+    let result = execute_sql_statement_with_options(
+        state,
+        &request.connection_id,
+        &request.database,
+        sql,
+        None,
+        Some(child_token),
+        QueryExecutionOptions { execution_id: Some(execution_id), ..Default::default() },
+    )
+    .await;
+
+    cancel_task.abort();
+    result
+}
+
+fn sql_file_statement_execution_id(parent_execution_id: &str, statement_index: usize) -> String {
+    format!("{parent_execution_id}:statement:{statement_index}")
 }
 
 #[allow(clippy::too_many_arguments)]

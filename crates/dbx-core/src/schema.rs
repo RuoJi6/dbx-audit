@@ -35,16 +35,6 @@ macro_rules! try_sqlserver {
     };
 }
 
-macro_rules! try_agent {
-    ($connections:expr, $pool_key:expr, $method:ident $(, $arg:expr)*) => {
-        if let Some(client) = extract_pool!(&$connections, $pool_key, Agent) {
-            drop($connections);
-            let mut client = client.lock().await;
-            return client.$method($($arg),*).await;
-        }
-    };
-}
-
 #[cfg(feature = "duckdb-bundled")]
 pub fn duckdb_query_tables(con: &duckdb::Connection) -> Result<Vec<db::TableInfo>, String> {
     duckdb_query_tables_in_database(con, "main", "main")
@@ -268,6 +258,16 @@ fn clickhouse_metadata_database<'a>(database: &'a str, schema: &'a str) -> &'a s
     }
 }
 
+fn agent_metadata_timeout(config: Option<&ConnectionConfig>) -> Option<Duration> {
+    let Some(config) = config else {
+        return Some(Duration::from_secs(60));
+    };
+    match config.effective_query_timeout_secs() {
+        0 => None,
+        seconds => Some(Duration::from_secs(seconds.max(60))),
+    }
+}
+
 pub async fn list_databases_core(state: &AppState, connection_id: &str) -> Result<Vec<db::DatabaseInfo>, String> {
     retry_metadata_connection(state, connection_id, None, || list_databases_once(state, connection_id)).await
 }
@@ -336,6 +336,7 @@ pub async fn list_sqlserver_linked_server_tables_core(
 
 async fn list_databases_once(state: &AppState, connection_id: &str) -> Result<Vec<db::DatabaseInfo>, String> {
     log::info!("[list_databases] connection_id={connection_id}");
+    let db_config = connection_config(state, connection_id).await;
     {
         let connections = state.connections.read().await;
         #[cfg(feature = "duckdb-bundled")]
@@ -369,7 +370,7 @@ async fn list_databases_once(state: &AppState, connection_id: &str) -> Result<Ve
             }
             drop(connections);
             let mut client = client.lock().await;
-            return client.list_databases().await;
+            return client.list_databases(agent_metadata_timeout(db_config.as_ref())).await;
         }
     }
 
@@ -427,7 +428,7 @@ async fn list_schemas_once(state: &AppState, connection_id: &str, database: &str
             let fallback_config = db_config.clone();
             drop(connections);
             let mut client = client.lock().await;
-            match client.list_schemas::<Vec<String>>(database).await {
+            match client.list_schemas::<Vec<String>>(database, agent_metadata_timeout(db_config.as_ref())).await {
                 Ok(schemas) if !schemas.is_empty() => return Ok(schemas),
                 Ok(schemas) => {
                     if let Some(config) = fallback_config.as_ref() {
@@ -526,6 +527,11 @@ async fn list_tables_once(
             let config = config.clone();
             let session = session.clone();
             drop(connections);
+            if uses_presto_like_information_schema_tables(&config.db_type) {
+                return external_driver_presto_like_tables(session, config.as_ref(), database, schema)
+                    .await
+                    .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types));
+            }
             return session
                 .invoke::<Vec<db::TableInfo>>(
                     "listTables",
@@ -584,7 +590,10 @@ async fn list_tables_once(
             let fallback_config = db_config.clone();
             drop(connections);
             let mut client = client.lock().await;
-            match client.list_tables::<Vec<db::TableInfo>>(database, schema).await {
+            match client
+                .list_tables::<Vec<db::TableInfo>>(database, schema, agent_metadata_timeout(db_config.as_ref()))
+                .await
+            {
                 Ok(tables) if !tables.is_empty() => {
                     return Ok(filter_table_infos(tables, filter, limit, offset, object_types))
                 }
@@ -746,11 +755,123 @@ fn normalize_table_info_object_type(value: &str) -> String {
     "TABLE".to_string()
 }
 
+fn uses_presto_like_information_schema_tables(db_type: &DatabaseType) -> bool {
+    matches!(db_type, DatabaseType::PrestoSql | DatabaseType::Trino)
+}
+
+async fn external_driver_presto_like_tables(
+    session: Arc<crate::plugins::PluginDriverSession>,
+    config: &ConnectionConfig,
+    database: &str,
+    schema: &str,
+) -> Result<Vec<db::TableInfo>, String> {
+    let result: db::QueryResult = session
+        .invoke(
+            "executeQuery",
+            serde_json::json!({
+                "connection": config,
+                "database": database,
+                "schema": schema,
+                "sql": presto_like_information_schema_tables_sql(database, schema),
+                "maxRows": 100000,
+                "fetchSize": 1000,
+                "timeoutSecs": 60
+            }),
+        )
+        .await?;
+    Ok(presto_like_tables_from_query_result(&result))
+}
+
+async fn external_driver_presto_like_objects(
+    session: Arc<crate::plugins::PluginDriverSession>,
+    config: &ConnectionConfig,
+    database: &str,
+    schema: &str,
+) -> Result<Vec<db::ObjectInfo>, String> {
+    let tables = external_driver_presto_like_tables(session, config, database, schema).await?;
+    Ok(tables
+        .into_iter()
+        .map(|table| db::ObjectInfo {
+            name: table.name,
+            object_type: table.table_type,
+            schema: Some(schema.to_string()),
+            comment: table.comment,
+            created_at: None,
+            updated_at: None,
+            parent_schema: table.parent_schema,
+            parent_name: table.parent_name,
+        })
+        .collect())
+}
+
+fn presto_like_information_schema_tables_sql(database: &str, schema: &str) -> String {
+    let source = if database.trim().is_empty() {
+        "information_schema.tables".to_string()
+    } else {
+        format!("{}.information_schema.tables", quote_presto_like_identifier(database))
+    };
+    format!(
+        "SELECT table_name, CASE table_type WHEN 'BASE TABLE' THEN 'TABLE' ELSE table_type END AS table_type \
+         FROM {source} \
+         WHERE table_schema = {} AND table_type IN ('BASE TABLE', 'VIEW') \
+         ORDER BY table_type, table_name",
+        sql_string_literal(schema)
+    )
+}
+
+fn presto_like_tables_from_query_result(result: &db::QueryResult) -> Vec<db::TableInfo> {
+    result
+        .rows
+        .iter()
+        .filter_map(|row| {
+            let name = query_result_cell_string(row, 0)?;
+            if name.trim().is_empty() {
+                return None;
+            }
+            Some(db::TableInfo {
+                name,
+                table_type: normalize_information_schema_table_type(
+                    query_result_cell_string(row, 1).as_deref().unwrap_or("TABLE"),
+                ),
+                comment: None,
+                parent_schema: None,
+                parent_name: None,
+            })
+        })
+        .collect()
+}
+
+fn query_result_cell_string(row: &[serde_json::Value], index: usize) -> Option<String> {
+    let value = row.get(index)?;
+    if value.is_null() {
+        return None;
+    }
+    value.as_str().map(ToString::to_string).or_else(|| Some(value.to_string()))
+}
+
+fn normalize_information_schema_table_type(table_type: &str) -> String {
+    match table_type.trim().to_ascii_uppercase().replace(' ', "_").as_str() {
+        "BASE_TABLE" => "TABLE".to_string(),
+        "VIEW" => "VIEW".to_string(),
+        "MATERIALIZED_VIEW" => "MATERIALIZED_VIEW".to_string(),
+        _ => table_type.to_string(),
+    }
+}
+
+fn quote_presto_like_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+fn sql_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         clickhouse_metadata_database, deduplicate_column_infos, filter_mysql_system_databases_for_config,
-        filter_table_infos, is_agent_postgres_metadata_fallback_config,
+        filter_table_infos, is_agent_postgres_metadata_fallback_config, normalize_information_schema_table_type,
+        presto_like_information_schema_tables_sql, presto_like_tables_from_query_result,
     };
     #[cfg(feature = "duckdb-bundled")]
     use super::{duckdb_attach_database, duckdb_list_databases, duckdb_query_tables_in_database};
@@ -918,6 +1039,51 @@ mod tests {
         assert_eq!(filtered[0].name, "active_users");
     }
 
+    #[test]
+    fn presto_like_information_schema_sql_uses_catalog_and_schema_without_system_jdbc() {
+        let sql = presto_like_information_schema_tables_sql("hive", "sales_analytics");
+
+        assert_eq!(
+            sql,
+            "SELECT table_name, CASE table_type WHEN 'BASE TABLE' THEN 'TABLE' ELSE table_type END AS table_type FROM \"hive\".information_schema.tables WHERE table_schema = 'sales_analytics' AND table_type IN ('BASE TABLE', 'VIEW') ORDER BY table_type, table_name"
+        );
+        assert!(!sql.contains("system.jdbc.tables"));
+    }
+
+    #[test]
+    fn presto_like_information_schema_sql_escapes_identifiers_and_literals() {
+        let sql = presto_like_information_schema_tables_sql("hi\"ve", "sales'analytics");
+
+        assert!(sql.contains("\"hi\"\"ve\".information_schema.tables"));
+        assert!(sql.contains("table_schema = 'sales''analytics'"));
+    }
+
+    #[test]
+    fn presto_like_tables_from_query_result_normalizes_base_table_type() {
+        let result = super::db::QueryResult {
+            columns: vec!["table_name".to_string(), "table_type".to_string()],
+            column_types: vec![],
+            column_sortables: vec![],
+            rows: vec![
+                vec![serde_json::json!("daily_revenue"), serde_json::json!("BASE TABLE")],
+                vec![serde_json::json!("revenue_view"), serde_json::json!("VIEW")],
+            ],
+            affected_rows: 0,
+            execution_time_ms: 1,
+            truncated: false,
+            session_id: None,
+            has_more: false,
+        };
+
+        let tables = presto_like_tables_from_query_result(&result);
+
+        assert_eq!(tables[0].name, "daily_revenue");
+        assert_eq!(tables[0].table_type, "TABLE");
+        assert_eq!(tables[1].name, "revenue_view");
+        assert_eq!(tables[1].table_type, "VIEW");
+        assert_eq!(normalize_information_schema_table_type("MATERIALIZED VIEW"), "MATERIALIZED_VIEW");
+    }
+
     #[cfg(feature = "duckdb-bundled")]
     #[test]
     fn duckdb_list_databases_includes_attached_database() {
@@ -989,6 +1155,20 @@ mod tests {
         assert!(is_agent_postgres_metadata_fallback_config(&test_connection_config(DatabaseType::Vastbase)));
         assert!(!is_agent_postgres_metadata_fallback_config(&test_connection_config(DatabaseType::Postgres)));
         assert!(!is_agent_postgres_metadata_fallback_config(&test_connection_config(DatabaseType::Mysql)));
+    }
+
+    #[test]
+    fn agent_metadata_timeout_defaults_to_sixty_seconds_and_honors_longer_config() {
+        assert_eq!(super::agent_metadata_timeout(None), Some(std::time::Duration::from_secs(60)));
+
+        let mut config = test_connection_config(DatabaseType::Oracle);
+        assert_eq!(super::agent_metadata_timeout(Some(&config)), Some(std::time::Duration::from_secs(60)));
+
+        config.query_timeout_secs = 120;
+        assert_eq!(super::agent_metadata_timeout(Some(&config)), Some(std::time::Duration::from_secs(120)));
+
+        config.query_timeout_secs = 0;
+        assert_eq!(super::agent_metadata_timeout(Some(&config)), None);
     }
 }
 
@@ -1091,6 +1271,9 @@ async fn list_objects_once(
             let config = config.clone();
             let session = session.clone();
             drop(connections);
+            if uses_presto_like_information_schema_tables(&config.db_type) {
+                return external_driver_presto_like_objects(session, config.as_ref(), database, schema).await;
+            }
             return session
                 .invoke::<Vec<db::ObjectInfo>>(
                     "listObjects",
@@ -1104,10 +1287,14 @@ async fn list_objects_once(
             let fallback_config = db_config.clone();
             drop(connections);
             if is_oracle {
-                return oracle_agent_list_objects(client, database, schema).await;
+                return oracle_agent_list_objects(client, database, schema, agent_metadata_timeout(db_config.as_ref()))
+                    .await;
             }
             let mut client = client.lock().await;
-            match client.list_objects::<Vec<db::ObjectInfo>>(database, schema).await {
+            match client
+                .list_objects::<Vec<db::ObjectInfo>>(database, schema, agent_metadata_timeout(db_config.as_ref()))
+                .await
+            {
                 Ok(objects) if !objects.is_empty() => return Ok(objects),
                 Ok(objects) => {
                     if let Some(config) = fallback_config.as_ref() {
@@ -1210,10 +1397,13 @@ async fn list_completion_objects_once(
         let fallback_config = db_config.clone();
         drop(connections);
         let objects = if is_oracle {
-            oracle_agent_list_objects(client, database, schema).await?
+            oracle_agent_list_objects(client, database, schema, agent_metadata_timeout(db_config.as_ref())).await?
         } else {
             let mut client = client.lock().await;
-            match client.list_objects::<Vec<db::ObjectInfo>>(database, schema).await {
+            match client
+                .list_objects::<Vec<db::ObjectInfo>>(database, schema, agent_metadata_timeout(db_config.as_ref()))
+                .await
+            {
                 Ok(objects) if !objects.is_empty() => objects,
                 Ok(objects) => {
                     if let Some(config) = fallback_config.as_ref() {
@@ -1418,7 +1608,15 @@ pub async fn get_columns_core(
                 let fallback_config = db_config.clone();
                 drop(connections);
                 let mut client = client.lock().await;
-                match client.get_columns::<Vec<db::ColumnInfo>>(database, schema, table).await {
+                match client
+                    .get_columns::<Vec<db::ColumnInfo>>(
+                        database,
+                        schema,
+                        table,
+                        agent_metadata_timeout(db_config.as_ref()),
+                    )
+                    .await
+                {
                     Ok(columns) if !columns.is_empty() => return Ok(deduplicate_column_infos(columns)),
                     Ok(columns) => {
                         if let Some(config) = fallback_config.as_ref() {
@@ -1554,7 +1752,11 @@ pub async fn list_indexes_core(
         {
             let connections = state.connections.read().await;
             try_sqlserver!(connections, &pool_key, list_indexes, schema, table);
-            try_agent!(connections, &pool_key, list_indexes, database, schema, table);
+            if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
+                drop(connections);
+                let mut client = client.lock().await;
+                return client.list_indexes(database, schema, table, agent_metadata_timeout(db_config.as_ref())).await;
+            }
         }
 
         let connections = state.connections.read().await;
@@ -1573,6 +1775,7 @@ pub async fn list_indexes_core(
             PoolKind::Postgres(p) => db::postgres::list_indexes(p, schema, table).await,
             PoolKind::Sqlite(p) => db::sqlite::list_indexes(p, schema, table).await,
             PoolKind::Rqlite(client) => db::rqlite_driver::list_indexes(client, schema, table).await,
+            PoolKind::MongoDb(client) => db::mongo_driver::list_indexes(client, database, table).await,
             _ => Ok(vec![]),
         }
     })
@@ -1591,11 +1794,18 @@ pub async fn list_foreign_keys_core(
     }
     retry_metadata_connection(state, connection_id, Some(database), || async {
         let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
+        let db_config = connection_config(state, connection_id).await;
 
         {
             let connections = state.connections.read().await;
             try_sqlserver!(connections, &pool_key, list_foreign_keys, schema, table);
-            try_agent!(connections, &pool_key, list_foreign_keys, database, schema, table);
+            if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
+                drop(connections);
+                let mut client = client.lock().await;
+                return client
+                    .list_foreign_keys(database, schema, table, agent_metadata_timeout(db_config.as_ref()))
+                    .await;
+            }
         }
 
         let connections = state.connections.read().await;
@@ -1626,11 +1836,16 @@ pub async fn list_triggers_core(
     }
     retry_metadata_connection(state, connection_id, Some(database), || async {
         let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
+        let db_config = connection_config(state, connection_id).await;
 
         {
             let connections = state.connections.read().await;
             try_sqlserver!(connections, &pool_key, list_triggers, schema, table);
-            try_agent!(connections, &pool_key, list_triggers, database, schema, table);
+            if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
+                drop(connections);
+                let mut client = client.lock().await;
+                return client.list_triggers(database, schema, table, agent_metadata_timeout(db_config.as_ref())).await;
+            }
         }
 
         let connections = state.connections.read().await;
@@ -1750,6 +1965,7 @@ pub async fn get_table_ddl_core(
     }
 
     let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
+    let db_config = connection_config(state, connection_id).await;
 
     {
         let connections = state.connections.read().await;
@@ -1789,12 +2005,15 @@ pub async fn get_table_ddl_core(
             let mut client = client.lock().await;
             return build_sqlserver_ddl(&mut client, schema, table).await;
         }
-        try_agent!(connections, &pool_key, get_table_ddl, database, schema, table);
+        if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
+            drop(connections);
+            let mut client = client.lock().await;
+            return client.get_table_ddl(database, schema, table, agent_metadata_timeout(db_config.as_ref())).await;
+        }
     }
 
     let connections = state.connections.read().await;
     let pool = connections.get(&pool_key).ok_or("Pool not found")?;
-    let db_config = connection_config(state, connection_id).await;
 
     match pool {
         PoolKind::Mysql(p, _) => mysql_ddl(p, table).await,
@@ -2059,6 +2278,20 @@ pub async fn get_object_source_core(
     name: &str,
     object_type: db::ObjectSourceKind,
 ) -> Result<db::ObjectSource, String> {
+    retry_metadata_connection(state, connection_id, Some(database), || {
+        get_object_source_once(state, connection_id, database, schema, name, object_type.clone())
+    })
+    .await
+}
+
+async fn get_object_source_once(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    schema: &str,
+    name: &str,
+    object_type: db::ObjectSourceKind,
+) -> Result<db::ObjectSource, String> {
     let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
     let db_config = connection_config(state, connection_id).await;
     let source = {
@@ -2098,10 +2331,20 @@ pub async fn get_object_source_core(
             if db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Oracle)
                 && matches!(object_type, db::ObjectSourceKind::Package | db::ObjectSourceKind::PackageBody)
             {
-                oracle_agent_object_source(client, database, schema, name, &object_type).await?
+                oracle_agent_object_source(
+                    client,
+                    database,
+                    schema,
+                    name,
+                    &object_type,
+                    agent_metadata_timeout(db_config.as_ref()),
+                )
+                .await?
             } else {
                 let mut client = client.lock().await;
-                let result: db::ObjectSource = client.get_object_source(database, schema, name, &object_type).await?;
+                let result: db::ObjectSource = client
+                    .get_object_source(database, schema, name, &object_type, agent_metadata_timeout(db_config.as_ref()))
+                    .await?;
                 return Ok(result);
             }
         } else {
@@ -2163,6 +2406,7 @@ async fn oracle_agent_list_objects(
     client: Arc<tokio::sync::Mutex<db::agent_driver::AgentDriverClient>>,
     database: &str,
     schema: &str,
+    timeout_duration: Option<Duration>,
 ) -> Result<Vec<db::ObjectInfo>, String> {
     let sql = oracle_list_objects_sql(schema);
     let params = agent_execute_query_params(
@@ -2172,7 +2416,7 @@ async fn oracle_agent_list_objects(
         QueryExecutionOptions { max_rows: Some(10_000), ..Default::default() },
     );
     let mut client = client.lock().await;
-    let result: db::QueryResult = client.execute_query(params).await?;
+    let result: db::QueryResult = client.execute_query_with_timeout(params, timeout_duration).await?;
     Ok(result
         .rows
         .into_iter()
@@ -2200,6 +2444,7 @@ async fn oracle_agent_object_source(
     schema: &str,
     name: &str,
     object_type: &db::ObjectSourceKind,
+    timeout_duration: Option<Duration>,
 ) -> Result<String, String> {
     let sql = oracle_object_source_sql(schema, name, object_type);
     let params = agent_execute_query_params(
@@ -2209,7 +2454,7 @@ async fn oracle_agent_object_source(
         QueryExecutionOptions { max_rows: Some(1), ..Default::default() },
     );
     let mut client = client.lock().await;
-    let result: db::QueryResult = client.execute_query(params).await?;
+    let result: db::QueryResult = client.execute_query_with_timeout(params, timeout_duration).await?;
     first_string_cell(result)
 }
 

@@ -143,6 +143,8 @@ pub struct TableDiff {
     pub source_table_comment: Option<Option<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_table_comment: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_sql: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,11 +215,26 @@ pub struct SchemaDiffPreparation {
 }
 
 pub fn prepare_schema_diff(options: SchemaDiffPreparationOptions) -> SchemaDiffPreparation {
-    let diffs = diff_schema(&options);
+    let mut diffs = diff_schema(&options);
     let function_diffs = diff_functions(&options.source_functions, &options.target_functions);
     let sequence_diffs = diff_sequences(&options.source_sequences, &options.target_sequences);
     let rule_diffs = diff_rules(&options.source_rules, &options.target_rules);
     let owner_diffs = diff_owners(&options.source_owners, &options.target_owners);
+    for diff in &mut diffs {
+        let sync_sql = generate_schema_sync_sql(
+            std::slice::from_ref(diff),
+            &[],
+            &[],
+            &[],
+            &[],
+            options.database_type,
+            options.target_schema.as_deref(),
+            options.cascade_delete,
+        );
+        if !sync_sql.is_empty() {
+            diff.sync_sql = Some(sync_sql);
+        }
+    }
     let sync_sql = generate_schema_sync_sql(
         &diffs,
         &function_diffs,
@@ -283,6 +300,7 @@ fn diff_schema(options: &SchemaDiffPreparationOptions) -> Vec<TableDiff> {
             triggers: None,
             source_table_comment: None,
             target_table_comment: None,
+            sync_sql: None,
         });
     }
 
@@ -300,6 +318,7 @@ fn diff_schema(options: &SchemaDiffPreparationOptions) -> Vec<TableDiff> {
             target_ddl: target_details.get(name_clone.as_str()).and_then(|detail| detail.ddl.clone()),
             source_table_comment: None,
             target_table_comment: None,
+            sync_sql: None,
         });
     }
 
@@ -317,6 +336,7 @@ fn diff_schema(options: &SchemaDiffPreparationOptions) -> Vec<TableDiff> {
             target_ddl: None,
             source_table_comment: None,
             target_table_comment: None,
+            sync_sql: None,
         });
     }
 
@@ -334,6 +354,7 @@ fn diff_schema(options: &SchemaDiffPreparationOptions) -> Vec<TableDiff> {
             target_ddl: target_details.get(name_clone.as_str()).and_then(|detail| detail.ddl.clone()),
             source_table_comment: None,
             target_table_comment: None,
+            sync_sql: None,
         });
     }
 
@@ -368,6 +389,7 @@ fn diff_schema(options: &SchemaDiffPreparationOptions) -> Vec<TableDiff> {
             target_ddl: target_details.get(name_clone.as_str()).and_then(|detail| detail.ddl.clone()),
             source_table_comment: if has_diff { comment_changed.then_some(source_comment) } else { None },
             target_table_comment: if has_diff { comment_changed.then_some(target_comment) } else { None },
+            sync_sql: None,
         });
     }
 
@@ -1536,6 +1558,7 @@ mod tests {
             target_ddl: None,
             source_table_comment: None,
             target_table_comment: None,
+            sync_sql: None,
         }];
 
         assert_eq!(
@@ -1570,6 +1593,7 @@ mod tests {
             target_ddl: None,
             source_table_comment: Some(Some("用户表".to_string())),
             target_table_comment: Some(Some("Users".to_string())),
+            sync_sql: None,
         }];
 
         assert_eq!(
@@ -1638,6 +1662,60 @@ mod tests {
     }
 
     #[test]
+    fn prepare_schema_diff_attaches_per_table_sync_sql() {
+        let options = SchemaDiffPreparationOptions {
+            source_tables: vec![TableInfo {
+                name: "users".to_string(),
+                table_type: "BASE TABLE".to_string(),
+                comment: None,
+                parent_schema: None,
+                parent_name: None,
+            }],
+            target_tables: vec![TableInfo {
+                name: "users".to_string(),
+                table_type: "BASE TABLE".to_string(),
+                comment: None,
+                parent_schema: None,
+                parent_name: None,
+            }],
+            source_details: vec![TableSchemaDetail {
+                name: "users".to_string(),
+                columns: vec![column("name", "varchar(128)", None)],
+                indexes: Vec::new(),
+                foreign_keys: Vec::new(),
+                triggers: Vec::new(),
+                ddl: Some("CREATE TABLE `users` (`name` varchar(128));".to_string()),
+            }],
+            target_details: vec![TableSchemaDetail {
+                name: "users".to_string(),
+                columns: vec![column("name", "varchar(64)", None)],
+                indexes: Vec::new(),
+                foreign_keys: Vec::new(),
+                triggers: Vec::new(),
+                ddl: Some("CREATE TABLE `users` (`name` varchar(64));".to_string()),
+            }],
+            source_functions: Vec::new(),
+            target_functions: Vec::new(),
+            source_sequences: Vec::new(),
+            target_sequences: Vec::new(),
+            source_rules: Vec::new(),
+            target_rules: Vec::new(),
+            source_owners: Vec::new(),
+            target_owners: Vec::new(),
+            database_type: DatabaseType::Mysql,
+            target_schema: None,
+            ignore_comments: false,
+            cascade_delete: false,
+        };
+
+        let result = prepare_schema_diff(options);
+        let table_sync_sql = result.diffs[0].sync_sql.as_deref().unwrap_or_default();
+
+        assert!(table_sync_sql.contains("ALTER TABLE `users`"));
+        assert!(!table_sync_sql.contains("CREATE TABLE"));
+    }
+
+    #[test]
     fn qualifies_generated_schema_sync_sql_with_target_schema() {
         let diffs = vec![TableDiff {
             diff_type: "modified".to_string(),
@@ -1683,6 +1761,7 @@ mod tests {
             target_ddl: None,
             source_table_comment: None,
             target_table_comment: None,
+            sync_sql: None,
         }];
 
         assert_eq!(

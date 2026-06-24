@@ -1093,6 +1093,9 @@ public final class DbxJdbcPlugin {
         if (quirks.useOracleMetadata()) {
             return oracleListTables(conn, oracleEffectiveSchema(conn, schema));
         }
+        if (usePrestoInformationSchemaTables(connection)) {
+            return prestoListTables(conn, database, schema);
+        }
         DatabaseMetaData meta = conn.getMetaData();
         String[] types = jdbcTableTypes(meta);
         String catalog = metadataCatalog(database, quirks);
@@ -1109,6 +1112,9 @@ public final class DbxJdbcPlugin {
         Connection conn = openConnection(connection);
         if (driverQuirks(connection).useOracleMetadata()) {
             return oracleListObjects(conn, oracleEffectiveSchema(conn, schema), schema);
+        }
+        if (usePrestoInformationSchemaTables(connection)) {
+            return prestoListObjects(conn, database, schema);
         }
         DatabaseMetaData meta = conn.getMetaData();
         JdbcDriverQuirks quirks = driverQuirks(connection);
@@ -1322,6 +1328,72 @@ public final class DbxJdbcPlugin {
                 result.add(item);
             }
         }
+    }
+
+    private static boolean usePrestoInformationSchemaTables(JsonNode connection) {
+        String url = optionalText(connection, "connection_string");
+        return urlMatchesPrefix(url, "jdbc:presto:") || urlMatchesPrefix(url, "jdbc:trino:");
+    }
+
+    private static JsonNode prestoListTables(Connection conn, String database, String schema) throws SQLException {
+        ArrayNode result = MAPPER.createArrayNode();
+        try (PreparedStatement ps = conn.prepareStatement(prestoInformationSchemaTablesSql(database))) {
+            ps.setString(1, schema);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    ObjectNode item = MAPPER.createObjectNode();
+                    item.put("name", rs.getString(1));
+                    item.put("table_type", normalizeInformationSchemaTableType(rs.getString(2)));
+                    item.putNull("comment");
+                    result.add(item);
+                }
+            }
+        }
+        return result;
+    }
+
+    private static JsonNode prestoListObjects(Connection conn, String database, String schema) throws SQLException {
+        ArrayNode result = MAPPER.createArrayNode();
+        try (PreparedStatement ps = conn.prepareStatement(prestoInformationSchemaTablesSql(database))) {
+            ps.setString(1, schema);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    ObjectNode item = MAPPER.createObjectNode();
+                    item.put("name", rs.getString(1));
+                    item.put("object_type", normalizeInformationSchemaTableType(rs.getString(2)));
+                    putNullable(item, "schema", schema);
+                    item.putNull("comment");
+                    result.add(item);
+                }
+            }
+        }
+        return result;
+    }
+
+    static String prestoInformationSchemaTablesSql(String database) {
+        String source = emptyToNull(database) == null
+            ? "information_schema.tables"
+            : quoteAnsiIdentifier(database) + ".information_schema.tables";
+        return "SELECT table_name, table_type FROM " + source +
+            " WHERE table_schema = ? AND table_type IN ('BASE TABLE', 'VIEW')" +
+            " ORDER BY table_type, table_name";
+    }
+
+    static String normalizeInformationSchemaTableType(String tableType) {
+        if (tableType == null) {
+            return "TABLE";
+        }
+        String normalized = tableType.trim().toUpperCase(Locale.ROOT).replace(' ', '_');
+        return switch (normalized) {
+            case "BASE_TABLE" -> "TABLE";
+            case "MATERIALIZED_VIEW" -> "MATERIALIZED_VIEW";
+            case "VIEW" -> "VIEW";
+            default -> tableType;
+        };
+    }
+
+    private static String quoteAnsiIdentifier(String identifier) {
+        return "\"" + identifier.replace("\"", "\"\"") + "\"";
     }
 
     private static void appendColumns(

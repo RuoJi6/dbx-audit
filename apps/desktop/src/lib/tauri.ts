@@ -653,6 +653,10 @@ export async function disconnectDb(connectionId: string): Promise<void> {
   return invoke("disconnect_db", { connectionId });
 }
 
+export async function checkConnectionHealth(connectionId: string): Promise<void> {
+  return invoke("check_connection_health", { connectionId });
+}
+
 export async function closeDatabaseConnection(connectionId: string, database: string): Promise<boolean> {
   return invoke("close_database_connection", { connectionId, database });
 }
@@ -1073,6 +1077,10 @@ export async function importJdbcDrivers(paths: (string | File)[]): Promise<JdbcD
 
 export async function installJdbcDriverFromMaven(coordinate: string, repositories: string[] = []): Promise<JdbcDriverInfo[]> {
   return invoke("install_jdbc_driver_from_maven", { request: { coordinate, repositories } });
+}
+
+export async function installPrestoSqlJdbcDriver(): Promise<JdbcDriverInfo[]> {
+  return invoke("install_prestosql_jdbc_driver");
 }
 
 export async function deleteJdbcDriver(path: string): Promise<JdbcDriverInfo[]> {

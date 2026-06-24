@@ -1,4 +1,30 @@
-const CONNECTION_ERROR_PATTERNS = ["connection", "broken pipe", "reset by peer", "timed out", "closed", "eof", "i/o error"];
+const CONNECTION_ERROR_PATTERNS = [
+  "connection reset",
+  "connection refused",
+  "connection timed out",
+  "connection closed",
+  "connection lost",
+  "connection not found",
+  "connection config not found",
+  "not connected",
+  "closed the connection",
+  "broken pipe",
+  "reset by peer",
+  "socket closed",
+  "unexpected eof",
+  "end-of-file",
+  "end-of-file on communication channel",
+  "server closed session",
+  "communicating with the server",
+  "exceeded maximum idle time",
+  "agent stdin not available",
+  "agent stdout not available",
+  "failed to write to agent stdin",
+  "failed to flush agent stdin",
+  "关闭的连接",
+  "连接已关闭",
+  "i/o error",
+];
 
 export function staleConnectionMessage(error: unknown): string {
   if (error instanceof Error) return error.message;

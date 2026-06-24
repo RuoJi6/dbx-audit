@@ -26,8 +26,8 @@ pub fn agent_connect_params(config: &ConnectionConfig, host: &str, port: u16, da
         postgres_like_agent_jdbc_connection_string(config, host, port, database)
     } else if config.db_type == DatabaseType::SapHana {
         sap_hana_jdbc_connection_string(config, host, port, database)
-    } else if config.db_type == DatabaseType::Trino {
-        trino_agent_jdbc_connection_string(config, host, port, database)
+    } else if matches!(config.db_type, DatabaseType::Trino | DatabaseType::PrestoSql) {
+        trino_like_jdbc_connection_string(config, host, port, database)
     } else if config.db_type == DatabaseType::H2 {
         h2_agent_jdbc_connection_string(config)
     } else {
@@ -455,12 +455,17 @@ fn sap_hana_jdbc_connection_string(config: &ConnectionConfig, host: &str, port: 
     }
 }
 
-fn trino_agent_jdbc_connection_string(config: &ConnectionConfig, host: &str, port: u16, database: &str) -> String {
+pub fn trino_like_jdbc_connection_string(config: &ConnectionConfig, host: &str, port: u16, database: &str) -> String {
+    let jdbc_scheme = match config.db_type {
+        DatabaseType::PrestoSql => "presto",
+        _ => "trino",
+    };
+    let jdbc_prefix = format!("jdbc:{jdbc_scheme}:");
     let base = config
         .connection_string
         .as_deref()
         .map(str::trim)
-        .filter(|value| value.get(..11).is_some_and(|prefix| prefix.eq_ignore_ascii_case("jdbc:trino:")))
+        .filter(|value| value.get(..jdbc_prefix.len()).is_some_and(|prefix| prefix.eq_ignore_ascii_case(&jdbc_prefix)))
         .map(|connection_string| {
             if host == config.host && port == config.port {
                 connection_string.to_string()
@@ -471,9 +476,9 @@ fn trino_agent_jdbc_connection_string(config: &ConnectionConfig, host: &str, por
         .unwrap_or_else(|| {
             let database = database.trim();
             if database.is_empty() {
-                format!("jdbc:trino://{host}:{port}")
+                format!("jdbc:{jdbc_scheme}://{host}:{port}")
             } else {
-                format!("jdbc:trino://{host}:{port}/{database}")
+                format!("jdbc:{jdbc_scheme}://{host}:{port}/{database}")
             }
         });
 
@@ -904,6 +909,30 @@ mod tests {
 
         assert_eq!(params["connection_string"], "jdbc:trino://trino.example.com:8080/hive");
         assert_eq!(params["ssl"], false);
+    }
+
+    #[test]
+    fn prestosql_jdbc_url_uses_presto_jdbc_scheme() {
+        let mut cfg = config(DatabaseType::PrestoSql, Some("hive/default"));
+        cfg.host = "presto.example.com".to_string();
+        cfg.port = 9090;
+
+        let params = agent_connect_params(&cfg, "presto.example.com", 9090, "hive/default");
+
+        assert_eq!(params["connection_string"], "jdbc:presto://presto.example.com:9090/hive/default");
+        assert_eq!(params["ssl"], false);
+    }
+
+    #[test]
+    fn prestosql_custom_jdbc_url_rewrites_forwarded_host() {
+        let mut cfg = config(DatabaseType::PrestoSql, Some("hive/default"));
+        cfg.host = "presto.internal".to_string();
+        cfg.port = 9090;
+        cfg.connection_string = Some("jdbc:presto://presto.internal:9090/hive/default?source=dbx".to_string());
+
+        let params = agent_connect_params(&cfg, "127.0.0.1", 19090, "hive/default");
+
+        assert_eq!(params["connection_string"], "jdbc:presto://127.0.0.1:19090/hive/default?source=dbx");
     }
 
     #[test]

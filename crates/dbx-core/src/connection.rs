@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
@@ -12,7 +12,7 @@ use crate::agent_connection::{
     agent_connect_params, h2_file_path_from_jdbc_url, is_h2_file_connection, mongo_legacy_error_with_auth_hint,
     mongo_uses_legacy_driver, oracle_alternate_connect_config_labels, oracle_alternate_connect_configs,
     oracle_auth_fallback_profiles, oracle_error_with_driver_hint, should_retry_mongo_with_legacy_driver,
-    should_retry_oracle_with_10g_driver,
+    should_retry_oracle_with_10g_driver, trino_like_jdbc_connection_string,
 };
 use crate::agent_manager::{JavaRuntimeMode, DEFAULT_JRE_KEY};
 use crate::database_capabilities;
@@ -30,6 +30,7 @@ use crate::storage::Storage;
 
 pub const JDBC_PLUGIN_NOT_INSTALLED: &str =
     "JDBC plugin is not installed. Install the optional JDBC plugin to use this connection.";
+pub const PRESTOSQL_JDBC_DRIVER_CLASS: &str = "io.prestosql.jdbc.PrestoDriver";
 const DEFAULT_AGENT_CONNECT_TIMEOUT_SECS: u64 = 30;
 const ACCESS_AGENT_CONNECT_TIMEOUT_SECS: u64 = 30;
 const POOL_CLOSE_TIMEOUT_SECS: u64 = 5;
@@ -81,9 +82,48 @@ pub enum PoolKind {
     MessageQueue,
 }
 
+macro_rules! agent_connection_pool_database_type {
+    () => {
+        DatabaseType::Dameng
+            | DatabaseType::Kingbase
+            | DatabaseType::Highgo
+            | DatabaseType::Vastbase
+            | DatabaseType::Goldendb
+            | DatabaseType::Databend
+            | DatabaseType::Yashandb
+            | DatabaseType::Databricks
+            | DatabaseType::SapHana
+            | DatabaseType::Teradata
+            | DatabaseType::Vertica
+            | DatabaseType::Firebird
+            | DatabaseType::Exasol
+            | DatabaseType::OceanbaseOracle
+            | DatabaseType::Gbase
+            | DatabaseType::Oracle
+            | DatabaseType::H2
+            | DatabaseType::Snowflake
+            | DatabaseType::Trino
+            | DatabaseType::Hive
+            | DatabaseType::Db2
+            | DatabaseType::Informix
+            | DatabaseType::Neo4j
+            | DatabaseType::Cassandra
+            | DatabaseType::Bigquery
+            | DatabaseType::Kylin
+            | DatabaseType::Sundb
+            | DatabaseType::Tdengine
+            | DatabaseType::Xugu
+            | DatabaseType::Iotdb
+            | DatabaseType::Etcd
+            | DatabaseType::Iris
+            | DatabaseType::Access
+    };
+}
+
 pub struct AppState {
-    pub connections: RwLock<HashMap<String, PoolKind>>,
-    keepalive_tasks: RwLock<HashMap<String, JoinHandle<()>>>,
+    pub connections: Arc<RwLock<HashMap<String, PoolKind>>>,
+    keepalive_tasks: Arc<RwLock<HashMap<String, JoinHandle<()>>>>,
+    pool_activity: Arc<RwLock<HashMap<String, PoolActivity>>>,
     pub configs: RwLock<HashMap<String, ConnectionConfig>>,
     pub running_queries: RunningQueries,
     pub tunnels: TunnelManager,
@@ -93,6 +133,40 @@ pub struct AppState {
     pub agent_manager: crate::agent_manager::AgentManager,
     #[cfg(feature = "mq-admin")]
     pub mq_registry: crate::mq::MqAdminRegistry,
+}
+
+#[derive(Clone, Copy)]
+struct PoolActivity {
+    last_used_at: Instant,
+}
+
+impl PoolActivity {
+    fn now() -> Self {
+        Self { last_used_at: Instant::now() }
+    }
+}
+
+pub struct PoolActivityTouch {
+    pool_key: String,
+    connections: Arc<RwLock<HashMap<String, PoolKind>>>,
+    pool_activity: Arc<RwLock<HashMap<String, PoolActivity>>>,
+}
+
+impl Drop for PoolActivityTouch {
+    fn drop(&mut self) {
+        let pool_key = self.pool_key.clone();
+        let connections = self.connections.clone();
+        let pool_activity = self.pool_activity.clone();
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        handle.spawn(async move {
+            if !connections.read().await.contains_key(&pool_key) {
+                return;
+            }
+            pool_activity.write().await.insert(pool_key, PoolActivity::now());
+        });
+    }
 }
 
 pub fn metadata_connection_config(config: &ConnectionConfig) -> ConnectionConfig {
@@ -114,6 +188,16 @@ pub fn database_connection_config(config: &ConnectionConfig, database: Option<&s
         }
     }
     db_config
+}
+
+pub fn prestosql_jdbc_config_for_endpoint(config: &ConnectionConfig, host: &str, port: u16) -> ConnectionConfig {
+    let mut jdbc_config = config.clone();
+    jdbc_config.connection_string =
+        Some(trino_like_jdbc_connection_string(config, host, port, config.effective_database().unwrap_or("")));
+    if jdbc_config.jdbc_driver_class.as_deref().is_none_or(|value| value.trim().is_empty()) {
+        jdbc_config.jdbc_driver_class = Some(PRESTOSQL_JDBC_DRIVER_CLASS.to_string());
+    }
+    jdbc_config
 }
 
 pub async fn connect_mysql_metadata_pool(
@@ -261,8 +345,9 @@ impl AppState {
         app_version: impl Into<String>,
     ) -> Self {
         Self {
-            connections: RwLock::new(HashMap::new()),
-            keepalive_tasks: RwLock::new(HashMap::new()),
+            connections: Arc::new(RwLock::new(HashMap::new())),
+            keepalive_tasks: Arc::new(RwLock::new(HashMap::new())),
+            pool_activity: Arc::new(RwLock::new(HashMap::new())),
             configs: RwLock::new(HashMap::new()),
             running_queries: RunningQueries::default(),
             tunnels: TunnelManager::new(),
@@ -311,7 +396,7 @@ impl AppState {
         Ok(PoolKind::ExternalDriver { driver_id: driver_id.to_string(), config: Arc::new(config.clone()), session })
     }
 
-    fn external_driver_runtime_env(&self, driver_id: &str) -> Result<PluginRuntimeEnv, String> {
+    pub fn external_driver_runtime_env(&self, driver_id: &str) -> Result<PluginRuntimeEnv, String> {
         if driver_id != "jdbc" {
             return Ok(PluginRuntimeEnv::default());
         }
@@ -326,6 +411,7 @@ impl AppState {
 
     pub async fn insert_connection_pool(&self, pool_key: String, pool: PoolKind, config: &ConnectionConfig) {
         self.stop_keepalive_task(&pool_key).await;
+        self.pool_activity.write().await.insert(pool_key.clone(), PoolActivity::now());
         self.start_keepalive_task(&pool_key, &pool, config).await;
         let previous = self.connections.write().await.insert(pool_key, pool);
         if let Some(pool) = previous {
@@ -335,27 +421,77 @@ impl AppState {
 
     async fn start_keepalive_task(&self, pool_key: &str, pool: &PoolKind, config: &ConnectionConfig) {
         let interval_secs = config.keepalive_interval_secs;
-        if interval_secs == 0 {
+        let idle_timeout_secs = config.idle_timeout_secs;
+        let idle_cleanup_enabled = is_session_scoped_pool_key(pool_key) && idle_timeout_secs > 0;
+        let mut target = keepalive_target_from_pool(pool, config);
+        if interval_secs == 0 && !idle_cleanup_enabled {
             return;
         }
-        let Some(mut target) = keepalive_target_from_pool(pool, config) else {
+        if interval_secs > 0 && target.is_none() {
             log::debug!(
                 "Connection keepalive requested for '{pool_key}', but this database driver does not keep a pingable client handle."
             );
-            return;
+            if !idle_cleanup_enabled {
+                return;
+            }
         };
 
         let key = pool_key.to_string();
-        let interval = Duration::from_secs(interval_secs.max(1));
+        let interval = if interval_secs > 0 {
+            Duration::from_secs(interval_secs.max(1))
+        } else {
+            Duration::from_secs(idle_timeout_secs.min(60).max(1))
+        };
         let timeout = Duration::from_secs(config.effective_connect_timeout_secs().max(1));
+        let connections = self.connections.clone();
+        let keepalive_tasks = self.keepalive_tasks.clone();
+        let pool_activity = self.pool_activity.clone();
+        let running_queries = self.running_queries.clone();
+        let idle_timeout = Duration::from_secs(idle_timeout_secs.max(1));
         let handle = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
-                let result = tokio::time::timeout(timeout, ping_keepalive_target(&mut target, timeout)).await;
-                match result {
-                    Ok(Ok(())) => {}
-                    Ok(Err(err)) => log::warn!("Connection keepalive failed for '{key}': {err}"),
-                    Err(_) => log::warn!("Connection keepalive timed out for '{key}' after {}s", timeout.as_secs()),
+
+                if running_queries.is_pool_active(&key) {
+                    continue;
+                }
+
+                if idle_cleanup_enabled {
+                    let idle_for = {
+                        let activity = pool_activity.read().await;
+                        activity.get(&key).map(|activity| activity.last_used_at.elapsed())
+                    };
+                    if idle_for.is_some_and(|elapsed| elapsed >= idle_timeout) {
+                        log::info!(
+                            "Closing idle session-scoped connection pool '{key}' after {}s",
+                            idle_timeout.as_secs()
+                        );
+                        keepalive_tasks.write().await.remove(&key);
+                        pool_activity.write().await.remove(&key);
+                        let removed = connections.write().await.remove(&key);
+                        if let Some(pool) = removed {
+                            close_pool_kind_with_timeout(key, pool).await;
+                        }
+                        break;
+                    }
+                }
+
+                if let Some(target) = target.as_mut() {
+                    let result = tokio::time::timeout(timeout, ping_keepalive_target(target, timeout)).await;
+                    match result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => {
+                            log::warn!("Connection keepalive failed for '{key}': {err}; invalidating pool");
+                            keepalive_tasks.write().await.remove(&key);
+                            pool_activity.write().await.remove(&key);
+                            let removed = connections.write().await.remove(&key);
+                            if let Some(pool) = removed {
+                                close_pool_kind_with_timeout(key, pool).await;
+                            }
+                            break;
+                        }
+                        Err(_) => log::warn!("Connection keepalive timed out for '{key}' after {}s", timeout.as_secs()),
+                    }
                 }
             }
         });
@@ -381,6 +517,18 @@ impl AppState {
         }
     }
 
+    pub async fn touch_pool_activity(&self, pool_key: &str) {
+        self.pool_activity.write().await.insert(pool_key.to_string(), PoolActivity::now());
+    }
+
+    pub fn pool_activity_touch(&self, pool_key: &str) -> PoolActivityTouch {
+        PoolActivityTouch {
+            pool_key: pool_key.to_string(),
+            connections: self.connections.clone(),
+            pool_activity: self.pool_activity.clone(),
+        }
+    }
+
     pub async fn get_or_create_pool(&self, connection_id: &str, database: Option<&str>) -> Result<String, String> {
         self.get_or_create_pool_for_session(connection_id, database, None).await
     }
@@ -403,6 +551,7 @@ impl AppState {
         if conns.contains_key(&pool_key) {
             drop(conns);
             if !self.remove_stale_connection_pool(&pool_key).await {
+                self.touch_pool_activity(&pool_key).await;
                 return Ok(pool_key);
             }
         } else {
@@ -632,39 +781,7 @@ impl AppState {
                 db::influxdb_driver::test_connection(&client, connect_timeout).await?;
                 PoolKind::InfluxDb(client)
             }
-            DatabaseType::Dameng
-            | DatabaseType::Kingbase
-            | DatabaseType::Highgo
-            | DatabaseType::Vastbase
-            | DatabaseType::Goldendb
-            | DatabaseType::Databend
-            | DatabaseType::Yashandb
-            | DatabaseType::Databricks
-            | DatabaseType::SapHana
-            | DatabaseType::Teradata
-            | DatabaseType::Vertica
-            | DatabaseType::Firebird
-            | DatabaseType::Exasol
-            | DatabaseType::OceanbaseOracle
-            | DatabaseType::Gbase
-            | DatabaseType::Oracle
-            | DatabaseType::H2
-            | DatabaseType::Snowflake
-            | DatabaseType::Trino
-            | DatabaseType::Hive
-            | DatabaseType::Db2
-            | DatabaseType::Informix
-            | DatabaseType::Neo4j
-            | DatabaseType::Cassandra
-            | DatabaseType::Bigquery
-            | DatabaseType::Kylin
-            | DatabaseType::Sundb
-            | DatabaseType::Tdengine
-            | DatabaseType::Xugu
-            | DatabaseType::Iotdb
-            | DatabaseType::Etcd
-            | DatabaseType::Iris
-            | DatabaseType::Access => {
+            agent_connection_pool_database_type!() => {
                 let connect_params =
                     agent_connect_params(&db_config, &host, port, db_config.effective_database().unwrap_or(""));
                 let mut client =
@@ -764,6 +881,10 @@ impl AppState {
                     }
                 }
                 PoolKind::Agent(Arc::new(tokio::sync::Mutex::new(client)))
+            }
+            DatabaseType::PrestoSql => {
+                let jdbc_config = prestosql_jdbc_config_for_endpoint(&db_config, &host, port);
+                self.external_driver_pool("jdbc", &jdbc_config).await?
             }
             DatabaseType::Jdbc => {
                 let mut jdbc_config = db_config.clone();
@@ -894,6 +1015,10 @@ impl AppState {
     }
 
     async fn remove_stale_connection_pool(&self, pool_key: &str) -> bool {
+        if self.running_queries.is_pool_active(pool_key) {
+            return false;
+        }
+
         let stale = {
             let connections = self.connections.read().await;
             let Some(pool) = connections.get(pool_key) else {
@@ -1053,7 +1178,8 @@ impl AppState {
                     let client = client.clone();
                     drop(connections);
                     let mut agent = client.lock().await;
-                    match agent.test_connection(serde_json::json!({})).await {
+                    let timeout = crate::db::connection_timeout();
+                    match agent.validate_connection(Some(timeout)).await {
                         Ok(_) => false,
                         Err(err) => {
                             log::warn!("Agent connection pool '{pool_key}' is stale: {err}");
@@ -1074,6 +1200,7 @@ impl AppState {
         }
 
         self.stop_keepalive_task(pool_key).await;
+        self.pool_activity.write().await.remove(pool_key);
         let removed = self.connections.write().await.remove(pool_key);
         if let Some(pool) = removed {
             close_pool_kind(pool).await;
@@ -1104,6 +1231,7 @@ impl AppState {
             self.reset_connection_transport(connection_id).await;
         } else {
             self.stop_keepalive_task(&pool_key).await;
+            self.pool_activity.write().await.remove(&pool_key);
             let removed = self.connections.write().await.remove(&pool_key);
             if let Some(pool) = removed {
                 close_pool_kind(pool).await;
@@ -1132,6 +1260,7 @@ impl AppState {
             return Ok(false);
         }
         self.stop_keepalive_task(&pool_key).await;
+        self.pool_activity.write().await.remove(&pool_key);
         let removed = self.connections.write().await.remove(&pool_key);
         if let Some(pool) = removed {
             close_pool_kind(pool).await;
@@ -1143,6 +1272,7 @@ impl AppState {
 
     pub async fn remove_pool_by_key(&self, pool_key: &str) -> bool {
         self.stop_keepalive_task(pool_key).await;
+        self.pool_activity.write().await.remove(pool_key);
         let removed = self.connections.write().await.remove(pool_key);
         if let Some(pool) = removed {
             close_pool_kind(pool).await;
@@ -1171,6 +1301,12 @@ impl AppState {
             .cloned()
             .collect();
         self.stop_keepalive_tasks(&keys_to_remove).await;
+        {
+            let mut activity = self.pool_activity.write().await;
+            for key in &keys_to_remove {
+                activity.remove(key);
+            }
+        }
         let mut conns = self.connections.write().await;
         let mut removed = Vec::with_capacity(keys_to_remove.len());
         for key in keys_to_remove {
@@ -1279,6 +1415,32 @@ impl AppState {
         .await;
         self.tunnels.stop_tunnel(connection_id).await;
         self.proxy_tunnels.stop_tunnel(connection_id).await;
+    }
+
+    /// Health-check the base connection pool for a given connection_id.
+    /// Returns `Ok(())` if the pool exists and is healthy, `Err` otherwise.
+    /// If the pool is unhealthy it is removed from the map so subsequent
+    /// `get_or_create_pool` calls will transparently recreate it.
+    pub async fn check_connection_health(&self, connection_id: &str) -> Result<(), String> {
+        let db_type = {
+            let configs = self.configs.read().await;
+            configs.get(connection_id).map(|c| c.db_type)
+        };
+        let pool_key = base_pool_key_for(db_type, connection_id, None, false);
+
+        // Check if pool exists first
+        {
+            let connections = self.connections.read().await;
+            if !connections.contains_key(&pool_key) {
+                return Err("No active connection pool found".to_string());
+            }
+        }
+
+        // `remove_stale_connection_pool` returns true if the pool was stale (and removed)
+        if self.remove_stale_connection_pool(&pool_key).await {
+            return Err("Connection pool is unhealthy".to_string());
+        }
+        Ok(())
     }
 
     pub async fn refresh_connections(&self) {
@@ -1435,6 +1597,12 @@ impl AppState {
         // Remove dead pools
         if !dead_keys.is_empty() {
             self.stop_keepalive_tasks(&dead_keys).await;
+            {
+                let mut activity = self.pool_activity.write().await;
+                for key in &dead_keys {
+                    activity.remove(key);
+                }
+            }
             let mut conns = self.connections.write().await;
             for key in &dead_keys {
                 if let Some(pool) = conns.remove(key) {
@@ -1480,6 +1648,12 @@ impl AppState {
             .cloned()
             .collect();
         self.stop_keepalive_tasks(&keys_to_remove).await;
+        {
+            let mut activity = self.pool_activity.write().await;
+            for key in &keys_to_remove {
+                activity.remove(key);
+            }
+        }
         let mut conns = self.connections.write().await;
         let mut removed = Vec::with_capacity(keys_to_remove.len());
         for key in keys_to_remove {
@@ -1508,6 +1682,12 @@ impl AppState {
             })
             .collect();
         self.stop_keepalive_tasks(&keys_to_remove).await;
+        {
+            let mut activity = self.pool_activity.write().await;
+            for key in &keys_to_remove {
+                activity.remove(key);
+            }
+        }
         let mut conns = self.connections.write().await;
         let mut removed = Vec::with_capacity(keys_to_remove.len());
         for key in keys_to_remove {
@@ -1535,6 +1715,7 @@ enum KeepaliveTarget {
     Elasticsearch(db::elasticsearch_driver::EsClient),
     VectorDb(db::vector_driver::VectorClient),
     InfluxDb(db::influxdb_driver::InfluxdbClient),
+    Agent(Arc<tokio::sync::Mutex<db::agent_driver::AgentDriverClient>>),
 }
 
 fn keepalive_target_from_pool(pool: &PoolKind, config: &ConnectionConfig) -> Option<KeepaliveTarget> {
@@ -1552,6 +1733,7 @@ fn keepalive_target_from_pool(pool: &PoolKind, config: &ConnectionConfig) -> Opt
         PoolKind::Elasticsearch(client) => Some(KeepaliveTarget::Elasticsearch(client.clone())),
         PoolKind::VectorDb(client) => Some(KeepaliveTarget::VectorDb(client.clone())),
         PoolKind::InfluxDb(client) => Some(KeepaliveTarget::InfluxDb(client.clone())),
+        PoolKind::Agent(client) => Some(KeepaliveTarget::Agent(client.clone())),
         _ => None,
     }
 }
@@ -1573,12 +1755,26 @@ async fn ping_keepalive_target(target: &mut KeepaliveTarget, timeout: Duration) 
         }
         KeepaliveTarget::ClickHouse(client) => db::clickhouse_driver::test_connection(client, timeout).await,
         KeepaliveTarget::SqlServer(client) => {
-            let mut client = client.lock().await;
+            let Ok(mut client) = client.try_lock() else {
+                return Ok(());
+            };
             db::sqlserver::test_connection(&mut client).await
         }
         KeepaliveTarget::Elasticsearch(client) => db::elasticsearch_driver::test_connection(client, timeout).await,
         KeepaliveTarget::VectorDb(client) => db::vector_driver::test_connection(client, timeout).await,
         KeepaliveTarget::InfluxDb(client) => db::influxdb_driver::test_connection(client, timeout).await,
+        KeepaliveTarget::Agent(client) => {
+            let Ok(mut client) = client.try_lock() else {
+                return Ok(());
+            };
+            match client.validate_connection(Some(timeout)).await {
+                Ok(_) => Ok(()),
+                Err(err) => {
+                    client.kill();
+                    Err(err)
+                }
+            }
+        }
     }
 }
 
@@ -1642,6 +1838,10 @@ fn session_scoped_pool_key(base_pool_key: String, client_session_id: Option<&str
     normalize_client_session_id(client_session_id)
         .map(|session| format!("{base_pool_key}:session:{session}"))
         .unwrap_or(base_pool_key)
+}
+
+fn is_session_scoped_pool_key(pool_key: &str) -> bool {
+    pool_key.contains(":session:")
 }
 
 pub(crate) fn config_for_pool_key<'a>(
@@ -1805,6 +2005,11 @@ fn base_pool_key_for(
 
 fn shares_database_pool_with_connection(db_type: &DatabaseType) -> bool {
     matches!(db_type, DatabaseType::Oracle)
+}
+
+#[cfg(test)]
+fn uses_agent_connection_pool(db_type: &DatabaseType) -> bool {
+    matches!(*db_type, agent_connection_pool_database_type!())
 }
 
 #[cfg(test)]
@@ -1998,8 +2203,9 @@ async fn detect_ob_oracle_mode(config: &ConnectionConfig, pool: &db::mysql::MySq
 mod tests {
     use super::{
         agent_connect_timeout, connection_remote_endpoint, connection_url_for_endpoint, database_connection_config,
-        metadata_connection_config, mysql_metadata_fallback_url, redacted_connection_url_for_endpoint,
-        uses_bare_mysql_pool, uses_tcp_probe, validate_h2_database_path, AppState, PoolKind,
+        metadata_connection_config, mysql_metadata_fallback_url, prestosql_jdbc_config_for_endpoint,
+        redacted_connection_url_for_endpoint, uses_bare_mysql_pool, uses_tcp_probe, validate_h2_database_path,
+        AppState, PoolKind, PRESTOSQL_JDBC_DRIVER_CLASS,
     };
     use crate::agent_connection::{
         agent_connect_params, mongo_legacy_error_with_auth_hint, mongo_uses_legacy_driver,
@@ -2083,6 +2289,32 @@ mod tests {
 
         config.connect_timeout_secs = 45;
         assert_eq!(agent_connect_timeout(&config).as_secs(), 45);
+    }
+
+    #[test]
+    fn prestosql_jdbc_config_sets_presto_url_and_driver_class() {
+        let mut config = mysql_config(Some("hive/default"));
+        config.db_type = DatabaseType::PrestoSql;
+        config.host = "presto.example.com".to_string();
+        config.port = 9090;
+
+        let jdbc_config = prestosql_jdbc_config_for_endpoint(&config, "127.0.0.1", 19090);
+
+        assert_eq!(jdbc_config.connection_string.as_deref(), Some("jdbc:presto://127.0.0.1:19090/hive/default"));
+        assert_eq!(jdbc_config.jdbc_driver_class.as_deref(), Some(PRESTOSQL_JDBC_DRIVER_CLASS));
+    }
+
+    #[test]
+    fn prestosql_jdbc_config_preserves_custom_driver_class_and_paths() {
+        let mut config = mysql_config(Some("hive"));
+        config.db_type = DatabaseType::PrestoSql;
+        config.jdbc_driver_class = Some("custom.PrestoDriver".to_string());
+        config.jdbc_driver_paths = vec!["D:\\software\\jar\\presto-jdbc-350.jar".to_string()];
+
+        let jdbc_config = prestosql_jdbc_config_for_endpoint(&config, "presto.example.com", 9090);
+
+        assert_eq!(jdbc_config.jdbc_driver_class.as_deref(), Some("custom.PrestoDriver"));
+        assert_eq!(jdbc_config.jdbc_driver_paths, vec!["D:\\software\\jar\\presto-jdbc-350.jar"]);
     }
 
     #[test]
@@ -2711,7 +2943,30 @@ mod tests {
     }
 
     #[test]
-    fn mysql_direct_connections_skip_tcp_probe() {
+    fn session_scoped_pool_keys_are_sanitized_and_detected() {
+        let key = super::session_scoped_pool_key_for(
+            Some(DatabaseType::Mysql),
+            "mysql-conn:analytics".to_string(),
+            Some("tab-1:count"),
+        );
+
+        assert_eq!(key, "mysql-conn:analytics:session:tab-1_count");
+        assert!(super::is_session_scoped_pool_key(&key));
+        assert!(!super::is_session_scoped_pool_key("mysql-conn:analytics"));
+        assert_eq!(
+            super::session_scoped_pool_key_for(Some(DatabaseType::DuckDb), "duckdb-conn".to_string(), Some("tab-1")),
+            "duckdb-conn"
+        );
+    }
+
+    #[test]
+    fn prestosql_uses_external_driver_pool_not_agent_pool() {
+        assert!(!super::uses_agent_connection_pool(&DatabaseType::PrestoSql));
+        assert!(super::uses_agent_connection_pool(&DatabaseType::Trino));
+    }
+
+    #[test]
+    fn mysql_hostname_connections_skip_tcp_probe() {
         let mut config = mysql_config(Some("app"));
         config.host = "mysql.example.com".to_string();
 
@@ -2827,6 +3082,36 @@ mod tests {
         assert!(!conns.contains_key("conn:session:tab-1"));
         assert!(!conns.contains_key("conn:analytics:session:tab-1"));
         assert!(conns.contains_key("other"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn pool_activity_touch_updates_existing_pool_only() {
+        let (state, dir) = test_app_state().await;
+        let pool = crate::db::sqlite::connect_path(":memory:").await.unwrap();
+        let pool_key = "conn:session:tab-1";
+
+        state.connections.write().await.insert(pool_key.to_string(), PoolKind::Sqlite(pool));
+        state.pool_activity.write().await.insert(
+            pool_key.to_string(),
+            super::PoolActivity { last_used_at: std::time::Instant::now() - std::time::Duration::from_secs(10) },
+        );
+
+        {
+            let _touch = state.pool_activity_touch(pool_key);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let elapsed = state.pool_activity.read().await.get(pool_key).unwrap().last_used_at.elapsed();
+        assert!(elapsed < std::time::Duration::from_secs(10));
+
+        {
+            let _touch = state.pool_activity_touch(pool_key);
+            state.connections.write().await.remove(pool_key);
+            state.pool_activity.write().await.remove(pool_key);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(!state.pool_activity.read().await.contains_key(pool_key));
 
         let _ = std::fs::remove_dir_all(dir);
     }

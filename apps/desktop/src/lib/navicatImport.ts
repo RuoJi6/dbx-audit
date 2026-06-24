@@ -199,7 +199,7 @@ async function parseConnection(node: ParsedNode): Promise<ConnectionConfig | nul
     database: database || undefined,
     color: "",
     transport_layers: [],
-    connect_timeout_secs: 5,
+    connect_timeout_secs: 10,
     query_timeout_secs: 30,
     keepalive_interval_secs: keepaliveInterval,
     ssl: false,

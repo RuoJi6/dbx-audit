@@ -66,7 +66,7 @@ impl PluginRuntimeEnv {
         self.vars.iter().find_map(|(name, value)| (name == key).then_some(value.as_str()))
     }
 
-    fn apply_to(&self, command: &mut Command) {
+    pub fn apply_to(&self, command: &mut Command) {
         for (key, value) in &self.vars {
             command.env(key, value);
         }

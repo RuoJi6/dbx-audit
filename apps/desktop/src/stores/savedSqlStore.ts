@@ -196,6 +196,7 @@ export const useSavedSqlStore = defineStore("savedSql", () => {
           database: input.database,
           schema: input.schema,
           sql: input.sql,
+          connectionId: input.connectionId,
           updatedAt: timestamp,
         }
       : {
@@ -249,6 +250,14 @@ export const useSavedSqlStore = defineStore("savedSql", () => {
     files.value = files.value.filter((file) => file.id !== id);
     bumpVersion();
     await syncToLocalDirectory();
+
+    // Close all tabs that reference this saved SQL file
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const queryStore = useQueryStore();
+    const tabsToClose = queryStore.tabs.filter((tab) => tab.savedSqlId === id);
+    for (const tab of tabsToClose) {
+      queryStore.closeTab(tab.id, { force: true });
+    }
   }
 
   async function persistFolders(nextFolders: SavedSqlFolder[]) {

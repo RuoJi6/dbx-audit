@@ -22,6 +22,10 @@ export interface MongoGetIndexesCommand {
   collection: string;
 }
 
+export interface MongoUseCommand {
+  database: string;
+}
+
 export type MongoWriteCommand = { kind: "insert"; collection: string; docsJson: string } | { kind: "update"; collection: string; filter: string; update: string; many: boolean } | { kind: "delete"; collection: string; filter: string; many: boolean };
 
 export interface MongoAggregateSafetyOptions {
@@ -127,6 +131,15 @@ export function parseMongoGetIndexesCommand(input: string): MongoGetIndexesComma
 
   return {
     collection: target.collection,
+  };
+}
+
+export function parseMongoUseCommand(input: string): MongoUseCommand | null {
+  const source = input.trim().replace(/;$/, "").trim();
+  const match = /^use\s+([a-zA-Z0-9_-]+)$/i.exec(source);
+  if (!match) return null;
+  return {
+    database: match[1],
   };
 }
 
@@ -247,6 +260,15 @@ export function mongoWriteToQueryResult(affectedRows: number, executionTimeMs: n
     columns: [],
     rows: [],
     affected_rows: affectedRows,
+    execution_time_ms: Math.max(0, Math.round(executionTimeMs)),
+  };
+}
+
+export function mongoUseToQueryResult(database: string, executionTimeMs: number): QueryResult {
+  return {
+    columns: ["message"],
+    rows: [[`switched to db ${database}`]],
+    affected_rows: 0,
     execution_time_ms: Math.max(0, Math.round(executionTimeMs)),
   };
 }

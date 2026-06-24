@@ -418,7 +418,7 @@ watch(
           <!-- Options -->
           <div class="space-y-2.5 pt-1">
             <div class="text-xs font-medium text-muted-foreground uppercase tracking-wider">
-              {{ t("settings.options") }}
+              {{ t("databaseExport.options") }}
             </div>
             <div class="flex items-center gap-2 cursor-pointer text-xs" @click="includeStructure = !includeStructure">
               <CheckSquare v-if="includeStructure" class="w-3.5 h-3.5 text-primary shrink-0" />

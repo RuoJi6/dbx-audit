@@ -164,3 +164,18 @@ async fn spawn_client_for_key(manager: &AgentManager, key: &str) -> Result<Agent
     client.try_optional_handshake(manager.agent_app_version()).await;
     Ok(client)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prestosql_does_not_use_agent_driver() {
+        assert_eq!(runtime_agent_key_candidates(&DatabaseType::PrestoSql, None), None);
+    }
+
+    #[test]
+    fn trino_uses_only_trino_agent_driver() {
+        assert_eq!(runtime_agent_key_candidates(&DatabaseType::Trino, None).unwrap(), vec!["trino"]);
+    }
+}

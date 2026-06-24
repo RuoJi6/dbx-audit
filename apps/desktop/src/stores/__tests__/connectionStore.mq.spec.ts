@@ -49,6 +49,7 @@ describe("connectionStore MQ sidebar tree", () => {
 
     vi.doMock("@/lib/tauriRuntime", () => ({ isTauriRuntime: () => false }));
     vi.doMock("@/lib/api", () => ({
+      checkConnectionHealth: vi.fn().mockResolvedValue(undefined),
       deleteSchemaCachePrefix: vi.fn().mockResolvedValue(undefined),
       listDatabases: vi.fn().mockResolvedValue([]),
       loadSchemaCache: vi.fn().mockResolvedValue(null),

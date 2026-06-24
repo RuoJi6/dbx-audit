@@ -221,7 +221,7 @@ fn builds_table_data_where_and_schema_queries() {
             where_input: Some("where status = 'active'".to_string()),
             include_row_id: false,
         }),
-        "SELECT * FROM `users` WHERE (status = 'active') ORDER BY `id` ASC LIMIT 100;"
+        "SELECT * FROM `users` WHERE (status = 'active') LIMIT 100;"
     );
     assert_eq!(
         build_table_data_select_sql(TableDataSelectSqlOptions {
@@ -333,7 +333,7 @@ fn builds_table_data_where_and_schema_queries() {
             where_input: Some("WHERE amount > 10".to_string()),
             include_row_id: false,
         }),
-        "SELECT * FROM (SELECT * FROM \"DBXTEST\".\"ORDERS\" WHERE (amount > 10) ORDER BY \"ID\" ASC) WHERE ROWNUM <= 50"
+        "SELECT * FROM (SELECT * FROM \"DBXTEST\".\"ORDERS\" WHERE (amount > 10)) WHERE ROWNUM <= 50"
     );
     assert_eq!(
             build_table_data_select_sql(TableDataSelectSqlOptions {
@@ -349,7 +349,7 @@ fn builds_table_data_where_and_schema_queries() {
                 where_input: Some("WHERE amount > 10".to_string()),
                 include_row_id: false,
             }),
-            "SELECT \"ID\", \"AMOUNT\" FROM (SELECT dbx_t.\"ID\", dbx_t.\"AMOUNT\", ROW_NUMBER() OVER (ORDER BY \"ID\" ASC) AS \"__dbx_row_num\" FROM \"DB2INST1\".\"ORDERS\" dbx_t WHERE (amount > 10)) dbx_page WHERE \"__dbx_row_num\" > 100 AND \"__dbx_row_num\" <= 150 ORDER BY \"__dbx_row_num\""
+            "SELECT \"ID\", \"AMOUNT\" FROM (SELECT dbx_t.\"ID\", dbx_t.\"AMOUNT\", ROW_NUMBER() OVER () AS \"__dbx_row_num\" FROM \"DB2INST1\".\"ORDERS\" dbx_t WHERE (amount > 10)) dbx_page WHERE \"__dbx_row_num\" > 100 AND \"__dbx_row_num\" <= 150 ORDER BY \"__dbx_row_num\""
         );
     assert_eq!(
         build_table_data_select_sql(TableDataSelectSqlOptions {
@@ -401,7 +401,7 @@ fn builds_informix_table_data_with_skip_first_pagination() {
             where_input: Some("WHERE active = 1".to_string()),
             include_row_id: false,
         }),
-        "SELECT SKIP 100 FIRST 50 * FROM users WHERE (active = 1) ORDER BY id ASC"
+        "SELECT SKIP 100 FIRST 50 * FROM users WHERE (active = 1)"
     );
 
     assert_eq!(
@@ -418,7 +418,7 @@ fn builds_informix_table_data_with_skip_first_pagination() {
 }
 
 #[test]
-fn explicit_table_data_order_overrides_default_key_order() {
+fn explicit_table_data_order_is_preserved() {
     assert_eq!(
         build_table_data_select_sql(TableDataSelectSqlOptions {
             database_type: Some(DatabaseType::Postgres),
@@ -484,7 +484,7 @@ fn builds_table_data_special_column_queries() {
                 where_input: None,
                 include_row_id: false,
             }),
-            "SELECT tbname, `ts` AS `ts`, `current` AS `current`, `voltage` AS `voltage`, `location` AS `location`, `groupid` AS `groupid` FROM `test_db`.`meters` ORDER BY `ts` ASC LIMIT 100;"
+            "SELECT tbname, `ts` AS `ts`, `current` AS `current`, `voltage` AS `voltage`, `location` AS `location`, `groupid` AS `groupid` FROM `test_db`.`meters` LIMIT 100;"
         );
     assert_eq!(
         build_table_data_select_sql(TableDataSelectSqlOptions {
@@ -520,7 +520,7 @@ fn builds_sqlserver_table_data_pages() {
             where_input: Some("where id = 1".to_string()),
             include_row_id: false,
         }),
-        "SELECT TOP (25) * FROM [dbo].[accounts] WHERE (id = 1) ORDER BY [id] ASC"
+        "SELECT TOP (25) * FROM [dbo].[accounts] WHERE (id = 1)"
     );
     assert_eq!(
             build_table_data_select_sql(TableDataSelectSqlOptions {
@@ -536,28 +536,28 @@ fn builds_sqlserver_table_data_pages() {
                 where_input: None,
                 include_row_id: false,
             }),
-            "WITH [dbx_page] AS (SELECT [order_id], [customer], ROW_NUMBER() OVER (ORDER BY [order_id] ASC) AS [__dbx_row_num] FROM [sales].[orders]) SELECT [order_id], [customer] FROM [dbx_page] WHERE [__dbx_row_num] > 100 AND [__dbx_row_num] <= 150 ORDER BY [__dbx_row_num]"
+            "WITH [dbx_page] AS (SELECT [order_id], [customer], ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS [__dbx_row_num] FROM [sales].[orders]) SELECT [order_id], [customer] FROM [dbx_page] WHERE [__dbx_row_num] > 100 AND [__dbx_row_num] <= 150 ORDER BY [__dbx_row_num]"
         );
 }
 
 #[test]
 fn builds_oracle_and_neo4j_table_data_queries() {
     assert_eq!(
-            build_table_data_select_sql(TableDataSelectSqlOptions {
-                database_type: Some(DatabaseType::Oracle),
-                schema: Some("DBXTEST".to_string()),
-                table_name: "DBX_LOAD_TABLE_006".to_string(),
-                primary_keys: vec![DBX_ROWID_COLUMN.to_string()],
-                columns: Vec::new(),
-                fallback_order_columns: Vec::new(),
-                order_by: None,
-                limit: Some(100),
-                offset: None,
-                where_input: None,
-                include_row_id: true,
-            }),
-            "SELECT ROWIDTOCHAR(t.ROWID) AS \"__DBX_ROWID\", t.* FROM \"DBXTEST\".\"DBX_LOAD_TABLE_006\" t ORDER BY t.ROWID ASC"
-        );
+        build_table_data_select_sql(TableDataSelectSqlOptions {
+            database_type: Some(DatabaseType::Oracle),
+            schema: Some("DBXTEST".to_string()),
+            table_name: "DBX_LOAD_TABLE_006".to_string(),
+            primary_keys: vec![DBX_ROWID_COLUMN.to_string()],
+            columns: Vec::new(),
+            fallback_order_columns: Vec::new(),
+            order_by: None,
+            limit: Some(100),
+            offset: None,
+            where_input: None,
+            include_row_id: true,
+        }),
+        "SELECT ROWIDTOCHAR(t.ROWID) AS \"__DBX_ROWID\", t.* FROM \"DBXTEST\".\"DBX_LOAD_TABLE_006\" t"
+    );
     assert_eq!(
             build_table_data_select_sql(TableDataSelectSqlOptions {
                 database_type: Some(DatabaseType::Neo4j),
@@ -572,7 +572,7 @@ fn builds_oracle_and_neo4j_table_data_queries() {
                 where_input: None,
                 include_row_id: false,
             }),
-            "MATCH (n:`Employee`) RETURN elementId(n) AS `__DBX_ELEMENT_ID`, n.`id` AS `id`, n.`first name` AS `first name`, n.`role` AS `role` ORDER BY n.`id` ASC LIMIT 100;"
+            "MATCH (n:`Employee`) RETURN elementId(n) AS `__DBX_ELEMENT_ID`, n.`id` AS `id`, n.`first name` AS `first name`, n.`role` AS `role` LIMIT 100;"
         );
 }
 

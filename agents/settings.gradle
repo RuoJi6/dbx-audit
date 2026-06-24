@@ -1,0 +1,16 @@
+rootProject.name = 'dbx-agents'
+
+def infrastructureModules = ['common', 'test-support']
+def driverModules = [
+    'access', 'dameng', 'kingbase', 'vastbase', 'goldendb', 'databend', 'databricks', 'saphana',
+    'teradata', 'vertica', 'firebird', 'exasol', 'oceanbase-oracle', 'gbase8a', 'gbase8s', 'oracle',
+    'oracle-legacy', 'oracle-10g', 'bigquery', 'kylin', 'sundb', 'h2', 'snowflake', 'trino', 'hive',
+    'db2', 'informix', 'neo4j', 'cassandra', 'gaussdb', 'mongodb', 'highgo', 'tdengine', 'yashandb',
+    'iris', 'iotdb', 'etcd', 'zookeeper'
+]
+
+include(*(infrastructureModules + driverModules))
+
+driverModules.each { name ->
+    project(":${name}").projectDir = file("drivers/${name}")
+}

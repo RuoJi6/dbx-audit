@@ -194,7 +194,7 @@ pub fn default_ssh_connect_timeout_secs() -> u64 {
 }
 
 pub fn default_connect_timeout_secs() -> u64 {
-    5
+    10
 }
 
 pub fn default_query_timeout_secs() -> u64 {
@@ -290,6 +290,8 @@ pub enum DatabaseType {
     H2,
     Snowflake,
     Trino,
+    #[serde(rename = "prestosql")]
+    PrestoSql,
     Hive,
     #[serde(rename = "db2")]
     Db2,
@@ -762,6 +764,7 @@ impl ConnectionConfig {
             DatabaseType::H2 => format!("h2://{host}:{port}{db_part}"),
             DatabaseType::Snowflake => format!("snowflake://{host}/{db_part}"),
             DatabaseType::Trino => format!("trino://{host}:{port}{db_part}"),
+            DatabaseType::PrestoSql => format!("prestosql://{host}:{port}{db_part}"),
             DatabaseType::Hive => format!("hive://{host}:{port}{db_part}"),
             DatabaseType::Db2 => format!("db2://{host}:{port}{db_part}"),
             DatabaseType::Informix => format!("informix://{host}:{port}{db_part}"),
@@ -935,6 +938,9 @@ impl ConnectionConfig {
             }
             DatabaseType::Trino => {
                 format!("trino://{}:{}@{host}:{port}{db_part}", username, password)
+            }
+            DatabaseType::PrestoSql => {
+                format!("prestosql://{}:{}@{host}:{port}{db_part}", username, password)
             }
             DatabaseType::Hive => {
                 format!("hive://{}:{}@{host}:{port}{db_part}", username, password)
@@ -1579,6 +1585,24 @@ mod tests {
         assert_eq!(hops[0].password, "secret");
         assert_eq!(hops[0].connect_timeout_secs, default_ssh_connect_timeout_secs());
         assert!(hops[0].expose_lan);
+    }
+
+    #[test]
+    fn missing_connection_timeout_defaults_to_ten_seconds() {
+        let config: ConnectionConfig = serde_json::from_value(serde_json::json!({
+            "id": "id",
+            "name": "name",
+            "db_type": "mysql",
+            "host": "10.1.2.3",
+            "port": 3306,
+            "username": "root",
+            "password": "",
+            "database": null
+        }))
+        .unwrap();
+
+        assert_eq!(config.connect_timeout_secs, 10);
+        assert_eq!(config.effective_connect_timeout_secs(), 10);
     }
 
     #[test]

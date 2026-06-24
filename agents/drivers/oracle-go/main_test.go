@@ -1,0 +1,284 @@
+package main
+
+import (
+	"encoding/json"
+	"errors"
+	"os"
+	"strings"
+	"testing"
+)
+
+func TestHandshakeResponse(t *testing.T) {
+	s := newServer()
+	resp, shutdown := s.handleLine(`{"jsonrpc":"2.0","id":7,"method":"handshake","params":{"appVersion":"dev"}}`)
+	if shutdown {
+		t.Fatal("handshake should not shut down the server")
+	}
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
+	}
+	data, err := json.Marshal(resp.Result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result struct {
+		ProtocolVersion      int      `json:"protocolVersion"`
+		AgentProtocolVersion int      `json:"agentProtocolVersion"`
+		Capabilities         []string `json:"capabilities"`
+	}
+	if err := json.Unmarshal(data, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.ProtocolVersion != 1 || result.AgentProtocolVersion != 1 {
+		t.Fatalf("unexpected protocol versions: %+v", result)
+	}
+	contract := protocolContract(t)
+	if result.ProtocolVersion != contract.ProtocolVersion || result.AgentProtocolVersion != contract.ProtocolVersion {
+		t.Fatalf("handshake protocol versions do not match contract: result=%+v contract=%+v", result, contract)
+	}
+	for _, capability := range result.Capabilities {
+		if !contains(contract.AllCapabilities, capability) {
+			t.Fatalf("handshake returned capability %q outside protocol contract %v", capability, contract.AllCapabilities)
+		}
+	}
+	if !contains(result.Capabilities, "query") || !contains(result.Capabilities, "metadata") {
+		t.Fatalf("expected query and metadata capabilities, got %v", result.Capabilities)
+	}
+}
+
+func TestCloseMissingQuerySessionReturnsFalse(t *testing.T) {
+	s := newServer()
+	resp, shutdown := s.handleLine(`{"jsonrpc":"2.0","id":8,"method":"close_query_session","params":{"sessionId":"missing"}}`)
+	if shutdown {
+		t.Fatal("close_query_session should not shut down the server")
+	}
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
+	}
+	if resp.Result != false {
+		t.Fatalf("expected false result, got %#v", resp.Result)
+	}
+}
+
+func TestEmptyResultSlicesMarshalAsArrays(t *testing.T) {
+	data, err := json.Marshal(queryResult{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if strings.Contains(text, `"columns":null`) || strings.Contains(text, `"rows":null`) {
+		t.Fatalf("query result should marshal nil slices as arrays: %s", text)
+	}
+
+	data, err = json.Marshal(indexInfo{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text = string(data)
+	if strings.Contains(text, `"columns":null`) || strings.Contains(text, `"included_columns":null`) {
+		t.Fatalf("index info should marshal nil slices as arrays: %s", text)
+	}
+}
+
+func TestGetTableDDLResultMarshalsAsString(t *testing.T) {
+	data, err := json.Marshal("CREATE TABLE HR.ORDERS (ID NUMBER)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ddl string
+	if err := json.Unmarshal(data, &ddl); err != nil {
+		t.Fatalf("get_table_ddl result must deserialize as a string: %v", err)
+	}
+}
+
+func TestNormalizeDDLObjectType(t *testing.T) {
+	tests := map[string]string{
+		"":                  "",
+		"table":             "TABLE",
+		"VIEW":              "VIEW",
+		"materialized view": "MATERIALIZED_VIEW",
+		"MATERIALIZED_VIEW": "MATERIALIZED_VIEW",
+		"procedure":         "",
+	}
+	for input, want := range tests {
+		if got := normalizeDDLObjectType(input); got != want {
+			t.Fatalf("normalizeDDLObjectType(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
+func protocolContract(t *testing.T) struct {
+	ProtocolVersion int      `json:"protocolVersion"`
+	AllCapabilities []string `json:"allCapabilities"`
+} {
+	t.Helper()
+	data, err := os.ReadFile("../../common/src/main/resources/agent-protocol-v1.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var contract struct {
+		ProtocolVersion int      `json:"protocolVersion"`
+		AllCapabilities []string `json:"allCapabilities"`
+	}
+	if err := json.Unmarshal(data, &contract); err != nil {
+		t.Fatal(err)
+	}
+	return contract
+}
+
+func TestOracleColumnTypeDDL(t *testing.T) {
+	charLen := 64
+	precision := 10
+	scale := 2
+	zeroScale := 0
+
+	tests := []struct {
+		name   string
+		column columnInfo
+		want   string
+	}{
+		{name: "varchar", column: columnInfo{DataType: "VARCHAR2", CharacterMaximumLength: &charLen}, want: "VARCHAR2(64)"},
+		{name: "number scale", column: columnInfo{DataType: "NUMBER", NumericPrecision: &precision, NumericScale: &scale}, want: "NUMBER(10,2)"},
+		{name: "number zero scale", column: columnInfo{DataType: "NUMBER", NumericPrecision: &precision, NumericScale: &zeroScale}, want: "NUMBER(10)"},
+		{name: "timestamp preserves precision", column: columnInfo{DataType: "TIMESTAMP(6)"}, want: "TIMESTAMP(6)"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := oracleColumnTypeDDL(tt.column); got != tt.want {
+				t.Fatalf("oracleColumnTypeDDL() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBuildDSNUsesConnectionStringWhenProvided(t *testing.T) {
+	dsn := buildDSN(connectParams{ConnectionString: "oracle://scott:tiger@db.example.com:1521/ORCLPDB1"})
+
+	if dsn != "oracle://scott:tiger@db.example.com:1521/ORCLPDB1" {
+		t.Fatalf("unexpected dsn: %s", dsn)
+	}
+}
+
+func TestBuildDSNUsesJdbcServiceHostAndPort(t *testing.T) {
+	dsn := buildDSN(connectParams{
+		Host:             "127.0.0.1",
+		Port:             11521,
+		Database:         "ORCLPDB1",
+		Username:         "scott",
+		Password:         "tiger",
+		ConnectionString: "jdbc:oracle:thin:@//oracle.example.com:1521/ORCLPDB1",
+	})
+
+	if strings.Contains(strings.ToLower(dsn), "jdbc:") {
+		t.Fatalf("dsn should be go-ora format, got: %s", dsn)
+	}
+	if !strings.Contains(dsn, "oracle.example.com:1521") || !strings.Contains(dsn, "ORCLPDB1") {
+		t.Fatalf("dsn should use JDBC host/port/database fields, got: %s", dsn)
+	}
+}
+
+func TestBuildDSNUsesRewrittenJdbcServiceHostAndPort(t *testing.T) {
+	dsn := buildDSN(connectParams{
+		Host:             "127.0.0.1",
+		Port:             11521,
+		Database:         "ORCLPDB1",
+		Username:         "scott",
+		Password:         "tiger",
+		ConnectionString: "jdbc:oracle:thin:@//127.0.0.1:11521/ORCLPDB1",
+	})
+
+	if strings.Contains(strings.ToLower(dsn), "jdbc:") {
+		t.Fatalf("dsn should be go-ora format, got: %s", dsn)
+	}
+	if !strings.Contains(dsn, "127.0.0.1:11521") || !strings.Contains(dsn, "ORCLPDB1") {
+		t.Fatalf("dsn should use rewritten JDBC host/port/database fields, got: %s", dsn)
+	}
+}
+
+func TestBuildDSNConvertsJdbcSID(t *testing.T) {
+	dsn := buildDSN(connectParams{
+		Host:             "127.0.0.1",
+		Port:             11521,
+		Database:         "ORCL",
+		Username:         "scott",
+		Password:         "tiger",
+		ConnectionString: "jdbc:oracle:thin:@oracle.example.com:1521:ORCL",
+	})
+
+	if strings.Contains(strings.ToLower(dsn), "jdbc:") {
+		t.Fatalf("dsn should be go-ora format, got: %s", dsn)
+	}
+	upperDSN := strings.ToUpper(dsn)
+	if !strings.Contains(dsn, "oracle.example.com:1521") || !strings.Contains(upperDSN, "SID=ORCL") {
+		t.Fatalf("dsn should use JDBC host/port and SID option, got: %s", dsn)
+	}
+}
+
+func TestBuildDSNConvertsJdbcDescriptor(t *testing.T) {
+	dsn := buildDSN(connectParams{
+		Username:         "scott",
+		Password:         "tiger",
+		ConnectionString: "jdbc:oracle:thin:@(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=db.example.com)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=ORCLPDB1)))",
+	})
+
+	if !strings.HasPrefix(dsn, "oracle://scott:tiger@") {
+		t.Fatalf("descriptor should become go-ora url, got: %s", dsn)
+	}
+	if !strings.Contains(dsn, "connStr=") {
+		t.Fatalf("descriptor should be passed via connStr option, got: %s", dsn)
+	}
+}
+
+func TestBuildDSNAddsSysDbaOption(t *testing.T) {
+	dsn := buildDSN(connectParams{
+		Host:      "127.0.0.1",
+		Port:      1521,
+		Database:  "SYSDBA:ORCLPDB1",
+		Username:  "sys",
+		Password:  "secret",
+		SysDBA:    true,
+		URLParams: "TRACE FILE=trace.log",
+	})
+
+	if strings.Contains(dsn, "SYSDBA:") {
+		t.Fatalf("dsn should strip SYSDBA prefix: %s", dsn)
+	}
+	if !strings.Contains(dsn, "ORCLPDB1") {
+		t.Fatalf("dsn should include service name: %s", dsn)
+	}
+	upperDSN := strings.ToUpper(dsn)
+	if !strings.Contains(upperDSN, "AUTH TYPE=SYSDBA") &&
+		!strings.Contains(upperDSN, "AUTH+TYPE=SYSDBA") &&
+		!strings.Contains(upperDSN, "AUTH%20TYPE=SYSDBA") {
+		t.Fatalf("dsn should include SYSDBA auth option: %s", dsn)
+	}
+}
+
+func TestListDatabasesSQLUsesUserDictionaryInsteadOfObjectDictionary(t *testing.T) {
+	sqlText := strings.ToUpper(oracleListDatabasesSQL)
+
+	if !strings.Contains(sqlText, "ALL_USERS") {
+		t.Fatalf("schema listing should query ALL_USERS, got: %s", oracleListDatabasesSQL)
+	}
+	if strings.Contains(sqlText, "ALL_TABLES") || strings.Contains(sqlText, "ALL_VIEWS") {
+		t.Fatalf("schema listing should not scan object dictionaries, got: %s", oracleListDatabasesSQL)
+	}
+}
+
+func TestIsOraclePGALimitError(t *testing.T) {
+	if !isOraclePGALimitError(errors.New("ORA-04036: PGA memory used by the instance exceeds PGA_AGGREGATE_LIMIT")) {
+		t.Fatal("expected ORA-04036 to be detected")
+	}
+	if isOraclePGALimitError(errors.New("ORA-00942: table or view does not exist")) {
+		t.Fatal("unexpected ORA-00942 match")
+	}
+}
+
+func contains(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}

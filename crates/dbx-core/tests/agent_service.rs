@@ -228,9 +228,10 @@ fn jre_needs_install_when_managed_runtime_version_differs() {
 }
 
 #[test]
-fn local_agent_jar_candidates_include_sibling_build_output() {
+fn local_agent_jar_candidates_include_monorepo_and_legacy_build_output() {
     let candidates = local_agent_jar_candidates("tdengine");
 
+    assert!(candidates.iter().any(|path| path.ends_with("agents/drivers/tdengine/build/libs/dbx-agent-tdengine.jar")));
     assert!(candidates.iter().any(|path| path.ends_with("dbx-agents/tdengine/build/libs/dbx-agent-tdengine.jar")));
 }
 
@@ -242,6 +243,10 @@ fn github_agent_asset_urls_map_to_r2_paths_by_category() {
     );
     assert_eq!(
         github_url_to_r2_path("https://github.com/t8y2/dbx-agents/releases/download/v1/dbx-agent-h2.jar", "driver"),
+        "agents/drivers/dbx-agent-h2.jar"
+    );
+    assert_eq!(
+        github_url_to_r2_path("https://github.com/t8y2/dbx/releases/download/agents-v0.3.0/dbx-agent-h2.jar", "driver"),
         "agents/drivers/dbx-agent-h2.jar"
     );
 }

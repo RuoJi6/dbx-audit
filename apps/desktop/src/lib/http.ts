@@ -164,6 +164,10 @@ export async function disconnectDb(connectionId: string): Promise<void> {
   return post("/api/connection/disconnect", { connectionId });
 }
 
+export async function checkConnectionHealth(connectionId: string): Promise<void> {
+  return post("/api/connection/check-health", { connectionId });
+}
+
 export async function closeDatabaseConnection(connectionId: string, database: string): Promise<boolean> {
   return post("/api/connection/close-database", { connectionId, database });
 }
@@ -222,6 +226,10 @@ export async function importJdbcDrivers(pathsOrFiles: (string | File)[]): Promis
 
 export async function installJdbcDriverFromMaven(coordinate: string, repositories: string[] = []): Promise<JdbcDriverInfo[]> {
   return post("/api/jdbc/drivers/maven", { coordinate, repositories });
+}
+
+export async function installPrestoSqlJdbcDriver(): Promise<JdbcDriverInfo[]> {
+  return post("/api/jdbc/drivers/prestosql", {});
 }
 
 export async function deleteJdbcDriver(path: string): Promise<JdbcDriverInfo[]> {

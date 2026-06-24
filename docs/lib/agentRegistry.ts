@@ -34,7 +34,7 @@ export interface AgentRegistry {
 }
 
 const AGENT_REGISTRY_R2_URL = "https://dl.dbxio.com/agents/agent-registry.json";
-const AGENT_REGISTRY_GITHUB_URL = "https://github.com/t8y2/dbx-agents/releases/latest/download/agent-registry.json";
+const AGENT_REGISTRY_GITHUB_URL = "https://github.com/t8y2/dbx/releases/download/agents-latest/agent-registry.json";
 
 export async function fetchAgentRegistry(): Promise<AgentRegistry | null> {
   const urls = [AGENT_REGISTRY_R2_URL, AGENT_REGISTRY_GITHUB_URL];

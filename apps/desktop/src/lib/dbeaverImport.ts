@@ -213,7 +213,7 @@ function buildConnection(entry: DbeaverConnectionEntry, credentials: ReturnType<
     database: database || undefined,
     color: getString(config.color || config["connection-color"]),
     transport_layers: [],
-    connect_timeout_secs: 5,
+    connect_timeout_secs: 10,
     query_timeout_secs: 30,
     ssl: false,
     oracle_connection_type: profile.dbType === "oracle" ? parsedUrl.oracleConnectionType || "service_name" : undefined,

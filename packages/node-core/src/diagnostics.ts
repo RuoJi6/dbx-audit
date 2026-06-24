@@ -43,6 +43,7 @@ export const BRIDGE_REQUIRED_TYPES = [
   "h2",
   "snowflake",
   "trino",
+  "prestosql",
   "hive",
   "db2",
   "informix",

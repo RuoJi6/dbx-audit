@@ -48,6 +48,7 @@ pub fn is_schema_aware(database_type: DatabaseType) -> bool {
             | DatabaseType::H2
             | DatabaseType::Snowflake
             | DatabaseType::Trino
+            | DatabaseType::PrestoSql
             | DatabaseType::Hive
             | DatabaseType::Db2
             | DatabaseType::Tdengine

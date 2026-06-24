@@ -6,6 +6,7 @@ import { useToast } from "@/composables/useToast";
 import { useTheme } from "@/composables/useTheme";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { loadEditorTheme, editorFontTheme } from "@/lib/editorThemes";
+import { createDbxCodeMirrorSqlDialect } from "@/lib/codemirrorSqlDialect";
 import { copyToClipboard } from "@/lib/clipboard";
 import * as api from "@/lib/api";
 import { Button } from "@/components/ui/button";
@@ -82,8 +83,7 @@ async function initDdlEditor(content: string) {
   const fontFamily = settingsStore.editorSettings.fontFamily;
   const themeExt = await loadEditorTheme(editorTheme, appAppearance);
   const fontExt = editorFontTheme(EditorView, fontSize, fontFamily, { fixedHeight: true, scrollable: true });
-  const baseDialect = props.dialect === "postgres" ? langSql.PostgreSQL : props.dialect === "sqlserver" ? langSql.MSSQL : langSql.MySQL;
-  const dialect = langSql.SQLDialect.define({ ...baseDialect.spec });
+  const dialect = createDbxCodeMirrorSqlDialect(langSql, props.dialect);
   const state = EditorState.create({
     doc: content,
     extensions: [

@@ -1,0 +1,11 @@
+dependencies {
+    implementation fileTree(dir: 'libs', include: ['*.jar'])
+    implementation 'com.oracle.database.jdbc:ojdbc6:11.2.0.4'
+    implementation 'com.oracle.database.nls:orai18n:11.2.0.4'
+}
+
+tasks.named('shadowJar') {
+    manifest {
+        attributes('Agent-Label': 'Oracle 10g', 'Main-Class': 'com.dbx.agent.oracle10g.Oracle10gAgent')
+    }
+}

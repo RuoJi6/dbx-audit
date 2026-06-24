@@ -10,6 +10,9 @@ import * as api from "@/lib/api";
 import type { QueryTab } from "@/types/database";
 import { useToast } from "@/composables/useToast";
 import { connectionObjectTreeQuerySchema, effectiveDatabaseTypeForConnection } from "@/lib/jdbcDialect";
+import { uuid } from "@/lib/utils";
+
+const DATA_TAB_METADATA_TTL_MS = 30_000;
 
 export function useDataGridActions(activeTab: ComputedRef<QueryTab | undefined>) {
   const { t } = useI18n();
@@ -31,7 +34,6 @@ export function useDataGridActions(activeTab: ComputedRef<QueryTab | undefined>)
     if (tab.tableMeta && primaryKeys.join("\0") !== tab.tableMeta.primaryKeys.join("\0")) {
       tab.tableMeta.primaryKeys = primaryKeys;
     }
-    const fallbackOrderColumns = effectiveDbType === "sqlserver" && !primaryKeys.length ? tableMeta?.columns.slice(0, 1).map((column) => column.name) : undefined;
     const useRowId = usesSyntheticRowIdKey(effectiveDbType, primaryKeys);
     return buildTableSelectSql({
       databaseType: effectiveDbType,
@@ -39,22 +41,25 @@ export function useDataGridActions(activeTab: ComputedRef<QueryTab | undefined>)
       tableName: tableMeta?.tableName ?? "",
       columns: tableMeta?.columns.map((column) => column.name),
       primaryKeys,
-      fallbackOrderColumns,
       includeRowId: useRowId,
       limit: options.limit ?? settingsStore.editorSettings.pageSize,
       ...options,
     });
   }
 
-  async function refreshDataTabTableMeta(tab: QueryTab): Promise<void> {
+  async function refreshDataTabTableMeta(tab: QueryTab, trace?: { traceId: string; elapsed: () => string }): Promise<void> {
     if (tab.mode !== "data" || !tab.connectionId || !tab.database) return;
     const tableMeta = tableMetaForDataTab(tab);
     if (!tableMeta?.tableName) return;
 
+    console.info("[DBX][reloadData:metadata:ensure-connected:start]", { traceId: trace?.traceId, elapsed: trace?.elapsed() });
     await connectionStore.ensureConnected(tab.connectionId);
+    console.info("[DBX][reloadData:metadata:ensure-connected:done]", { traceId: trace?.traceId, elapsed: trace?.elapsed() });
     const config = connectionStore.getConfig(tab.connectionId);
     const querySchema = connectionObjectTreeQuerySchema(config, tab.database, tableMeta.schema);
+    console.info("[DBX][reloadData:metadata:get-columns:start]", { traceId: trace?.traceId, elapsed: trace?.elapsed(), schema: querySchema, table: tableMeta.tableName });
     const columns = await api.getColumns(tab.connectionId, tab.database, querySchema, tableMeta.tableName);
+    console.info("[DBX][reloadData:metadata:get-columns:done]", { traceId: trace?.traceId, elapsed: trace?.elapsed(), columnCount: columns.length });
     const primaryKeys = editablePrimaryKeys(effectiveDatabaseTypeForConnection(config), columns, tableMeta.tableType);
     queryStore.setTableMeta(tab.id, {
       schema: tableMeta.schema,
@@ -75,21 +80,53 @@ export function useDataGridActions(activeTab: ComputedRef<QueryTab | undefined>)
   async function onReloadData(sql?: string, _searchText?: string, whereInput?: string, orderBy?: string, limit?: number, offset?: number) {
     const tab = activeTab.value;
     if (!tab) return;
+    const traceId = uuid().slice(0, 8);
+    const startedAt = performance.now();
+    const elapsed = () => `${Math.round(performance.now() - startedAt)}ms`;
     if (tab.mode === "data" && tableMetaForDataTab(tab)) {
       tab.whereInput = whereInput ?? "";
       const pageLimit = limit ?? settingsStore.editorSettings.pageSize;
       const pageOffset = offset ?? 0;
-      try {
-        await refreshDataTabTableMeta(tab);
-      } catch (e: any) {
-        toast(e?.message || String(e), 5000);
-      }
-      const nextSql = await buildTableSql(tab, { whereInput, orderBy, limit: pageLimit, offset: pageOffset });
-      queryStore.updateSql(tab.id, nextSql);
-      await queryStore.executeTabSql(tab.id, nextSql, {
-        pagination: { limit: pageLimit, offset: pageOffset },
-        preserveResultDuringExecution: true,
+      console.info("[DBX][reloadData:start]", {
+        traceId,
+        tabId: tab.id,
+        connectionId: tab.connectionId,
+        database: tab.database,
+        table: tableMetaForDataTab(tab)?.tableName,
+        elapsed: elapsed(),
       });
+      queryStore.setExecuting(tab.id, true);
+      const tableMeta = tableMetaForDataTab(tab);
+      const metadataAgeMs = tab.tableMetaUpdatedAt ? Date.now() - tab.tableMetaUpdatedAt : Number.POSITIVE_INFINITY;
+      const shouldRefreshMetadata = !tableMeta?.columns.length || metadataAgeMs > DATA_TAB_METADATA_TTL_MS;
+      if (shouldRefreshMetadata) {
+        try {
+          console.info("[DBX][reloadData:metadata:start]", { traceId, elapsed: elapsed(), reason: tableMeta?.columns.length ? "stale" : "missing", metadataAgeMs });
+          await refreshDataTabTableMeta(tab, { traceId, elapsed });
+          console.info("[DBX][reloadData:metadata:done]", { traceId, elapsed: elapsed() });
+        } catch (e: any) {
+          console.warn("[DBX][reloadData:metadata:error]", { traceId, elapsed: elapsed(), error: e });
+          toast(e?.message || String(e), 5000);
+        }
+      } else {
+        console.info("[DBX][reloadData:metadata:skip]", { traceId, elapsed: elapsed(), columnCount: tableMeta.columns.length, metadataAgeMs });
+      }
+      try {
+        console.info("[DBX][reloadData:build-sql:start]", { traceId, elapsed: elapsed() });
+        const nextSql = await buildTableSql(tab, { whereInput, orderBy, limit: pageLimit, offset: pageOffset });
+        console.info("[DBX][reloadData:build-sql:done]", { traceId, elapsed: elapsed() });
+        queryStore.updateSql(tab.id, nextSql);
+        console.info("[DBX][reloadData:execute:start]", { traceId, elapsed: elapsed() });
+        await queryStore.executeTabSql(tab.id, nextSql, {
+          pagination: { limit: pageLimit, offset: pageOffset },
+          preserveResultDuringExecution: true,
+        });
+        console.info("[DBX][reloadData:execute:done]", { traceId, elapsed: elapsed() });
+      } catch (e) {
+        console.error("[DBX][reloadData:error]", { traceId, elapsed: elapsed(), error: e });
+        queryStore.setExecuting(tab.id, false);
+        throw e;
+      }
       return;
     }
     if (tab.resultSortedSql) {

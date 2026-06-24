@@ -6,6 +6,7 @@ use serde::Deserialize;
 
 use crate::error::AppError;
 use crate::state::WebState;
+use dbx_core::query_cancel::RunningTaskMetadata;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -269,7 +270,10 @@ pub async fn execute_query(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let execution_id = req.execution_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    let registered = state.app.running_queries.register(execution_id.clone());
+    let registered = state.app.running_queries.register_task(
+        execution_id.clone(),
+        RunningTaskMetadata::query(req.connection_id.clone(), req.database.clone(), req.client_session_id.clone()),
+    );
     let cancel_token = registered.token();
 
     let result = dbx_core::query::execute_sql_statement_with_options(
@@ -302,7 +306,10 @@ pub async fn execute_multi(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let execution_id = req.execution_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    let registered = state.app.running_queries.register(execution_id.clone());
+    let registered = state.app.running_queries.register_task(
+        execution_id.clone(),
+        RunningTaskMetadata::query(req.connection_id.clone(), req.database.clone(), req.client_session_id.clone()),
+    );
     let cancel_token = registered.token();
 
     let result = dbx_core::query::execute_multi_core_with_options(

@@ -1841,6 +1841,28 @@ test("prefix matches still rank above fuzzy matches", () => {
   assert.equal(items[0]?.label, "name");
 });
 
+test("suggests columns after multiple select-list expressions", () => {
+  const sql = "select project_name, review_accountant, doc from ypmng_archive LIMIT 100";
+  const cursor = "select project_name, review_accountant, doc".length;
+  const items = buildSqlCompletionItems(sql, cursor, {
+    tables: [{ name: "ypmng_archive", type: "table" }],
+    objects: [{ name: "proc_get_ypfmm_pd_score_list_with_template_doc_id", schema: "y_jnpf", type: "procedure" }],
+    columnsByTable: new Map([
+      [
+        "ypmng_archive",
+        [
+          { name: "doc_id", table: "ypmng_archive", dataType: "bigint" },
+          { name: "project_name", table: "ypmng_archive", dataType: "varchar" },
+          { name: "review_accountant", table: "ypmng_archive", dataType: "varchar" },
+        ],
+      ],
+    ]),
+  });
+
+  assert.ok(items.some((item) => item.label === "doc_id" && item.type === "column"));
+  assert.ok(!items.some((item) => item.type === "function" && item.label.startsWith("proc_")));
+});
+
 // --- Type-aware comparison hints ---
 
 test("suggests NULL and IS NULL after comparison operator", () => {

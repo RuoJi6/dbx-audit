@@ -1613,12 +1613,12 @@ onUnmounted(() => {
           @download-and-install="downloadAndInstallUpdate"
           @restart="restartApp"
         />
-        <CloseActionPromptDialog v-if="isDesktop" v-model:open="showCloseActionPrompt" @quit="chooseQuit" @minimize="chooseMinimize" />
+        <CloseActionPromptDialog v-if="isDesktop && showCloseActionPrompt" v-model:open="showCloseActionPrompt" @quit="chooseQuit" @minimize="chooseMinimize" />
         <QuickOpenDialog :open="showQuickOpen" @update:open="showQuickOpen = $event" @select="handleQuickOpenSelect" />
       </div>
       <Teleport to="body">
         <Transition name="toast">
-          <div v-if="toastVisible" class="fixed bottom-6 inset-x-0 w-max mx-auto z-99999 px-4 py-2 rounded-lg bg-foreground text-background text-sm shadow-lg select-text">
+          <div v-if="toastVisible" class="fixed bottom-6 inset-x-0 w-max max-w-[90vw] sm:max-w-3xl mx-auto z-99999 px-4 py-2 rounded-lg bg-foreground text-background text-sm shadow-lg select-text whitespace-pre-wrap break-words">
             {{ toastMessage }}
           </div>
         </Transition>

@@ -46,6 +46,15 @@ function oracleConn(id: string): ConnectionConfig {
   };
 }
 
+function withConnectionHealthMock(handler: typeof fetch): typeof fetch {
+  return (async (input, init) => {
+    if (String(input) === "/api/connection/check-health") {
+      return new Response("null", { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    return handler(input, init);
+  });
+}
+
 async function waitFor(predicate: () => boolean, timeoutMs = 1000) {
   const started = Date.now();
   while (!predicate()) {
@@ -383,7 +392,7 @@ test("completed query executions append result runs and select the latest run", 
   let executeCount = 0;
 
   connectionStore.addEphemeralConnection(conn("conn-1"));
-  globalThis.fetch = (async (input, init) => {
+  globalThis.fetch = withConnectionHealthMock(async (input, init) => {
     const url = String(input);
     if (url === "/api/query/prepare-pagination-plan") {
       const body = JSON.parse(String(init?.body ?? "{}"));
@@ -406,7 +415,7 @@ test("completed query executions append result runs and select the latest run", 
       });
     }
     return new Response("unexpected request", { status: 500 });
-  }) as typeof fetch;
+  });
 
   try {
     const tabId = store.createTab("conn-1", "db", "Query");
@@ -438,7 +447,7 @@ test("failed query executions append switchable error result runs", async () => 
   const originalFetch = globalThis.fetch;
 
   connectionStore.addEphemeralConnection(conn("conn-1"));
-  globalThis.fetch = (async (input, init) => {
+  globalThis.fetch = withConnectionHealthMock(async (input, init) => {
     const url = String(input);
     if (url === "/api/query/prepare-pagination-plan") {
       const body = JSON.parse(String(init?.body ?? "{}"));
@@ -451,7 +460,7 @@ test("failed query executions append switchable error result runs", async () => 
       return new Response("backend exploded", { status: 500 });
     }
     return new Response("unexpected request", { status: 500 });
-  }) as typeof fetch;
+  });
 
   try {
     const tabId = store.createTab("conn-1", "db", "Query");
@@ -463,6 +472,43 @@ test("failed query executions append switchable error result runs", async () => 
     assert.equal(tab?.activeResultRunId, tab?.resultRuns?.[0]?.id);
     assert.deepEqual(tab?.resultRuns?.[0]?.result?.columns, ["Error"]);
     assert.deepEqual(tab?.result?.columns, ["Error"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreStorage();
+  }
+});
+
+test("query execution errors mentioning connection keep the connection active", async () => {
+  const restoreStorage = installMemoryStorage();
+  setActivePinia(createPinia());
+  const connectionStore = useConnectionStore();
+  const store = useQueryStore();
+  const originalFetch = globalThis.fetch;
+
+  connectionStore.addEphemeralConnection(conn("conn-1"));
+  connectionStore.activeConnectionId = "conn-1";
+  globalThis.fetch = withConnectionHealthMock(async (input, init) => {
+    const url = String(input);
+    if (url === "/api/query/prepare-pagination-plan") {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      return new Response(JSON.stringify({ sqlToExecute: body.options.sql, useAgentResultSession: false }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (url === "/api/query/execute-multi") {
+      return new Response('relation "connection" does not exist', { status: 500 });
+    }
+    return new Response("unexpected request", { status: 500 });
+  });
+
+  try {
+    const tabId = store.createTab("conn-1", "db", "Query");
+    await store.executeTabSql(tabId, "select connection from missing_table");
+
+    assert.equal(connectionStore.connectedIds.has("conn-1"), true);
+    assert.equal(connectionStore.activeConnectionId, "conn-1");
+    assert.equal(connectionStore.connectionErrors["conn-1"], undefined);
   } finally {
     globalThis.fetch = originalFetch;
     restoreStorage();
@@ -524,7 +570,7 @@ test("normalizes unquoted Oracle query identifiers before loading editable metad
 
   connectionStore.addEphemeralConnection(oracleConn("oracle-1"));
 
-  globalThis.fetch = (async (input, init) => {
+  globalThis.fetch = withConnectionHealthMock(async (input, init) => {
     const url = String(input);
     if (url === "/api/query/execute-multi") {
       return new Response(
@@ -596,7 +642,7 @@ test("normalizes unquoted Oracle query identifiers before loading editable metad
       });
     }
     return new Response("unexpected request", { status: 500 });
-  }) as typeof fetch;
+  });
 
   try {
     const tabId = store.createTab("oracle-1", "ORCL", "Query 1", "query", "app");
@@ -626,7 +672,7 @@ test("evicting cached tab results releases multi-result payloads and sessions", 
 
   connectionStore.addEphemeralConnection(conn("conn-1"));
 
-  globalThis.fetch = (async (input, init) => {
+  globalThis.fetch = withConnectionHealthMock(async (input, init) => {
     const url = String(input);
     if (url === "/api/query/execute-multi") {
       executeCount++;
@@ -675,7 +721,7 @@ test("evicting cached tab results releases multi-result payloads and sessions", 
       );
     }
     return new Response("unexpected request", { status: 500 });
-  }) as typeof fetch;
+  });
 
   try {
     const tabIds: string[] = [];
@@ -709,7 +755,7 @@ test("result cache eviction keeps recently accessed inactive tabs", async () => 
 
   connectionStore.addEphemeralConnection(conn("conn-1"));
 
-  globalThis.fetch = (async (input) => {
+  globalThis.fetch = withConnectionHealthMock(async (input) => {
     const url = String(input);
     if (url === "/api/query/execute-multi") {
       executeCount++;
@@ -743,7 +789,7 @@ test("result cache eviction keeps recently accessed inactive tabs", async () => 
       });
     }
     return new Response("unexpected request", { status: 500 });
-  }) as typeof fetch;
+  });
 
   try {
     const tabIds: string[] = [];
@@ -775,9 +821,9 @@ test("result cache eviction keeps recently accessed inactive tabs", async () => 
 test("closing tabs clears removed result payloads before dropping tab references", async () => {
   const restoreStorage = installMemoryStorage();
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = (async () => {
+  globalThis.fetch = withConnectionHealthMock(async () => {
     return new Response(JSON.stringify(true), { status: 200, headers: { "Content-Type": "application/json" } });
-  }) as typeof fetch;
+  });
   try {
     setActivePinia(createPinia());
     const store = useQueryStore();
@@ -813,9 +859,9 @@ test("closing tabs clears removed result payloads before dropping tab references
 test("closing database tabs removes browser tabs for that database only", async () => {
   const restoreStorage = installMemoryStorage();
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = (async () => {
+  globalThis.fetch = withConnectionHealthMock(async () => {
     return new Response(JSON.stringify(true), { status: 200, headers: { "Content-Type": "application/json" } });
-  }) as typeof fetch;
+  });
 
   try {
     setActivePinia(createPinia());
@@ -863,9 +909,9 @@ test("closing database tabs removes browser tabs for that database only", async 
 test("closing connection tabs removes every tab for that connection only", async () => {
   const restoreStorage = installMemoryStorage();
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = (async () => {
+  globalThis.fetch = withConnectionHealthMock(async () => {
     return new Response(JSON.stringify(true), { status: 200, headers: { "Content-Type": "application/json" } });
-  }) as typeof fetch;
+  });
 
   try {
     setActivePinia(createPinia());
@@ -910,9 +956,9 @@ test("closing connection tabs removes every tab for that connection only", async
 test("releasing connection tabs keeps SQL tabs and closes object tabs", async () => {
   const restoreStorage = installMemoryStorage();
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = (async () => {
+  globalThis.fetch = withConnectionHealthMock(async () => {
     return new Response(JSON.stringify(true), { status: 200, headers: { "Content-Type": "application/json" } });
-  }) as typeof fetch;
+  });
 
   try {
     setActivePinia(createPinia());
@@ -970,9 +1016,9 @@ test("releasing connection tabs keeps SQL tabs and closes object tabs", async ()
 test("releasing database tabs keeps SQL tabs and closes table tabs for that database only", async () => {
   const restoreStorage = installMemoryStorage();
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = (async () => {
+  globalThis.fetch = withConnectionHealthMock(async () => {
     return new Response(JSON.stringify(true), { status: 200, headers: { "Content-Type": "application/json" } });
-  }) as typeof fetch;
+  });
 
   try {
     setActivePinia(createPinia());
@@ -1015,9 +1061,9 @@ test("releasing database tabs keeps SQL tabs and closes table tabs for that data
 test("disconnecting a connection closes every tab for that connection", async () => {
   const restoreStorage = installMemoryStorage();
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = (async () => {
+  globalThis.fetch = withConnectionHealthMock(async () => {
     return new Response(JSON.stringify(true), { status: 200, headers: { "Content-Type": "application/json" } });
-  }) as typeof fetch;
+  });
 
   try {
     setActivePinia(createPinia());
@@ -1066,7 +1112,7 @@ test("starting a new query clears the previous result payload immediately", asyn
     execution_time_ms: 1,
   };
 
-  globalThis.fetch = (async (input) => {
+  globalThis.fetch = withConnectionHealthMock(async (input) => {
     const url = String(input);
     if (url === "/api/query/prepare-pagination-plan") {
       return new Response(JSON.stringify({ sqlToExecute: "select 1", useAgentResultSession: false }), {
@@ -1087,7 +1133,7 @@ test("starting a new query clears the previous result payload immediately", asyn
       });
     }
     return new Response("unexpected request", { status: 500 });
-  }) as typeof fetch;
+  });
 
   try {
     const execution = store.executeTabSql(tabId, "select 1");
@@ -1120,7 +1166,7 @@ test("grid refreshes can preserve the previous result while loading", async () =
   };
   tab.result = previousResult;
 
-  globalThis.fetch = (async (input) => {
+  globalThis.fetch = withConnectionHealthMock(async (input) => {
     const url = String(input);
     if (url === "/api/query/prepare-pagination-plan") {
       return new Response(JSON.stringify({ sqlToExecute: "select 1 order by name", useAgentResultSession: false }), {
@@ -1141,7 +1187,7 @@ test("grid refreshes can preserve the previous result while loading", async () =
       });
     }
     return new Response("unexpected request", { status: 500 });
-  }) as typeof fetch;
+  });
 
   try {
     const execution = store.executeTabSql(tabId, "select 1 order by name", {
@@ -1172,7 +1218,7 @@ test("data tab execution preserves pagination offset metadata", async () => {
   const tab = store.tabs.find((item) => item.id === tabId);
   assert.ok(tab);
 
-  globalThis.fetch = (async (input, init) => {
+  globalThis.fetch = withConnectionHealthMock(async (input, init) => {
     const url = String(input);
     if (url === "/api/query/prepare-pagination-plan") {
       preparedPagination = true;
@@ -1186,7 +1232,7 @@ test("data tab execution preserves pagination offset metadata", async () => {
       });
     }
     return new Response("unexpected request", { status: 500 });
-  }) as typeof fetch;
+  });
 
   try {
     await store.executeTabSql(tabId, 'SELECT * FROM "users" LIMIT 100 OFFSET 100;', {
@@ -1224,7 +1270,7 @@ test("activating an empty data tab waits for explicit execution", async () => {
   tab.resultPageLimit = 50;
   tab.resultPageOffset = 50;
 
-  globalThis.fetch = (async (input, init) => {
+  globalThis.fetch = withConnectionHealthMock(async (input, init) => {
     const url = String(input);
     if (url === "/api/query/execute-multi") {
       executeBody = JSON.parse(String(init?.body ?? "{}"));
@@ -1234,7 +1280,7 @@ test("activating an empty data tab waits for explicit execution", async () => {
       });
     }
     return new Response("unexpected request", { status: 500 });
-  }) as typeof fetch;
+  });
 
   try {
     await store.reloadEvictedTab(tabId);
@@ -1275,7 +1321,7 @@ test("query result export fetches every paginated page", async () => {
     has_more: true,
   };
 
-  globalThis.fetch = (async (input, init) => {
+  globalThis.fetch = withConnectionHealthMock(async (input, init) => {
     const url = String(input);
     if (url === "/api/query/prepare-pagination-plan") {
       const body = JSON.parse(String(init?.body ?? "{}"));
@@ -1306,7 +1352,7 @@ test("query result export fetches every paginated page", async () => {
       });
     }
     return new Response("unexpected request", { status: 500 });
-  }) as typeof fetch;
+  });
 
   try {
     const exported = await store.fetchTabResultForExport(tabId);
@@ -1350,7 +1396,7 @@ test("query result export treats the known query total as a progress estimate", 
     has_more: true,
   };
 
-  globalThis.fetch = (async (input, init) => {
+  globalThis.fetch = withConnectionHealthMock(async (input, init) => {
     const url = String(input);
     if (url === "/api/query/prepare-pagination-plan") {
       const body = JSON.parse(String(init?.body ?? "{}"));
@@ -1378,7 +1424,7 @@ test("query result export treats the known query total as a progress estimate", 
       });
     }
     return new Response("unexpected request", { status: 500 });
-  }) as typeof fetch;
+  });
 
   try {
     const exported = await store.fetchTabResultForExport(tabId, (info) => progress.push(info));
@@ -1416,7 +1462,7 @@ test("jdbc query pagination uses result sessions without capping max rows to one
   const tab = store.tabs.find((item) => item.id === tabId);
   assert.ok(tab);
 
-  globalThis.fetch = (async (input, init) => {
+  globalThis.fetch = withConnectionHealthMock(async (input, init) => {
     const url = String(input);
     if (url === "/api/query/prepare-pagination-plan") {
       prepareBody = JSON.parse(String(init?.body ?? "{}"));
@@ -1453,7 +1499,7 @@ test("jdbc query pagination uses result sessions without capping max rows to one
       });
     }
     return new Response("unexpected request", { status: 500 });
-  }) as typeof fetch;
+  });
 
   try {
     await store.executeTabSql(tabId, "SELECT * FROM CT_Loc");
@@ -1518,7 +1564,7 @@ test("table data export fetches every filtered page", async () => {
     primaryKeys: ["id"],
   };
 
-  globalThis.fetch = (async (input, init) => {
+  globalThis.fetch = withConnectionHealthMock(async (input, init) => {
     const url = String(input);
     if (url === "/api/query/build-table-select-sql") {
       const body = JSON.parse(String(init?.body ?? "{}"));
@@ -1541,7 +1587,7 @@ test("table data export fetches every filtered page", async () => {
       });
     }
     return new Response("unexpected request", { status: 500 });
-  }) as typeof fetch;
+  });
 
   try {
     const exported = await store.fetchTabResultForExport(tabId);
@@ -1599,7 +1645,7 @@ test("query execution finishes without waiting for metadata analysis", async () 
   assert.ok(tab);
 
   let resolveMetadata: ((value: Response) => void) | undefined;
-  globalThis.fetch = (async (input) => {
+  globalThis.fetch = withConnectionHealthMock(async (input) => {
     const url = String(input);
     if (url === "/api/query/prepare-pagination-plan") {
       return new Response(JSON.stringify({ sqlToExecute: "select id from users", useAgentResultSession: false }), {
@@ -1619,7 +1665,7 @@ test("query execution finishes without waiting for metadata analysis", async () 
       });
     }
     return new Response("unexpected request", { status: 500 });
-  }) as typeof fetch;
+  });
 
   try {
     await store.executeTabSql(tabId, "select id from users");
@@ -1652,7 +1698,7 @@ test("query execution is scoped to the tab client session", async () => {
   const tabId = store.createTab("conn-1", "db", "Query");
   let executeBody: any;
 
-  globalThis.fetch = (async (input, init) => {
+  globalThis.fetch = withConnectionHealthMock(async (input, init) => {
     const url = String(input);
     if (url === "/api/query/prepare-pagination-plan") {
       return new Response(JSON.stringify({ sqlToExecute: "select 1", useAgentResultSession: false }), {
@@ -1674,7 +1720,7 @@ test("query execution is scoped to the tab client session", async () => {
       });
     }
     return new Response("unexpected request", { status: 500 });
-  }) as typeof fetch;
+  });
 
   try {
     await store.executeTabSql(tabId, "select 1");
@@ -1701,7 +1747,7 @@ test("query execution keeps automatically counting total rows in the background"
 
   let resolveCount: ((value: Response) => void) | undefined;
   let countBody: any;
-  globalThis.fetch = (async (input, init) => {
+  globalThis.fetch = withConnectionHealthMock(async (input, init) => {
     const url = String(input);
     if (url === "/api/query/prepare-pagination-plan") {
       return new Response(
@@ -1742,7 +1788,7 @@ test("query execution keeps automatically counting total rows in the background"
       });
     }
     return new Response("unexpected request", { status: 500 });
-  }) as typeof fetch;
+  });
 
   try {
     await store.executeTabSql(tabId, "select id from users");
@@ -1786,7 +1832,7 @@ test("paginated query execution keeps the previous total while refreshing it in 
   tab.resultTotalRowCount = 250;
 
   let resolveCount: ((value: Response) => void) | undefined;
-  globalThis.fetch = (async (input) => {
+  globalThis.fetch = withConnectionHealthMock(async (input) => {
     const url = String(input);
     if (url === "/api/query/prepare-pagination-plan") {
       return new Response(
@@ -1826,7 +1872,7 @@ test("paginated query execution keeps the previous total while refreshing it in 
       });
     }
     return new Response("unexpected request", { status: 500 });
-  }) as typeof fetch;
+  });
 
   try {
     await store.executeTabSql(tabId, "select id from users", {
@@ -1867,7 +1913,7 @@ test("multi statement execution shows the first result set by default", async ()
   connectionStore.addEphemeralConnection(conn("conn-1"));
   const tabId = store.createTab("conn-1", "db", "Query");
 
-  globalThis.fetch = (async (input) => {
+  globalThis.fetch = withConnectionHealthMock(async (input) => {
     const url = String(input);
     if (url === "/api/query/prepare-pagination-plan") {
       return new Response(JSON.stringify({ sqlToExecute: "set @id = 1; select @id", useAgentResultSession: false }), {
@@ -1891,7 +1937,7 @@ test("multi statement execution shows the first result set by default", async ()
       });
     }
     return new Response("unexpected request", { status: 500 });
-  }) as typeof fetch;
+  });
 
   try {
     await store.executeTabSql(tabId, "set @id = 1; select @id");
@@ -2005,7 +2051,7 @@ test("reorderTab preserves relative order within pinned group", () => {
   const tabD = store.createTab("conn-1", "db", "D", "query");
   const tabE = store.createTab("conn-1", "db", "E", "query");
 
-  // Pin A, B, C — leave D, E unpinned
+  // Pin A, B, C; leave D, E unpinned
   store.togglePinnedTab(tabA);
   // toggle so orderPinnedFirst runs: [A, B, C, D, E]
   store.togglePinnedTab(tabB);
