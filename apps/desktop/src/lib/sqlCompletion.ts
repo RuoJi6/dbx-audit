@@ -1547,6 +1547,9 @@ export function getSqlCompletionContext(sql: string, cursor: number): SqlComplet
   const prioritizeSelectAliases = isInOrderOrGroupByContext(beforeCursor);
   const inCallRoutineContext = isCallRoutineContext(beforeCursor);
   const inPotentialPackageMemberContext = !!qualifier && !exclusiveTableSuggestions && !insertInfo && !oracleTableFunctionContext;
+  const suggestColumns = !!qualifier || !!updateInfo?.inSetClause || (inColumnContext && referencedTables.length > 0);
+  const preferColumnsOverGlobalRoutines = suggestColumns && referencedTables.length > 0 && !qualifier;
+  const suggestRoutines = inCallRoutineContext || oracleTableFunctionContext || inPotentialPackageMemberContext || (!preferColumnsOverGlobalRoutines && !exclusiveTableSuggestions && !exclusiveColumnSuggestions && !insertInfo && prefix.length >= 2);
 
   const statementKind = detectStatementKind(beforeCursor || fullStatement);
   const preferredKeywords = preferredKeywordsForCompletion(updateInfo, deleteInfo);
@@ -1556,9 +1559,9 @@ export function getSqlCompletionContext(sql: string, cursor: number): SqlComplet
     qualifier: insertInfo ? undefined : qualifier,
     qualifierParts: insertInfo ? undefined : qualifierParts,
     suggestTables: insertInfo ? false : afterTableTrigger,
-    suggestColumns: !!qualifier || !!updateInfo?.inSetClause || (inColumnContext && referencedTables.length > 0),
+    suggestColumns,
     suggestKeywords: !exclusiveTableSuggestions && !exclusiveColumnSuggestions && !insertInfo && !inCallRoutineContext,
-    suggestRoutines: inCallRoutineContext || oracleTableFunctionContext || inPotentialPackageMemberContext || (!exclusiveTableSuggestions && !exclusiveColumnSuggestions && !insertInfo && prefix.length >= 2),
+    suggestRoutines,
     suggestJoinConditions: insertInfo ? false : inJoinConditionContext && referencedTables.length >= 2,
     exclusiveTableSuggestions: insertInfo ? false : exclusiveTableSuggestions,
     exclusiveColumnSuggestions: exclusiveColumnSuggestions || !!insertInfo || !!updateInfo?.inSetClause,
@@ -1667,6 +1670,8 @@ function parseTrailingIdentifierPart(input: string, endExclusive: number): { sta
 function isInColumnContext(beforeCursor: string): boolean {
   if (!beforeCursor) return false;
 
+  if (isInSelectListContext(beforeCursor)) return true;
+
   // Strip string literals
   const cleaned = beforeCursor.replace(/'[^']*'/g, "''").replace(/"[^"]*"/g, "''");
 
@@ -1690,6 +1695,77 @@ function isInColumnContext(beforeCursor: string): boolean {
   }
 
   return false;
+}
+
+function isInSelectListContext(beforeCursor: string): boolean {
+  let depth = 0;
+  let inSingleQuote = false;
+  let inDoubleQuote = false;
+  let inBacktick = false;
+  const selectOpenByDepth = new Map<number, boolean>();
+
+  for (let i = 0; i < beforeCursor.length; i++) {
+    const ch = beforeCursor[i] ?? "";
+    const next = beforeCursor[i + 1] ?? "";
+
+    if (inSingleQuote) {
+      if (ch === "\\" && next) {
+        i++;
+      } else if (ch === "'" && next === "'") {
+        i++;
+      } else if (ch === "'") {
+        inSingleQuote = false;
+      }
+      continue;
+    }
+    if (inDoubleQuote) {
+      if (ch === '"' && next === '"') {
+        i++;
+      } else if (ch === '"') {
+        inDoubleQuote = false;
+      }
+      continue;
+    }
+    if (inBacktick) {
+      if (ch === "`") inBacktick = false;
+      continue;
+    }
+
+    if (ch === "'") {
+      inSingleQuote = true;
+      continue;
+    }
+    if (ch === '"') {
+      inDoubleQuote = true;
+      continue;
+    }
+    if (ch === "`") {
+      inBacktick = true;
+      continue;
+    }
+    if (ch === "(") {
+      depth++;
+      continue;
+    }
+    if (ch === ")") {
+      selectOpenByDepth.delete(depth);
+      depth = Math.max(0, depth - 1);
+      continue;
+    }
+    if (!/[A-Za-z_]/.test(ch)) continue;
+
+    let end = i + 1;
+    while (end < beforeCursor.length && /[A-Za-z0-9_$]/.test(beforeCursor[end] ?? "")) end++;
+    const word = beforeCursor.slice(i, end).toLowerCase();
+    if (word === "select") {
+      selectOpenByDepth.set(depth, true);
+    } else if (word === "from") {
+      selectOpenByDepth.set(depth, false);
+    }
+    i = end - 1;
+  }
+
+  return selectOpenByDepth.get(depth) === true;
 }
 
 function isInJoinConditionContext(beforeCursor: string): boolean {

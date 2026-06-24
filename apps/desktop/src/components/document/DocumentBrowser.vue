@@ -16,6 +16,7 @@ import * as api from "@/lib/api";
 import { clampSearchSplitWidth } from "@/lib/dataGridSearchSplit";
 import { documentViewerFontStyle } from "@/lib/documentViewerFontStyle";
 import { buildDocumentFilterCondition, combineDocumentFilterConditions, currentDocumentFilterJson, defaultDocumentFilterRule, documentFilterModeNeedsValue, documentFilterModeOptions, documentStoreProviderFor, type DocumentFilterMode, type DocumentFilterRule } from "@/lib/documentStoreProvider";
+import { buildMongoInsertDocument, buildMongoUpdateDocument, formatMongoShellLiteral, parseMongoDocumentInputValue, type MongoInputValue } from "@/lib/mongoDocumentValues";
 import { normalizeResultPageSize } from "@/lib/paginationPageSize";
 import { useSettingsStore } from "@/stores/settingsStore";
 import JsonEditNode from "./JsonEditNode.vue";
@@ -226,34 +227,37 @@ function clearDocumentFilters(clearLocalFilter?: (columnIndex?: number) => void)
   applyFilter();
 }
 
-async function gridSave(changes: { dirtyRows: Map<number, Map<number, string | number | boolean | null>>; deletedRows: Set<number>; columns: string[]; rows: (string | number | boolean | null)[][] }) {
+async function gridSave(changes: { dirtyRows: Map<number, Map<number, MongoInputValue>>; deletedRows: Set<number>; columns: string[]; rows: MongoInputValue[][] }) {
   const cols = changes.columns;
   const idColIdx = cols.indexOf("_id");
   if (idColIdx < 0) throw new Error("No _id column");
+  const isEs = documentStoreProvider.value.kind === "elasticsearch";
 
   for (const [rowIdx, dirtyCols] of changes.dirtyRows) {
     const row = changes.rows[rowIdx];
     const id = row?.[idColIdx];
     if (id == null) continue;
-    const doc = documents.value[rowIdx];
-    if (!doc) continue;
-    const updated = { ...doc };
-    for (const [colIdx, newVal] of dirtyCols) {
-      const col = cols[colIdx];
-      if (col === "_id") continue;
-      if (newVal === null) {
-        delete updated[col];
-      } else if (typeof newVal === "string") {
-        try {
-          updated[col] = JSON.parse(newVal);
-        } catch {
-          updated[col] = newVal;
+
+    if (isEs) {
+      const doc = documents.value[rowIdx];
+      if (!doc) continue;
+      const updated = { ...doc };
+      for (const [colIdx, newVal] of dirtyCols) {
+        const col = cols[colIdx];
+        if (col === "_id") continue;
+        if (newVal === null) {
+          delete updated[col];
+        } else {
+          updated[col] = parseMongoDocumentInputValue(newVal);
         }
-      } else {
-        updated[col] = newVal;
       }
+      await api.mongoUpdateDocument(props.connectionId, props.database, props.collection, String(id), JSON.stringify(updated));
+      continue;
     }
-    await api.mongoUpdateDocument(props.connectionId, props.database, props.collection, String(id), JSON.stringify(updated));
+
+    const updateDoc = buildMongoUpdateDocument(dirtyCols, cols);
+    if (Object.keys(updateDoc).length === 0) continue;
+    await api.mongoUpdateDocument(props.connectionId, props.database, props.collection, String(id), JSON.stringify(updateDoc));
   }
 
   for (const rowIdx of changes.deletedRows) {
@@ -279,51 +283,7 @@ function mongoIdPreview(val: unknown): string {
   return formatMongoValue(val);
 }
 
-function buildUpdateDoc(changes: Map<number, string | number | boolean | null>, columns: string[]): Record<string, unknown> {
-  const setFields: Record<string, unknown> = {};
-  const unsetFields: Record<string, unknown> = {};
-  for (const [colIdx, newVal] of changes) {
-    const col = columns[colIdx];
-    if (!col || col === "_id") continue;
-    if (newVal === null) {
-      unsetFields[col] = "";
-    } else if (typeof newVal === "string") {
-      try {
-        setFields[col] = JSON.parse(newVal);
-      } catch {
-        setFields[col] = newVal;
-      }
-    } else {
-      setFields[col] = newVal;
-    }
-  }
-  const doc: Record<string, unknown> = {};
-  if (Object.keys(setFields).length > 0) doc.$set = setFields;
-  if (Object.keys(unsetFields).length > 0) doc.$unset = unsetFields;
-  return doc;
-}
-
-function buildNewDoc(newRow: (string | number | boolean | null)[], columns: string[]): Record<string, unknown> {
-  const doc: Record<string, unknown> = {};
-  for (let ci = 0; ci < columns.length; ci++) {
-    const col = columns[ci];
-    if (!col || col === "_id") continue;
-    const val = newRow[ci];
-    if (val === null) continue;
-    if (typeof val === "string") {
-      try {
-        doc[col] = JSON.parse(val);
-      } catch {
-        doc[col] = val;
-      }
-    } else {
-      doc[col] = val;
-    }
-  }
-  return doc;
-}
-
-async function previewDocumentChanges(changes: { dirtyRows: Map<number, Map<number, string | number | boolean | null>>; deletedRows: Set<number>; newRows: (string | number | boolean | null)[][]; columns: string[]; rows: (string | number | boolean | null)[][] }): Promise<string[]> {
+async function previewDocumentChanges(changes: { dirtyRows: Map<number, Map<number, MongoInputValue>>; deletedRows: Set<number>; newRows: MongoInputValue[][]; columns: string[]; rows: MongoInputValue[][] }): Promise<string[]> {
   const { dirtyRows, deletedRows, newRows, columns, rows } = changes;
   const idColIdx = columns.indexOf("_id");
   const stmts: string[] = [];
@@ -334,11 +294,12 @@ async function previewDocumentChanges(changes: { dirtyRows: Map<number, Map<numb
     const row = rows[rowIdx];
     const id = row?.[idColIdx];
     if (id == null) continue;
-    const updateDoc = buildUpdateDoc(dirtyCols, columns);
     if (isEs) {
+      const updateDoc = buildMongoUpdateDocument(dirtyCols, columns);
       stmts.push(`POST /${coll}/_update/${JSON.stringify(String(id))}\n${JSON.stringify({ doc: updateDoc.$set ?? updateDoc }, null, 2)}`);
     } else {
-      stmts.push(`db.${coll}.updateOne({_id: ${mongoIdPreview(id)}}, ${JSON.stringify(updateDoc)})`);
+      const updateDoc = buildMongoUpdateDocument(dirtyCols, columns);
+      stmts.push(`db.${coll}.updateOne({_id: ${mongoIdPreview(id)}}, ${formatMongoShellLiteral(updateDoc)})`);
     }
   }
 
@@ -354,11 +315,11 @@ async function previewDocumentChanges(changes: { dirtyRows: Map<number, Map<numb
   }
 
   for (const newRow of newRows) {
-    const doc = buildNewDoc(newRow, columns);
+    const doc = buildMongoInsertDocument(newRow, columns);
     if (isEs) {
       stmts.push(`POST /${coll}/_doc\n${JSON.stringify(doc, null, 2)}`);
     } else {
-      stmts.push(`db.${coll}.insertOne(${JSON.stringify(doc)})`);
+      stmts.push(`db.${coll}.insertOne(${formatMongoShellLiteral(doc)})`);
     }
   }
 
@@ -592,14 +553,7 @@ function formatForEdit(value: unknown): string {
 }
 
 function parseFieldValue(raw: string): unknown {
-  const trimmed = raw.trim();
-  if (trimmed === "NULL") return null;
-  if (/^(true|false|null)$/i.test(trimmed)) return JSON.parse(trimmed.toLowerCase());
-  if (/^-?\d+(?:\.\d+)?$/.test(trimmed)) return Number(trimmed);
-  if (trimmed.startsWith("{") || trimmed.startsWith("[") || trimmed.startsWith('"')) {
-    return JSON.parse(trimmed);
-  }
-  return raw;
+  return parseMongoDocumentInputValue(raw);
 }
 
 function buildObjectFromNodes(nodes: EditNode[], path: string): JsonRecord {

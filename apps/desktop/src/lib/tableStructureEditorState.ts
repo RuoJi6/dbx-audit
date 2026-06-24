@@ -643,8 +643,14 @@ export function splitDataType(raw: string): { baseType: string; params: string }
   const trimmed = raw.trim();
   const parenIdx = trimmed.indexOf("(");
   if (parenIdx === -1) return { baseType: trimmed, params: "" };
-  const baseType = trimmed.slice(0, parenIdx).trim();
-  const params = trimmed.slice(parenIdx + 1, trimmed.lastIndexOf(")")).trim();
+  const closeIdx = trimmed.lastIndexOf(")");
+  const baseTypePrefix = trimmed.slice(0, parenIdx).trim();
+  const params = trimmed.slice(parenIdx + 1, closeIdx).trim();
+  const suffix = trimmed
+    .slice(closeIdx + 1)
+    .trim()
+    .replace(/\s+/g, " ");
+  const baseType = /^(?:signed|unsigned|zerofill)(?:\s+(?:signed|unsigned|zerofill))*$/i.test(suffix) ? `${baseTypePrefix} ${suffix}`.trim() : baseTypePrefix;
   return { baseType, params };
 }
 
@@ -660,7 +666,10 @@ export function combineDataTypeForDatabase(dbType: DatabaseType | undefined, bas
   if (isDataTypeLengthDisabled(dbType, baseType)) {
     return baseType;
   }
-  return combineDataType(baseType, normalizeDataTypeParams(dbType, baseType, params));
+  const normalizedParams = normalizeDataTypeParams(dbType, baseType, params);
+  const mysqlType = combineMysqlNumericAttributeType(dbType, baseType, normalizedParams);
+  if (mysqlType) return mysqlType;
+  return combineDataType(baseType, normalizedParams);
 }
 
 export function normalizeDataTypeParams(dbType: DatabaseType | undefined, baseType: string, params: string): string {
@@ -699,6 +708,21 @@ function isTemporalPrecisionType(dbType: DatabaseType | undefined, baseType: str
     default:
       return false;
   }
+}
+
+function combineMysqlNumericAttributeType(dbType: DatabaseType | undefined, baseType: string, params: string): string | null {
+  if (!params || !isMysqlLikeStructureType(dbType)) return null;
+  const parts = baseType.trim().replace(/\s+/g, " ").split(" ").filter(Boolean);
+  const typeName = parts[0]?.toLowerCase();
+  if (!typeName || !["tinyint", "smallint", "mediumint", "int", "integer", "bigint", "real", "double", "float", "decimal", "numeric"].includes(typeName)) return null;
+  const attrIndex = parts.findIndex((part) => ["signed", "unsigned", "zerofill"].includes(part.toLowerCase()));
+  if (attrIndex === -1) return null;
+  if (!parts.slice(attrIndex).every((part) => ["signed", "unsigned", "zerofill"].includes(part.toLowerCase()))) return null;
+  return `${parts.slice(0, attrIndex).join(" ")}(${params}) ${parts.slice(attrIndex).join(" ")}`;
+}
+
+function isMysqlLikeStructureType(dbType: DatabaseType | undefined): boolean {
+  return dbType === "mysql" || dbType === "doris" || dbType === "starrocks" || dbType === "goldendb" || dbType === "sundb" || dbType === "databend";
 }
 
 function isValidTemporalPrecision(dbType: DatabaseType | undefined, params: string): boolean {

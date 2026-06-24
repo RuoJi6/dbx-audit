@@ -1,7 +1,7 @@
 import { defineStore } from "pinia";
 import { uuid } from "@/lib/utils";
 import { ref, computed, watch } from "vue";
-import type { ColumnInfo, ConnectionConfig, ForeignKeyInfo, ObjectInfo, SidebarLayout, TreeNode } from "@/types/database";
+import type { ColumnInfo, ConnectionConfig, ForeignKeyInfo, ObjectInfo, SidebarLayout, TableInfo, TreeNode } from "@/types/database";
 import { applyPinnedTreeNodeState, updatePinnedTreeNodeInPlace } from "@/lib/pinnedItems";
 import {
   reconcileLayout,
@@ -27,7 +27,7 @@ import { buildDatabaseTreeNodes, buildDuckDbConnectionTreeNodes, sortSidebarName
 import { buildSqlServerDatabaseTreeNodes, SQLSERVER_DEFAULT_SCHEMA } from "@/lib/sqlServerTree";
 import { findDatabaseTreeNode } from "@/lib/treeRefreshTarget";
 import { shouldMarkDisconnected } from "@/lib/connectionHealth";
-import { connectionAttemptTimeoutMessage, connectionAttemptTimeoutMs } from "@/lib/connectionAttemptTimeout";
+import { connectionAttemptOriginalErrorMessage, connectionAttemptTimeoutMessage, connectionAttemptTimeoutMs } from "@/lib/connectionAttemptTimeout";
 import { filterDatabaseNamesForConnection, filterVisibleDatabaseNames, normalizeVisibleDatabaseSelection } from "@/lib/visibleDatabases";
 import {
   buildObjectGroupPlaceholderNodes,
@@ -51,9 +51,11 @@ import { getTableMetadataCapabilities } from "@/lib/tableMetadataCapabilities";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { encodeSqlServerLinkedSchema, parseSqlServerLinkedSchema } from "@/lib/sqlServerLinkedServers";
 import { inferMongoCompletionFields, type MongoCompletionField } from "@/lib/mongoCompletion";
+import { completionSchemasFromTree, completionTablesFromTree } from "@/lib/completionTreeIndex";
 
 const PINNED_TREE_NODES_STORAGE_KEY = "dbx-pinned-tree-nodes";
 const ACTIVE_CONNECTION_STORAGE_KEY = "dbx-active-connection";
+const CONNECTION_HEALTH_CHECK_TTL_MS = 2000;
 function sidebarObjectGroupPageSize(): number {
   const settingsStore = useSettingsStore();
   const size = settingsStore.desktopSettings.sidebar_table_page_size;
@@ -145,6 +147,7 @@ export const useConnectionStore = defineStore("connection", () => {
   const treeNodes = ref<TreeNode[]>([]);
   const pinnedTreeNodeIds = ref<Set<string>>(new Set());
   const connectedIds = ref<Set<string>>(new Set());
+  const lastConnectionHealthCheckAt = ref<Record<string, number>>({});
   const loadedTreeNodeChildrenIds = ref<Set<string>>(new Set());
   const connectionErrors = ref<Record<string, string>>({});
   const editingConnectionId = ref<string | null>(null);
@@ -254,28 +257,66 @@ export const useConnectionStore = defineStore("connection", () => {
     delete connectionErrors.value[connectionId];
   }
 
+  function markConnectionHealthChecked(connectionId: string) {
+    lastConnectionHealthCheckAt.value[connectionId] = Date.now();
+  }
+
+  function clearConnectionHealthCheck(connectionId: string) {
+    if (!lastConnectionHealthCheckAt.value[connectionId]) return;
+    delete lastConnectionHealthCheckAt.value[connectionId];
+  }
+
+  function hasRecentConnectionHealthCheck(connectionId: string) {
+    const checkedAt = lastConnectionHealthCheckAt.value[connectionId];
+    return typeof checkedAt === "number" && Date.now() - checkedAt < CONNECTION_HEALTH_CHECK_TTL_MS;
+  }
+
   function recordConnectionError(connectionId: string, error: unknown): string {
     const message = connectionErrorMessage(error);
     setConnectionError(connectionId, message);
     return message;
   }
 
-  function recordMetadataLoadError(connectionId: string, error: unknown) {
+  function markConnectionLost(connectionId: string, error: unknown) {
+    connectedIds.value.delete(connectionId);
+    clearConnectionHealthCheck(connectionId);
+    if (activeConnectionId.value === connectionId) activeConnectionId.value = null;
+    recordConnectionError(connectionId, error);
+  }
+
+  function recordConnectionLostError(connectionId: string, error: unknown): boolean {
     if (shouldMarkDisconnected(error)) {
-      connectedIds.value.delete(connectionId);
-      if (activeConnectionId.value === connectionId) activeConnectionId.value = null;
+      markConnectionLost(connectionId, error);
+      return true;
     }
+    return false;
+  }
+
+  // Metadata loaders keep this internal: match connection-loss errors before recording generic errors.
+  function recordMetadataLoadError(connectionId: string, error: unknown) {
+    if (recordConnectionLostError(connectionId, error)) return;
     recordConnectionError(connectionId, error);
   }
 
   async function withConnectionAttemptTimeout<T>(promise: Promise<T>, config: ConnectionConfig): Promise<T> {
     const timeoutMs = connectionAttemptTimeoutMs(config);
+    const timeoutMessage = connectionAttemptTimeoutMessage(timeoutMs);
+    let timedOut = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    void promise.catch((error) => {
+      if (!timedOut) return;
+      const current = connectionErrors.value[config.id];
+      if (current !== timeoutMessage) return;
+      setConnectionError(config.id, connectionAttemptOriginalErrorMessage(timeoutMessage, connectionErrorMessage(error)));
+    });
     try {
       return await Promise.race([
         promise,
         new Promise<never>((_, reject) => {
-          timer = setTimeout(() => reject(new Error(connectionAttemptTimeoutMessage(timeoutMs))), timeoutMs);
+          timer = setTimeout(() => {
+            timedOut = true;
+            reject(new Error(timeoutMessage));
+          }, timeoutMs);
         }),
       ]);
     } finally {
@@ -315,6 +356,7 @@ export const useConnectionStore = defineStore("connection", () => {
       h2: "H2",
       snowflake: "Snowflake",
       trino: "Trino",
+      prestosql: "PrestoSQL",
       hive: "Hive",
       db2: "DB2",
       informix: "Informix",
@@ -354,7 +396,7 @@ export const useConnectionStore = defineStore("connection", () => {
       url_params: config.url_params || "",
       attached_databases: Array.isArray(config.attached_databases) ? config.attached_databases.filter((database) => database.name?.trim() && database.path?.trim()) : [],
       transport_layers: Array.isArray(config.transport_layers) ? config.transport_layers : [],
-      connect_timeout_secs: config.connect_timeout_secs || 5,
+      connect_timeout_secs: config.connect_timeout_secs || 10,
       query_timeout_secs: config.query_timeout_secs ?? 30,
       idle_timeout_secs: config.idle_timeout_secs ?? 60,
       keepalive_interval_secs: config.keepalive_interval_secs ?? 0,
@@ -497,6 +539,14 @@ export const useConnectionStore = defineStore("connection", () => {
     return refreshedGroup?.children ?? [];
   }
 
+  function tableInfosToCompletionTables(tables: readonly TableInfo[], schema?: string): SqlCompletionTable[] {
+    return tables.map((table) => ({
+      name: table.name,
+      schema,
+      type: table.table_type === "VIEW" || table.table_type === "MATERIALIZED VIEW" ? "view" : "table",
+    }));
+  }
+
   async function loadPagedTableGroupChildren(options: {
     node: TreeNode;
     parentNodeId: string;
@@ -516,6 +566,7 @@ export const useConnectionStore = defineStore("connection", () => {
     const tables = await api.listTables(options.node.connectionId, options.node.database, options.querySchema, searchFilter, fetchLimit, searchFilter ? undefined : options.offset, options.objectTypes);
     const hasMore = searchFilter ? false : tables.length > options.pageSize;
     const pageTables = hasMore ? tables.slice(0, options.pageSize) : tables;
+    indexCompletionTables(options.node.connectionId, options.node.database, options.effectiveSchema, tableInfosToCompletionTables(pageTables, options.effectiveSchema));
     const objects = mergeTableInfosIntoObjects([], pageTables, options.effectiveSchema);
     const visibleObjectCount = objects.filter((object) => options.objectTypes.includes(normalizedObjectTreeKind(object.object_type))).length;
     return {
@@ -699,6 +750,7 @@ export const useConnectionStore = defineStore("connection", () => {
     for (const id of removedIds) {
       clearConnectionError(id);
       connectedIds.value.delete(id);
+      clearConnectionHealthCheck(id);
       sidebarLayout.value = removeConnectionFromSidebarLayout(sidebarLayout.value, id);
     }
     rebuildTreeNodes();
@@ -729,6 +781,7 @@ export const useConnectionStore = defineStore("connection", () => {
     connections.value = nextConnections;
     rebuildTreeNodes();
     connectedIds.value.delete(config.id);
+    clearConnectionHealthCheck(config.id);
     invalidateCompletionCache(config.id);
     clearLoadedChildrenCache(config.id);
     const node = findNode(treeNodes.value, config.id);
@@ -817,6 +870,7 @@ export const useConnectionStore = defineStore("connection", () => {
       const id = await withConnectionAttemptTimeout(api.connectDb(config), config);
       activeConnectionId.value = id;
       connectedIds.value.add(id);
+      markConnectionHealthChecked(id);
       clearConnectionError(config.id);
       if (id !== config.id) clearConnectionError(id);
 
@@ -863,6 +917,7 @@ export const useConnectionStore = defineStore("connection", () => {
         break;
     }
     connectedIds.value.delete(connectionId);
+    clearConnectionHealthCheck(connectionId);
     const node = findNode(treeNodes.value, connectionId);
     if (node) {
       node.isExpanded = false;
@@ -902,7 +957,20 @@ export const useConnectionStore = defineStore("connection", () => {
   }
 
   async function ensureConnected(connectionId: string) {
-    if (connectedIds.value.has(connectionId)) return;
+    if (connectedIds.value.has(connectionId)) {
+      if (hasRecentConnectionHealthCheck(connectionId)) return;
+      // Optimistic: verify backend pool is actually healthy
+      try {
+        await api.checkConnectionHealth(connectionId);
+        markConnectionHealthChecked(connectionId);
+        return;
+      } catch {
+        // Backend pool is dead — remove from connectedIds and reconnect
+        connectedIds.value.delete(connectionId);
+        clearConnectionHealthCheck(connectionId);
+        if (activeConnectionId.value === connectionId) activeConnectionId.value = null;
+      }
+    }
     let config = getConfig(connectionId);
     if (!config) {
       await initFromDisk();
@@ -917,6 +985,7 @@ export const useConnectionStore = defineStore("connection", () => {
       await beforeConnectHandler?.(config);
       await withConnectionAttemptTimeout(api.connectDb(config), config);
       connectedIds.value.add(connectionId);
+      markConnectionHealthChecked(connectionId);
       activeConnectionId.value = connectionId;
       clearConnectionError(connectionId);
     } catch (e) {
@@ -1500,6 +1569,7 @@ export const useConnectionStore = defineStore("connection", () => {
       if (simpleObjectDisplay) {
         try {
           const [objects, tables] = await Promise.all([api.listObjects(connectionId, database, querySchema), api.listTables(connectionId, database, querySchema)]);
+          indexCompletionTables(connectionId, database, effectiveSchema, tableInfosToCompletionTables(tables, effectiveSchema));
           children = buildSimpleObjectTreeNodes({
             nodeId,
             connectionId,
@@ -1509,6 +1579,7 @@ export const useConnectionStore = defineStore("connection", () => {
           });
         } catch {
           const tables = await api.listTables(connectionId, database, querySchema);
+          indexCompletionTables(connectionId, database, effectiveSchema, tableInfosToCompletionTables(tables, effectiveSchema));
           children = buildTableTreeNodes({ nodeId, connectionId, database, schema: effectiveSchema, tables });
         }
       } else {
@@ -1656,7 +1727,7 @@ export const useConnectionStore = defineStore("connection", () => {
 
     const config = getConfig(connectionId);
     const metadataCapabilities = getTableMetadataCapabilities(effectiveDatabaseTypeForConnection(config));
-    if (node.type === "table" && !parseSqlServerLinkedSchema(schema)) {
+    if ((node.type === "table" || node.type === "mongo-collection") && !parseSqlServerLinkedSchema(schema)) {
       if (metadataCapabilities.indexes) {
         children.push({
           id: `${parentId}:__indexes`,
@@ -1670,6 +1741,8 @@ export const useConnectionStore = defineStore("connection", () => {
           children: [],
         });
       }
+    }
+    if (node.type === "table" && !parseSqlServerLinkedSchema(schema)) {
       if (metadataCapabilities.foreignKeys) {
         children.push({
           id: `${parentId}:__fkeys`,
@@ -1709,6 +1782,33 @@ export const useConnectionStore = defineStore("connection", () => {
 
     node.isLoading = true;
     try {
+      if (effectiveDatabaseTypeForConnection(getConfig(connectionId)) === "mongodb") {
+        const fields = await listMongoCompletionFields(connectionId, database, table);
+        setChildren(
+          node,
+          fields.map((field) => {
+            const column = {
+              name: field.name,
+              data_type: field.type || "unknown",
+              is_nullable: true,
+              column_default: null,
+              is_primary_key: field.name === "_id",
+              extra: "sampled",
+            };
+            return {
+              id: `${parentId}:${field.name}`,
+              label: `${field.name} (${column.data_type})`,
+              type: "column" as const,
+              connectionId,
+              database,
+              tableName: table,
+              meta: column,
+            };
+          }),
+        );
+        node.isExpanded = true;
+        return;
+      }
       const querySchema = metadataQuerySchema(connectionId, database, schema);
       const columns = await api.getColumns(connectionId, database, querySchema, table);
       setChildren(
@@ -1876,6 +1976,8 @@ export const useConnectionStore = defineStore("connection", () => {
       }
     } else if (node.type === "mongo-db" && node.connectionId && node.database) {
       await loadMongoCollections(node.connectionId, node.database);
+    } else if (node.type === "mongo-collection" && node.connectionId && node.database) {
+      await loadTableGroups(node.connectionId, node.database, node.label, node.schema, node.id);
     } else if (node.type === "database" && node.connectionId && hasTreeNodeDatabaseContext(node)) {
       const config = getConfig(node.connectionId);
       const effectiveDbType = effectiveDatabaseTypeForConnection(config);
@@ -2126,8 +2228,10 @@ export const useConnectionStore = defineStore("connection", () => {
     const allScopes = [...completionTableIndex.entries()].filter(([key]) => key.startsWith(`${connectionId}:${database}:`)).map(([, entry]) => entry);
     const preferred = schema ? completionTableIndex.get(completionScopeKey(connectionId, database, schema)) : undefined;
     const scopes = preferred ? [preferred, ...allScopes.filter((entry) => entry !== preferred)] : allScopes;
+    const treeTables = completionTablesFromTree(treeNodes.value, connectionId, database, schema);
     const ranked = scopes
       .flatMap((entry) => entry?.tables ?? [])
+      .concat(treeTables)
       .map((table) => ({ table, score: tableMatchScore(table, filter, schema) }))
       .filter((entry) => entry.score >= 0)
       .sort((a, b) => b.score - a.score || a.table.name.localeCompare(b.table.name));
@@ -2147,7 +2251,7 @@ export const useConnectionStore = defineStore("connection", () => {
   }
 
   function lookupLocalCompletionSchemas(connectionId: string, database: string, filter = "", limit = 50): string[] {
-    const schemas = schemaListCache.value[`${connectionId}:${database}`] ?? [];
+    const schemas = dedupeCompletionQualifierNames([...(schemaListCache.value[`${connectionId}:${database}`] ?? []), ...completionSchemasFromTree(treeNodes.value, connectionId, database)]);
     const normalized = filter.trim().toLowerCase();
     return schemas
       .filter((schema) => fuzzyTextMatch(schema, normalized))
@@ -2162,6 +2266,20 @@ export const useConnectionStore = defineStore("connection", () => {
       .filter((database) => fuzzyTextMatch(database, normalized))
       .sort((a, b) => tableMatchScore({ name: b }, normalized) - tableMatchScore({ name: a }, normalized))
       .slice(0, limit);
+  }
+
+  function dedupeCompletionQualifierNames(names: string[]): string[] {
+    const seen = new Set<string>();
+    const result: string[] = [];
+    for (const name of names) {
+      const normalized = name.trim();
+      if (!normalized) continue;
+      const key = normalized.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      result.push(normalized);
+    }
+    return result;
   }
 
   function lookupLocalCompletionColumns(connectionId: string, database: string, table: string, schema?: string): SqlCompletionColumn[] {
@@ -2340,7 +2458,7 @@ export const useConnectionStore = defineStore("connection", () => {
           }
           const limitedTables = limit ? dedupeCompletionTables(results).slice(0, limit) : results;
           completionTablesCache.value[cacheKey] = limitedTables;
-          indexCompletionTables(connectionId, database, schema, limitedTables);
+          indexCompletionTables(connectionId, database, undefined, limitedTables);
           evictOldestCacheEntries(completionTablesCache.value, COMPLETION_CACHE_MAX);
           return completionTablesCache.value[cacheKey];
         }
@@ -2360,7 +2478,7 @@ export const useConnectionStore = defineStore("connection", () => {
           }),
         );
         completionTablesCache.value[cacheKey] = tableGroups.flat();
-        indexCompletionTables(connectionId, database, schema, completionTablesCache.value[cacheKey]);
+        indexCompletionTables(connectionId, database, undefined, completionTablesCache.value[cacheKey]);
         evictOldestCacheEntries(completionTablesCache.value, COMPLETION_CACHE_MAX);
         return completionTablesCache.value[cacheKey];
       }
@@ -2987,6 +3105,7 @@ export const useConnectionStore = defineStore("connection", () => {
       connections.value.push(normalized);
     }
     connectedIds.value.add(normalized.id);
+    markConnectionHealthChecked(normalized.id);
     clearConnectionError(normalized.id);
   }
 
@@ -3008,6 +3127,8 @@ export const useConnectionStore = defineStore("connection", () => {
     setConnectionError,
     clearConnectionError,
     recordConnectionError,
+    markConnectionLost,
+    recordConnectionLostError,
     sidebarLayout,
     getConfig,
     isTreeNodePinned,

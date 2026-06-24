@@ -118,6 +118,27 @@ fn builds_mysql_column_and_index_changes() {
 }
 
 #[test]
+fn builds_mysql_unsigned_integer_column_with_length_before_attribute() {
+    let mut score = column("score");
+    score.data_type = "int unsigned(11)".to_string();
+
+    let result = build_table_structure_change_sql(TableStructureSqlOptions {
+        database_type: Some(DatabaseType::Mysql),
+        schema: None,
+        table_name: "users".to_string(),
+        columns: vec![score],
+        indexes: Vec::new(),
+        foreign_keys: Vec::new(),
+        triggers: Vec::new(),
+        table_comment: None,
+        original_table_comment: None,
+    });
+
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert_eq!(result.statements, vec!["ALTER TABLE `users` ADD COLUMN `score` int(11) unsigned;"]);
+}
+
+#[test]
 fn builds_highgo_foreign_key_changes_with_postgres_syntax() {
     let mut old_fk = foreign_key("orders_user_id_fkey", "user_id", "users", "id");
     old_fk.marked_for_drop = true;

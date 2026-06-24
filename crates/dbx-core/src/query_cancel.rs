@@ -4,16 +4,64 @@ use tokio_util::sync::CancellationToken;
 
 type InterruptFn = Box<dyn Fn() + Send + 'static>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunningTaskKind {
+    Query,
+    Count,
+    Explain,
+    Export,
+    Unknown,
+}
+
+impl Default for RunningTaskKind {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RunningTaskMetadata {
+    pub kind: RunningTaskKind,
+    pub connection_id: Option<String>,
+    pub database: Option<String>,
+    pub client_session_id: Option<String>,
+}
+
+impl RunningTaskMetadata {
+    pub fn query(
+        connection_id: impl Into<String>,
+        database: impl Into<String>,
+        client_session_id: Option<String>,
+    ) -> Self {
+        let kind = task_kind_from_client_session_id(client_session_id.as_deref());
+        Self { kind, connection_id: Some(connection_id.into()), database: Some(database.into()), client_session_id }
+    }
+}
+
+#[derive(Clone)]
+struct RunningTask {
+    token: CancellationToken,
+    metadata: RunningTaskMetadata,
+    pool_key: Option<String>,
+}
+
 #[derive(Clone, Default)]
 pub struct RunningQueries {
-    inner: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    inner: Arc<Mutex<HashMap<String, RunningTask>>>,
     interrupts: Arc<Mutex<HashMap<String, InterruptFn>>>,
 }
 
 impl RunningQueries {
     pub fn register(&self, execution_id: String) -> RegisteredQuery {
+        self.register_task(execution_id, RunningTaskMetadata::default())
+    }
+
+    pub fn register_task(&self, execution_id: String, metadata: RunningTaskMetadata) -> RegisteredQuery {
         let token = CancellationToken::new();
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).insert(execution_id.clone(), token.clone());
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(execution_id.clone(), RunningTask { token: token.clone(), metadata, pool_key: None });
 
         RegisteredQuery { execution_id, token, running_queries: self.clone() }
     }
@@ -23,7 +71,8 @@ impl RunningQueries {
     }
 
     pub fn cancel(&self, execution_id: &str) -> bool {
-        let token = self.inner.lock().unwrap_or_else(|e| e.into_inner()).get(execution_id).cloned();
+        let token =
+            self.inner.lock().unwrap_or_else(|e| e.into_inner()).get(execution_id).map(|task| task.token.clone());
         let interrupt = self.interrupts.lock().unwrap_or_else(|e| e.into_inner()).remove(execution_id);
 
         if let Some(interrupt) = interrupt {
@@ -37,14 +86,48 @@ impl RunningQueries {
         }
     }
 
+    pub fn set_pool_key(&self, execution_id: &str, pool_key: impl Into<String>) {
+        if let Some(task) = self.inner.lock().unwrap_or_else(|e| e.into_inner()).get_mut(execution_id) {
+            task.pool_key = Some(pool_key.into());
+        }
+    }
+
+    pub fn is_pool_active(&self, pool_key: &str) -> bool {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).values().any(|task| {
+            let _kind = task.metadata.kind;
+            task.pool_key.as_deref() == Some(pool_key)
+        })
+    }
+
     #[cfg(test)]
     pub fn has(&self, execution_id: &str) -> bool {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).contains_key(execution_id)
     }
 
+    #[cfg(test)]
+    pub fn task_kind(&self, execution_id: &str) -> Option<RunningTaskKind> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).get(execution_id).map(|task| task.metadata.kind)
+    }
+
     fn remove(&self, execution_id: &str) {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).remove(execution_id);
         self.interrupts.lock().unwrap_or_else(|e| e.into_inner()).remove(execution_id);
+    }
+}
+
+fn task_kind_from_client_session_id(client_session_id: Option<&str>) -> RunningTaskKind {
+    let Some(session_id) = client_session_id else {
+        return RunningTaskKind::Query;
+    };
+    let session_id = session_id.trim().to_ascii_lowercase();
+    if session_id.ends_with(":count") {
+        RunningTaskKind::Count
+    } else if session_id.ends_with(":explain") {
+        RunningTaskKind::Explain
+    } else if session_id.ends_with(":export") {
+        RunningTaskKind::Export
+    } else {
+        RunningTaskKind::Query
     }
 }
 
@@ -68,7 +151,7 @@ impl Drop for RegisteredQuery {
 
 #[cfg(test)]
 mod tests {
-    use super::RunningQueries;
+    use super::{RunningQueries, RunningTaskKind, RunningTaskMetadata};
 
     #[test]
     fn cancel_marks_registered_query_as_cancelled() {
@@ -80,6 +163,20 @@ mod tests {
     }
 
     #[test]
+    fn cancel_invokes_registered_interrupt() {
+        let running = RunningQueries::default();
+        let interrupted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = interrupted.clone();
+        let _registered = running.register("exec-1".to_string());
+        running.register_interrupt("exec-1", move || {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        assert!(running.cancel("exec-1"));
+        assert!(interrupted.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
     fn dropping_registration_removes_running_query() {
         let running = RunningQueries::default();
         let registered = running.register("exec-1".to_string());
@@ -88,5 +185,21 @@ mod tests {
         drop(registered);
 
         assert!(!running.has("exec-1"));
+    }
+
+    #[test]
+    fn register_task_tracks_kind_and_pool_activity() {
+        let running = RunningQueries::default();
+        let registered = running.register_task(
+            "exec-1".to_string(),
+            RunningTaskMetadata::query("conn-1", "main", Some("tab-1:export".to_string())),
+        );
+
+        running.set_pool_key("exec-1", "conn-1:main:session:tab-1_export");
+
+        assert_eq!(running.task_kind("exec-1"), Some(RunningTaskKind::Export));
+        assert!(running.is_pool_active("conn-1:main:session:tab-1_export"));
+        drop(registered);
+        assert!(!running.is_pool_active("conn-1:main:session:tab-1_export"));
     }
 }

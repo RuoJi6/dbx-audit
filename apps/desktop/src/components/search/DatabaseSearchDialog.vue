@@ -320,7 +320,7 @@ function openResult(item: SearchResultItem) {
             <Badge variant="outline">{{ results.length }}</Badge>
           </div>
           <div v-if="results.length" class="max-h-[360px] space-y-2 overflow-auto pr-1">
-            <button v-for="item in results" :key="item.id" class="flex w-full items-start gap-3 rounded-md border bg-background px-3 py-2 text-left transition-colors hover:bg-muted/40" @click="openResult(item)">
+            <button v-for="item in results" :key="item.id" class="flex w-full items-start gap-3 rounded-md border bg-background px-3 py-2 text-left hover:bg-muted/40" @click="openResult(item)">
               <Table2 class="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
               <div class="min-w-0 flex-1">
                 <div class="flex min-w-0 flex-wrap items-center gap-2">

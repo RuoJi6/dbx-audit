@@ -39,6 +39,7 @@ import {
   getDefaultLengthForType,
   isDataTypeLengthDisabled,
   isProtectedManticoreIdColumn,
+  parseExtraToColumnExtra,
   splitDataType,
   toColumnNames,
   applyManticoreDdlColumnExtras,
@@ -84,6 +85,7 @@ const emit = defineEmits<{
 const activeTab = ref("columns");
 const loading = ref(false);
 const saving = ref(false);
+const postSaveRefreshing = ref(false);
 const sqlPreviewLoading = ref(false);
 const ddlContent = ref("");
 const ddlLoading = ref(false);
@@ -109,6 +111,91 @@ const pendingStatements = ref<string[]>([]);
 const warnings = ref<string[]>([]);
 const foreignKeys = ref<EditableStructureForeignKey[]>([]);
 const triggers = ref<EditableStructureTrigger[]>([]);
+
+interface StructureRefreshScope {
+  columns: boolean;
+  indexes: boolean;
+  foreignKeys: boolean;
+  triggers: boolean;
+  tableComment: boolean;
+}
+
+const FULL_STRUCTURE_REFRESH_SCOPE: StructureRefreshScope = {
+  columns: true,
+  indexes: true,
+  foreignKeys: true,
+  triggers: true,
+  tableComment: true,
+};
+
+function sameList(left: string[] | null | undefined, right: string[] | null | undefined): boolean {
+  const a = left ?? [];
+  const b = right ?? [];
+  return a.length === b.length && a.every((value, index) => value === b[index]);
+}
+
+function sameText(left: string | null | undefined, right: string | null | undefined): boolean {
+  return (left ?? "") === (right ?? "");
+}
+
+function columnChanged(column: EditableStructureColumn, index: number): boolean {
+  if (!column.original || column.markedForDrop) return true;
+  const original = column.original;
+  return (
+    column.originalPosition !== index ||
+    column.name !== original.name ||
+    column.dataType !== original.data_type ||
+    column.isNullable !== original.is_nullable ||
+    !sameText(column.defaultValue, original.column_default) ||
+    !sameText(column.comment, original.comment) ||
+    column.isPrimaryKey !== original.is_primary_key ||
+    JSON.stringify(column.extra) !== JSON.stringify(parseExtraToColumnExtra(original.extra, databaseType.value))
+  );
+}
+
+function indexChanged(index: EditableStructureIndex): boolean {
+  if (!index.original || index.markedForDrop) return true;
+  const original = index.original;
+  return (
+    index.name !== original.name ||
+    !sameList(index.columns, original.columns) ||
+    index.isUnique !== original.is_unique ||
+    !sameText(index.filter, original.filter) ||
+    !sameText(index.indexType, original.index_type) ||
+    !sameList(index.includedColumns, original.included_columns) ||
+    !sameText(index.comment, original.comment)
+  );
+}
+
+function foreignKeyChanged(foreignKey: EditableStructureForeignKey): boolean {
+  if (!foreignKey.original || foreignKey.markedForDrop) return true;
+  const original = foreignKey.original;
+  return (
+    foreignKey.name !== original.name ||
+    foreignKey.column !== original.column ||
+    !sameText(foreignKey.refSchema, original.ref_schema) ||
+    foreignKey.refTable !== original.ref_table ||
+    foreignKey.refColumn !== original.ref_column ||
+    !sameText(foreignKey.onUpdate, original.on_update) ||
+    !sameText(foreignKey.onDelete, original.on_delete)
+  );
+}
+
+function triggerChanged(trigger: EditableStructureTrigger): boolean {
+  if (!trigger.original || trigger.markedForDrop) return true;
+  const original = trigger.original;
+  return trigger.name !== original.name || trigger.timing !== original.timing || trigger.event !== original.event || !sameText(trigger.statement, original.statement);
+}
+
+function captureStructureRefreshScope(): StructureRefreshScope {
+  return {
+    columns: columns.value.some(columnChanged),
+    indexes: indexes.value.some(indexChanged),
+    foreignKeys: foreignKeys.value.some(foreignKeyChanged),
+    triggers: triggers.value.some(triggerChanged),
+    tableComment: tableComment.value !== originalTableComment.value,
+  };
+}
 
 function isPlainModShortcut(event: KeyboardEvent, key: string): boolean {
   if (event.isComposing || event.altKey || event.shiftKey) return false;
@@ -422,6 +509,7 @@ function isManticoreJsonColumn(column: EditableStructureColumn): boolean {
 
 let sqlPreviewRequestId = 0;
 let keydownListenerRegistered = false;
+let skipNextRefreshVersion = false;
 
 async function refreshSqlPreview() {
   const requestId = ++sqlPreviewRequestId;
@@ -451,12 +539,13 @@ async function refreshSqlPreview() {
   }
 }
 
-const canApply = computed(() => !loading.value && !saving.value && !sqlPreviewLoading.value && pendingStatements.value.length > 0 && warnings.value.length === 0 && !!props.connectionId && (isCreateMode.value ? !!newTableName.value.trim() : !!props.tableName));
+const canApply = computed(() => !loading.value && !saving.value && !postSaveRefreshing.value && !sqlPreviewLoading.value && pendingStatements.value.length > 0 && warnings.value.length === 0 && !!props.connectionId && (isCreateMode.value ? !!newTableName.value.trim() : !!props.tableName));
 
 function resetState() {
   activeTab.value = "columns";
   loading.value = false;
   saving.value = false;
+  postSaveRefreshing.value = false;
   sqlPreviewLoading.value = false;
   errorMessage.value = "";
   columns.value = [];
@@ -472,44 +561,65 @@ function resetState() {
   originalTableComment.value = "";
 }
 
-async function loadStructure(silent = false) {
+async function loadStructure(silent = false, scope: StructureRefreshScope = FULL_STRUCTURE_REFRESH_SCOPE, showErrors = true) {
   if (!props.connectionId || !props.database || !props.tableName) return;
   if (!silent) loading.value = true;
   errorMessage.value = "";
   try {
     await store.ensureConnected(props.connectionId);
-    let nextColumns = await api.getColumns(props.connectionId, props.database, metadataSchema.value, props.tableName);
-    if (databaseType.value === "manticoresearch" && tableMetadataCapabilities.value.ddl) {
+    if (scope.columns) {
+      let nextColumns = await api.getColumns(props.connectionId, props.database, metadataSchema.value, props.tableName);
+      if (databaseType.value === "manticoresearch" && tableMetadataCapabilities.value.ddl) {
+        try {
+          const ddl = await api.getTableDdl(props.connectionId, props.database, metadataSchema.value, props.tableName);
+          ddlContent.value = ddl;
+          ddlFetched.value = true;
+          nextColumns = applyManticoreDdlColumnExtras(nextColumns, ddl);
+        } catch {
+          /* ignore — Manticore column properties can still come from SHOW COLUMNS when available */
+        }
+      }
+      columns.value = createColumnDrafts(nextColumns, databaseType.value);
+    }
+
+    const [nextIndexes, nextForeignKeys, nextTriggers] = await Promise.all([
+      scope.indexes ? (tableMetadataCapabilities.value.indexes ? api.listIndexes(props.connectionId, props.database, metadataSchema.value, props.tableName).catch(() => []) : Promise.resolve([])) : Promise.resolve(undefined),
+      scope.foreignKeys ? (tableMetadataCapabilities.value.foreignKeys ? api.listForeignKeys(props.connectionId, props.database, metadataSchema.value, props.tableName).catch(() => []) : Promise.resolve([])) : Promise.resolve(undefined),
+      scope.triggers ? (tableMetadataCapabilities.value.triggers ? api.listTriggers(props.connectionId, props.database, metadataSchema.value, props.tableName).catch(() => []) : Promise.resolve([])) : Promise.resolve(undefined),
+    ]);
+    if (nextIndexes) indexes.value = createIndexDrafts(nextIndexes);
+    if (nextForeignKeys) foreignKeys.value = createForeignKeyDrafts(nextForeignKeys);
+    if (nextTriggers) triggers.value = createTriggerDrafts(nextTriggers);
+
+    if (scope.tableComment) {
       try {
-        const ddl = await api.getTableDdl(props.connectionId, props.database, metadataSchema.value, props.tableName);
-        ddlContent.value = ddl;
-        ddlFetched.value = true;
-        nextColumns = applyManticoreDdlColumnExtras(nextColumns, ddl);
+        const tables = await api.listTables(props.connectionId, props.database, metadataSchema.value);
+        const table = tables.find((t) => t.name.toLowerCase() === props.tableName!.toLowerCase() && t.table_type !== "VIEW");
+        originalTableComment.value = table?.comment || "";
+        tableComment.value = table?.comment || "";
       } catch {
-        /* ignore — Manticore column properties can still come from SHOW COLUMNS when available */
+        /* ignore — table comment is optional */
       }
     }
-    const [nextIndexes, nextForeignKeys, nextTriggers] = await Promise.all([
-      tableMetadataCapabilities.value.indexes ? api.listIndexes(props.connectionId, props.database, metadataSchema.value, props.tableName).catch(() => []) : Promise.resolve([]),
-      tableMetadataCapabilities.value.foreignKeys ? api.listForeignKeys(props.connectionId, props.database, metadataSchema.value, props.tableName).catch(() => []) : Promise.resolve([]),
-      tableMetadataCapabilities.value.triggers ? api.listTriggers(props.connectionId, props.database, metadataSchema.value, props.tableName).catch(() => []) : Promise.resolve([]),
-    ]);
-    columns.value = createColumnDrafts(nextColumns, databaseType.value);
-    indexes.value = createIndexDrafts(nextIndexes);
-    foreignKeys.value = createForeignKeyDrafts(nextForeignKeys);
-    triggers.value = createTriggerDrafts(nextTriggers);
-    try {
-      const tables = await api.listTables(props.connectionId, props.database, metadataSchema.value);
-      const table = tables.find((t) => t.name.toLowerCase() === props.tableName!.toLowerCase() && t.table_type !== "VIEW");
-      originalTableComment.value = table?.comment || "";
-      tableComment.value = table?.comment || "";
-    } catch {
-      /* ignore — table comment is optional */
-    }
   } catch (e: any) {
-    errorMessage.value = e?.message || String(e);
+    if (showErrors) {
+      errorMessage.value = e?.message || String(e);
+    } else {
+      console.warn("[DBX][structure-editor:refresh-failed]", e);
+    }
   } finally {
     if (!silent) loading.value = false;
+  }
+}
+
+async function refreshStructureAfterSave(scope: StructureRefreshScope) {
+  try {
+    await loadStructure(true, scope, false);
+  } catch (e) {
+    console.warn("[DBX][structure-editor:post-save-refresh-failed]", e);
+  } finally {
+    postSaveRefreshing.value = false;
+    if (activeTab.value === "ddl") void fetchDdl();
   }
 }
 
@@ -834,6 +944,7 @@ async function applyChanges() {
   saving.value = true;
   errorMessage.value = "";
   const sql = previewSqlText.value;
+  const refreshScope = captureStructureRefreshScope();
   const startedAt = Date.now();
   try {
     const connection = store.getConfig(props.connectionId);
@@ -841,11 +952,19 @@ async function applyChanges() {
     const result = await api.executeBatch(props.connectionId, props.database, pendingStatements.value, props.schema, timeoutSecs);
     await recordStructureHistory(sql, startedAt, true, result);
     toast(t("structureEditor.saved"), 2500);
-    emit("saved", tableComment.value !== originalTableComment.value);
+    pendingStatements.value = [];
+    warnings.value = [];
+    ddlFetched.value = false;
+    ddlContent.value = "";
     if (isCreateMode.value) {
+      emit("saved", tableComment.value !== originalTableComment.value);
       emit("close");
     } else {
-      await loadStructure(true);
+      saving.value = false;
+      postSaveRefreshing.value = true;
+      skipNextRefreshVersion = true;
+      emit("saved", tableComment.value !== originalTableComment.value);
+      void refreshStructureAfterSave(refreshScope);
     }
   } catch (e: any) {
     errorMessage.value = e?.message || String(e);
@@ -951,6 +1070,10 @@ watch([() => props.tableName, newTableName], () => {
 
 watch(refreshVersion, (version, previous) => {
   if (version === previous || !version || isCreateMode.value) return;
+  if (skipNextRefreshVersion) {
+    skipNextRefreshVersion = false;
+    return;
+  }
   void loadStructure(true);
 });
 

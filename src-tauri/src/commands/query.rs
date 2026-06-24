@@ -5,6 +5,7 @@ use tauri::State;
 use crate::commands::connection::AppState;
 use dbx_core::db;
 use dbx_core::models::connection::DatabaseType;
+use dbx_core::query_cancel::RunningTaskMetadata;
 use dbx_core::sql::split_sql_statements;
 
 #[tauri::command]
@@ -23,8 +24,13 @@ pub async fn execute_query(
     client_session_id: Option<String>,
     timeout_secs: Option<u64>,
 ) -> Result<db::QueryResult, String> {
-    let registered_query =
-        execution_id.as_ref().filter(|id| !id.trim().is_empty()).map(|id| state.running_queries.register(id.clone()));
+    let execution_id = execution_id.filter(|id| !id.trim().is_empty());
+    let registered_query = execution_id.as_ref().map(|id| {
+        state.running_queries.register_task(
+            id.clone(),
+            RunningTaskMetadata::query(connection_id.clone(), database.clone(), client_session_id.clone()),
+        )
+    });
     let cancel_token = registered_query.as_ref().map(|query| query.token());
 
     dbx_core::query::execute_sql_statement_with_options(
@@ -41,7 +47,7 @@ pub async fn execute_query(
             result_session_id,
             client_session_id,
             timeout_secs,
-            execution_id: execution_id.filter(|id| !id.trim().is_empty()),
+            execution_id,
         },
     )
     .await
@@ -63,10 +69,15 @@ pub async fn execute_multi(
     client_session_id: Option<String>,
     timeout_secs: Option<u64>,
 ) -> Result<Vec<db::QueryResult>, String> {
-    let registered_query =
-        execution_id.as_ref().filter(|id| !id.trim().is_empty()).map(|id| state.running_queries.register(id.clone()));
+    let execution_id = execution_id.filter(|id| !id.trim().is_empty());
+    let registered_query = execution_id.as_ref().map(|id| {
+        state.running_queries.register_task(
+            id.clone(),
+            RunningTaskMetadata::query(connection_id.clone(), database.clone(), client_session_id.clone()),
+        )
+    });
     let cancel_token = registered_query.as_ref().map(|query| query.token());
-    let trace_id = execution_id.clone().as_deref().unwrap_or("no-execution-id").to_string();
+    let trace_id = execution_id.as_deref().unwrap_or("no-execution-id").to_string();
     let started_at = Instant::now();
     log::info!(
         "[query][execute_multi:start] trace_id={} connection_id={} database={} schema={:?} sql={}",
@@ -91,7 +102,7 @@ pub async fn execute_multi(
             result_session_id,
             client_session_id,
             timeout_secs,
-            execution_id: execution_id.filter(|id| !id.trim().is_empty()),
+            execution_id,
         },
     )
     .await;

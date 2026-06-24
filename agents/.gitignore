@@ -1,0 +1,7 @@
+*/libs/*.jar
+gradle.properties
+build/
+*/bin/
+.gradle/
+.DS_Store
+openspec

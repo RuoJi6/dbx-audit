@@ -18,7 +18,7 @@ import { getSchemaDiffOptionsForDbType } from "@/lib/schemaDiffOptions";
 import { getDefaultOptionsForDbType } from "@/types/schemaDiff";
 import type { SchemaDiffCompareOptions, SchemaDiffConfig } from "@/types/schemaDiff";
 import type { ObjectSourceKind } from "@/types/database";
-import { convertToSchemaDiffObjects, groupDiffObjects, type OperationGroup, type SchemaDiffObject, type DiffOperationType, type DiffObjectKind, type SchemaDiffPreparation } from "@/lib/schemaDiff";
+import { buildDeploySqlForObjects, convertToSchemaDiffObjects, groupDiffObjects, type OperationGroup, type SchemaDiffObject, type DiffOperationType, type DiffObjectKind, type SchemaDiffPreparation } from "@/lib/schemaDiff";
 import { Splitpanes, Pane } from "splitpanes";
 import "splitpanes/dist/splitpanes.css";
 
@@ -459,54 +459,7 @@ function handleToggleObjectSelection(objectId: string, selected: boolean) {
 }
 
 function regenerateDeploySql() {
-  // Only select top-level objects (exclude children)
-  const selected = diffObjects.value.filter((o) => {
-    const isTopLevel = !o.id.startsWith("col-") && !o.id.startsWith("idx-") && !o.id.startsWith("fk-") && !o.id.startsWith("trg-");
-    return o.selected && o.operationType !== "none" && isTopLevel;
-  });
-
-  if (selected.length === 0) {
-    deploySql.value = "-- No objects selected";
-    return;
-  }
-
-  const lines: string[] = [];
-
-  for (const obj of selected) {
-    if (obj.operationType === "create") {
-      if (obj.sourceDdl) {
-        lines.push(`-- Create ${obj.objectKind}: ${obj.name}`);
-        lines.push(obj.sourceDdl);
-        lines.push("");
-      }
-    } else if (obj.operationType === "delete") {
-      lines.push(`-- Drop ${obj.objectKind}: ${obj.name}`);
-      const dropSql = generateDropSql(obj);
-      lines.push(dropSql);
-      lines.push("");
-    } else if (obj.operationType === "modify") {
-      if (obj.sourceDdl) {
-        lines.push(`-- Modify ${obj.objectKind}: ${obj.name}`);
-        lines.push(obj.sourceDdl);
-        lines.push("");
-      }
-    }
-  }
-
-  deploySql.value = lines.join("\n") || "-- No DDL available for selected objects";
-}
-
-function generateDropSql(obj: SchemaDiffObject): string {
-  const typeMap: Record<string, string> = {
-    table: "TABLE",
-    view: "VIEW",
-    function: "FUNCTION",
-    sequence: "SEQUENCE",
-    rule: "RULE",
-    owner: "OWNED BY",
-  };
-  const sqlType = typeMap[obj.objectKind] || obj.objectKind.toUpperCase();
-  return `DROP ${sqlType} IF EXISTS ${obj.name};`;
+  deploySql.value = buildDeploySqlForObjects(diffObjects.value);
 }
 
 async function handleExecuteScript() {

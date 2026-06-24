@@ -33,3 +33,37 @@ async fn live_mysql_compatible_limited_text_protocol_query_succeeds() {
     assert!(!result.rows.is_empty());
     assert!(result.rows.len() <= 100);
 }
+
+#[tokio::test]
+#[ignore = "requires a remote MySQL endpoint"]
+async fn live_mysql_query_cancel_kills_running_sleep() {
+    let url = std::env::var("DBX_LIVE_MYSQL_CANCEL_URL").expect("DBX_LIVE_MYSQL_CANCEL_URL");
+
+    let opts = mysql_async::OptsBuilder::from_opts(mysql_async::Opts::from_url(&url).unwrap())
+        .pool_opts(mysql_async::PoolOpts::new().with_constraints(mysql_async::PoolConstraints::new(1, 1).unwrap()));
+    let pool = mysql_async::Pool::new(opts);
+    let mut conn = dbx_core::db::mysql::get_conn_with_health_check(&pool).await.unwrap();
+    let connection_id = mysql_async::Conn::id(&conn);
+    let kill_opts = conn.opts().clone();
+
+    let query = tokio::spawn(async move {
+        dbx_core::db::mysql::execute_query_on_conn_with_max_rows(
+            &mut conn,
+            "SELECT SLEEP(30)",
+            false,
+            Some(10),
+            Default::default(),
+        )
+        .await
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    dbx_core::db::mysql::kill_query_with_opts(kill_opts, connection_id).await.unwrap();
+
+    let started = std::time::Instant::now();
+    let result = query.await.unwrap();
+
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    let result = result.unwrap();
+    assert_eq!(result.rows, vec![vec![serde_json::json!("1")]]);
+}

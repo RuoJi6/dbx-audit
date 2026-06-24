@@ -72,7 +72,13 @@ pub async fn install_jdbc_driver_from_maven(
     state: State<'_, Arc<AppState>>,
     request: JdbcMavenInstallRequest,
 ) -> Result<Vec<JdbcDriverInfo>, String> {
-    jdbc::install_jdbc_driver_from_maven(state.plugins.root_dir(), request).await
+    let env = state.external_driver_runtime_env("jdbc")?;
+    jdbc::install_jdbc_driver_from_maven(state.plugins.root_dir(), request, env).await
+}
+
+#[tauri::command]
+pub async fn install_prestosql_jdbc_driver(state: State<'_, Arc<AppState>>) -> Result<Vec<JdbcDriverInfo>, String> {
+    jdbc::install_prestosql_jdbc_driver(state.plugins.root_dir()).await
 }
 
 #[tauri::command]

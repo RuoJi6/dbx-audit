@@ -7,6 +7,7 @@ import { useToast } from "@/composables/useToast";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useTheme } from "@/composables/useTheme";
 import { loadEditorTheme, editorFontTheme } from "@/lib/editorThemes";
+import { createDbxCodeMirrorSqlDialect } from "@/lib/codemirrorSqlDialect";
 import { Splitpanes, Pane } from "splitpanes";
 import type { SchemaDiffObject, DiffOperationType, DiffObjectKind } from "@/lib/schemaDiff";
 import { ArrowLeft, Copy, Download, Play, Loader2, PlusCircle, XCircle, ArrowRightLeft, Table, Eye, FunctionSquare, ListOrdered, ScrollText, UserCog, ListTree, Link2, Zap } from "@lucide/vue";
@@ -109,7 +110,7 @@ const operationColors: Record<DiffOperationType, string> = {
 async function initEditor() {
   if (!editorContainer.value) return;
 
-  const [{ EditorView }, { EditorState, Compartment }, { sql, PostgreSQL, SQLDialect }, { basicSetup }] = await Promise.all([import("@codemirror/view"), import("@codemirror/state"), import("@codemirror/lang-sql"), import("codemirror")]);
+  const [{ EditorView }, { EditorState, Compartment }, langSql, { basicSetup }] = await Promise.all([import("@codemirror/view"), import("@codemirror/state"), import("@codemirror/lang-sql"), import("codemirror")]);
 
   const themeComp = new Compartment();
   const fontComp = new Compartment();
@@ -122,25 +123,13 @@ async function initEditor() {
   const themeExt = await loadEditorTheme(editorTheme, appAppearance);
   const fontExt = editorFontTheme(EditorView, fontSize, fontFamily, { fixedHeight: true, scrollable: true });
 
-  // Custom PostgreSQL dialect with PL/pgSQL support (same as QueryEditor.vue)
-  const extraKeywords = "PIVOT UNPIVOT EXCLUDE REPLACE QUALIFY ASOF POSITIONAL ANTI SEMI SAMPLE TABLESAMPLE STRUCT MAP LIST ARRAY LAMBDA UNNEST LATERAL FILTER RECURSIVE SUMMARIZE PRAGMA READ_CSV READ_PARQUET READ_JSON DESCRIBE SHOW COPY EXPORT IMPORT";
-  const plpgsqlKeywords = "PERFORM";
-  const plpgsqlTypes = " RECORD JSON JSONB";
-  const plpgsqlBuiltin = "SQLERRM TG_NAME TG_WHEN TG_LEVEL TG_OP TG_RELID TG_RELNAME TG_TABLE_NAME TG_TABLE_SCHEMA TG_NARGS TG_ARGV";
-
-  const dialect = SQLDialect.define({
-    ...PostgreSQL.spec,
-    keywords: [PostgreSQL.spec.keywords || "", extraKeywords, plpgsqlKeywords].filter(Boolean).join(" "),
-    types: [PostgreSQL.spec.types || "", plpgsqlTypes].filter(Boolean).join(" ") || undefined,
-    builtin: [PostgreSQL.spec.builtin || "", plpgsqlBuiltin].filter(Boolean).join(" ") || undefined,
-    doubleDollarQuotedStrings: false,
-  });
+  const dialect = createDbxCodeMirrorSqlDialect(langSql, "postgres");
 
   const state = EditorState.create({
     doc: props.deploySql,
     extensions: [
       basicSetup,
-      sql({ dialect }),
+      langSql.sql({ dialect }),
       themeComp.of(themeExt),
       fontComp.of(fontExt),
       EditorView.updateListener.of((update: any) => {

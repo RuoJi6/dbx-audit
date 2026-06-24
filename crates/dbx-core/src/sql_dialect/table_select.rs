@@ -21,30 +21,9 @@ pub fn build_table_data_select_sql(options: TableDataSelectSqlOptions) -> String
     let table = qualified_table_name(database_type, options.schema.as_deref(), &options.table_name);
     let predicate = normalize_where_input(options.where_input.as_deref());
     let where_clause = if predicate.is_empty() { String::new() } else { format!(" WHERE ({predicate})") };
-    let row_id_alias =
-        if options.include_row_id && database_type == Some(DatabaseType::Oracle) { Some("t") } else { None };
-    let default_order_alias = if database_type == Some(DatabaseType::Jdbc) { None } else { row_id_alias };
     let default_order_by = if database_type == Some(DatabaseType::InfluxDb) {
         // InfluxQL only allows sorting of timestamp column
         Some("time DESC".to_string())
-    } else if !options.primary_keys.is_empty() {
-        Some(
-            options
-                .primary_keys
-                .iter()
-                .map(|pk| format!("{} ASC", quote_order_identifier(database_type, pk, default_order_alias)))
-                .collect::<Vec<_>>()
-                .join(", "),
-        )
-    } else if !options.fallback_order_columns.is_empty() {
-        Some(
-            options
-                .fallback_order_columns
-                .iter()
-                .map(|column| format!("{} ASC", quote_table_identifier(database_type, column)))
-                .collect::<Vec<_>>()
-                .join(", "),
-        )
     } else {
         None
     };
@@ -193,27 +172,8 @@ fn build_rownum_table_select_sql(
     format!("SELECT {select_columns} FROM ({inner_select}) WHERE ROWNUM <= {limit}")
 }
 
-pub(super) fn is_oracle_row_id(database_type: Option<DatabaseType>, name: &str) -> bool {
-    database_type == Some(DatabaseType::Oracle) && name.eq_ignore_ascii_case(DBX_ROWID_COLUMN)
-}
-
 pub(super) fn is_tdengine_tbname(database_type: Option<DatabaseType>, name: &str) -> bool {
     database_type == Some(DatabaseType::Tdengine) && name.eq_ignore_ascii_case(DBX_TDENGINE_TBNAME_COLUMN)
-}
-
-pub(super) fn quote_order_identifier(
-    database_type: Option<DatabaseType>,
-    name: &str,
-    table_alias: Option<&str>,
-) -> String {
-    if is_oracle_row_id(database_type, name) {
-        return table_alias.map(|alias| format!("{alias}.ROWID")).unwrap_or_else(|| "ROWID".to_string());
-    }
-    if is_tdengine_tbname(database_type, name) {
-        return DBX_TDENGINE_TBNAME_COLUMN.to_string();
-    }
-    let quoted = quote_table_identifier(database_type, name);
-    table_alias.map(|alias| format!("{alias}.{quoted}")).unwrap_or(quoted)
 }
 
 pub(super) fn build_select_columns(database_type: Option<DatabaseType>, columns: &[String]) -> String {
@@ -338,19 +298,7 @@ pub(super) fn build_neo4j_table_select_sql(options: &TableDataSelectSqlOptions, 
         "elementId(n) AS {}, {returned_columns}",
         quote_table_identifier(Some(DatabaseType::Neo4j), DBX_NEO4J_ELEMENT_ID_COLUMN)
     );
-    let default_order_by = if options.primary_keys.is_empty() {
-        None
-    } else {
-        Some(
-            options
-                .primary_keys
-                .iter()
-                .map(|pk| format!("n.{} ASC", quote_table_identifier(Some(DatabaseType::Neo4j), pk)))
-                .collect::<Vec<_>>()
-                .join(", "),
-        )
-    };
-    let order_by = options.order_by.as_deref().filter(|order| !order.trim().is_empty()).or(default_order_by.as_deref());
+    let order_by = options.order_by.as_deref().filter(|order| !order.trim().is_empty());
     let order = order_by.map(|order_by| format!(" ORDER BY {order_by}")).unwrap_or_default();
     let skip = options.offset.filter(|offset| *offset > 0).map(|offset| format!(" SKIP {offset}")).unwrap_or_default();
     format!("MATCH (n:{label}){where_clause} RETURN {returns}{order}{skip} LIMIT {limit};")

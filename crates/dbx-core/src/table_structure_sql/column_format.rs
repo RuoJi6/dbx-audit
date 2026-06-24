@@ -132,6 +132,12 @@ pub(super) fn normalize_column_data_type(dialect: StructureDialect, data_type: &
         return trimmed.to_string();
     }
 
+    if dialect == StructureDialect::Mysql {
+        if let Some(normalized) = normalize_mysql_numeric_attribute_type(base_type, params) {
+            return normalized;
+        }
+    }
+
     if is_temporal_precision_type(dialect, base_type) {
         return if is_valid_temporal_precision(params, dialect) {
             format!("{base_type}({params})")
@@ -141,6 +147,41 @@ pub(super) fn normalize_column_data_type(dialect: StructureDialect, data_type: &
     }
 
     trimmed.to_string()
+}
+
+fn normalize_mysql_numeric_attribute_type(base_type: &str, params: &str) -> Option<String> {
+    let mut parts: Vec<&str> = base_type.split_whitespace().collect();
+    let type_name = parts.first().copied()?.to_ascii_lowercase();
+    if !matches!(
+        type_name.as_str(),
+        "tinyint"
+            | "smallint"
+            | "mediumint"
+            | "int"
+            | "integer"
+            | "bigint"
+            | "real"
+            | "double"
+            | "float"
+            | "decimal"
+            | "numeric"
+    ) {
+        return None;
+    }
+    let split_index = parts.iter().position(|part| {
+        let normalized = part.to_ascii_lowercase();
+        matches!(normalized.as_str(), "signed" | "unsigned" | "zerofill")
+    })?;
+    if !parts[split_index..].iter().all(|part| {
+        let normalized = part.to_ascii_lowercase();
+        matches!(normalized.as_str(), "signed" | "unsigned" | "zerofill")
+    }) {
+        return None;
+    }
+
+    let attrs = parts.split_off(split_index).join(" ");
+    let base = parts.join(" ");
+    Some(format!("{base}({params}) {attrs}"))
 }
 
 pub(super) fn is_temporal_precision_type(dialect: StructureDialect, base_type: &str) -> bool {

@@ -4,6 +4,7 @@ use axum::extract::{Multipart, Path, State};
 use axum::Json;
 use dbx_core::agent_service::AgentProgressEvent;
 use dbx_core::jdbc::{self, JdbcDriverInfo, JdbcMavenBundleInfo, JdbcMavenInstallRequest, JdbcPluginStatus};
+use dbx_core::plugins::PluginRuntimeEnv;
 use tokio::sync::broadcast;
 
 use crate::error::AppError;
@@ -28,7 +29,18 @@ pub async fn install_jdbc_driver_from_maven(
     Json(req): Json<JdbcMavenInstallRequest>,
 ) -> Result<Json<Vec<JdbcDriverInfo>>, AppError> {
     let root = state.app.plugins.root_dir();
-    Ok(Json(jdbc::install_jdbc_driver_from_maven(root, req).await.map_err(AppError::internal)?))
+    Ok(Json(
+        jdbc::install_jdbc_driver_from_maven(root, req, PluginRuntimeEnv::default())
+            .await
+            .map_err(AppError::internal)?,
+    ))
+}
+
+pub async fn install_prestosql_jdbc_driver(
+    State(state): State<Arc<WebState>>,
+) -> Result<Json<Vec<JdbcDriverInfo>>, AppError> {
+    let root = state.app.plugins.root_dir();
+    Ok(Json(jdbc::install_prestosql_jdbc_driver(root).await.map_err(AppError::internal)?))
 }
 
 pub async fn import_jdbc_drivers(

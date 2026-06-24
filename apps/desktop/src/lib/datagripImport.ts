@@ -389,7 +389,7 @@ function buildConnection(fragment: DataSourceFragment): ConnectionConfig {
     database,
     color: "",
     transport_layers: [],
-    connect_timeout_secs: 5,
+    connect_timeout_secs: 10,
     query_timeout_secs: 30,
     ssl: false,
     oracle_connection_type: profile.dbType === "oracle" ? parsed.oracleConnectionType || "service_name" : undefined,

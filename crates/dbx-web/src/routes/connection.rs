@@ -110,6 +110,14 @@ pub async fn disconnect_db(
     Ok(Json(()))
 }
 
+pub async fn check_connection_health(
+    State(state): State<Arc<WebState>>,
+    Json(body): Json<DisconnectRequest>,
+) -> Result<Json<()>, AppError> {
+    state.app.check_connection_health(&body.connection_id).await.map_err(AppError)?;
+    Ok(Json(()))
+}
+
 pub async fn close_database_connection(
     State(state): State<Arc<WebState>>,
     Json(body): Json<CloseDatabaseConnectionRequest>,

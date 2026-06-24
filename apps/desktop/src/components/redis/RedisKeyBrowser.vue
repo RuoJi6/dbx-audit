@@ -82,6 +82,7 @@ const commandText = ref("");
 const commandRunning = ref(false);
 const commandDb = ref(props.db);
 const commandHistory = ref<RedisCommandHistoryEntry[]>([]);
+const commandHistoryIndex = ref(-1);
 const activeSidePanel = ref<RedisSidePanel>("detail");
 const showCreateKeyDialog = ref(false);
 const creatingKey = ref(false);
@@ -427,6 +428,17 @@ function appendCommandHistory(entry: Omit<RedisCommandHistoryEntry, "id">) {
   scrollCommandTerminalToEnd();
 }
 
+function appendCommandOutput(entry: Omit<RedisCommandHistoryEntry, "id">) {
+  // 显示输出但不记入历史（用于错误提示、空命令提示等）
+  const tempEntry = { id: ++commandHistoryId, ...entry };
+  commandHistory.value = [...commandHistory.value, tempEntry];
+  scrollCommandTerminalToEnd();
+  // 1秒后自动移除提示
+  setTimeout(() => {
+    commandHistory.value = commandHistory.value.filter((e) => e.id !== tempEntry.id);
+  }, 1000);
+}
+
 async function runRedisCommand(command: string) {
   const prompt = commandPrompt.value;
   commandRunning.value = true;
@@ -681,7 +693,8 @@ async function createRedisKey() {
 async function executeCommand() {
   const command = commandText.value.trim();
   if (!command) {
-    appendCommandHistory({
+    // 空命令显示提示但不记入历史
+    appendCommandOutput({
       prompt: commandPrompt.value,
       command: "",
       output: t("redis.commandEmpty"),
@@ -692,6 +705,7 @@ async function executeCommand() {
   if (isRedisClearScreenCommand(command)) {
     commandHistory.value = [];
     commandText.value = "";
+    commandHistoryIndex.value = -1;
     scrollCommandTerminalToEnd();
     return;
   }
@@ -705,15 +719,18 @@ async function executeCommand() {
       error: true,
     });
     commandText.value = "";
+    commandHistoryIndex.value = -1;
     return;
   }
   if (safety === "confirm") {
     pendingDanger.value = { kind: "command", command };
     showDangerConfirm.value = true;
     commandText.value = "";
+    commandHistoryIndex.value = -1;
     return;
   }
   commandText.value = "";
+  commandHistoryIndex.value = -1;
   await runRedisCommand(command);
 }
 
@@ -830,6 +847,47 @@ function resumeRedisBrowserBackgroundWork() {
 
 async function clearInMemoryHistory() {
   commandHistory.value = [];
+}
+
+function onCommandAreaClick() {
+  // 只有在没有选中文本时才聚焦输入框，避免清除用户的文本选择
+  const selection = window.getSelection();
+  if (!selection || selection.toString().length === 0) {
+    getCommandInput()?.focus();
+  }
+}
+
+function onCommandInputKeydown(event: KeyboardEvent) {
+  // 上下键切换历史命令
+  if (event.key === "ArrowUp") {
+    event.preventDefault();
+    if (commandHistory.value.length === 0) return;
+
+    if (commandHistoryIndex.value === -1) {
+      // 首次按上键，从最后一条开始
+      commandHistoryIndex.value = commandHistory.value.length - 1;
+    } else if (commandHistoryIndex.value > 0) {
+      // 继续往前
+      commandHistoryIndex.value--;
+    }
+    commandText.value = commandHistory.value[commandHistoryIndex.value].command;
+  } else if (event.key === "ArrowDown") {
+    event.preventDefault();
+    if (commandHistoryIndex.value === -1) return;
+
+    if (commandHistoryIndex.value < commandHistory.value.length - 1) {
+      // 往后
+      commandHistoryIndex.value++;
+      commandText.value = commandHistory.value[commandHistoryIndex.value].command;
+    } else {
+      // 到达末尾，清空输入
+      commandHistoryIndex.value = -1;
+      commandText.value = "";
+    }
+  } else if (event.key === "Enter") {
+    event.preventDefault();
+    executeCommand();
+  }
 }
 
 onMounted(() => {
@@ -980,8 +1038,8 @@ defineExpose({ focusSearch });
             </TabsContent>
 
             <TabsContent value="command" class="m-0 min-h-0 flex-1 flex flex-col">
-              <div class="dbx-editor-font-family relative flex min-h-0 flex-1 flex-col bg-[#171b21] text-[13px] leading-5 text-slate-200" @click="getCommandInput()?.focus()">
-                <div ref="commandTerminalRef" class="min-h-0 flex-1 overflow-auto px-4 pb-3 pt-4">
+              <div class="dbx-editor-font-family relative flex min-h-0 flex-1 flex-col bg-[#171b21] text-[13px] leading-5 text-slate-200" @click="onCommandAreaClick">
+                <div ref="commandTerminalRef" class="redis-command-terminal min-h-0 flex-1 overflow-auto px-4 pb-3 pt-4">
                   <div class="mb-4 text-slate-400">
                     <span class="text-slate-200">{{ t("redis.commandWelcome") }}</span>
                   </div>
@@ -1001,11 +1059,12 @@ defineExpose({ focusSearch });
                     v-model="commandText"
                     data-redis-command-input
                     class="dbx-editor-font-family min-w-0 flex-1 border-0 bg-transparent p-0 text-[13px] text-slate-200 caret-[#d7ba7d] outline-none placeholder:text-slate-500"
-                    :disabled="commandRunning"
+                    :class="{ 'opacity-50': commandRunning }"
+                    :readonly="commandRunning"
                     autocomplete="off"
                     autocapitalize="off"
                     spellcheck="false"
-                    @keydown.enter.prevent="executeCommand"
+                    @keydown="onCommandInputKeydown"
                   />
                   <Loader2 v-if="commandRunning" class="h-3.5 w-3.5 shrink-0 animate-spin text-slate-500" />
                 </form>
@@ -1156,5 +1215,10 @@ defineExpose({ focusSearch });
 
 .redis-workspace-splitpanes :deep(.splitpanes__splitter:hover) {
   background: var(--primary) !important;
+}
+
+.redis-command-terminal {
+  user-select: text;
+  -webkit-user-select: text;
 }
 </style>

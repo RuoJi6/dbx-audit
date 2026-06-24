@@ -40,6 +40,7 @@ export type DatabaseType =
   | "h2"
   | "snowflake"
   | "trino"
+  | "prestosql"
   | "hive"
   | "db2"
   | "informix"
@@ -570,6 +571,7 @@ export interface QueryTab {
     columns: ColumnInfo[];
     primaryKeys: string[];
   };
+  tableMetaUpdatedAt?: number;
   tableInfoTab?: TableInfoTab;
   queryAnalysis?: {
     schema?: string;

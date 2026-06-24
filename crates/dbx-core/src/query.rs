@@ -805,6 +805,12 @@ pub async fn do_execute(
     cancel_token: Option<CancellationToken>,
     options: QueryExecutionOptions,
 ) -> Result<db::QueryResult, String> {
+    if let Some(execution_id) = options.execution_id.as_deref() {
+        state.running_queries.set_pool_key(execution_id, pool_key.to_string());
+    }
+    state.touch_pool_activity(pool_key).await;
+    let _activity_touch = state.pool_activity_touch(pool_key);
+
     let query_timeout = resolve_query_timeout(options.timeout_secs);
     let (_duckdb_attached_names, conn_name_if_readonly) = {
         let configs = state.configs.read().await;
@@ -853,10 +859,23 @@ pub async fn do_execute(
             let bare = *mode == crate::connection::MysqlMode::Bare;
             let max_rows = options.max_rows;
             drop(connections);
+            let mut conn = db::mysql::get_conn_with_health_check(&p).await?;
+            let connection_id = conn.id();
+            if let Some(ref execution_id) = options.execution_id {
+                let kill_opts = conn.opts().clone();
+                state.running_queries.register_interrupt(execution_id, move || {
+                    let kill_opts = kill_opts.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = db::mysql::kill_query_with_opts(kill_opts, connection_id).await {
+                            log::warn!("Failed to cancel MySQL query {connection_id}: {error}");
+                        }
+                    });
+                });
+            }
             wait_for_query_opt(
                 cancel_token,
                 query_timeout,
-                db::mysql::execute_query_with_max_rows(&p, sql, bare, max_rows, mysql_dialect),
+                db::mysql::execute_query_on_conn_with_max_rows(&mut conn, sql, bare, max_rows, mysql_dialect),
             )
             .await
         }
@@ -864,21 +883,21 @@ pub async fn do_execute(
             let p = p.clone();
             let schema = schema.map(|s| s.to_string());
             let max_rows = options.max_rows;
+            let query_timeout = query_timeout;
             drop(connections);
             if let Some(schema) = schema {
-                wait_for_query_opt(
+                db::postgres::execute_query_with_schema_and_max_rows_and_cancel(
+                    &p,
+                    &schema,
+                    sql,
+                    max_rows,
                     cancel_token,
                     query_timeout,
-                    db::postgres::execute_query_with_schema_and_max_rows(&p, &schema, sql, max_rows),
                 )
                 .await
             } else {
-                wait_for_query_opt(
-                    cancel_token,
-                    query_timeout,
-                    db::postgres::execute_query_with_max_rows(&p, sql, max_rows),
-                )
-                .await
+                db::postgres::execute_query_with_max_rows_and_cancel(&p, sql, max_rows, cancel_token, query_timeout)
+                    .await
             }
         }
         PoolKind::Sqlite(p) => {
@@ -1011,21 +1030,39 @@ pub async fn do_execute(
             let max_rows = options.max_rows;
             let rpc_timeout = query_timeout;
             drop(connections);
-            let result = wait_for_query_opt(cancel_token, query_timeout, async move {
-                let mut client = client.lock().await;
+            if is_canceled(&cancel_token) {
+                return Err(canceled_error());
+            }
+            let cancel_for_agent = cancel_token.clone();
+            let result = async move {
+                let mut client = match cancel_for_agent.as_ref() {
+                    Some(token) => {
+                        tokio::select! {
+                            biased;
+                            _ = token.cancelled() => return Err(canceled_error()),
+                            guard = client.lock() => guard,
+                        }
+                    }
+                    None => client.lock().await,
+                };
                 if let Some(session_id) = options.result_session_id.as_deref() {
                     let params = agent_fetch_query_page_params(session_id, options.page_size.unwrap_or(MAX_ROWS));
-                    client.fetch_query_page_with_timeout(params, rpc_timeout).await
+                    client.fetch_query_page_with_timeout_and_cancel(params, rpc_timeout, cancel_for_agent.clone()).await
                 } else if options.page_size.is_some() {
                     let params = agent_execute_query_page_params(&sql, database.as_deref(), schema.as_deref(), options);
-                    client.execute_query_page_with_timeout(params, rpc_timeout).await
+                    client
+                        .execute_query_page_with_timeout_and_cancel(params, rpc_timeout, cancel_for_agent.clone())
+                        .await
                 } else {
                     let params = agent_execute_query_params(&sql, database.as_deref(), schema.as_deref(), options);
-                    client.execute_query_with_timeout(params, rpc_timeout).await
+                    client.execute_query_with_timeout_and_cancel(params, rpc_timeout, cancel_for_agent.clone()).await
                 }
-            })
+            }
             .await
             .map(|result| normalize_query_result_for_js(truncate_result_with_max_rows(result, max_rows)));
+            if matches!(result.as_ref(), Err(err) if err == QUERY_CANCELED) {
+                state.remove_pool_by_key(pool_key).await;
+            }
             if matches!(result.as_ref(), Err(err) if should_discard_pool_after_error(pool_db_type, err)) {
                 state.remove_pool_by_key(pool_key).await;
             }
@@ -1226,6 +1263,11 @@ async fn execute_postgres_drop_database(
     let pool_key = state
         .get_or_create_pool_for_session(connection_id, Some(admin_database), options.client_session_id.as_deref())
         .await?;
+    if let Some(execution_id) = options.execution_id.as_deref() {
+        state.running_queries.set_pool_key(execution_id, pool_key.clone());
+    }
+    state.touch_pool_activity(&pool_key).await;
+    let _activity_touch = state.pool_activity_touch(pool_key.as_str());
 
     if is_canceled(&cancel_token) {
         return Err(canceled_error());
@@ -1359,6 +1401,11 @@ pub async fn execute_multi_core_with_options(
             .get_or_create_pool_for_session(connection_id, Some(database), options.client_session_id.as_deref())
             .await?
     };
+    if let Some(execution_id) = options.execution_id.as_deref() {
+        state.running_queries.set_pool_key(execution_id, pool_key.clone());
+    }
+    state.touch_pool_activity(&pool_key).await;
+    let _activity_touch = state.pool_activity_touch(pool_key.as_str());
 
     let is_sqlserver = {
         let connections = state.connections.read().await;

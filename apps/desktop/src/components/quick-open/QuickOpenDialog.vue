@@ -141,7 +141,7 @@ watch(
           </div>
 
           <div v-else class="divide-y">
-            <div v-for="(item, index) in filteredItems" :key="item.id" :class="['px-4 py-2 cursor-pointer transition-colors', index === selectedIndex ? 'bg-accent' : 'hover:bg-muted']" @click="handleSelect(item)" @mouseenter="selectedIndex = index">
+            <div v-for="(item, index) in filteredItems" :key="item.id" :class="['px-4 py-2 cursor-pointer', index === selectedIndex ? 'bg-accent' : 'hover:bg-muted']" @click="handleSelect(item)" @mouseenter="selectedIndex = index">
               <div class="flex items-center justify-between gap-3">
                 <div class="flex-1 min-w-0">
                   <div class="text-sm font-medium truncate">

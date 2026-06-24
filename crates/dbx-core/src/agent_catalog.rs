@@ -158,7 +158,7 @@ const AGENT_CATALOG: &[AgentCatalogEntry] = &[
     AgentCatalogEntry {
         db_type: DatabaseType::Trino,
         key: "trino",
-        label: "Trino (Presto)",
+        label: "Trino",
         store_visible: true,
         profiles: &[],
     },
