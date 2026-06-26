@@ -99,6 +99,9 @@ export function connectionUrlPlaceholder(dbType: DatabaseType): string {
     case "etcd":
       return "etcd://host:2379";
 
+    case "zookeeper":
+      return "zookeeper://host:2181";
+
     case "sqlite":
       return "sqlite:///absolute/path/to/database.db";
 
@@ -129,6 +132,7 @@ export function connectionUrlPlaceholder(dbType: DatabaseType): string {
     case "elasticsearch":
     case "qdrant":
     case "milvus":
+    case "weaviate":
       return "http://user:password@host:port";
 
     case "dameng":

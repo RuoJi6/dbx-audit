@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, onBeforeUnmount, onMounted } from "vue";
+import { computed, ref, nextTick, onBeforeUnmount, onMounted } from "vue";
 import { useI18n } from "vue-i18n";
 import { DynamicScroller, DynamicScrollerItem, RecycleScroller } from "vue-virtual-scroller";
 import { Braces, Copy, Eye, FileText, Terminal, Trash2, Save, RefreshCw, Plus, Loader2, Pencil, WrapText, IndentIncrease, IndentDecrease } from "@lucide/vue";
@@ -17,6 +17,7 @@ import { useTheme } from "@/composables/useTheme";
 import { useEditorFontFamilyStyle } from "@/composables/useEditorFontFamilyStyle";
 import { createRedisShikiJsonHighlighter, type RedisJsonHighlighter } from "@/lib/redisJsonHighlighter";
 import { copyToClipboard } from "@/lib/clipboard";
+import { formatTtl } from "@/lib/ttlFormat";
 import { canEditRedisMemberDetail, clampRedisMemberDetailSheetWidth, formatRedisMemberDetail, getRedisMemberSelectionKey } from "@/lib/redisValuePresentation";
 
 const { t } = useI18n();
@@ -32,7 +33,7 @@ const props = defineProps<{
   metadata?: RedisKeyInfo | null;
 }>();
 
-const emit = defineEmits<{ deleted: [] }>();
+const emit = defineEmits<{ deleted: []; loaded: [value: RedisValue] }>();
 
 const data = ref<RedisValue | null>(null);
 const loading = ref(false);
@@ -46,6 +47,7 @@ const showDeleteConfirm = ref(false);
 const showMemberDetail = ref(false);
 const editingTtl = ref(false);
 const ttlInput = ref("");
+const ttlInputEl = ref<InstanceType<typeof Input>>();
 const collectionItems = ref<any[]>([]);
 const scanCursor = ref<number | undefined>(undefined);
 const selectedMemberTitle = ref("");
@@ -182,12 +184,13 @@ const isBinaryStringValue = computed(() => data.value?.key_type === "string" && 
 const hasMore = computed(() => scanCursor.value != null && scanCursor.value > 0);
 const metadataSizeLabel = computed(() => {
   const metadata = props.metadata;
-  if (!metadata || metadata.size <= 0) return "";
+  const size = metadata?.size ?? 0;
+  if (!metadata || size <= 0) return "";
   if (metadata.key_type === "string") {
-    if (metadata.size >= 1024) return `${(metadata.size / 1024).toFixed(1)} KB`;
-    return `${metadata.size} B`;
+    if (size >= 1024) return `${(size / 1024).toFixed(1)} KB`;
+    return `${size} B`;
   }
-  return String(metadata.size);
+  return String(size);
 });
 
 function collectionCountLabel(kind: "items" | "fields" | "members", loaded: number, total?: number | null) {
@@ -199,7 +202,9 @@ async function load(options: { selectDefaultMember?: boolean } = {}) {
   const shouldSelectDefaultMember = options.selectDefaultMember ?? true;
   loading.value = true;
   try {
-    data.value = await api.redisGetValue(props.connectionId, props.db, props.keyRaw);
+    const loadedValue = await api.redisGetValue(props.connectionId, props.db, props.keyRaw);
+    data.value = loadedValue;
+    emit("loaded", loadedValue);
     scanCursor.value = data.value.scan_cursor ?? undefined;
     if (data.value.key_type === "string") {
       const detail = formatRedisMemberDetail(data.value.value);
@@ -627,6 +632,7 @@ function startEditTtl() {
   if (!data.value) return;
   ttlInput.value = data.value.ttl > 0 ? String(data.value.ttl) : "";
   editingTtl.value = true;
+  void nextTick(() => ttlInputEl.value?.$el?.focus());
 }
 
 async function saveTtl() {
@@ -780,12 +786,13 @@ onBeforeUnmount(() => {
           <Badge variant="secondary" class="dbx-editor-font-family text-xs uppercase">{{ data.key_type }}</Badge>
           <Badge v-if="metadataSizeLabel" variant="outline" class="text-xs text-muted-foreground"> {{ t("redis.columnSize") }}: {{ metadataSizeLabel }} </Badge>
           <template v-if="!editingTtl">
-            <Badge v-if="data.ttl > 0" variant="outline" class="text-xs cursor-pointer text-muted-foreground hover:bg-accent" @click="startEditTtl">TTL: {{ data.ttl }}s</Badge>
+            <Badge v-if="data.ttl > 0" variant="outline" class="text-xs cursor-pointer text-muted-foreground hover:bg-accent" @click="startEditTtl">TTL: {{ formatTtl(data.ttl, t) }}</Badge>
             <Badge v-else-if="data.ttl === -1" variant="outline" class="text-xs cursor-pointer text-muted-foreground hover:bg-accent" @click="startEditTtl">{{ t("redis.noExpiry") }}</Badge>
           </template>
           <div v-else class="flex items-center gap-1">
-            <Input v-model="ttlInput" class="h-6 w-20 text-xs" placeholder="seconds (-1=no expiry)" autofocus @keydown.enter="saveTtl" @keydown.escape="cancelEditTtl" />
-            <Button variant="ghost" size="icon" class="h-6 w-6" @click="saveTtl"><Save class="h-3 w-3" /></Button>
+            <Input ref="ttlInputEl" v-model="ttlInput" class="h-6 w-20 text-xs" placeholder="seconds (-1=no expiry)" @keydown.enter="saveTtl" @keydown.escape="cancelEditTtl" @blur="cancelEditTtl" />
+            <!-- mousedown fires before blur so saveTtl starts first; .prevent keeps focus on the Input so blur doesn't cancel the edit prematurely -->
+            <Button variant="ghost" size="icon" class="h-6 w-6" @mousedown.prevent="saveTtl"><Save class="h-3 w-3" /></Button>
           </div>
         </div>
       </div>

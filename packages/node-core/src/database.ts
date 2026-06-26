@@ -1,11 +1,12 @@
 import type { ConnectionConfig, ProxyTunnelConfig } from "./connections.js";
 import { createServer, connect as netConnect, type Server, type Socket } from "node:net";
 import { readFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { join } from "node:path";
-import { homedir, platform } from "node:os";
 import Database from "better-sqlite3";
 import { sqlSafetyFromEnv } from "./sql-safety.js";
 import { isDirectQueryType } from "./diagnostics.js";
+import { bridgePortFilePath } from "./paths.js";
 
 export interface TableInfo {
   name: string;
@@ -325,23 +326,10 @@ interface MongoDocumentResult {
   total: number;
 }
 
-function bridgeAppDataDir(): string {
-  const home = homedir();
-  switch (platform()) {
-    case "darwin":
-      return join(home, "Library", "Application Support", "com.dbx.app");
-    case "win32":
-      return join(process.env.APPDATA || join(home, "AppData", "Roaming"), "com.dbx.app");
-    default:
-      return join(home, ".config", "com.dbx.app");
-  }
-}
-
 async function bridgeDataRequest<T>(path: string, body: Record<string, unknown>): Promise<T> {
   let bridgeUrl: string;
   try {
-    const portFile = join(bridgeAppDataDir(), "mcp-bridge-port");
-    const port = (await readFile(portFile, "utf-8")).trim();
+    const port = (await readFile(bridgePortFilePath(), "utf-8")).trim();
     bridgeUrl = `http://127.0.0.1:${port}`;
   } catch {
     throw new Error("DBX desktop app is not running. This database type requires DBX to be running for query execution.");
@@ -933,10 +921,11 @@ export function evaluateMongoAggregateSafety(command: MongoAggregateCommand, opt
 }
 
 function parseCollectionMethodTarget(source: string, method: string): { collection: string; methodCallIndex: number } | null {
-  const direct = new RegExp(`^db\\.([A-Za-z_$][\\w$]*)\\.${method}\\s*\\(`).exec(source);
-  if (direct) return { collection: direct[1], methodCallIndex: source.indexOf(`.${method}`) };
-  const quoted = new RegExp(`^db\\.getCollection\\(\\s*(['"])([^'"]+)\\1\\s*\\)\\.${method}\\s*\\(`).exec(source);
-  if (quoted) return { collection: quoted[2], methodCallIndex: source.indexOf(`.${method}`) };
+  const escapedMethod = escapeRegExp(method);
+  const direct = new RegExp(`^db\\s*\\.\\s*([A-Za-z_$][\\w$]*)\\s*\\.\\s*${escapedMethod}\\s*\\(`).exec(source);
+  if (direct) return { collection: direct[1], methodCallIndex: findChainedMethodCallIndex(source, method) };
+  const quoted = new RegExp(`^db\\s*\\.\\s*getCollection\\s*\\(\\s*(['"])([^'"]+)\\1\\s*\\)\\s*\\.\\s*${escapedMethod}\\s*\\(`).exec(source);
+  if (quoted) return { collection: quoted[2], methodCallIndex: findChainedMethodCallIndex(source, method) };
   return null;
 }
 
@@ -948,12 +937,23 @@ function parseMethodArgs(source: string, methodCallIndex: number): string[] | nu
 }
 
 function readChainedCallArgument(chain: string, method: string): string | undefined {
-  const pattern = new RegExp(`\\.${method}\\s*\\(`, "g");
-  const match = pattern.exec(chain);
+  const match = chainedMethodCallPattern(method).exec(chain);
   if (!match) return undefined;
-  const openIndex = match.index + match[0].lastIndexOf("(");
+  const openIndex = chain.indexOf("(", match.index);
   const closeIndex = findMatchingParen(chain, openIndex);
   return closeIndex < 0 ? undefined : chain.slice(openIndex + 1, closeIndex);
+}
+
+function findChainedMethodCallIndex(source: string, method: string): number {
+  return chainedMethodCallPattern(method).exec(source)?.index ?? -1;
+}
+
+function chainedMethodCallPattern(method: string): RegExp {
+  return new RegExp(`\\.\\s*${escapeRegExp(method)}\\s*\\(`, "g");
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function readChainedIntegerArgument(chain: string, method: string, fallback: number): number | null {

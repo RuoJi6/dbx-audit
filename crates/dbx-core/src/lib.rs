@@ -30,12 +30,14 @@ pub mod models;
 pub mod mongo_ops;
 #[cfg(feature = "mq-admin")]
 pub mod mq;
+pub mod nacos;
 pub mod object_source_sql;
 pub mod path_utils;
 pub mod plugins;
 pub mod query;
 pub mod query_cancel;
 pub mod query_execution_sql;
+pub mod query_result_export;
 pub mod query_result_sql;
 pub mod redis_ops;
 pub mod saved_sql;

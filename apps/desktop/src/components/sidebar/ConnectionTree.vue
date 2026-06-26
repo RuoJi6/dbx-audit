@@ -13,7 +13,7 @@ import { usesTreeSchemaMode } from "@/lib/databaseFeatureSupport";
 import { connectionUsesDatabaseObjectTreeMode, effectiveDatabaseTypeForConnection } from "@/lib/jdbcDialect";
 import { activeTabSidebarTarget, findSidebarNodeForActiveTab, findSidebarNodeForTarget, findNodePathForTarget, scrollTopForSidebarNode, shouldScrollActiveSidebarSelection, type ActiveTabSidebarTarget } from "@/lib/sidebarActiveTabTarget";
 import { findLoadedTableTargetForCandidate, queryContextTargetFromCandidate, queryCursorTableCandidate, type QueryCursorTableCandidate } from "@/lib/queryCursorTableTarget";
-import { SIDEBAR_TREE_ROW_HEIGHT, SIDEBAR_TREE_PRERENDER_COUNT, SIDEBAR_TREE_SCROLL_BUFFER, flattenTree, scrollTopForExpandedTreeNode, shouldAutoScrollExpandedTreeNode, shouldVirtualizeFlatTree, type FlatTreeNode } from "@/composables/useFlatTree";
+import { SIDEBAR_TREE_ROW_HEIGHT, SIDEBAR_TREE_PRERENDER_COUNT, SIDEBAR_TREE_SCROLL_BUFFER, flattenTree, shouldVirtualizeFlatTree, type FlatTreeNode } from "@/composables/useFlatTree";
 import { sidebarTreeContextKey } from "@/lib/sidebarTreeContext";
 import TreeItem from "./TreeItem.vue";
 import { RecycleScroller } from "vue-virtual-scroller";
@@ -33,6 +33,7 @@ const plainTreeScrollerRef = ref<HTMLElement | null>(null);
 type SearchScope = "connection" | "database" | "schema" | "table" | "view";
 const selectedSearchScopes = ref<SearchScope[]>([]);
 const searchCollapsedIds = ref<Set<string>>(new Set());
+const searchRefreshedGroupIds = new Set<string>();
 let searchTimer: number | undefined;
 
 watch(
@@ -53,25 +54,34 @@ watch(
   { flush: "sync" },
 );
 
-watch(deferredSearchQuery, (newQuery) => {
+watch(deferredSearchQuery, (newQuery, oldQuery) => {
   store.sidebarSearchQuery = newQuery;
   const tasks: Promise<void>[] = [];
   for (const root of store.treeNodes) {
-    findExpandedTableParents(root, tasks);
+    collectExpandedObjectGroups(root, tasks, newQuery ? searchRefreshedGroupIds : undefined);
+  }
+  if (!newQuery && oldQuery) {
+    searchRefreshedGroupIds.clear();
   }
   Promise.all(tasks).catch(() => {});
 });
 
-function findExpandedTableParents(node: TreeNode, tasks: Promise<void>[]) {
-  if (node.isExpanded && node.connectionId && (node.type === "database" || node.type === "schema")) {
-    const groupTypes = new Set(["group-tables", "group-views", "group-procedures", "group-functions", "group-sequences", "group-packages"]);
-    if (node.children?.some((child) => groupTypes.has(child.type))) {
-      tasks.push(store.loadObjectGroupChildren(node, { force: true }));
+const searchableObjectGroupTypes = new Set<TreeNodeType>(["group-tables", "group-views", "group-materialized-views"]);
+
+function collectExpandedObjectGroups(node: TreeNode, tasks: Promise<void>[], refreshedGroupIds?: Set<string>) {
+  if (refreshedGroupIds && node.isExpanded && node.children) {
+    for (const child of node.children) {
+      if (child.connectionId && searchableObjectGroupTypes.has(child.type)) {
+        refreshedGroupIds.add(child.id);
+        tasks.push(store.loadObjectGroupChildren(child, { force: true }));
+      }
     }
+  } else if (!refreshedGroupIds && searchRefreshedGroupIds.has(node.id)) {
+    tasks.push(store.loadObjectGroupChildren(node, { force: true }));
   }
   if (node.children) {
     for (const child of node.children) {
-      findExpandedTableParents(child, tasks);
+      collectExpandedObjectGroups(child, tasks, refreshedGroupIds);
     }
   }
 }
@@ -81,11 +91,17 @@ const isFiltering = computed(() => !!searchQuery.value.trim() || hasSearchScopeF
 
 const SEARCH_SCOPE_TO_NODE_TYPES: Record<SearchScope, TreeNodeType[]> = {
   connection: ["connection"],
-  database: ["database", "redis-db", "mq-tenant", "mongo-db"],
+  database: ["database", "redis-db", "mq-tenant", "nacos-namespace", "mongo-db"],
   schema: ["schema"],
   table: ["table", "mongo-collection", "vector-collection", "elasticsearch-index"],
   view: ["view"],
 };
+
+// Database-level container types. When browsing a large number of children
+// under one of these (e.g. hundreds of tables) and scrolling down, the row is
+// kept pinned at the top of the tree so the active database stays visible and
+// can be collapsed with one click. Mirrors the `database` search scope above.
+const DATABASE_LEVEL_TYPES = new Set<TreeNodeType>(SEARCH_SCOPE_TO_NODE_TYPES.database);
 
 const searchScopeOptions = computed(() => {
   return [
@@ -168,6 +184,56 @@ const visibleNodeIndexById = computed(() => {
 });
 const useVirtualTree = computed(() => shouldVirtualizeFlatTree(flatNodes.value.length));
 const activeTab = computed(() => queryStore.tabs.find((tab) => tab.id === queryStore.activeTabId));
+
+// --- Sticky database header ---
+// RecycleScroller positions each row absolutely, so CSS `position: sticky` on
+// a database row can't work. Instead we overlay a pinned row from this parent
+// component, tracking scroll offset to find the topmost visible database-level
+// ancestor. The overlay reuses <TreeItem>, so collapse/expand comes for free.
+const stickyScrollTop = ref(0);
+
+function onTreeScroll() {
+  const scroller = (treeScrollerRef.value?.$el as HTMLElement | undefined) ?? null;
+  if (scroller) stickyScrollTop.value = scroller.scrollTop;
+}
+
+// RecycleScroller only emits scrollStart/scrollEnd, not continuous scroll, so
+// attach a native passive listener on its root element once it mounts.
+watch(
+  treeScrollerRef,
+  (scroller, _old, onCleanup) => {
+    const el = (scroller?.$el as HTMLElement | undefined) ?? null;
+    if (!el) return;
+    el.addEventListener("scroll", onTreeScroll, { passive: true });
+    onCleanup(() => el.removeEventListener("scroll", onTreeScroll));
+  },
+  { flush: "post" },
+);
+
+const stickyNode = computed<FlatTreeNode | null>(() => {
+  if (!useVirtualTree.value || isFiltering.value) return null;
+  const nodes = flatNodes.value;
+  const len = nodes.length;
+  if (len === 0) return null;
+
+  const topIndex = Math.min(Math.floor(stickyScrollTop.value / SIDEBAR_TREE_ROW_HEIGHT), len - 1);
+  // Walk UP from the topmost visible row to the nearest database-level ancestor.
+  // If the topmost row is itself a database node (it hasn't scrolled past the
+  // viewport yet), return null so the overlay doesn't duplicate the real row.
+  for (let i = topIndex; i >= 0; i--) {
+    const item = nodes[i];
+    if (!DATABASE_LEVEL_TYPES.has(item.type)) continue;
+    return i === topIndex ? null : item;
+  }
+  return null;
+});
+
+// Reset tracking when the tree rebuilds (connect/disconnect/collapse) so a
+// stale scrollTop doesn't keep the overlay mounted after a structural change.
+watch(flatNodes, () => {
+  stickyScrollTop.value = 0;
+});
+
 const sidebarTreeOverflowClass = computed(() => (settingsStore.editorSettings.sidebarAllowHorizontalScroll ? "overflow-x-auto sidebar-tree-horizontal-scroll" : "overflow-x-hidden"));
 
 provide(sidebarTreeContextKey, {
@@ -312,7 +378,7 @@ function resolveLoadedLocateTarget(target: ActiveTabSidebarTarget, candidate: Qu
 }
 
 async function ensureTreeLoadedForTarget(target: ActiveTabSidebarTarget, opts?: { force?: boolean }) {
-  if (target.type === "saved-sql-file" || target.type === "etcd-root") return;
+  if (target.type === "saved-sql-file" || target.type === "etcd-root" || target.type === "zookeeper-root") return;
   const connId = target.connectionId;
   if (!connId) return;
 
@@ -336,10 +402,12 @@ async function ensureTreeLoadedForTarget(target: ActiveTabSidebarTarget, opts?: 
         await store.loadMongoDatabases(connId);
       } else if (config.db_type === "elasticsearch") {
         await store.loadElasticsearchIndices(connId);
-      } else if (config.db_type === "qdrant" || config.db_type === "milvus") {
+      } else if (config.db_type === "qdrant" || config.db_type === "milvus" || config.db_type === "weaviate") {
         await store.loadVectorCollections(connId);
       } else if (config.db_type === "mq") {
         await store.loadMqTenants(connId, loadOptions);
+      } else if (config.db_type === "nacos") {
+        await store.loadNacosNamespaces(connId, loadOptions);
       } else {
         await store.loadDatabases(connId, loadOptions);
       }
@@ -348,7 +416,7 @@ async function ensureTreeLoadedForTarget(target: ActiveTabSidebarTarget, opts?: 
     }
   }
 
-  if (config.db_type === "mq") return;
+  if (config.db_type === "mq" || config.db_type === "nacos") return;
   if (!("database" in target) || !target.database) return;
 
   // Find the database node
@@ -447,29 +515,6 @@ function onSearchToggle(node: TreeNode) {
   if (node.isExpanded) next.add(node.id);
   else next.delete(node.id);
   searchCollapsedIds.value = next;
-}
-
-async function onNodeToggled(node: TreeNode, wasExpanded: boolean) {
-  if (wasExpanded || !node.isExpanded) return;
-  if (!shouldAutoScrollExpandedTreeNode(node.type)) return;
-
-  await nextTick();
-
-  const expandedIndex = flatNodes.value.findIndex((item) => item.id === node.id);
-  const insertedRowCount = flattenTree([node]).length - 1;
-  const scroller = treeScrollerRef.value?.$el as HTMLElement | undefined;
-  if (!scroller || expandedIndex < 0 || insertedRowCount <= 0) return;
-
-  const nextScrollTop = scrollTopForExpandedTreeNode({
-    expandedIndex,
-    insertedRowCount,
-    currentScrollTop: scroller.scrollTop,
-    viewportHeight: scroller.clientHeight,
-  });
-
-  if (nextScrollTop !== scroller.scrollTop) {
-    scroller.scrollTop = nextScrollTop;
-  }
 }
 
 function currentTreeScroller(): HTMLElement | null {
@@ -612,6 +657,9 @@ defineExpose({ focusSearch, createNewGroup });
         />
       </div>
     </div>
+    <div v-if="stickyNode" class="sticky-database-header relative z-[5] border-b border-border/60">
+      <TreeItem :node="stickyNode.node" :depth="stickyNode.depth" :drag-disabled="true" @search-toggle="onSearchToggle" />
+    </div>
     <RecycleScroller
       v-if="flatNodes.length > 0 && useVirtualTree"
       ref="treeScrollerRef"
@@ -628,16 +676,7 @@ defineExpose({ focusSearch, createNewGroup });
       flow-mode
     >
       <template #default="{ item }">
-        <TreeItem
-          :node="item.node"
-          :depth="item.depth"
-          :drag-disabled="isFiltering"
-          :pending-rename="pendingRenameGroupId === item.node.id"
-          :highlighted="highlightedNodeId === item.node.id"
-          @node-toggled="onNodeToggled"
-          @search-toggle="onSearchToggle"
-          @rename-started="pendingRenameGroupId = null"
-        />
+        <TreeItem :node="item.node" :depth="item.depth" :drag-disabled="isFiltering" :pending-rename="pendingRenameGroupId === item.node.id" :highlighted="highlightedNodeId === item.node.id" @search-toggle="onSearchToggle" @rename-started="pendingRenameGroupId = null" />
       </template>
     </RecycleScroller>
     <div v-else-if="flatNodes.length > 0" ref="plainTreeScrollerRef" class="sidebar-tree min-h-0 flex-1 overflow-y-auto" :class="sidebarTreeOverflowClass" @click="clearSidebarSelection">
@@ -649,7 +688,6 @@ defineExpose({ focusSearch, createNewGroup });
         :drag-disabled="isFiltering"
         :pending-rename="pendingRenameGroupId === item.node.id"
         :highlighted="highlightedNodeId === item.id"
-        @node-toggled="onNodeToggled"
         @search-toggle="onSearchToggle"
         @rename-started="pendingRenameGroupId = null"
       />
@@ -661,6 +699,10 @@ defineExpose({ focusSearch, createNewGroup });
 </template>
 
 <style scoped>
+.sticky-database-header {
+  background-color: var(--background);
+}
+
 .connection-tree-scroller {
   will-change: scroll-position;
   contain: content;

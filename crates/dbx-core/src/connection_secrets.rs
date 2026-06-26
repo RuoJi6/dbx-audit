@@ -705,6 +705,7 @@ mod tests {
             password: password.to_string(),
             database: Some("postgres".to_string()),
             visible_databases: None,
+            visible_schemas: None,
             attached_databases: Vec::new(),
             color: None,
             transport_layers: Vec::new(),

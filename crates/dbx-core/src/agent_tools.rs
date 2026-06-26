@@ -85,7 +85,9 @@ fn get_columns_tool() -> ToolDefinition {
             "required": ["table"]
         }),
         read_only: true,
-        parallel_ok: true,
+        // get_columns runs sequentially: concurrent metadata queries can exhaust
+        // single-connection drivers (e.g. DuckDB), causing cascading tool errors.
+        parallel_ok: false,
     }
 }
 /// execute_query tool definition.

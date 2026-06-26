@@ -90,11 +90,7 @@ public final class TDengineAgent extends BaseDatabaseAgent {
 
     @Override
     public List<String> listSchemas() {
-        List<String> result = new ArrayList<>();
-        for (DatabaseInfo database : listDatabases()) {
-            result.add(database.getName());
-        }
-        return result;
+        return Collections.emptyList();
     }
 
     @Override

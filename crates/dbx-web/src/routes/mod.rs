@@ -13,8 +13,10 @@ pub mod layout;
 pub mod mongo;
 #[cfg(feature = "mq-admin")]
 pub mod mq;
+pub mod nacos;
 pub mod plugins;
 pub mod query;
+pub mod query_result_export;
 pub mod redis;
 pub mod redis_pubsub_ws;
 pub mod saved_sql;
@@ -28,3 +30,4 @@ pub mod table_import;
 pub mod text_export;
 pub mod transfer;
 pub mod update;
+pub mod zookeeper;

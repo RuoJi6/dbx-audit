@@ -18,10 +18,40 @@ use dbx_core::db::agent_driver::AgentMethod;
 use dbx_core::models::connection::{rewrite_jdbc_url_host, ConnectionConfig, DatabaseType};
 pub use dbx_core::path_utils::expand_tilde;
 
+const MONGO_LEGACY_DRIVER_PROFILE: &str = "mongodb-legacy";
+const MONGO_LEGACY_DRIVER_LABEL: &str = "MongoDB (Legacy)";
+
 fn mongo_legacy_connect_params(config: &ConnectionConfig, host: &str, port: u16) -> serde_json::Value {
     serde_json::json!({
         "connection": agent_connect_params(config, host, port, config.effective_database().unwrap_or(""))
     })
+}
+
+fn mark_mongo_legacy_driver(config: &mut ConnectionConfig) -> bool {
+    if config.db_type != DatabaseType::MongoDb {
+        return false;
+    }
+    let changed = config.driver_profile.as_deref() != Some(MONGO_LEGACY_DRIVER_PROFILE)
+        || config.driver_label.as_deref() != Some(MONGO_LEGACY_DRIVER_LABEL);
+    config.driver_profile = Some(MONGO_LEGACY_DRIVER_PROFILE.to_string());
+    config.driver_label = Some(MONGO_LEGACY_DRIVER_LABEL.to_string());
+    changed
+}
+
+async fn persist_mongo_legacy_driver_profile(state: &AppState, config: &ConnectionConfig) -> Result<(), String> {
+    if config.one_time {
+        return Ok(());
+    }
+
+    let mut configs: Vec<ConnectionConfig> =
+        state.storage.load_connections().await?.into_iter().map(|config| config.canonicalized()).collect();
+    let Some(saved_config) = configs.iter_mut().find(|saved_config| saved_config.id == config.id) else {
+        return Ok(());
+    };
+    if !mark_mongo_legacy_driver(saved_config) {
+        return Ok(());
+    }
+    save_connection_configs(state, &configs).await
 }
 
 async fn test_agent_connection(
@@ -168,10 +198,16 @@ async fn connect_agent_pool(
 
 #[cfg(test)]
 mod tests {
-    use super::{load_connection_configs, mongo_legacy_connect_params, save_connection_configs};
-    use dbx_core::connection::{AppState, PoolKind};
+    use super::{
+        mark_mongo_legacy_driver, mongo_legacy_connect_params, MONGO_LEGACY_DRIVER_LABEL, MONGO_LEGACY_DRIVER_PROFILE,
+    };
     use dbx_core::models::connection::{ConnectionConfig, DatabaseType};
-    use dbx_core::storage::Storage;
+    #[cfg(feature = "mq-admin")]
+    use {
+        super::{load_connection_configs, save_connection_configs},
+        dbx_core::connection::{AppState, PoolKind},
+        dbx_core::storage::Storage,
+    };
 
     fn mongodb_config() -> ConnectionConfig {
         ConnectionConfig {
@@ -187,6 +223,7 @@ mod tests {
             password: "secret".to_string(),
             database: Some("RestCloud_V45PUB_Gateway".to_string()),
             visible_databases: None,
+            visible_schemas: None,
             attached_databases: Vec::new(),
             color: None,
             transport_layers: Vec::new(),
@@ -222,6 +259,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "mq-admin")]
     fn mq_config(id: &str, admin_url: &str) -> ConnectionConfig {
         let mut config = mongodb_config();
         config.id = id.to_string();
@@ -257,6 +295,16 @@ mod tests {
             params["connection"]["connection_string"],
             "mongodb://mongouser:secret@172.22.4.42:27017/RestCloud_V45PUB_Gateway?authSource=admin"
         );
+    }
+
+    #[test]
+    fn mark_mongo_legacy_driver_updates_profile_and_label() {
+        let mut config = mongodb_config();
+
+        assert!(mark_mongo_legacy_driver(&mut config));
+        assert_eq!(config.driver_profile.as_deref(), Some(MONGO_LEGACY_DRIVER_PROFILE));
+        assert_eq!(config.driver_label.as_deref(), Some(MONGO_LEGACY_DRIVER_LABEL));
+        assert!(!mark_mongo_legacy_driver(&mut config));
     }
 
     #[cfg(feature = "mq-admin")]
@@ -386,17 +434,20 @@ async fn save_connection_configs(state: &AppState, configs: &[ConnectionConfig])
     state.storage.save_connections(configs).await?;
     let sync = sync_connection_configs(state, configs).await;
     remove_connection_pools_for_connection_ids(state, &sync.connection_pool_ids_to_drop).await;
+    drop_nacos_adapters_for_connection_ids(state, &sync.nacos_adapter_ids_to_drop).await;
     drop_mq_adapters_for_connection_ids(state, &sync.mq_adapter_ids_to_drop).await;
     Ok(())
 }
 
 struct ConnectionConfigSync {
+    nacos_adapter_ids_to_drop: Vec<String>,
     mq_adapter_ids_to_drop: Vec<String>,
     connection_pool_ids_to_drop: Vec<String>,
 }
 
 async fn sync_connection_configs(state: &AppState, configs: &[ConnectionConfig]) -> ConnectionConfigSync {
     let saved_ids: HashSet<&str> = configs.iter().map(|config| config.id.as_str()).collect();
+    let mut nacos_adapter_ids_to_drop = HashSet::new();
     let mut mq_adapter_ids_to_drop = HashSet::new();
     let mut connection_pool_ids_to_drop = HashSet::new();
     let mut runtime_configs = state.configs.write().await;
@@ -405,6 +456,9 @@ async fn sync_connection_configs(state: &AppState, configs: &[ConnectionConfig])
             true
         } else {
             connection_pool_ids_to_drop.insert(id.clone());
+            if existing.db_type == DatabaseType::Nacos {
+                nacos_adapter_ids_to_drop.insert(id.clone());
+            }
             if existing.db_type == DatabaseType::MessageQueue {
                 mq_adapter_ids_to_drop.insert(id.clone());
             }
@@ -412,10 +466,16 @@ async fn sync_connection_configs(state: &AppState, configs: &[ConnectionConfig])
         }
     });
     for config in configs {
+        if config.db_type == DatabaseType::Nacos {
+            nacos_adapter_ids_to_drop.insert(config.id.clone());
+        }
         if config.db_type == DatabaseType::MessageQueue {
             mq_adapter_ids_to_drop.insert(config.id.clone());
         }
         if let Some(previous) = runtime_configs.insert(config.id.clone(), config.clone()) {
+            if previous.db_type == DatabaseType::Nacos {
+                nacos_adapter_ids_to_drop.insert(config.id.clone());
+            }
             if previous.db_type == DatabaseType::MessageQueue {
                 mq_adapter_ids_to_drop.insert(config.id.clone());
             }
@@ -425,13 +485,20 @@ async fn sync_connection_configs(state: &AppState, configs: &[ConnectionConfig])
         }
     }
     ConnectionConfigSync {
+        nacos_adapter_ids_to_drop: nacos_adapter_ids_to_drop.into_iter().collect(),
         mq_adapter_ids_to_drop: mq_adapter_ids_to_drop.into_iter().collect(),
         connection_pool_ids_to_drop: connection_pool_ids_to_drop.into_iter().collect(),
     }
 }
 
 fn is_transient_runtime_config_id(id: &str) -> bool {
-    id.starts_with("__test_") || id.starts_with("__visible_draft_")
+    id.starts_with("__test_") || id.starts_with("__visible_draft_") || id.starts_with("__visible_schema_draft_")
+}
+
+async fn drop_nacos_adapters_for_connection_ids(state: &AppState, connection_ids: &[String]) {
+    for connection_id in connection_ids {
+        state.nacos_registry.drop_connection(connection_id).await;
+    }
 }
 
 #[cfg(feature = "mq-admin")]
@@ -446,7 +513,7 @@ async fn drop_mq_adapters_for_connection_ids(_state: &AppState, _connection_ids:
 
 async fn remove_connection_pools_for_connection_ids(state: &AppState, connection_ids: &[String]) {
     for connection_id in connection_ids {
-        state.remove_connection_pools(connection_id).await;
+        state.remove_connection_pools_detached(connection_id).await;
     }
 }
 
@@ -460,6 +527,7 @@ async fn load_connection_configs(state: &AppState) -> Result<Vec<ConnectionConfi
         state.storage.load_connections().await?.into_iter().map(|config| config.canonicalized()).collect();
     let sync = sync_connection_configs(state, &configs).await;
     remove_connection_pools_for_connection_ids(state, &sync.connection_pool_ids_to_drop).await;
+    drop_nacos_adapters_for_connection_ids(state, &sync.nacos_adapter_ids_to_drop).await;
     drop_mq_adapters_for_connection_ids(state, &sync.mq_adapter_ids_to_drop).await;
     Ok(configs)
 }
@@ -645,10 +713,11 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
                     .await
                     .map(|_| "Connection successful".to_string())
             }
-            DatabaseType::Qdrant | DatabaseType::Milvus => {
+            DatabaseType::Qdrant | DatabaseType::Milvus | DatabaseType::Weaviate => {
                 let kind = match config.db_type {
                     DatabaseType::Qdrant => db::vector_driver::VectorDbKind::Qdrant,
                     DatabaseType::Milvus => db::vector_driver::VectorDbKind::Milvus,
+                    DatabaseType::Weaviate => db::vector_driver::VectorDbKind::Weaviate,
                     _ => unreachable!(),
                 };
                 let client = db::vector_driver::VectorClient::new(
@@ -715,6 +784,12 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
                     .await
                     .map(|_| "Connection successful".to_string())
             }
+            DatabaseType::Nacos => {
+                let admin_config = state.nacos_admin_config_for_connection(connection_id, &config).await?;
+                let adapter = state.nacos_registry.build_transient_config(admin_config).await?;
+                adapter.test_connection().await?;
+                Ok("Connection successful".to_string())
+            }
             #[cfg(feature = "mq-admin")]
             DatabaseType::MessageQueue => {
                 let mqc = state.mq_admin_config_for_connection(connection_id, &config).await?;
@@ -759,8 +834,11 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
     let config = config.canonicalized();
     let id = config.id.clone();
     let db_config = metadata_connection_config(&config);
+    let attempt = state.begin_connection_attempt(&id).await;
+    let mut connected_config = config.clone();
+    let mut connected_db_config = db_config.clone();
 
-    state.remove_connection_pools(&id).await;
+    state.remove_connection_pools_detached(&id).await;
     state.reset_connection_transport_for_config(&id, &db_config).await;
 
     let (host, port) = state.connection_host_port(&id, &db_config).await?;
@@ -829,7 +907,8 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
         DatabaseType::DuckDb => return Err("DuckDB support not compiled (enable duckdb-bundled feature)".to_string()),
         DatabaseType::MongoDb => {
             if mongo_uses_legacy_driver(&db_config) {
-                let mut client = state.agent_manager.spawn(&db_config.db_type, Some("mongodb-legacy")).await?;
+                let mut client =
+                    state.agent_manager.spawn(&db_config.db_type, Some(MONGO_LEGACY_DRIVER_PROFILE)).await?;
                 client
                     .connect(mongo_legacy_connect_params(&db_config, &host, port))
                     .await
@@ -846,8 +925,16 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
                         .await
                         {
                             Ok(()) => {
+                                state
+                                    .insert_connection_pool_for_attempt(
+                                        &id,
+                                        attempt,
+                                        id.clone(),
+                                        PoolKind::MongoDb(client),
+                                        &db_config,
+                                    )
+                                    .await?;
                                 state.configs.write().await.insert(id.clone(), config);
-                                state.insert_connection_pool(id.clone(), PoolKind::MongoDb(client), &db_config).await;
                                 return Ok(id);
                             }
                             Err(e) => e,
@@ -857,13 +944,17 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
                 };
                 if should_retry_mongo_with_legacy_driver(&native_err) {
                     log::info!("Native MongoDB driver failed ({native_err}), falling back to agent driver");
-                    let mut client = state.agent_manager.spawn(&db_config.db_type, Some("mongodb-legacy")).await?;
+                    let mut client =
+                        state.agent_manager.spawn(&db_config.db_type, Some(MONGO_LEGACY_DRIVER_PROFILE)).await?;
                     client.connect(mongo_legacy_connect_params(&db_config, &host, port)).await.map_err(|err| {
                         format!(
                             "{native_err}\n\nFallback with MongoDB (Legacy) driver failed: {}",
                             mongo_legacy_error_with_auth_hint(&err)
                         )
                     })?;
+                    mark_mongo_legacy_driver(&mut connected_config);
+                    connected_db_config = metadata_connection_config(&connected_config);
+                    persist_mongo_legacy_driver_profile(state.inner(), &connected_config).await?;
                     PoolKind::Agent(std::sync::Arc::new(tokio::sync::Mutex::new(client)))
                 } else {
                     return Err(native_err);
@@ -908,10 +999,11 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
             db::elasticsearch_driver::test_connection(&mut client, connect_timeout).await?;
             PoolKind::Elasticsearch(client)
         }
-        DatabaseType::Qdrant | DatabaseType::Milvus => {
+        DatabaseType::Qdrant | DatabaseType::Milvus | DatabaseType::Weaviate => {
             let kind = match db_config.db_type {
                 DatabaseType::Qdrant => db::vector_driver::VectorDbKind::Qdrant,
                 DatabaseType::Milvus => db::vector_driver::VectorDbKind::Milvus,
+                DatabaseType::Weaviate => db::vector_driver::VectorDbKind::Weaviate,
                 _ => unreachable!(),
             };
             let client = db::vector_driver::VectorClient::new(
@@ -974,6 +1066,12 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
             db::influxdb_driver::test_connection(&client, connect_timeout).await?;
             PoolKind::InfluxDb(client)
         }
+        DatabaseType::Nacos => {
+            let admin_config = state.nacos_admin_config_for_connection(&id, &config).await?;
+            let adapter = state.nacos_registry.build_transient_config(admin_config).await?;
+            adapter.test_connection().await?;
+            PoolKind::Nacos
+        }
         #[cfg(feature = "mq-admin")]
         DatabaseType::MessageQueue => {
             let mqc = state.mq_admin_config_for_connection(&id, &config).await?;
@@ -999,8 +1097,8 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
         db_type => return Err(format!("Unsupported database type: {db_type:?}")),
     };
 
-    state.insert_connection_pool(id.clone(), pool, &db_config).await;
-    state.configs.write().await.insert(id.clone(), config);
+    state.insert_connection_pool_for_attempt(&id, attempt, id.clone(), pool, &connected_db_config).await?;
+    state.configs.write().await.insert(id.clone(), connected_config);
 
     Ok(id)
 }
@@ -1025,10 +1123,12 @@ pub async fn connection_final_proxy_port(
 
 #[tauri::command]
 pub async fn disconnect_db(state: State<'_, Arc<AppState>>, connection_id: String) -> Result<(), String> {
-    state.remove_connection_pools(&connection_id).await;
+    state.supersede_connection_attempt(&connection_id).await;
+    state.remove_connection_pools_detached(&connection_id).await;
+    drop_nacos_adapters_for_connection_ids(state.inner(), std::slice::from_ref(&connection_id)).await;
     drop_mq_adapters_for_connection_ids(state.inner(), std::slice::from_ref(&connection_id)).await;
     state.reset_connection_transport(&connection_id).await;
-    if connection_id.starts_with("__visible_draft_") {
+    if connection_id.starts_with("__visible_draft_") || connection_id.starts_with("__visible_schema_draft_") {
         state.configs.write().await.remove(&connection_id);
     }
     Ok(())

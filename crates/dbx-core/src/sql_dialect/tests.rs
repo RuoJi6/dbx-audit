@@ -15,6 +15,7 @@ fn transfer_identifier_policy_preserves_legacy_output() {
 #[test]
 fn quotes_identifiers_by_database_type() {
     assert_eq!(quote_table_identifier(Some(DatabaseType::Mysql), "user`name"), "`user``name`");
+    assert_eq!(quote_table_identifier(Some(DatabaseType::ClickHouse), "user`name"), "`user``name`");
     assert_eq!(quote_table_identifier(Some(DatabaseType::Goldendb), "user`name"), "`user``name`");
     assert_eq!(quote_table_identifier(Some(DatabaseType::StarRocks), "user`name"), "`user``name`");
     assert_eq!(quote_table_identifier(Some(DatabaseType::SqlServer), "user]name"), "[user]]name]");

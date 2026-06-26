@@ -694,7 +694,7 @@ fn should_discard_agent_pool_after_error(err: &str) -> bool {
 pub fn pool_error_action(db_type: Option<DatabaseType>, err: &str) -> PoolErrorAction {
     let lower = err.to_lowercase();
     if db::sqlserver::is_driver_panic_error(err)
-        || (db_type == Some(DatabaseType::SqlServer) && is_dbx_query_timeout_error(&lower))
+        || (is_dbx_query_timeout_error(&lower) && should_discard_pool_after_query_timeout(db_type))
         || (db_type.is_some_and(|db_type| database_capabilities::is_agent_type(&db_type))
             && should_discard_agent_pool_after_error(err)
             && !is_connection_error(err))
@@ -707,6 +707,35 @@ pub fn pool_error_action(db_type: Option<DatabaseType>, err: &str) -> PoolErrorA
     } else {
         PoolErrorAction::Keep
     }
+}
+
+fn should_discard_pool_after_query_timeout(db_type: Option<DatabaseType>) -> bool {
+    let Some(db_type) = db_type else {
+        return false;
+    };
+    database_capabilities::is_agent_type(&db_type)
+        || matches!(
+            db_type,
+            DatabaseType::Mysql
+                | DatabaseType::Postgres
+                | DatabaseType::Redshift
+                | DatabaseType::Gaussdb
+                | DatabaseType::Kwdb
+                | DatabaseType::OpenGauss
+                | DatabaseType::Questdb
+                | DatabaseType::Doris
+                | DatabaseType::StarRocks
+                | DatabaseType::ManticoreSearch
+                | DatabaseType::ClickHouse
+                | DatabaseType::SqlServer
+                | DatabaseType::Rqlite
+                | DatabaseType::Turso
+                | DatabaseType::Elasticsearch
+                | DatabaseType::Qdrant
+                | DatabaseType::Milvus
+                | DatabaseType::Weaviate
+                | DatabaseType::InfluxDb
+        )
 }
 
 pub fn should_discard_pool_after_error(db_type: Option<DatabaseType>, err: &str) -> bool {
@@ -828,7 +857,7 @@ pub async fn do_execute(
     let connections = state.connections.read().await;
     let pool = connections.get(pool_key).ok_or("Connection not found")?;
 
-    match pool {
+    let result = match pool {
         #[cfg(feature = "duckdb-bundled")]
         PoolKind::DuckDb(con) => {
             let con = con.clone();
@@ -1005,6 +1034,7 @@ pub async fn do_execute(
         PoolKind::Redis(_) => Err("Use Redis-specific commands".to_string()),
         PoolKind::MongoDb(_) => Err("Use MongoDB-specific commands".to_string()),
         PoolKind::MessageQueue => Err("Use Message Queue-specific commands".to_string()),
+        PoolKind::Nacos => Err("Use Nacos-specific commands".to_string()),
         PoolKind::InfluxDb(client) => {
             let client = client.clone();
             let database = pool_key.split(':').nth(1).unwrap_or("default").to_string();
@@ -1059,7 +1089,7 @@ pub async fn do_execute(
                 }
             }
             .await
-            .map(|result| normalize_query_result_for_js(truncate_result_with_max_rows(result, max_rows)));
+            .map(|result| truncate_result_with_max_rows(result, max_rows));
             if matches!(result.as_ref(), Err(err) if err == QUERY_CANCELED) {
                 state.remove_pool_by_key(pool_key).await;
             }
@@ -1122,9 +1152,10 @@ pub async fn do_execute(
                 }
             })
             .await
-            .map(|result| normalize_query_result_for_js(truncate_result_with_max_rows(result, max_rows)))
+            .map(|result| truncate_result_with_max_rows(result, max_rows))
         }
-    }
+    };
+    result.map(normalize_query_result_for_js)
 }
 
 fn external_driver_query_params(
@@ -1236,14 +1267,17 @@ pub async fn execute_sql_statement_with_options(
         do_execute(state, &pool_key, mysql_dialect, Some(database), sql, schema, cancel_token.clone(), options.clone())
             .await;
 
-    match &result {
-        Err(e)
-            if pool_error_action(db_type, e) == PoolErrorAction::ReconnectAndRetry && !is_canceled(&cancel_token) =>
-        {
+    let action = result.as_ref().err().map(|e| pool_error_action(db_type, e));
+    match action {
+        Some(PoolErrorAction::ReconnectAndRetry) if !is_canceled(&cancel_token) => {
             let db_opt = if database.is_empty() { None } else { Some(database) };
             let new_key =
                 state.reconnect_pool_for_session(connection_id, db_opt, options.client_session_id.as_deref()).await?;
             do_execute(state, &new_key, mysql_dialect, Some(database), sql, schema, cancel_token, options).await
+        }
+        Some(PoolErrorAction::Discard) => {
+            state.remove_pool_by_key(&pool_key).await;
+            result
         }
         _ => result,
     }
@@ -1465,7 +1499,18 @@ pub async fn execute_multi_core_with_options(
         // Read-only check for MySQL batch path
         check_read_only_for_connection_multi(state, &pool_key, &statements).await?;
         let mysql_dialect = connection_mysql_query_dialect(state, connection_id).await;
-        return execute_multi_mysql(&pool, mode, mysql_dialect, &statements, cancel_token, options).await;
+        return execute_multi_mysql(
+            state,
+            &pool_key,
+            db_type,
+            &pool,
+            mode,
+            mysql_dialect,
+            &statements,
+            cancel_token,
+            options,
+        )
+        .await;
     }
 
     let mut results = Vec::with_capacity(statements.len());
@@ -1496,6 +1541,9 @@ pub async fn execute_multi_core_with_options(
 }
 
 async fn execute_multi_mysql(
+    state: &AppState,
+    pool_key: &str,
+    db_type: Option<DatabaseType>,
     pool: &db::mysql::MySqlPool,
     mode: crate::connection::MysqlMode,
     dialect: db::mysql::MySqlQueryDialect,
@@ -1508,7 +1556,13 @@ async fn execute_multi_mysql(
     let max_rows = options.max_rows;
     let mut conn = match db::mysql::get_conn_with_health_check(pool).await {
         Ok(conn) => conn,
-        Err(err) => return Ok(vec![error_query_result(err)]),
+        Err(err) => {
+            if matches!(pool_error_action(db_type, &err), PoolErrorAction::Discard | PoolErrorAction::ReconnectAndRetry)
+            {
+                state.remove_pool_by_key(pool_key).await;
+            }
+            return Ok(vec![error_query_result(err)]);
+        }
     };
     let mut results = Vec::with_capacity(statements.len());
 
@@ -1526,7 +1580,14 @@ async fn execute_multi_mysql(
         .await
         {
             Ok(result) => results.push(result),
-            Err(err) => results.push(error_query_result(err)),
+            Err(err) => {
+                let action = pool_error_action(db_type, &err);
+                results.push(error_query_result(err));
+                if matches!(action, PoolErrorAction::Discard | PoolErrorAction::ReconnectAndRetry) {
+                    state.remove_pool_by_key(pool_key).await;
+                    break;
+                }
+            }
         }
     }
 
@@ -1743,6 +1804,7 @@ pub async fn execute_statements_in_transaction(
     check_read_only_for_connection_multi(state, &pool_key, statements).await?;
 
     let start = std::time::Instant::now();
+    let db_type = connection_database_type(state, connection_id).await;
 
     // Clone the pool handle within the lock, then drop it before any async work.
     let path = {
@@ -1756,7 +1818,7 @@ pub async fn execute_statements_in_transaction(
             | PoolKind::Turso(_)
             | PoolKind::SqlServer(_)
             | PoolKind::Agent(_) => TxPath::Explicit,
-            PoolKind::MessageQueue => TxPath::None,
+            PoolKind::MessageQueue | PoolKind::Nacos => TxPath::None,
             #[cfg(feature = "duckdb-bundled")]
             PoolKind::DuckDb(_)
             | PoolKind::Redis(_)
@@ -1778,7 +1840,7 @@ pub async fn execute_statements_in_transaction(
         })
     };
 
-    match path {
+    let result = match path {
         Some(TxPath::Pg(pool)) => exec_tx_pg_inner(pool, statements, schema, start).await,
         Some(TxPath::Mysql(pool, _bare)) => exec_tx_mysql_inner(pool, statements, start).await,
         Some(TxPath::Sqlite(pool)) => exec_tx_sqlite_inner(pool, statements, start).await,
@@ -1791,7 +1853,15 @@ pub async fn execute_statements_in_transaction(
             exec_tx_none_inner(state, &pool_key, mysql_dialect, Some(database), statements, schema, start).await
         }
         None => Err("Connection not found for transaction".to_string()),
+    };
+
+    if let Err(err) = result.as_ref() {
+        if matches!(pool_error_action(db_type, err), PoolErrorAction::Discard | PoolErrorAction::ReconnectAndRetry) {
+            state.remove_pool_by_key(&pool_key).await;
+        }
     }
+
+    result
 }
 
 /// Owned pool variants for safe dispatch across async boundaries.
@@ -2199,7 +2269,12 @@ mod tests {
         let err = "Query timed out after 30 seconds";
 
         assert_eq!(pool_error_action(Some(DatabaseType::SqlServer), err), PoolErrorAction::Discard);
-        assert_eq!(pool_error_action(Some(DatabaseType::Mysql), err), PoolErrorAction::Keep);
+        assert_eq!(pool_error_action(Some(DatabaseType::Mysql), err), PoolErrorAction::Discard);
+        assert_eq!(pool_error_action(Some(DatabaseType::Postgres), err), PoolErrorAction::Discard);
+        assert_eq!(pool_error_action(Some(DatabaseType::ClickHouse), err), PoolErrorAction::Discard);
+        assert_eq!(pool_error_action(Some(DatabaseType::Oracle), err), PoolErrorAction::Discard);
+        assert_eq!(pool_error_action(Some(DatabaseType::Sqlite), err), PoolErrorAction::Keep);
+        assert_eq!(pool_error_action(Some(DatabaseType::DuckDb), err), PoolErrorAction::Keep);
     }
 
     #[test]
@@ -2369,6 +2444,7 @@ mod tests {
             password: String::new(),
             database: None,
             visible_databases: None,
+            visible_schemas: None,
             attached_databases: Vec::new(),
             color: None,
             transport_layers: Vec::new(),

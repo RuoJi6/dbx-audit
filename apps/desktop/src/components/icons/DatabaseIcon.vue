@@ -79,10 +79,13 @@ const assetIcons: Record<string, string> = {
   etcd: "etcd",
   qdrant: "qdrant",
   milvus: "milvus.png",
+  weaviate: "weaviate.png",
   mq: "pulsar",
   pulsar: "pulsar",
+  nacos: "nacos.png",
   iris: "iris.png",
   influxdb: "influxdb",
+  zookeeper: "zookeeper",
 };
 
 const letterIcons: Record<string, { letter: string; color: string }> = {};

@@ -285,7 +285,7 @@ pub async fn list_tables(client: &ChClient, database: &str) -> Result<Vec<TableI
 
 pub async fn get_columns(client: &ChClient, database: &str, table: &str) -> Result<Vec<ColumnInfo>, String> {
     let sql = format!(
-        "SELECT name, type, default_kind, default_expression, is_in_primary_key, comment \
+        "SELECT name, type, default_kind, default_expression, is_in_primary_key, is_in_partition_key, comment \
          FROM system.columns WHERE database = '{}' AND table = '{}' ORDER BY position",
         database.replace('\'', "\\'"),
         table.replace('\'', "\\'")
@@ -298,6 +298,7 @@ pub async fn get_columns(client: &ChClient, database: &str, table: &str) -> Resu
             let data_type = row.get(1).and_then(|v| v.as_str()).unwrap_or("").to_string();
             let is_nullable = data_type.starts_with("Nullable");
             let is_pk = row.get(4).and_then(|v| v.as_u64()).unwrap_or(0) == 1;
+            let is_partition_key = row.get(5).and_then(|v| v.as_u64()).unwrap_or(0) == 1;
             let default_kind = row.get(2).and_then(|v| v.as_str()).unwrap_or("");
             let default_expr = row.get(3).and_then(|v| v.as_str()).unwrap_or("");
             let column_default = if default_kind.is_empty() { None } else { Some(default_expr.to_string()) };
@@ -307,8 +308,8 @@ pub async fn get_columns(client: &ChClient, database: &str, table: &str) -> Resu
                 is_nullable,
                 column_default,
                 is_primary_key: is_pk,
-                extra: None,
-                comment: row.get(5).and_then(|v| v.as_str()).filter(|value| !value.is_empty()).map(str::to_string),
+                extra: is_partition_key.then(|| "partition_key".to_string()),
+                comment: row.get(6).and_then(|v| v.as_str()).filter(|value| !value.is_empty()).map(str::to_string),
                 numeric_precision: None,
                 numeric_scale: None,
                 character_maximum_length: None,

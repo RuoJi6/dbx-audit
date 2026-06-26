@@ -503,6 +503,7 @@ mod tests {
             password: String::new(),
             database: None,
             visible_databases: None,
+            visible_schemas: None,
             attached_databases: Vec::new(),
             color: None,
             transport_layers: Vec::new(),

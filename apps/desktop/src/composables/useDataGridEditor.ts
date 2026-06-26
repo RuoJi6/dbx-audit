@@ -9,6 +9,7 @@ import { useConnectionStore } from "@/stores/connectionStore";
 import { useHistoryStore } from "@/stores/historyStore";
 import type { ColumnInfo, DatabaseType } from "@/types/database";
 import { DBX_NEO4J_ELEMENT_ID_COLUMN, DBX_ROWID_COLUMN } from "@/lib/tableEditing";
+import { effectiveDatabaseTypeForConnection } from "@/lib/jdbcDialect";
 
 interface RowItem {
   id: number;
@@ -142,6 +143,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
   const dirtyRows = ref<Map<number, Map<number, CellValue>>>(new Map());
   const newRows = ref<CellValue[][]>([]);
   const deletedRows = ref<Set<number>>(new Set());
+  const pendingChangesVersion = ref(0);
   let restoredEditingCell = false;
   let restoredTransactionActive = false;
   let suppressNextBlurCommit = false;
@@ -173,6 +175,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
   const deletedRowCount = computed(() => deletedRows.value.size);
   const pendingChangeCount = computed(() => dirtyRowCount.value + newRowCount.value + deletedRowCount.value);
   const hasPendingChanges = computed(() => pendingChangeCount.value > 0);
+  const resolvedDatabaseType = computed(() => databaseType.value ?? effectiveDatabaseTypeForConnection(connectionStore.getConfig(connectionId.value ?? "")));
 
   // --- Transaction state ---
   const transactionActive = ref(false);
@@ -180,7 +183,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
   const saveError = ref("");
 
   const hasBackendSaveTarget = computed(() => !!connectionId.value && !!tableMeta.value);
-  const useTransaction = computed(() => editable.value && supportsDataGridTransaction(databaseType.value) && (!!customSaveHandler?.value || hasBackendSaveTarget.value));
+  const useTransaction = computed(() => editable.value && supportsDataGridTransaction(resolvedDatabaseType.value) && (!!customSaveHandler?.value || hasBackendSaveTarget.value));
 
   if (hasPendingChanges.value && useTransaction.value) {
     transactionActive.value = true;
@@ -216,6 +219,10 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
 
   function enterTransaction() {
     transactionActive.value = true;
+  }
+
+  function touchPendingChanges() {
+    pendingChangesVersion.value++;
   }
 
   function exitTransaction() {
@@ -355,7 +362,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     return coerceDataGridCellValue({
       value,
       oldValue,
-      databaseType: databaseType.value,
+      databaseType: resolvedDatabaseType.value,
       columnInfo: tableColumnForGridColumn(columnIndex),
     }) as CellValue;
   }
@@ -391,7 +398,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     const val = item?.data[colIdx] ?? null;
     editValue.value = dataGridCellEditorText({
       value: val,
-      databaseType: databaseType.value,
+      databaseType: resolvedDatabaseType.value,
       columnInfo: tableColumnForGridColumn(colIdx),
     });
     focusEditInput();
@@ -415,6 +422,8 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
       if (newRows.value[item.newIndex]) {
         newRows.value[item.newIndex][col] = newVal;
       }
+      newRows.value = [...newRows.value];
+      touchPendingChanges();
       editingCell.value = null;
       isCommitting = false;
       return;
@@ -445,6 +454,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
       if (rowChanges?.size === 0) dirtyRows.value.delete(item.sourceIndex);
     }
     dirtyRows.value = new Map(dirtyRows.value);
+    touchPendingChanges();
     editingCell.value = null;
     isCommitting = false;
   }
@@ -466,6 +476,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
       const oldVal = newRows.value[item.newIndex]?.[col];
       newRows.value[item.newIndex][col] = value === null ? null : coerceCellValue(value, oldVal, col);
       newRows.value = [...newRows.value];
+      touchPendingChanges();
       return;
     }
 
@@ -486,6 +497,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
       if (rowChanges?.size === 0) dirtyRows.value.delete(item.sourceIndex);
     }
     dirtyRows.value = new Map(dirtyRows.value);
+    touchPendingChanges();
   }
 
   function cancelEdit() {
@@ -511,6 +523,8 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
   function addRow() {
     rowStatusFilter.value = rowStatusFilterAfterAddingRow(rowStatusFilter.value);
     newRows.value.push(result.value.columns.map(() => null));
+    newRows.value = [...newRows.value];
+    touchPendingChanges();
     if (useTransaction.value && !transactionActive.value) {
       enterTransaction();
     }
@@ -532,8 +546,8 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
   }
 
   function shouldClearClonedColumn(columnName: string, columnInfo: ColumnInfo | undefined): boolean {
-    if (databaseType.value === "oracle" && columnName.toUpperCase() === DBX_ROWID_COLUMN) return true;
-    if (databaseType.value === "neo4j" && columnName === DBX_NEO4J_ELEMENT_ID_COLUMN) return true;
+    if (resolvedDatabaseType.value === "oracle" && columnName.toUpperCase() === DBX_ROWID_COLUMN) return true;
+    if (resolvedDatabaseType.value === "neo4j" && columnName === DBX_NEO4J_ELEMENT_ID_COLUMN) return true;
     const extra = columnInfo?.extra ?? "";
     const columnDefault = columnInfo?.column_default ?? "";
     return /\b(auto_increment|autoincrement|identity|generated)\b/i.test(extra) || /\bnextval\s*\(/i.test(columnDefault);
@@ -545,6 +559,8 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     const clonedData = clonedRowData(item);
     rowStatusFilter.value = rowStatusFilterAfterAddingRow(rowStatusFilter.value);
     newRows.value.push(clonedData);
+    newRows.value = [...newRows.value];
+    touchPendingChanges();
     if (useTransaction.value && !transactionActive.value) {
       enterTransaction();
     }
@@ -564,6 +580,8 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
       const clonedData = clonedRowData(item);
       newRows.value.push(clonedData);
     }
+    newRows.value = [...newRows.value];
+    touchPendingChanges();
     if (useTransaction.value && !transactionActive.value) {
       enterTransaction();
     }
@@ -574,11 +592,15 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     if (!item) return;
     if (item.isNew && item.newIndex !== undefined) {
       newRows.value.splice(item.newIndex, 1);
+      newRows.value = [...newRows.value];
     } else if (item.sourceIndex !== undefined) {
       if (!canEditExistingRows.value) return;
       dirtyRows.value.delete(item.sourceIndex);
       deletedRows.value.add(item.sourceIndex);
+      dirtyRows.value = new Map(dirtyRows.value);
+      deletedRows.value = new Set(deletedRows.value);
     }
+    touchPendingChanges();
     if (editingCell.value?.rowId === rowId) editingCell.value = null;
     if (useTransaction.value && !transactionActive.value) {
       enterTransaction();
@@ -616,6 +638,8 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     const item = getRowItem(rowId);
     if (item?.sourceIndex !== undefined) {
       deletedRows.value.delete(item.sourceIndex);
+      deletedRows.value = new Set(deletedRows.value);
+      touchPendingChanges();
     }
   }
 
@@ -634,7 +658,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
   function saveStatementOptions() {
     if (!tableMeta.value) return null;
     return {
-      databaseType: databaseType.value,
+      databaseType: resolvedDatabaseType.value,
       tableMeta: tableMeta.value,
       columns: result.value.columns,
       sourceColumns: sourceColumns.value,
@@ -687,7 +711,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
   }
 
   async function recordFailedDataGridHistory(statements: string[], rollbackStatements: string[], start: number, error: unknown) {
-    const message = normalizeDataGridSaveError(databaseType.value, error);
+    const message = normalizeDataGridSaveError(resolvedDatabaseType.value, error);
     try {
       await recordDataGridHistory(statements, rollbackStatements, Date.now() - start, {
         success: false,
@@ -718,13 +742,14 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
           rows: result.value.rows,
         });
       } catch (e: any) {
-        saveError.value = normalizeDataGridSaveError(databaseType.value, e);
+        saveError.value = normalizeDataGridSaveError(resolvedDatabaseType.value, e);
         isSaving.value = false;
         return;
       }
       dirtyRows.value.clear();
       newRows.value = [];
       deletedRows.value.clear();
+      touchPendingChanges();
       exitTransaction();
       isSaving.value = false;
       if (shouldReloadAfterSave) {
@@ -739,7 +764,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
       try {
         preparedSave = await api.prepareDataGridSave(stmtOptions);
       } catch (e: any) {
-        saveError.value = normalizeDataGridSaveError(databaseType.value, e);
+        saveError.value = normalizeDataGridSaveError(resolvedDatabaseType.value, e);
         isSaving.value = false;
         return;
       }
@@ -760,6 +785,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     let apiResult: { affected_rows?: number } | undefined;
     console.info("[DBX][dataGrid:save-statements]", {
       databaseType: databaseType.value,
+      resolvedDatabaseType: resolvedDatabaseType.value,
       table: tableMeta.value ? [tableMeta.value.schema, tableMeta.value.tableName].filter(Boolean).join(".") : undefined,
       statements: stmts,
       rollbackStatements: rollbackStmts,
@@ -808,6 +834,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     dirtyRows.value.clear();
     newRows.value = [];
     deletedRows.value.clear();
+    touchPendingChanges();
     exitTransaction();
     isSaving.value = false;
     if (shouldReloadAfterSave) {
@@ -819,6 +846,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     dirtyRows.value.clear();
     newRows.value = [];
     deletedRows.value.clear();
+    touchPendingChanges();
     editingCell.value = null;
     exitTransaction();
   }
@@ -925,7 +953,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
       previewStatements.value = stmts;
       return stmts;
     } catch (e: any) {
-      saveError.value = normalizeDataGridSaveError(databaseType.value, e);
+      saveError.value = normalizeDataGridSaveError(resolvedDatabaseType.value, e);
       return [];
     } finally {
       isPreviewLoading.value = false;
@@ -939,6 +967,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     dirtyRows,
     newRows,
     deletedRows,
+    pendingChangesVersion,
     dirtyRowCount,
     newRowCount,
     deletedRowCount,

@@ -602,6 +602,7 @@ mod tests {
             password: "secret".to_string(),
             database: None,
             visible_databases: None,
+            visible_schemas: None,
             attached_databases: Vec::new(),
             color: None,
             transport_layers: vec![TransportLayerConfig::Ssh(crate::models::connection::SshTunnelConfig {

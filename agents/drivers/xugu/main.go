@@ -36,6 +36,23 @@ JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
 WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
   AND UPPER(t.TABLE_NAME) = UPPER(?)
   AND c.CONS_TYPE = 'P'`
+const xuguListColumnsSQL = `
+SELECT c.COL_NAME, c.TYPE_NAME, c.NOT_NULL, c.DEF_VAL, c.COMMENTS, c.SCALE
+FROM ALL_COLUMNS c
+JOIN ALL_TABLES t ON t.DB_ID = c.DB_ID AND t.TABLE_ID = c.TABLE_ID
+JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
+WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
+  AND UPPER(t.TABLE_NAME) = UPPER(?)
+  AND (c.IS_HIDE IS NULL OR c.IS_HIDE = FALSE)
+ORDER BY c.COL_NO`
+const xuguListIndexesSQL = `
+SELECT i.INDEX_NAME, i.KEYS, i.IS_UNIQUE, i.IS_PRIMARY, i.INDEX_TYPE, i.FILTER
+FROM ALL_INDEXES i
+JOIN ALL_TABLES t ON t.DB_ID = i.DB_ID AND t.TABLE_ID = i.TABLE_ID
+JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
+WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
+  AND UPPER(t.TABLE_NAME) = UPPER(?)
+ORDER BY i.INDEX_NAME`
 
 type request struct {
 	ID     json.RawMessage            `json:"id"`
@@ -670,7 +687,9 @@ func isXuguMetadataAccessError(err error) bool {
 		strings.Contains(message, "SYS_TABLES") ||
 		strings.Contains(message, "ALL_VIEWS") ||
 		strings.Contains(message, "SYS_VIEWS") ||
+		strings.Contains(message, "ALL_COLUMNS") ||
 		strings.Contains(message, "ALL_CONSTRAINTS") ||
+		strings.Contains(message, "ALL_INDEXES") ||
 		strings.Contains(message, "SYS_COLUMNS") ||
 		strings.Contains(message, "SYS_CONSTRAINTS") ||
 		strings.Contains(message, "SYS_INDEXES") ||
@@ -815,15 +834,7 @@ func (s *server) getColumns(schema, table string) ([]columnInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	rows, err := s.queryRows(`
-SELECT c.COL_NAME, c.TYPE_NAME, c.NOT_NULL, c.DEF_VAL, c.COMMENTS, c.SCALE
-FROM SYS_COLUMNS c
-JOIN SYS_TABLES t ON t.DB_ID = c.DB_ID AND t.TABLE_ID = c.TABLE_ID
-JOIN SYS_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
-WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
-  AND UPPER(t.TABLE_NAME) = UPPER(?)
-  AND (c.IS_HIDE IS NULL OR c.IS_HIDE = FALSE)
-ORDER BY c.COL_NO`, []any{schema, table})
+	rows, err := s.queryRows(xuguListColumnsSQL, []any{schema, table})
 	if err != nil {
 		if isXuguMetadataAccessError(err) {
 			return s.columnsFromSelect(schema, table, primaryKeys)
@@ -916,14 +927,7 @@ func (s *server) listIndexes(schema, table string) ([]indexInfo, error) {
 		return nil, err
 	}
 	table = strings.ToUpper(strings.TrimSpace(table))
-	rows, err := s.queryRows(`
-SELECT i.INDEX_NAME, i.KEYS, i.IS_UNIQUE, i.IS_PRIMARY, i.INDEX_TYPE, i.FILTER
-FROM SYS_INDEXES i
-JOIN SYS_TABLES t ON t.DB_ID = i.DB_ID AND t.TABLE_ID = i.TABLE_ID
-JOIN SYS_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
-WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
-  AND UPPER(t.TABLE_NAME) = UPPER(?)
-ORDER BY i.INDEX_NAME`, []any{schema, table})
+	rows, err := s.queryRows(xuguListIndexesSQL, []any{schema, table})
 	if err != nil {
 		if isXuguMetadataAccessError(err) {
 			return []indexInfo{}, nil
@@ -1065,7 +1069,10 @@ func (s *server) getTableDDL(schema, table string) (string, error) {
 		defer rows.Close()
 		if rows.Next() {
 			if scanErr := rows.Scan(&ddl); scanErr == nil && strings.TrimSpace(ddl) != "" {
-				return ddl, rows.Err()
+				if err := rows.Err(); err != nil {
+					return "", err
+				}
+				return s.appendTableIndexDDL(schema, table, ddl), nil
 			}
 		}
 	}
@@ -1073,7 +1080,7 @@ func (s *server) getTableDDL(schema, table string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return ddl, nil
+	return s.appendTableIndexDDL(schema, table, ddl), nil
 }
 
 func (s *server) getExplainInfo(sqlText string) (string, error) {
@@ -1449,6 +1456,10 @@ func (s *server) buildTableDDL(schema, table string) (string, error) {
 		if !column.IsNullable {
 			builder.WriteString(" NOT NULL")
 		}
+		if column.Comment != nil && strings.TrimSpace(*column.Comment) != "" {
+			builder.WriteString(" COMMENT ")
+			builder.WriteString(quoteStringLiteral(strings.TrimSpace(*column.Comment)))
+		}
 	}
 	primary := make([]string, 0)
 	for _, column := range columns {
@@ -1462,7 +1473,117 @@ func (s *server) buildTableDDL(schema, table string) (string, error) {
 		builder.WriteByte(')')
 	}
 	builder.WriteString("\n)")
+	if comment, err := s.tableComment(schema, table); err == nil && strings.TrimSpace(comment) != "" {
+		builder.WriteString("\nCOMMENT ")
+		builder.WriteString(quoteStringLiteral(strings.TrimSpace(comment)))
+	}
 	return builder.String(), nil
+}
+
+func (s *server) appendTableIndexDDL(schema, table, ddl string) string {
+	indexDDL, err := s.tableIndexDDL(schema, table)
+	if err == nil && strings.TrimSpace(indexDDL) != "" {
+		return appendDDLStatement(ddl, indexDDL)
+	}
+	indexes, err := s.listIndexes(schema, table)
+	if err != nil || len(indexes) == 0 {
+		return ddl
+	}
+	var builder strings.Builder
+	for _, index := range indexes {
+		if index.IsPrimary || len(index.Columns) == 0 {
+			continue
+		}
+		if builder.Len() > 0 {
+			builder.WriteString("\n")
+		}
+		if index.IsUnique {
+			builder.WriteString("CREATE UNIQUE INDEX ")
+		} else {
+			builder.WriteString("CREATE INDEX ")
+		}
+		builder.WriteString(quoteIdentifier(index.Name))
+		builder.WriteString(" ON ")
+		builder.WriteString(quoteIdentifier(schema))
+		builder.WriteByte('.')
+		builder.WriteString(quoteIdentifier(table))
+		builder.WriteByte('(')
+		for i, column := range index.Columns {
+			if i > 0 {
+				builder.WriteString(", ")
+			}
+			builder.WriteString(quoteIdentifier(column))
+		}
+		builder.WriteByte(')')
+		if index.IndexType != nil && strings.TrimSpace(*index.IndexType) != "" {
+			builder.WriteString(" INDEXTYPE IS ")
+			builder.WriteString(strings.TrimSpace(*index.IndexType))
+		}
+		builder.WriteByte(';')
+	}
+	if builder.Len() == 0 {
+		return ddl
+	}
+	return appendDDLStatement(ddl, builder.String())
+}
+
+func (s *server) tableIndexDDL(schema, table string) (string, error) {
+	rows, err := s.queryRows(
+		"SELECT TO_CHAR(DBMS_METADATA.GET_DDL('INDEX', ?, ?)) FROM DUAL",
+		[]any{strings.ToUpper(strings.TrimSpace(table)), schema},
+	)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	var ddl string
+	if rows.Next() {
+		if err := rows.Scan(&ddl); err != nil {
+			return "", err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	return ddl, nil
+}
+
+func (s *server) tableComment(schema, table string) (string, error) {
+	rows, err := s.queryRows(`
+SELECT t.COMMENTS
+FROM ALL_TABLES t
+JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
+WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
+  AND UPPER(t.TABLE_NAME) = UPPER(?)`, []any{schema, table})
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	var comment *string
+	if rows.Next() {
+		if err := rows.Scan(&comment); err != nil {
+			return "", err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	if comment == nil {
+		return "", nil
+	}
+	return *comment, nil
+}
+
+func appendDDLStatement(ddl, extra string) string {
+	ddl = strings.TrimRight(ddl, "\r\n\t ")
+	extra = strings.TrimSpace(extra)
+	if extra == "" {
+		return ddl
+	}
+	if !strings.HasSuffix(ddl, ";") {
+		ddl += ";"
+	}
+	return ddl + "\n\n" + extra
 }
 
 func columnTypeDDL(column columnInfo) string {
@@ -1556,6 +1677,10 @@ func stringPtr(value string) *string {
 		return nil
 	}
 	return &value
+}
+
+func quoteStringLiteral(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
 }
 
 func indexTypeName(value any) string {

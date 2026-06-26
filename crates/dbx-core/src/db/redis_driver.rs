@@ -30,10 +30,26 @@ pub struct RedisDatabaseInfo {
 pub struct RedisKeyInfo {
     pub key_display: String,
     pub key_raw: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub key_type: String,
+    #[serde(default = "default_missing_ttl", skip_serializing_if = "is_missing_ttl")]
     pub ttl: i64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub size: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub value_preview: String,
+}
+
+fn default_missing_ttl() -> i64 {
+    -2
+}
+
+fn is_missing_ttl(ttl: &i64) -> bool {
+    *ttl == -2
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -761,6 +777,16 @@ pub async fn scan_cluster_keys_page(
     pattern: &str,
     count: usize,
 ) -> Result<RedisScanResult, String> {
+    scan_cluster_keys_page_with_options(pool, cursor, pattern, count, true).await
+}
+
+pub async fn scan_cluster_keys_page_with_options(
+    pool: &RedisClusterPool,
+    cursor: u64,
+    pattern: &str,
+    count: usize,
+    include_types: bool,
+) -> Result<RedisScanResult, String> {
     let master_nodes = cluster_master_nodes(pool).await?;
     if master_nodes.is_empty() {
         return Ok(RedisScanResult { cursor: 0, keys: Vec::new(), total_keys: 0 });
@@ -776,7 +802,7 @@ pub async fn scan_cluster_keys_page(
         let endpoint = &master_nodes[index];
         let mut con = connect_cluster_node(pool, endpoint).await?;
         let current_cursor = if index == node_index { node_cursor } else { 0 };
-        let result = scan_keys_page(&mut con, current_cursor, pattern, count).await?;
+        let result = scan_keys_page_with_options(&mut con, current_cursor, pattern, count, include_types).await?;
         if !result.keys.is_empty() {
             let next_cursor = if result.cursor != 0 {
                 encode_cluster_cursor(index, result.cursor)?
@@ -1434,13 +1460,26 @@ pub async fn scan_keys_page<C>(con: &mut C, cursor: u64, pattern: &str, count: u
 where
     C: ConnectionLike + Send + Sync + Unpin,
 {
-    scan_keys_batch(con, cursor, pattern, count, 1).await
+    scan_keys_batch(con, cursor, pattern, count, 1, true).await
+}
+
+pub async fn scan_keys_page_with_options<C>(
+    con: &mut C,
+    cursor: u64,
+    pattern: &str,
+    count: usize,
+    include_types: bool,
+) -> Result<RedisScanResult, String>
+where
+    C: ConnectionLike + Send + Sync + Unpin,
+{
+    scan_keys_batch(con, cursor, pattern, count, 1, include_types).await
 }
 
 /// Batch-scan keys with server-side multi-SCAN support.
 ///
-/// Performs up to `max_iterations` SCAN→TYPE cycles in a single call,
-/// dramatically reducing frontend↔backend roundtrips when fetching many keys.
+/// Performs up to `max_iterations` SCAN cycles in a single call. TYPE metadata
+/// is optional so large key-name searches can avoid extra Redis work.
 /// DBSIZE is only called on the first iteration (cursor == 0).
 pub async fn scan_keys_batch<C>(
     con: &mut C,
@@ -1448,6 +1487,7 @@ pub async fn scan_keys_batch<C>(
     pattern: &str,
     count: usize,
     max_iterations: usize,
+    include_types: bool,
 ) -> Result<RedisScanResult, String>
 where
     C: ConnectionLike + Send + Sync + Unpin,
@@ -1472,23 +1512,34 @@ where
         let (next_cursor, keys) = parse_scan_keys(raw)?;
 
         if !keys.is_empty() {
-            let mut pipe = redis::pipe();
-            for key in &keys {
-                pipe.cmd("TYPE").arg(key);
-            }
-            let key_types: Vec<String> = pipe.query_async(con).await.unwrap_or_default();
+            let key_types: Vec<String> = if include_types {
+                let mut pipe = redis::pipe();
+                for key in &keys {
+                    pipe.cmd("TYPE").arg(key);
+                }
+                pipe.query_async(con).await.unwrap_or_default()
+            } else {
+                Vec::new()
+            };
 
             for (index, key) in keys.iter().enumerate() {
-                let key_type = key_types.get(index).cloned().unwrap_or_else(|| "unknown".to_string());
+                let key_type = if include_types {
+                    key_types.get(index).cloned().unwrap_or_else(|| "unknown".to_string())
+                } else {
+                    String::new()
+                };
+                let value_preview = if include_types {
+                    redis_key_value_preview(key_types.get(index).map(String::as_str).unwrap_or("unknown"))
+                } else {
+                    String::new()
+                };
                 all_keys.push(RedisKeyInfo {
                     key_display: redis_key_bytes_to_display(key),
                     key_raw: redis_key_bytes_to_raw(key),
                     key_type,
                     ttl: -2,
                     size: 0,
-                    value_preview: redis_key_value_preview(
-                        key_types.get(index).map(String::as_str).unwrap_or("unknown"),
-                    ),
+                    value_preview,
                 });
             }
         }
@@ -2541,6 +2592,7 @@ mod tests {
             password: String::new(),
             database: Some("4".to_string()),
             visible_databases: None,
+            visible_schemas: None,
             attached_databases: Vec::new(),
             color: None,
             transport_layers: Vec::new(),

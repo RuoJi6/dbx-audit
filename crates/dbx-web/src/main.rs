@@ -205,6 +205,7 @@ async fn main() {
         .route("/schema/objects", get(routes::schema::list_objects))
         .route("/schema/object-statistics", get(routes::schema::list_object_statistics))
         .route("/schema/completion-objects", get(routes::schema::list_completion_objects))
+        .route("/schema/completion-assistant", post(routes::schema::completion_assistant_search))
         .route("/schema/object-source", get(routes::schema::get_object_source))
         .route("/schema/columns", get(routes::schema::list_columns))
         .route("/schema/indexes", get(routes::schema::list_indexes))
@@ -335,6 +336,27 @@ async fn main() {
         .route("/etcd/get", post(routes::etcd::get))
         .route("/etcd/put", post(routes::etcd::put))
         .route("/etcd/delete", post(routes::etcd::delete))
+        // ZooKeeper
+        .route("/zookeeper/list-prefix", post(routes::zookeeper::list_prefix))
+        .route("/zookeeper/get", post(routes::zookeeper::get))
+        .route("/zookeeper/put", post(routes::zookeeper::put))
+        .route("/zookeeper/delete", post(routes::zookeeper::delete))
+        // Nacos
+        .route("/nacos/test-connection", post(routes::nacos::test_connection))
+        .route("/nacos/namespaces/list", post(routes::nacos::list_namespaces))
+        .route("/nacos/namespaces/create", post(routes::nacos::create_namespace))
+        .route("/nacos/namespaces/update", post(routes::nacos::update_namespace))
+        .route("/nacos/configs/list", post(routes::nacos::list_configs))
+        .route("/nacos/configs/get", post(routes::nacos::get_config))
+        .route("/nacos/configs/publish", post(routes::nacos::publish_config))
+        .route("/nacos/configs/delete", post(routes::nacos::delete_config))
+        .route("/nacos/configs/history/list", post(routes::nacos::list_config_history))
+        .route("/nacos/configs/history/get", post(routes::nacos::get_config_history))
+        .route("/nacos/configs/history/rollback", post(routes::nacos::rollback_config))
+        .route("/nacos/services/list", post(routes::nacos::list_services))
+        .route("/nacos/instances/list", post(routes::nacos::list_instances))
+        .route("/nacos/instances/update", post(routes::nacos::update_instance))
+        .route("/nacos/raw", post(routes::nacos::raw_request))
         // MongoDB
         .route("/mongo/list-databases", post(routes::mongo::list_databases))
         .route("/mongo/list-collections", post(routes::mongo::list_collections))
@@ -396,6 +418,17 @@ async fn main() {
         .route("/export/table/progress/{exportId}", get(routes::table_export::table_export_progress))
         .route("/export/table/download/{exportId}", get(routes::table_export::table_export_download))
         .route("/export/table/cancel", post(routes::table_export::cancel_table_export))
+        // Query result export
+        .route("/export/query-result", post(routes::query_result_export::start_query_result_export))
+        .route(
+            "/export/query-result/progress/{exportId}",
+            get(routes::query_result_export::query_result_export_progress),
+        )
+        .route(
+            "/export/query-result/download/{exportId}",
+            get(routes::query_result_export::query_result_export_download),
+        )
+        .route("/export/query-result/cancel", post(routes::query_result_export::cancel_query_result_export))
         // SQL file
         .route("/sql-file/preview", post(routes::sql_file::preview_sql_file))
         .route("/sql-file/execute", post(routes::sql_file::execute_sql_file))

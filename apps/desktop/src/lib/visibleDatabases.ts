@@ -97,3 +97,32 @@ export function filterDatabaseNamesForConnection(databaseNames: string[], connec
   }
   return databaseNames.filter((name) => !isSystemDatabaseName(connection?.db_type, name));
 }
+
+export function visibleSchemaFilterIsEnabled(visibleSchemas: Record<string, string[]> | undefined, database: string): boolean {
+  return Array.isArray(visibleSchemas?.[database]);
+}
+
+export function filterSchemaNamesForConnection(schemaNames: string[], connection: Pick<ConnectionConfig, "db_type" | "visible_schemas"> | undefined, database: string): string[] {
+  const visibleSchemas = connection?.visible_schemas;
+  if (!visibleSchemaFilterIsEnabled(visibleSchemas, database)) {
+    return schemaNames.filter((name) => !isSystemDatabaseName(connection?.db_type, name));
+  }
+  const visible = new Set(visibleSchemas![database]);
+  return schemaNames.filter((name) => visible.has(name));
+}
+
+export function normalizeVisibleSchemaSelection(selectedNames: string[], schemaNames: string[]): string[] {
+  const available = new Set(schemaNames);
+  const seen = new Set<string>();
+  return selectedNames.filter((name) => {
+    if (!available.has(name) || seen.has(name)) return false;
+    seen.add(name);
+    return true;
+  });
+}
+
+const DRAFT_VISIBLE_SCHEMAS_PREFIX = "__visible_schema_draft_";
+
+export function buildDraftVisibleSchemasConnectionId(seed: string): string {
+  return `${DRAFT_VISIBLE_SCHEMAS_PREFIX}${seed}`;
+}

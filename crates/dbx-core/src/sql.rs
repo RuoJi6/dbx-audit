@@ -55,32 +55,99 @@ pub struct SqlFileImportStatement {
     pub source_statement_count: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SqlDialectProfile {
+    supports_hash_line_comments: bool,
+    supports_oracle_plsql_blocks: bool,
+    supports_slash_line_block_delimiter: bool,
+    supports_custom_delimiter_commands: bool,
+    supports_dollar_quoted_strings: bool,
+    supports_go_batch_separator: bool,
+    keeps_sqlserver_module_batch_at_cursor: bool,
+}
+
+impl Default for SqlDialectProfile {
+    fn default() -> Self {
+        Self {
+            supports_hash_line_comments: false,
+            supports_oracle_plsql_blocks: false,
+            supports_slash_line_block_delimiter: false,
+            supports_custom_delimiter_commands: true,
+            supports_dollar_quoted_strings: true,
+            supports_go_batch_separator: false,
+            keeps_sqlserver_module_batch_at_cursor: false,
+        }
+    }
+}
+
+impl SqlDialectProfile {
+    fn for_database_type(db_type: DatabaseType) -> Self {
+        if Self::is_oracle_like_database(db_type) {
+            return Self::oracle_like();
+        }
+
+        if matches!(db_type, DatabaseType::SqlServer) {
+            return Self::sql_server();
+        }
+
+        if Self::is_mysql_compatible_database(db_type) {
+            return Self::mysql_compatible();
+        }
+
+        Self::default()
+    }
+
+    fn mysql_compatible() -> Self {
+        Self { supports_hash_line_comments: true, ..Self::default() }
+    }
+
+    fn oracle_like() -> Self {
+        Self { supports_oracle_plsql_blocks: true, supports_slash_line_block_delimiter: true, ..Self::default() }
+    }
+
+    fn sql_server() -> Self {
+        Self { supports_go_batch_separator: true, keeps_sqlserver_module_batch_at_cursor: true, ..Self::default() }
+    }
+
+    fn is_mysql_compatible_database(db_type: DatabaseType) -> bool {
+        matches!(
+            db_type,
+            DatabaseType::Mysql
+                | DatabaseType::Doris
+                | DatabaseType::StarRocks
+                | DatabaseType::ManticoreSearch
+                | DatabaseType::Goldendb
+        )
+    }
+
+    fn is_oracle_like_database(db_type: DatabaseType) -> bool {
+        matches!(
+            db_type,
+            DatabaseType::Oracle
+                | DatabaseType::Dameng
+                | DatabaseType::Gaussdb
+                | DatabaseType::Yashandb
+                | DatabaseType::OceanbaseOracle
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SqlParsingOptions {
-    pub supports_hash_line_comments: bool,
-    pub supports_oracle_plsql_blocks: bool,
+    profile: SqlDialectProfile,
 }
 
 impl SqlParsingOptions {
     pub fn for_database_type(db_type: DatabaseType) -> Self {
-        Self {
-            supports_hash_line_comments: matches!(
-                db_type,
-                DatabaseType::Mysql
-                    | DatabaseType::Doris
-                    | DatabaseType::StarRocks
-                    | DatabaseType::ManticoreSearch
-                    | DatabaseType::Goldendb
-            ),
-            supports_oracle_plsql_blocks: matches!(
-                db_type,
-                DatabaseType::Oracle | DatabaseType::Dameng | DatabaseType::Gaussdb | DatabaseType::OceanbaseOracle
-            ),
-        }
+        Self::from_profile(SqlDialectProfile::for_database_type(db_type))
     }
 
     pub fn mysql_compatible() -> Self {
-        Self { supports_hash_line_comments: true, ..Self::default() }
+        Self::from_profile(SqlDialectProfile::mysql_compatible())
+    }
+
+    fn from_profile(profile: SqlDialectProfile) -> Self {
+        Self { profile }
     }
 }
 
@@ -220,7 +287,7 @@ impl SqlStatementSplitter {
                     i += 1;
                     continue;
                 }
-                if self.options.supports_hash_line_comments && ch == '#' {
+                if self.options.profile.supports_hash_line_comments && ch == '#' {
                     self.in_line_comment = true;
                     self.buffer.push(ch);
                     self.previous = Some(ch);
@@ -234,7 +301,13 @@ impl SqlStatementSplitter {
                     i += 1;
                     continue;
                 }
-                if let Some(tag) = dollar_quote_tag_at(&chars, i) {
+                if let Some(tag) = self
+                    .options
+                    .profile
+                    .supports_dollar_quoted_strings
+                    .then(|| dollar_quote_tag_at(&chars, i))
+                    .flatten()
+                {
                     if self.custom_delimiter.is_none() && !self.on_delimiter_line() {
                         for tag_ch in tag.chars() {
                             self.buffer.push(tag_ch);
@@ -263,7 +336,8 @@ impl SqlStatementSplitter {
                 ';' if !self.in_single_quote && !self.in_double_quote && !self.in_backtick => {
                     if self.custom_delimiter.is_some() {
                         self.buffer.push(ch);
-                    } else if self.options.supports_oracle_plsql_blocks && starts_with_oracle_plsql_block(&self.buffer)
+                    } else if self.options.profile.supports_oracle_plsql_blocks
+                        && starts_with_oracle_plsql_block(&self.buffer)
                     {
                         self.buffer.push(ch);
                         if oracle_plsql_block_is_complete(&self.buffer) {
@@ -281,7 +355,7 @@ impl SqlStatementSplitter {
                     let buf_end = self.buffer.len() - 1;
                     let last_line_start = self.buffer[..buf_end].rfind('\n').map_or(0, |p| p + 1);
                     let last_line = self.buffer[last_line_start..buf_end].trim();
-                    if self.options.supports_oracle_plsql_blocks && last_line == "/" {
+                    if self.options.profile.supports_slash_line_block_delimiter && last_line == "/" {
                         let before = self.buffer[..last_line_start].trim();
                         if has_executable_sql_with_options(before, self.options) {
                             statements.push(before.to_string());
@@ -291,7 +365,13 @@ impl SqlStatementSplitter {
                         i += 1;
                         continue;
                     }
-                    if let Some(new_delim) = parse_delimiter_command(last_line) {
+                    if let Some(new_delim) = self
+                        .options
+                        .profile
+                        .supports_custom_delimiter_commands
+                        .then(|| parse_delimiter_command(last_line))
+                        .flatten()
+                    {
                         self.custom_delimiter = if new_delim == ";" { None } else { Some(new_delim.to_string()) };
                         if last_line_start > 0 {
                             let before = self.buffer[..last_line_start].trim();
@@ -324,13 +404,13 @@ impl SqlStatementSplitter {
         let mut statements = Vec::new();
         let trimmed = self.buffer.trim();
         let last_line = trimmed.rsplit('\n').next().unwrap_or(trimmed).trim();
-        if parse_delimiter_command(last_line).is_some() {
+        if self.options.profile.supports_custom_delimiter_commands && parse_delimiter_command(last_line).is_some() {
             let before = trimmed.rsplit_once('\n').map(|x| x.0).unwrap_or("").trim();
             if has_executable_sql_with_options(before, self.options) {
                 statements.push(before.to_string());
             }
             self.buffer.clear();
-        } else if self.options.supports_oracle_plsql_blocks && last_line == "/" {
+        } else if self.options.profile.supports_slash_line_block_delimiter && last_line == "/" {
             let before = trimmed.rsplit_once('\n').map(|x| x.0).unwrap_or("").trim();
             if has_executable_sql_with_options(before, self.options) {
                 statements.push(before.to_string());
@@ -474,12 +554,12 @@ fn split_statement_range_at_blank_lines(
     statement: &SqlStatementRange,
     options: SqlParsingOptions,
 ) -> Vec<SqlStatementRange> {
-    if options.supports_oracle_plsql_blocks && starts_with_oracle_plsql_block(&statement.text) {
+    if options.profile.supports_oracle_plsql_blocks && starts_with_oracle_plsql_block(&statement.text) {
         return vec![statement.clone()];
     }
 
     let mut ranges = Vec::new();
-    let mut scanner = SqlScanner::default();
+    let mut scanner = SqlScanner::with_profile(options.profile);
     let mut current_start = statement.start;
     let mut line_start = statement.start;
     let mut line_has_non_whitespace = false;
@@ -590,7 +670,7 @@ fn split_sql_statement_ranges_with_options(sql: &str, options: SqlParsingOptions
                 i += 2;
                 continue;
             }
-            if options.supports_hash_line_comments && ch == '#' {
+            if options.profile.supports_hash_line_comments && ch == '#' {
                 in_line_comment = true;
                 i += ch.len_utf8();
                 continue;
@@ -600,7 +680,9 @@ fn split_sql_statement_ranges_with_options(sql: &str, options: SqlParsingOptions
                 i += 2;
                 continue;
             }
-            if let Some(tag) = dollar_quote_tag_at_str(sql, i) {
+            if let Some(tag) =
+                options.profile.supports_dollar_quoted_strings.then(|| dollar_quote_tag_at_str(sql, i)).flatten()
+            {
                 if custom_delimiter.is_none() && !is_on_delimiter_line(sql, start, i) {
                     i += tag.len();
                     dollar_quote_tag = Some(tag);
@@ -610,13 +692,15 @@ fn split_sql_statement_ranges_with_options(sql: &str, options: SqlParsingOptions
             if ch == '\n' {
                 let line_start = sql[..i].rfind('\n').map_or(0, |pos| pos + 1);
                 let line = sql[line_start..i].trim();
-                if options.supports_oracle_plsql_blocks && line == "/" {
+                if options.profile.supports_slash_line_block_delimiter && line == "/" {
                     push_statement_range(&mut ranges, sql, start, line_start, options);
                     start = i + ch.len_utf8();
                     i = start;
                     continue;
                 }
-                if let Some(new_delimiter) = parse_delimiter_command(line) {
+                if let Some(new_delimiter) =
+                    options.profile.supports_custom_delimiter_commands.then(|| parse_delimiter_command(line)).flatten()
+                {
                     let before = sql[start..line_start].trim();
                     if has_executable_sql_with_options(before, options) {
                         push_statement_range(&mut ranges, sql, start, line_start, options);
@@ -644,7 +728,7 @@ fn split_sql_statement_ranges_with_options(sql: &str, options: SqlParsingOptions
             }
             ';' if !in_single_quote && !in_double_quote && !in_backtick && custom_delimiter.is_none() => {
                 let is_oracle_plsql =
-                    options.supports_oracle_plsql_blocks && starts_with_oracle_plsql_block(&sql[start..i]);
+                    options.profile.supports_oracle_plsql_blocks && starts_with_oracle_plsql_block(&sql[start..i]);
                 if is_oracle_plsql {
                     if !oracle_plsql_block_is_complete(&sql[start..i + ch.len_utf8()]) {
                         i += ch.len_utf8();
@@ -674,11 +758,11 @@ fn split_sql_statement_ranges_with_options(sql: &str, options: SqlParsingOptions
 
     let trimmed = sql[start..].trim();
     let last_line = trimmed.rsplit('\n').next().unwrap_or(trimmed).trim();
-    if parse_delimiter_command(last_line).is_some() {
+    if options.profile.supports_custom_delimiter_commands && parse_delimiter_command(last_line).is_some() {
         if let Some(line_start) = sql[start..].rfind('\n').map(|pos| start + pos + 1) {
             push_statement_range(&mut ranges, sql, start, line_start, options);
         }
-    } else if options.supports_oracle_plsql_blocks && last_line == "/" {
+    } else if options.profile.supports_slash_line_block_delimiter && last_line == "/" {
         if let Some(line_start) = sql[start..].rfind('\n').map(|pos| start + pos + 1) {
             push_statement_range(&mut ranges, sql, start, line_start, options);
         }
@@ -768,7 +852,7 @@ fn dollar_quote_tag_at_str(sql: &str, index: usize) -> Option<String> {
 }
 
 pub fn split_sql_batches(sql: &str) -> Vec<String> {
-    let ranges = split_sql_batch_ranges(sql);
+    let ranges = split_sql_batch_ranges(sql, SqlDialectProfile::sql_server());
     if ranges.is_empty() {
         let trimmed = sql.trim();
         return if trimmed.is_empty() { Vec::new() } else { vec![trimmed.to_string()] };
@@ -776,7 +860,7 @@ pub fn split_sql_batches(sql: &str) -> Vec<String> {
     ranges.into_iter().map(|range| range.text).collect()
 }
 
-fn split_sql_batch_ranges(sql: &str) -> Vec<SqlStatementRange> {
+fn split_sql_batch_ranges(sql: &str, profile: SqlDialectProfile) -> Vec<SqlStatementRange> {
     let mut batches = Vec::new();
     let mut current_start = 0;
     let lines: Vec<&str> = sql.split('\n').collect();
@@ -788,8 +872,9 @@ fn split_sql_batch_ranges(sql: &str) -> Vec<SqlStatementRange> {
         offset = line_end + 1; // +1 for the '\n'
 
         let trimmed = line.trim();
-        if trimmed.eq_ignore_ascii_case("go")
-            || trimmed.to_ascii_lowercase().starts_with("go ") && trimmed[2..].trim().is_empty()
+        if profile.supports_go_batch_separator
+            && (trimmed.eq_ignore_ascii_case("go")
+                || trimmed.to_ascii_lowercase().starts_with("go ") && trimmed[2..].trim().is_empty())
         {
             push_batch_range(&mut batches, sql, current_start, line_start);
             current_start = line_end.min(sql.len());
@@ -817,12 +902,13 @@ fn push_batch_range(ranges: &mut Vec<SqlStatementRange>, sql: &str, start: usize
 }
 
 fn find_sqlserver_statement_at_cursor(sql: &str, cursor_pos: usize) -> String {
+    let profile = SqlDialectProfile::sql_server();
     let cursor = utf16_offset_to_byte_index(sql, cursor_pos);
-    let batches = split_sql_batch_ranges(sql);
+    let batches = split_sql_batch_ranges(sql, profile);
 
     for (idx, batch) in batches.iter().enumerate() {
         if cursor >= batch.start && cursor <= batch.end {
-            if starts_with_sqlserver_module_ddl(&batch.text) {
+            if profile.keeps_sqlserver_module_batch_at_cursor && starts_with_sqlserver_module_ddl(&batch.text) {
                 return batch.text.clone();
             }
             let relative_cursor = sql[..cursor].encode_utf16().count() - sql[..batch.start].encode_utf16().count();
@@ -831,7 +917,7 @@ fn find_sqlserver_statement_at_cursor(sql: &str, cursor_pos: usize) -> String {
 
         if cursor < batch.start {
             if let Some(prev) = idx.checked_sub(1).and_then(|prev_idx| batches.get(prev_idx)) {
-                if starts_with_sqlserver_module_ddl(&prev.text) {
+                if profile.keeps_sqlserver_module_batch_at_cursor && starts_with_sqlserver_module_ddl(&prev.text) {
                     return prev.text.clone();
                 }
                 let relative_cursor = prev.text.encode_utf16().count();
@@ -1152,8 +1238,8 @@ fn parse_insert_values_tail(tail: &str) -> Option<String> {
     }
 }
 
-#[derive(Default)]
 struct SqlScanner {
+    profile: SqlDialectProfile,
     in_single_quote: bool,
     in_double_quote: bool,
     in_backtick: bool,
@@ -1164,6 +1250,10 @@ struct SqlScanner {
 }
 
 impl SqlScanner {
+    fn with_profile(profile: SqlDialectProfile) -> Self {
+        Self { profile, ..Self::default() }
+    }
+
     fn step(&mut self, sql: &str, idx: usize, ch: char) {
         if let Some(tag) = self.dollar_quote_tag.clone() {
             if sql[idx..].starts_with(&tag) {
@@ -1192,9 +1282,13 @@ impl SqlScanner {
         if !self.in_single_quote && !self.in_double_quote && !self.in_backtick {
             if ch == '-' && next == Some('-') {
                 self.in_line_comment = true;
+            } else if self.profile.supports_hash_line_comments && ch == '#' {
+                self.in_line_comment = true;
             } else if ch == '/' && next == Some('*') {
                 self.in_block_comment = true;
-            } else if let Some(tag) = dollar_quote_tag_at_str(sql, idx) {
+            } else if let Some(tag) =
+                self.profile.supports_dollar_quoted_strings.then(|| dollar_quote_tag_at_str(sql, idx)).flatten()
+            {
                 self.dollar_quote_tag = Some(tag);
             }
         }
@@ -1221,6 +1315,21 @@ impl SqlScanner {
             || self.in_line_comment
             || self.in_block_comment
             || self.dollar_quote_tag.is_some()
+    }
+}
+
+impl Default for SqlScanner {
+    fn default() -> Self {
+        Self {
+            profile: SqlDialectProfile::default(),
+            in_single_quote: false,
+            in_double_quote: false,
+            in_backtick: false,
+            in_line_comment: false,
+            in_block_comment: false,
+            dollar_quote_tag: None,
+            previous: None,
+        }
     }
 }
 
@@ -1456,7 +1565,7 @@ fn leading_executable_sql_with_options(sql: &str, options: SqlParsingOptions) ->
             continue;
         }
 
-        if options.supports_hash_line_comments && bytes[i] == b'#' {
+        if options.profile.supports_hash_line_comments && bytes[i] == b'#' {
             i += 1;
             while i < bytes.len() && bytes[i] != b'\n' {
                 i += 1;
@@ -1499,7 +1608,7 @@ fn first_executable_sql_token_with_options(sql: &str, options: SqlParsingOptions
             continue;
         }
 
-        if options.supports_hash_line_comments && bytes[i] == b'#' {
+        if options.profile.supports_hash_line_comments && bytes[i] == b'#' {
             i += 1;
             while i < bytes.len() && bytes[i] != b'\n' {
                 i += 1;
@@ -1819,7 +1928,7 @@ fn has_executable_sql_with_options(statement: &str, options: SqlParsingOptions) 
             continue;
         }
 
-        if options.supports_hash_line_comments && ch == '#' {
+        if options.profile.supports_hash_line_comments && ch == '#' {
             in_line_comment = true;
             previous = Some(ch);
             i += 1;
@@ -1866,8 +1975,8 @@ mod tests {
     use super::{
         decode_sql_file_bytes, find_statement_at_cursor_for_database, optimize_sql_file_import_statements,
         prepare_sql_file_statement, split_sql_script, split_sql_statements_for_database,
-        starts_with_executable_sql_keyword, starts_with_executable_sql_keyword_for_database, SqlFileStatementAction,
-        SqlStatementSplitter,
+        starts_with_executable_sql_keyword, starts_with_executable_sql_keyword_for_database, SqlDialectProfile,
+        SqlFileStatementAction, SqlStatementSplitter,
     };
 
     #[test]
@@ -2299,6 +2408,45 @@ DELIMITER ;";
     }
 
     #[test]
+    fn sql_dialect_profiles_map_database_types_to_parser_capabilities() {
+        let default = SqlDialectProfile::for_database_type(DatabaseType::Postgres);
+        assert_eq!(default, SqlDialectProfile::default());
+        assert!(default.supports_custom_delimiter_commands);
+        assert!(default.supports_dollar_quoted_strings);
+        assert!(!default.supports_hash_line_comments);
+        assert!(!default.supports_oracle_plsql_blocks);
+        assert!(!default.supports_slash_line_block_delimiter);
+        assert!(!default.supports_go_batch_separator);
+        assert!(!default.keeps_sqlserver_module_batch_at_cursor);
+
+        let mysql = SqlDialectProfile::for_database_type(DatabaseType::Mysql);
+        assert_eq!(mysql, SqlDialectProfile::mysql_compatible());
+        assert!(mysql.supports_hash_line_comments);
+        assert!(SqlDialectProfile::for_database_type(DatabaseType::Doris).supports_hash_line_comments);
+        assert!(SqlDialectProfile::for_database_type(DatabaseType::StarRocks).supports_hash_line_comments);
+        assert!(SqlDialectProfile::for_database_type(DatabaseType::ManticoreSearch).supports_hash_line_comments);
+        assert!(SqlDialectProfile::for_database_type(DatabaseType::Goldendb).supports_hash_line_comments);
+
+        for db_type in [
+            DatabaseType::Oracle,
+            DatabaseType::Dameng,
+            DatabaseType::Gaussdb,
+            DatabaseType::Yashandb,
+            DatabaseType::OceanbaseOracle,
+        ] {
+            let profile = SqlDialectProfile::for_database_type(db_type);
+            assert_eq!(profile, SqlDialectProfile::oracle_like());
+            assert!(profile.supports_oracle_plsql_blocks);
+            assert!(profile.supports_slash_line_block_delimiter);
+        }
+
+        let sql_server = SqlDialectProfile::for_database_type(DatabaseType::SqlServer);
+        assert_eq!(sql_server, SqlDialectProfile::sql_server());
+        assert!(sql_server.supports_go_batch_separator);
+        assert!(sql_server.keeps_sqlserver_module_batch_at_cursor);
+    }
+
+    #[test]
     fn oracle_like_split_keeps_anonymous_plsql_block_together() {
         let sql = "\
 DECLARE
@@ -2424,6 +2572,29 @@ SELECT 1;";
             split_sql_statements_for_database(sql, DatabaseType::Oracle),
             vec![
                 "CREATE TRIGGER trg_audit\nBEFORE INSERT ON employees\nFOR EACH ROW\nBEGIN\n    INSERT INTO audit_log VALUES (:NEW.id, 'INSERT');\nEND;",
+                "SELECT 1"
+            ]
+        );
+    }
+
+    #[test]
+    fn yashandb_split_keeps_create_trigger_with_slash_delimiter_together() {
+        let sql = "\
+CREATE TRIGGER \"TB_SC_UPDATE_TIME_TRI\"
+BEFORE UPDATE ON \"TB_SC\"
+FOR EACH ROW
+ BEGIN
+   IF NOT UPDATING('UPDATE_TIME')  THEN
+   \t\t:NEW.\"UPDATE_TIME\" := CURRENT_TIMESTAMP;
+   END IF;
+END;
+/
+SELECT 1;";
+
+        assert_eq!(
+            split_sql_statements_for_database(sql, DatabaseType::Yashandb),
+            vec![
+                "CREATE TRIGGER \"TB_SC_UPDATE_TIME_TRI\"\nBEFORE UPDATE ON \"TB_SC\"\nFOR EACH ROW\n BEGIN\n   IF NOT UPDATING('UPDATE_TIME')  THEN\n   \t\t:NEW.\"UPDATE_TIME\" := CURRENT_TIMESTAMP;\n   END IF;\nEND;",
                 "SELECT 1"
             ]
         );

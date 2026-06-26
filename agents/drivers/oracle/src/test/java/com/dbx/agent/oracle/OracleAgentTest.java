@@ -66,6 +66,26 @@ class OracleAgentTest extends JdbcFakeExecutionBehaviorTest {
     }
 
     @Test
+    void listTablesSqlUsesSplitDictionaryQuery() {
+        String sql = OracleAgent.listTablesSql().toUpperCase(Locale.ROOT);
+
+        Assertions.assertTrue(sql.contains("ALL_TABLES"), sql);
+        Assertions.assertTrue(sql.contains("ALL_OBJECTS"), sql);
+        Assertions.assertTrue(sql.contains("UNION ALL"), sql);
+        Assertions.assertFalse(sql.contains("ALL_TAB_COMMENTS"), sql);
+    }
+
+    @Test
+    void listObjectsSqlUsesSplitDictionaryQuery() {
+        String sql = OracleAgent.listObjectsSql().toUpperCase(Locale.ROOT);
+
+        Assertions.assertTrue(sql.contains("ALL_TABLES"), sql);
+        Assertions.assertTrue(sql.contains("ALL_OBJECTS"), sql);
+        Assertions.assertTrue(sql.contains("UNION ALL"), sql);
+        Assertions.assertFalse(sql.contains("ALL_TAB_COMMENTS"), sql);
+    }
+
+    @Test
     void detectsPgaLimitError() {
         Assertions.assertTrue(OracleAgent.isPgaLimitError(new SQLException(
             "ORA-04036: PGA memory used by the instance exceeds PGA_AGGREGATE_LIMIT",

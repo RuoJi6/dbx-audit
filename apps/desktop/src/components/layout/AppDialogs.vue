@@ -26,6 +26,7 @@ const props = defineProps<{
   connectionPrefill?: ConnectionDeepLinkDraft | null;
   showSettingsDialog: boolean;
   settingsInitialTab?: string;
+  settingsInitialSection?: string;
   appVersion?: string;
   showDangerDialog: boolean;
   dangerSql: string;
@@ -107,7 +108,7 @@ watch(
     @connect-failed="emit('connectFailed', $event)"
     @open-driver-store="emit('openDriverStore')"
   />
-  <EditorSettingsDialog v-if="showSettingsDialog" :open="showSettingsDialog" :initial-tab="settingsInitialTab || 'editor'" :app-version="appVersion" @update:open="emit('update:showSettingsDialog', $event)" />
+  <EditorSettingsDialog v-if="showSettingsDialog" :open="showSettingsDialog" :initial-tab="settingsInitialTab || 'editor'" :initial-section="settingsInitialSection" :app-version="appVersion" @update:open="emit('update:showSettingsDialog', $event)" />
   <DangerConfirmDialog
     v-if="showDangerDialog"
     :open="showDangerDialog"

@@ -22,6 +22,7 @@ fn postgres_test_config(id: &str, database: &str) -> ConnectionConfig {
         password: String::new(),
         database: Some(database.to_string()),
         visible_databases: None,
+        visible_schemas: None,
         attached_databases: Vec::new(),
         color: None,
         transport_layers: Vec::new(),
