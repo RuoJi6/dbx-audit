@@ -73,8 +73,10 @@ function parseGroups(tokens: (string | number)[], start: number): { groups: Geom
         i = inner.end;
       }
       if (i < tokens.length && tokens[i] === ")") i++;
-    } else if (tokens[i] === ")" || tokens[i] === ",") {
+    } else if (tokens[i] === ")") {
       break;
+    } else if (tokens[i] === ",") {
+      i++;
     } else if (typeof tokens[i] === "number") {
       const seq = parseCoordSequence(tokens, i);
       groups.push({ coords: seq.coords, children: [] });

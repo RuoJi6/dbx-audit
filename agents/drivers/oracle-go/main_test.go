@@ -265,6 +265,34 @@ func TestListDatabasesSQLUsesUserDictionaryInsteadOfObjectDictionary(t *testing.
 	}
 }
 
+func TestListTablesSQLUsesSplitDictionaryQuery(t *testing.T) {
+	sqlText := strings.ToUpper(oracleListTablesSQL)
+
+	if !strings.Contains(sqlText, "ALL_TABLES") || !strings.Contains(sqlText, "ALL_OBJECTS") {
+		t.Fatalf("table listing should split tables and views, got: %s", oracleListTablesSQL)
+	}
+	if !strings.Contains(sqlText, "UNION ALL") {
+		t.Fatalf("table listing should union table and view metadata, got: %s", oracleListTablesSQL)
+	}
+	if strings.Contains(sqlText, "ALL_TAB_COMMENTS") {
+		t.Fatalf("table listing should not load comments during refresh, got: %s", oracleListTablesSQL)
+	}
+}
+
+func TestListObjectsSQLUsesSplitDictionaryQuery(t *testing.T) {
+	sqlText := strings.ToUpper(oracleListObjectsSQL)
+
+	if !strings.Contains(sqlText, "ALL_TABLES") || !strings.Contains(sqlText, "ALL_OBJECTS") {
+		t.Fatalf("object listing should split tables from other objects, got: %s", oracleListObjectsSQL)
+	}
+	if !strings.Contains(sqlText, "UNION ALL") {
+		t.Fatalf("object listing should union object metadata, got: %s", oracleListObjectsSQL)
+	}
+	if strings.Contains(sqlText, "ALL_TAB_COMMENTS") {
+		t.Fatalf("object listing should not load comments during refresh, got: %s", oracleListObjectsSQL)
+	}
+}
+
 func TestIsOraclePGALimitError(t *testing.T) {
 	if !isOraclePGALimitError(errors.New("ORA-04036: PGA memory used by the instance exceeds PGA_AGGREGATE_LIMIT")) {
 		t.Fatal("expected ORA-04036 to be detected")

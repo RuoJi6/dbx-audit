@@ -32,6 +32,7 @@ const SCHEME_PROFILES: Record<string, ConnectionProfile> = {
   redis: { type: "redis", profile: "redis", label: "Redis", defaultPort: 6379 },
   rediss: { type: "redis", profile: "redis", label: "Redis", defaultPort: 6379 },
   etcd: { type: "etcd", profile: "etcd", label: "etcd", defaultPort: 2379 },
+  zookeeper: { type: "zookeeper", profile: "zookeeper", label: "Apache ZooKeeper", defaultPort: 2181 },
   mongodb: { type: "mongodb", profile: "mongodb", label: "MongoDB", defaultPort: 27017 },
   "mongodb+srv": { type: "mongodb", profile: "mongodb", label: "MongoDB", defaultPort: 27017 },
   clickhouse: { type: "clickhouse", profile: "clickhouse", label: "ClickHouse", defaultPort: 8123 },
@@ -41,6 +42,7 @@ const SCHEME_PROFILES: Record<string, ConnectionProfile> = {
   elasticsearch: { type: "elasticsearch", profile: "elasticsearch", label: "Elasticsearch", defaultPort: 9200 },
   qdrant: { type: "qdrant", profile: "qdrant", label: "Qdrant", defaultPort: 6333 },
   milvus: { type: "milvus", profile: "milvus", label: "Milvus", defaultPort: 19530 },
+  weaviate: { type: "weaviate", profile: "weaviate", label: "Weaviate", defaultPort: 8080 },
   dm: { type: "dameng", profile: "dm", label: "DM (Dameng)", defaultPort: 5236 },
   dameng: { type: "dameng", profile: "dm", label: "DM (Dameng)", defaultPort: 5236 },
   gaussdb: { type: "gaussdb", profile: "gaussdb", label: "GaussDB", defaultPort: 5432 },
@@ -63,6 +65,7 @@ const HTTP_SELECTED_PROFILES: Record<string, ConnectionProfile> = {
   elasticsearch: SCHEME_PROFILES.elasticsearch,
   qdrant: SCHEME_PROFILES.qdrant,
   milvus: SCHEME_PROFILES.milvus,
+  weaviate: SCHEME_PROFILES.weaviate,
 };
 
 function decodeUrlPart(value: string): string {
@@ -445,6 +448,21 @@ export function parseConnectionUrl(value: string, preferredProfile?: string): Pa
       useMongoUrl: true,
     };
   }
+  if (profile.type === "zookeeper") {
+    return {
+      dbType: profile.type,
+      driverProfile: profile.profile,
+      driverLabel: profile.label,
+      host: parsed.hostname.replace(/^\[(.*)]$/, "$1"),
+      port: parsed.port ? Number(parsed.port) : profile.defaultPort,
+      username: decodeUrlPart(parsed.username),
+      password: decodeUrlPart(parsed.password),
+      database: undefined,
+      urlParams,
+      ssl: false,
+      connectionString: zookeeperConnectStringFromUrl(parsed, profile.defaultPort),
+    };
+  }
 
   return {
     dbType: profile.type,
@@ -458,6 +476,14 @@ export function parseConnectionUrl(value: string, preferredProfile?: string): Pa
     urlParams: effectiveUrlParams,
     ssl: scheme === "rediss" || scheme === "https" || urlParamsRequireTls(profile.type, effectiveUrlParams) || (profile.type === "mysql" && isTidbCloudHost(parsed.hostname)),
   };
+}
+
+function zookeeperConnectStringFromUrl(parsed: URL, defaultPort: number): string {
+  const rawHost = parsed.hostname.replace(/^\[(.*)]$/, "$1");
+  const host = rawHost.includes(":") ? `[${rawHost}]` : rawHost;
+  const port = parsed.port ? Number(parsed.port) : defaultPort;
+  const chroot = parsed.pathname && parsed.pathname !== "/" ? parsed.pathname : "";
+  return `${host}:${port}${chroot}`;
 }
 
 export function applyParsedConnectionUrl(config: Omit<ConnectionConfig, "id">, parsed: ParsedConnectionUrl): Omit<ConnectionConfig, "id"> {

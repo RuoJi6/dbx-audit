@@ -22,6 +22,7 @@ export const BRIDGE_REQUIRED_TYPES = [
   "elasticsearch",
   "qdrant",
   "milvus",
+  "weaviate",
   "etcd",
   "dameng",
   "kingbase",
@@ -57,6 +58,7 @@ export const BRIDGE_REQUIRED_TYPES = [
   "jdbc",
   "access",
   "influxdb",
+  "zookeeper",
 ] as const;
 
 export interface DbxDiagnostics {

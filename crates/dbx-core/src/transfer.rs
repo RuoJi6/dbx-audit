@@ -647,6 +647,13 @@ pub fn escape_value_typed(val: &serde_json::Value, db_type: &DatabaseType, colum
                     }
                 }
             }
+            DatabaseType::SqlServer => {
+                if *b {
+                    "1".to_string()
+                } else {
+                    "0".to_string()
+                }
+            }
             _ => {
                 if *b {
                     "TRUE".to_string()
@@ -1544,7 +1551,7 @@ pub fn pagination_sql(
     let col_list = columns.iter().map(|c| quote_identifier(c, db_type)).collect::<Vec<_>>().join(", ");
 
     match db_type {
-        DatabaseType::SqlServer | DatabaseType::Oracle => {
+        DatabaseType::SqlServer | DatabaseType::Oracle | DatabaseType::Dameng => {
             format!(
                 "SELECT {col_list} FROM {full_table} ORDER BY (SELECT NULL) OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY"
             )
@@ -1573,7 +1580,7 @@ pub fn pagination_sql_with_order(
     let order_expression = postgres_order_by_expression(order_by_columns, db_type);
 
     match db_type {
-        DatabaseType::SqlServer | DatabaseType::Oracle => {
+        DatabaseType::SqlServer | DatabaseType::Oracle | DatabaseType::Dameng => {
             let order_by = order_expression.unwrap_or_else(|| "(SELECT NULL)".to_string());
             format!(
                 "SELECT {col_list} FROM {full_table} ORDER BY {order_by} OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY"
@@ -1614,7 +1621,7 @@ pub fn pagination_sql_with_filter_order(
         .or_else(|| postgres_order_by_expression(default_order_columns, db_type));
 
     match db_type {
-        DatabaseType::SqlServer | DatabaseType::Oracle => {
+        DatabaseType::SqlServer | DatabaseType::Oracle | DatabaseType::Dameng => {
             let order_by = order_expression.unwrap_or_else(|| "(SELECT NULL)".to_string());
             format!(
                 "SELECT {col_list} FROM {full_table}{where_clause} ORDER BY {order_by} OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY"
@@ -1660,7 +1667,7 @@ pub fn keyset_pagination_sql(
     let where_clause = keyset_where_clause(primary_keys, last_pk_values, db_type);
 
     match db_type {
-        DatabaseType::SqlServer | DatabaseType::Oracle => {
+        DatabaseType::SqlServer | DatabaseType::Oracle | DatabaseType::Dameng => {
             format!(
                 "SELECT {col_list} FROM {full_table}{where_clause} ORDER BY {order} OFFSET 0 ROWS FETCH NEXT {limit} ROWS ONLY"
             )
@@ -3363,7 +3370,7 @@ where
         });
 
         let rewritten_source = match object.object_type {
-            db::ObjectSourceKind::View => object.source.clone(),
+            db::ObjectSourceKind::View | db::ObjectSourceKind::MaterializedView => object.source.clone(),
             db::ObjectSourceKind::Procedure | db::ObjectSourceKind::Function => {
                 rewrite_postgres_routine_schema(&object.source, &request.target_schema)
                     .unwrap_or_else(|| object.source.clone())
@@ -3544,6 +3551,7 @@ mod tests {
             password: String::new(),
             database: None,
             visible_databases: None,
+            visible_schemas: None,
             attached_databases: Vec::new(),
             color: None,
             transport_layers: Vec::new(),
@@ -3960,6 +3968,43 @@ mod tests {
     }
 
     #[test]
+    fn dameng_export_pagination_uses_offset_fetch() {
+        let sql = pagination_sql(
+            &[String::from("id"), String::from("name")],
+            "users",
+            "SYSDBA",
+            &DatabaseType::Dameng,
+            500,
+            100,
+        );
+
+        assert_eq!(
+            sql,
+            "SELECT \"id\", \"name\" FROM \"SYSDBA\".\"users\" ORDER BY (SELECT NULL) OFFSET 500 ROWS FETCH NEXT 100 ROWS ONLY"
+        );
+        assert!(!sql.contains(" LIMIT "));
+    }
+
+    #[test]
+    fn dameng_ordered_pagination_uses_offset_fetch() {
+        let sql = pagination_sql_with_order(
+            &[String::from("id"), String::from("name")],
+            "users",
+            "SYSDBA",
+            &DatabaseType::Dameng,
+            200,
+            100,
+            &[String::from("id")],
+        );
+
+        assert_eq!(
+            sql,
+            "SELECT \"id\", \"name\" FROM \"SYSDBA\".\"users\" ORDER BY \"id\" OFFSET 200 ROWS FETCH NEXT 100 ROWS ONLY"
+        );
+        assert!(!sql.contains(" LIMIT "));
+    }
+
+    #[test]
     fn filtered_pagination_preserves_where_and_order() {
         let sql = pagination_sql_with_filter_order(
             &[String::from("id"), String::from("status")],
@@ -3977,6 +4022,27 @@ mod tests {
             sql,
             "SELECT \"id\", \"status\" FROM \"public\".\"users\" WHERE (status = 'active') ORDER BY \"id\" DESC LIMIT 2000 OFFSET 10000"
         );
+    }
+
+    #[test]
+    fn dameng_filtered_pagination_preserves_where_and_order() {
+        let sql = pagination_sql_with_filter_order(
+            &[String::from("id"), String::from("status")],
+            "users",
+            "SYSDBA",
+            &DatabaseType::Dameng,
+            10_000,
+            2_000,
+            Some("WHERE status = 'active'"),
+            Some("\"id\" DESC"),
+            &[String::from("id")],
+        );
+
+        assert_eq!(
+            sql,
+            "SELECT \"id\", \"status\" FROM \"SYSDBA\".\"users\" WHERE (status = 'active') ORDER BY \"id\" DESC OFFSET 10000 ROWS FETCH NEXT 2000 ROWS ONLY"
+        );
+        assert!(!sql.contains(" LIMIT "));
     }
 
     #[test]
@@ -4002,6 +4068,25 @@ mod tests {
             sql,
             "SELECT [id], [name] FROM [dbo].[users] ORDER BY [id] ASC OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY"
         );
+    }
+
+    #[test]
+    fn dameng_keyset_pagination_includes_offset_fetch() {
+        let sql = keyset_pagination_sql(
+            &[String::from("id"), String::from("name")],
+            "users",
+            "SYSDBA",
+            &DatabaseType::Dameng,
+            &[String::from("id")],
+            &[json!(25)],
+            100,
+        );
+
+        assert_eq!(
+            sql,
+            "SELECT \"id\", \"name\" FROM \"SYSDBA\".\"users\" WHERE \"id\" > 25 ORDER BY \"id\" ASC OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY"
+        );
+        assert!(!sql.contains(" LIMIT "));
     }
 
     #[test]
@@ -4238,6 +4323,37 @@ mod tests {
         );
 
         assert_eq!(sql, "INSERT INTO [dbo].[customers] ([name], [note]) VALUES\n(N'Tiếng Việt', N'O''Brien')");
+    }
+
+    #[test]
+    fn sqlserver_insert_formats_bit_booleans_as_numeric_literals() {
+        let sql = generate_insert_typed(
+            &[String::from("enabled"), String::from("deleted")],
+            &[Some(String::from("bit")), Some(String::from("BIT"))],
+            &[vec![json!(true), json!(false)]],
+            "flags",
+            "dbo",
+            &DatabaseType::SqlServer,
+        );
+
+        assert_eq!(sql, "INSERT INTO [dbo].[flags] ([enabled], [deleted]) VALUES\n(1, 0)");
+    }
+
+    #[test]
+    fn sqlserver_upsert_formats_bit_booleans_as_numeric_literals() {
+        let sql = generate_upsert_typed(
+            &[String::from("id"), String::from("enabled")],
+            &[Some(String::from("int")), Some(String::from("bit"))],
+            &[vec![json!(1), json!(true)]],
+            "flags",
+            "dbo",
+            &DatabaseType::SqlServer,
+            &[String::from("id")],
+        );
+
+        assert!(sql.contains("USING (VALUES\n(1, 1)\n)"));
+        assert!(!sql.contains("TRUE"));
+        assert!(!sql.contains("FALSE"));
     }
 
     #[test]

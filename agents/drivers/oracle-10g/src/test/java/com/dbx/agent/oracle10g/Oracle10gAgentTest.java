@@ -15,6 +15,7 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Locale;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import org.junit.jupiter.api.Assertions;
@@ -87,6 +88,26 @@ class Oracle10gAgentTest extends JdbcFakeExecutionBehaviorTest {
             Arrays.asList("APP_TABLE", "APP_VIEW", "APP_PROC", "APP_FUNC"),
             objects.stream().map(ObjectInfo::getName).collect(Collectors.toList())
         );
+    }
+
+    @Test
+    void listTablesSqlUsesSplitDictionaryQuery() {
+        String sql = Oracle10gAgent.listTablesSql().toUpperCase(Locale.ROOT);
+
+        Assertions.assertTrue(sql.contains("ALL_TABLES"), sql);
+        Assertions.assertTrue(sql.contains("ALL_OBJECTS"), sql);
+        Assertions.assertTrue(sql.contains("UNION ALL"), sql);
+        Assertions.assertFalse(sql.contains("ALL_TAB_COMMENTS"), sql);
+    }
+
+    @Test
+    void listObjectsSqlUsesSplitDictionaryQuery() {
+        String sql = Oracle10gAgent.listObjectsSql().toUpperCase(Locale.ROOT);
+
+        Assertions.assertTrue(sql.contains("ALL_TABLES"), sql);
+        Assertions.assertTrue(sql.contains("ALL_OBJECTS"), sql);
+        Assertions.assertTrue(sql.contains("UNION ALL"), sql);
+        Assertions.assertFalse(sql.contains("ALL_TAB_COMMENTS"), sql);
     }
 
     @Test

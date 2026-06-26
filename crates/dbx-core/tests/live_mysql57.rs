@@ -67,3 +67,39 @@ async fn live_mysql_query_cancel_kills_running_sleep() {
     let result = result.unwrap();
     assert_eq!(result.rows, vec![vec![serde_json::json!("1")]]);
 }
+
+#[tokio::test]
+#[ignore = "requires a remote MySQL endpoint"]
+async fn live_mysql_recovers_after_server_idle_disconnect() {
+    let url = std::env::var("DBX_LIVE_MYSQL_IDLE_URL").expect("DBX_LIVE_MYSQL_IDLE_URL");
+
+    let pool =
+        dbx_core::db::mysql::connect_with_ca_cert_and_pool_limit(&url, None, std::time::Duration::from_secs(5), 1)
+            .await
+            .unwrap();
+
+    dbx_core::db::mysql::execute_query_with_max_rows(
+        &pool,
+        "SET SESSION wait_timeout = 1",
+        false,
+        Some(10),
+        Default::default(),
+    )
+    .await
+    .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    let result = dbx_core::db::mysql::execute_query_with_max_rows(
+        &pool,
+        "SELECT 1 AS recovered",
+        false,
+        Some(10),
+        Default::default(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.columns, vec!["recovered"]);
+    assert_eq!(result.rows, vec![vec![serde_json::json!("1")]]);
+}

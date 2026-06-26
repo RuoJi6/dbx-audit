@@ -83,6 +83,15 @@ class TDengineAgentMetadataTest {
     }
 
     @Test
+    void doesNotExposeDatabasesAsSchemas() {
+        TDengineAgent agent = new TDengineAgent();
+        TestSupport.setPrivateConnection(agent, JdbcMetadataSqlFake.connection());
+
+        Assertions.assertTrue(agent.listSchemas().isEmpty());
+        Assertions.assertTrue(JdbcMetadataSqlFake.statements.isEmpty());
+    }
+
+    @Test
     void setsDatabaseBeforeExecutionWhenSchemaIsProvided() {
         TDengineAgent agent = new TDengineAgent();
         TestSupport.setPrivateConnection(agent, JdbcAgentFake.connection());

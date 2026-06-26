@@ -21,9 +21,11 @@ pub mod mcp_bridge;
 pub mod mongo_cmd;
 #[cfg(feature = "mq-admin")]
 pub mod mq_cmd;
+pub mod nacos_cmd;
 pub mod plugins;
 pub mod query;
 pub mod query_cancel;
+pub mod query_result_export;
 pub mod redis_cmd;
 pub mod redis_pubsub_server;
 pub mod saved_sql;
@@ -40,3 +42,4 @@ pub mod text_export;
 pub mod transfer;
 pub mod update;
 pub mod xlsx_export;
+pub mod zookeeper_cmd;

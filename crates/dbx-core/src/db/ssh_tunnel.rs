@@ -77,6 +77,18 @@ async fn connect_and_authenticate(
             .map_err(|_| format!("SSH connection timed out ({connect_timeout_secs}s)"))?
             .map_err(|e| format!("SSH connection failed: {e}"))?;
 
+    // Probe with "none" authentication first. Some SSH proxies and jump-hosts
+    // accept connections without any credential, and this is also the standard
+    // SSH probe used to discover the auth methods the server supports.
+    let none_res = tokio::time::timeout(connect_timeout, session.authenticate_none(ssh_user))
+        .await
+        .map_err(|_| format!("SSH auth probe timed out ({connect_timeout_secs}s)"))?
+        .map_err(|e| format!("SSH auth probe failed: {e}"))?;
+    if none_res.success() {
+        return Ok(session);
+    }
+
+    // "none" was rejected — fall back to the configured credential method.
     if !ssh_key_path.is_empty() {
         // Validate SSH key file path
         validate_file_path(ssh_key_path, |_| false)?;
@@ -114,7 +126,10 @@ async fn connect_and_authenticate(
             Err(agent_err) => return Err(agent_err),
         }
     } else {
-        return Err("No SSH authentication method provided (password, key, or ssh-agent)".to_string());
+        return Err(
+            "SSH authentication failed: \"none\" was rejected and no password, key, or ssh-agent is configured"
+                .to_string(),
+        );
     }
 
     Ok(session)

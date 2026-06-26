@@ -75,6 +75,7 @@ pub fn quote_table_identifier(database_type: Option<DatabaseType>, name: &str) -
         Some(DatabaseType::Jdbc) => name.to_string(),
         Some(
             DatabaseType::Mysql
+            | DatabaseType::ClickHouse
             | DatabaseType::Goldendb
             | DatabaseType::StarRocks
             | DatabaseType::ManticoreSearch

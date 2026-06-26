@@ -67,12 +67,13 @@ pub async fn connect_db(
     let config = body.config;
     let app = &state.app;
     let connection_id = config.id.clone();
+    let attempt = app.begin_connection_attempt(&connection_id).await;
 
-    app.remove_connection_pools(&connection_id).await;
+    app.remove_connection_pools_detached(&connection_id).await;
     app.reset_connection_transport_for_config(&connection_id, &config).await;
     app.configs.write().await.insert(connection_id.clone(), config.clone());
 
-    app.get_or_create_pool(&connection_id, None).await.map_err(AppError)?;
+    app.get_or_create_pool_for_connection_attempt(&connection_id, None, attempt).await.map_err(AppError)?;
 
     Ok(Json(connection_id))
 }
@@ -101,9 +102,13 @@ pub async fn disconnect_db(
 ) -> Result<Json<()>, AppError> {
     let app = &state.app;
 
-    app.remove_connection_pools(&body.connection_id).await;
+    app.supersede_connection_attempt(&body.connection_id).await;
+    app.remove_connection_pools_detached(&body.connection_id).await;
+    app.nacos_registry.drop_connection(&body.connection_id).await;
+    #[cfg(feature = "mq-admin")]
+    app.mq_registry.drop_connection(&body.connection_id).await;
     app.reset_connection_transport(&body.connection_id).await;
-    if body.connection_id.starts_with("__visible_draft_") {
+    if body.connection_id.starts_with("__visible_draft_") || body.connection_id.starts_with("__visible_schema_draft_") {
         app.configs.write().await.remove(&body.connection_id);
     }
 
@@ -134,6 +139,7 @@ pub async fn save_connections(
     state.app.storage.save_connections(&body.configs).await.map_err(AppError)?;
     let sync = sync_connection_configs(&state, &body.configs).await;
     remove_connection_pools_for_connection_ids(&state, &sync.connection_pool_ids_to_drop).await;
+    drop_nacos_adapters_for_connection_ids(&state, &sync.nacos_adapter_ids_to_drop).await;
     drop_mq_adapters_for_connection_ids(&state, &sync.mq_adapter_ids_to_drop).await;
     Ok(Json(()))
 }
@@ -142,17 +148,20 @@ pub async fn load_connections(State(state): State<Arc<WebState>>) -> Result<Json
     let configs = state.app.storage.load_connections().await.map_err(AppError)?;
     let sync = sync_connection_configs(&state, &configs).await;
     remove_connection_pools_for_connection_ids(&state, &sync.connection_pool_ids_to_drop).await;
+    drop_nacos_adapters_for_connection_ids(&state, &sync.nacos_adapter_ids_to_drop).await;
     drop_mq_adapters_for_connection_ids(&state, &sync.mq_adapter_ids_to_drop).await;
     Ok(Json(configs))
 }
 
 struct ConnectionConfigSync {
+    nacos_adapter_ids_to_drop: Vec<String>,
     mq_adapter_ids_to_drop: Vec<String>,
     connection_pool_ids_to_drop: Vec<String>,
 }
 
 async fn sync_connection_configs(state: &WebState, configs: &[ConnectionConfig]) -> ConnectionConfigSync {
     let saved_ids: HashSet<&str> = configs.iter().map(|config| config.id.as_str()).collect();
+    let mut nacos_adapter_ids_to_drop = HashSet::new();
     let mut mq_adapter_ids_to_drop = HashSet::new();
     let mut connection_pool_ids_to_drop = HashSet::new();
     let mut runtime_configs = state.app.configs.write().await;
@@ -161,6 +170,9 @@ async fn sync_connection_configs(state: &WebState, configs: &[ConnectionConfig])
             true
         } else {
             connection_pool_ids_to_drop.insert(id.clone());
+            if existing.db_type == dbx_core::models::connection::DatabaseType::Nacos {
+                nacos_adapter_ids_to_drop.insert(id.clone());
+            }
             if existing.db_type == dbx_core::models::connection::DatabaseType::MessageQueue {
                 mq_adapter_ids_to_drop.insert(id.clone());
             }
@@ -168,10 +180,16 @@ async fn sync_connection_configs(state: &WebState, configs: &[ConnectionConfig])
         }
     });
     for config in configs {
+        if config.db_type == dbx_core::models::connection::DatabaseType::Nacos {
+            nacos_adapter_ids_to_drop.insert(config.id.clone());
+        }
         if config.db_type == dbx_core::models::connection::DatabaseType::MessageQueue {
             mq_adapter_ids_to_drop.insert(config.id.clone());
         }
         if let Some(previous) = runtime_configs.insert(config.id.clone(), config.clone()) {
+            if previous.db_type == dbx_core::models::connection::DatabaseType::Nacos {
+                nacos_adapter_ids_to_drop.insert(config.id.clone());
+            }
             if previous.db_type == dbx_core::models::connection::DatabaseType::MessageQueue {
                 mq_adapter_ids_to_drop.insert(config.id.clone());
             }
@@ -181,13 +199,20 @@ async fn sync_connection_configs(state: &WebState, configs: &[ConnectionConfig])
         }
     }
     ConnectionConfigSync {
+        nacos_adapter_ids_to_drop: nacos_adapter_ids_to_drop.into_iter().collect(),
         mq_adapter_ids_to_drop: mq_adapter_ids_to_drop.into_iter().collect(),
         connection_pool_ids_to_drop: connection_pool_ids_to_drop.into_iter().collect(),
     }
 }
 
 fn is_transient_runtime_config_id(id: &str) -> bool {
-    id.starts_with("__test_") || id.starts_with("__visible_draft_")
+    id.starts_with("__test_") || id.starts_with("__visible_draft_") || id.starts_with("__visible_schema_draft_")
+}
+
+async fn drop_nacos_adapters_for_connection_ids(state: &WebState, connection_ids: &[String]) {
+    for connection_id in connection_ids {
+        state.app.nacos_registry.drop_connection(connection_id).await;
+    }
 }
 
 #[cfg(feature = "mq-admin")]
@@ -202,7 +227,7 @@ async fn drop_mq_adapters_for_connection_ids(_state: &WebState, _connection_ids:
 
 async fn remove_connection_pools_for_connection_ids(state: &WebState, connection_ids: &[String]) {
     for connection_id in connection_ids {
-        state.app.remove_connection_pools(connection_id).await;
+        state.app.remove_connection_pools_detached(connection_id).await;
     }
 }
 
@@ -238,6 +263,7 @@ mod tests {
             password: String::new(),
             database: None,
             visible_databases: None,
+            visible_schemas: None,
             attached_databases: Vec::new(),
             color: None,
             transport_layers: Vec::new(),

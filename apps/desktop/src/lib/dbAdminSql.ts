@@ -34,6 +34,10 @@ export interface SchemaNameSqlOptions {
   name: string;
 }
 
+export interface SchemaCommentSqlOptions extends SchemaNameSqlOptions {
+  comment: string;
+}
+
 export interface DuplicateTableStructureSqlOptions {
   databaseType?: DatabaseType;
   schema?: string | null;
@@ -73,6 +77,34 @@ export function buildDropSchemaSql(options: SchemaNameSqlOptions): Promise<strin
   return api.buildDropSchemaSql(options);
 }
 
+export function supportsSchemaComment(databaseType?: DatabaseType): boolean {
+  return databaseType === "postgres";
+}
+
+export function buildGetSchemaCommentSql(options: SchemaNameSqlOptions): string {
+  if (!supportsSchemaComment(options.databaseType)) {
+    throw new Error("Schema comments are not supported by this database");
+  }
+  return ["SELECT d.description AS comment", "FROM pg_catalog.pg_namespace n", "LEFT JOIN pg_catalog.pg_description d ON d.objoid = n.oid AND d.objsubid = 0 AND d.classoid = 'pg_namespace'::regclass", `WHERE n.nspname = ${quoteSqlLiteral(options.name)};`].join("\n");
+}
+
+export function buildSetSchemaCommentSql(options: SchemaCommentSqlOptions): string {
+  if (!supportsSchemaComment(options.databaseType)) {
+    throw new Error("Schema comments are not supported by this database");
+  }
+  const comment = options.comment.trim();
+  const literal = comment ? quoteSqlLiteral(comment) : "NULL";
+  return `COMMENT ON SCHEMA ${quotePostgresIdentifier(options.name)} IS ${literal};`;
+}
+
 export function buildDuplicateTableStructureSql(options: DuplicateTableStructureSqlOptions): Promise<string> {
   return api.buildDuplicateTableStructureSql(options);
+}
+
+function quotePostgresIdentifier(value: string): string {
+  return `"${value.replace(/"/g, '""')}"`;
+}
+
+function quoteSqlLiteral(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
 }

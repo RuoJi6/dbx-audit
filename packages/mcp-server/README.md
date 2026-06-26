@@ -117,7 +117,7 @@ AI Agent → MCP Server → Database
 The MCP server reads your database connections from DBX's SQLite database:
 
 - **macOS**: `~/Library/Application Support/com.dbx.app/dbx.db`
-- **Linux**: `~/.config/com.dbx.app/dbx.db`
+- **Linux**: `~/.local/share/com.dbx.app/dbx.db`
 - **Windows**: `%APPDATA%\com.dbx.app\dbx.db`
 
 ## DBX UI Integration
@@ -234,7 +234,7 @@ DBX_MCP_ALLOW_DANGEROUS_SQL=1
 MCP Server 从 DBX 的 SQLite 数据库读取连接信息：
 
 - **macOS**: `~/Library/Application Support/com.dbx.app/dbx.db`
-- **Linux**: `~/.config/com.dbx.app/dbx.db`
+- **Linux**: `~/.local/share/com.dbx.app/dbx.db`
 - **Windows**: `%APPDATA%\com.dbx.app\dbx.db`
 
 ### DBX UI 联动

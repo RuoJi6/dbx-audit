@@ -7,6 +7,7 @@ type CachedStructuredFilterRule = {
   mode: "equals" | "not-equals" | "is-null" | "is-not-null" | "like" | "not-like" | "less-than" | "greater-than";
   rawValue: string;
   conjunction: "AND" | "OR";
+  disabled?: boolean;
 };
 type StructuredFilterCacheState = {
   scopeKey: string;
@@ -39,6 +40,7 @@ import {
   Code2,
   Copy,
   Eye,
+  EyeOff,
   Loader2,
   X,
   Undo2,
@@ -60,6 +62,7 @@ import {
   PanelBottom,
   PanelRight,
   TableProperties,
+  Database,
 } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import QueryLoadingState from "@/components/common/QueryLoadingState.vue";
@@ -87,7 +90,7 @@ import type { BuildSingleColumnAlterSqlOptions } from "@/lib/tableStructureEdito
 import { buildTableSelectSql, quoteTableIdentifier } from "@/lib/tableSelectSql";
 import { uuid } from "@/lib/utils";
 import { resolveHeaderColumnType } from "@/lib/dataGridColumnType";
-import { canEditExistingTableRows, hiveTablePropertiesIndicateTransactional, isHiddenGridColumn, isTdengineExistingRowReadonlyColumn, usesSyntheticRowIdKey } from "@/lib/tableEditing";
+import { canEditExistingTableRows, canUseKeylessRowPredicate, hiveTablePropertiesIndicateTransactional, isClickHouseExistingRowReadonlyColumn, isHiddenGridColumn, isTdengineExistingRowReadonlyColumn, usesSyntheticRowIdKey } from "@/lib/tableEditing";
 import { buildDataGridContextFilterCondition, buildDataGridCountSql, buildHiveTablePropertiesSql, type DataGridContextFilterMode } from "@/lib/dataGridSql";
 import {
   buildVisibleTransposeRows,
@@ -129,7 +132,7 @@ import { parseClipboardTable } from "@/lib/gridSelection";
 
 import { useToast } from "@/composables/useToast";
 import { useDataGridExport } from "@/composables/useDataGridExport";
-import { readTextFromClipboard } from "@/lib/clipboard";
+import { eventTargetAllowsNativeClipboard, isPlainClipboardShortcut, readTextFromClipboard } from "@/lib/clipboard";
 import ExportProgressDialog from "@/components/export/ExportProgressDialog.vue";
 import { DATA_GRID_ROW_NUM_WIDTH, useDataGridColumnResize } from "@/composables/useDataGridColumnResize";
 import { useDataGridSelection } from "@/composables/useDataGridSelection";
@@ -137,15 +140,19 @@ import { useDataGridEditor } from "@/composables/useDataGridEditor";
 import { useSqlHighlighter } from "@/composables/useSqlHighlighter";
 import { useCellDetailEditor, type UseCellDetailEditorReturn } from "@/composables/useCellDetailEditor";
 import { useTheme } from "@/composables/useTheme";
+import { useConnectionStore } from "@/stores/connectionStore";
 import { useSettingsStore } from "@/stores/settingsStore";
-import type { DataGridSortDirection } from "@/lib/dataGridSort";
+import type { DataGridSortDirection, DataGridSortMode } from "@/lib/dataGridSort";
 import { getTableMetadataCapabilities } from "@/lib/tableMetadataCapabilities";
 import { forgetDataGridConditionHistory, loadDataGridConditionHistory, rememberDataGridConditionHistory } from "@/lib/dataGridConditionHistory";
+import { caretPositionInsideInsertedSqlSingleQuotes, insertedSqlSingleQuoteAtCaret } from "@/lib/sqlQuoteCaret";
+import { effectiveDatabaseTypeForConnection } from "@/lib/jdbcDialect";
 
 const SqlPreviewPanel = defineAsyncComponent(() => import("@/components/editor/SqlPreviewPanel.vue"));
 
 const { t } = useI18n();
 const slots = useSlots();
+const connectionStore = useConnectionStore();
 const settingsStore = useSettingsStore();
 const { isDark } = useTheme();
 const { toast } = useToast();
@@ -169,7 +176,7 @@ type ConditionSuggestion = {
   kind: "column" | "history";
 };
 
-type SortMenuValue = "asc" | "desc" | "clear";
+type SortMenuValue = "local-asc" | "local-desc" | "database-asc" | "database-desc" | "clear";
 
 const props = defineProps<{
   result: QueryResult;
@@ -186,6 +193,7 @@ const props = defineProps<{
   sortColumn?: string;
   sortColumnIndex?: number;
   sortDirection?: DataGridSortDirection;
+  sortMode?: DataGridSortMode;
   tableMeta?: {
     schema?: string;
     tableName: string;
@@ -202,6 +210,7 @@ const props = defineProps<{
   cacheKey?: string;
   onExecuteSql?: (sql: string) => Promise<void>;
   fullExportResult?: (onProgress?: (info: { rowsExported: number; totalRows: number | null }) => void) => Promise<QueryResult | undefined>;
+  queryResultExportRequest?: (options: { exportId: string; filePath: string; format: "csv" | "xlsx" }) => Promise<api.QueryResultExportRequest | undefined>;
   allExportResults?: Array<{ sheetName: string; result: QueryResult }>;
   customSaveHandler?: import("@/composables/useDataGridEditor").CustomSaveHandler;
 }>();
@@ -213,7 +222,7 @@ const dataGridElapsed = () => `${Math.round(performance.now() - dataGridCreatedA
 const emit = defineEmits<{
   reload: [sql?: string, searchText?: string, whereInput?: string, orderBy?: string, limit?: number, offset?: number];
   paginate: [offset: number, limit: number, whereInput?: string, orderBy?: string];
-  sort: [column: string, columnIndex: number, direction: "asc" | "desc" | null, whereInput?: string];
+  sort: [column: string, columnIndex: number, direction: "asc" | "desc" | null, whereInput?: string, mode?: DataGridSortMode];
   "update:whereInput": [value: string];
   "update:orderByInput": [value: string];
 }>();
@@ -284,6 +293,7 @@ const columnTypeMap = computed(() => {
   }
   return map;
 });
+const resolvedDatabaseType = computed(() => props.databaseType ?? effectiveDatabaseTypeForConnection(connectionStore.getConfig(props.connectionId ?? "")));
 
 const columnCommentMap = computed(() => {
   const map = new Map<string, string>();
@@ -349,16 +359,29 @@ function columnIsSorted(column: string, columnIndex: number): boolean {
 function sortMenuItems(column: string, columnIndex: number) {
   return [
     {
-      label: t("grid.sortAscending"),
-      value: "asc",
+      label: t("grid.sortCurrentPageAscending"),
+      value: "local-asc",
       icon: ArrowUp,
-      checked: columnIsSorted(column, columnIndex) && sortDir.value === "asc",
+      checked: columnIsSorted(column, columnIndex) && sortDir.value === "asc" && sortMode.value === "local",
     },
     {
-      label: t("grid.sortDescending"),
-      value: "desc",
+      label: t("grid.sortCurrentPageDescending"),
+      value: "local-desc",
       icon: ArrowDown,
-      checked: columnIsSorted(column, columnIndex) && sortDir.value === "desc",
+      checked: columnIsSorted(column, columnIndex) && sortDir.value === "desc" && sortMode.value === "local",
+    },
+    {
+      label: t("grid.sortDatabaseAscending"),
+      value: "database-asc",
+      icon: Database,
+      checked: columnIsSorted(column, columnIndex) && sortDir.value === "asc" && sortMode.value === "database",
+      separatorBefore: true,
+    },
+    {
+      label: t("grid.sortDatabaseDescending"),
+      value: "database-desc",
+      icon: Database,
+      checked: columnIsSorted(column, columnIndex) && sortDir.value === "desc" && sortMode.value === "database",
     },
     {
       label: t("grid.clearSort"),
@@ -371,7 +394,7 @@ function sortMenuItems(column: string, columnIndex: number) {
 }
 
 function selectedSortMenuValue(column: string, columnIndex: number): SortMenuValue | undefined {
-  return columnIsSorted(column, columnIndex) ? sortDir.value : undefined;
+  return columnIsSorted(column, columnIndex) ? (`${sortMode.value}-${sortDir.value}` as SortMenuValue) : undefined;
 }
 
 function typeColorClass(t: string): string {
@@ -424,6 +447,7 @@ const transposeViewportWidth = ref(0);
 const sortCol = ref<string | null>(null);
 const sortColIndex = ref<number | null>(null);
 const sortDir = ref<DataGridSortDirection>("asc");
+const sortMode = ref<DataGridSortMode>("database");
 const searchText = ref("");
 const deferredClientSearchText = ref("");
 const searchOverlayVisible = ref(false);
@@ -453,6 +477,7 @@ const orderBySuggestionPosition = ref({ left: 0, top: 0 });
 const orderByInput = ref(props.initialOrderByInput ?? "");
 const hasOrderByInput = computed(() => orderByInput.value.trim().length > 0);
 const whereFilterInput = ref(props.initialWhereInput ?? "");
+let previousWhereFilterInputValue = whereFilterInput.value;
 const hasWhereFilterInput = computed(() => whereFilterInput.value.trim().length > 0);
 const conditionHistoryScope = computed(() => ({
   connectionId: props.connectionId,
@@ -496,6 +521,7 @@ type StructuredFilterRule = {
   mode: FilterMode;
   rawValue: string;
   conjunction: "AND" | "OR";
+  disabled?: boolean;
 };
 
 const localColumnFilters = ref<Record<number, Set<string>>>({});
@@ -522,7 +548,7 @@ const structuredFilterCacheKey = computed(() => props.cacheKey || [props.connect
 const structuredFilterScopeKey = computed(() => [props.connectionId ?? "", props.database ?? "", props.schema ?? "", props.context ?? "", props.tableMeta?.schema ?? "", props.tableMeta?.tableName ?? "", filterBuilderColumnOptions.value.join("\0")].join("\u0001"));
 const structuredFilterRules = ref<StructuredFilterRule[]>([]);
 const appliedStructuredWhereInput = ref("");
-const structuredFilterCount = computed(() => structuredFilterRules.value.filter((rule) => !!rule.columnName && (!filterModeNeedsValue(rule.mode) || rule.rawValue.trim().length > 0)).length);
+const structuredFilterCount = computed(() => structuredFilterRules.value.filter((rule) => !rule.disabled && !!rule.columnName && (!filterModeNeedsValue(rule.mode) || rule.rawValue.trim().length > 0)).length);
 const hasStructuredFilters = computed(() => !!combineWhereInputs(undefined, appliedStructuredWhereInput.value));
 const formatterOpenColumn = ref<number | null>(null);
 type FormatterDraftKind = Exclude<ColumnFormatterConfig["kind"], "custom-ref">;
@@ -931,7 +957,7 @@ async function applyTypedLocalFilterValue() {
   const columnName = props.result.columns[draft.columnIndex];
   if (!columnName) return;
   const condition = await buildColumnValueFilterCondition({
-    databaseType: props.databaseType,
+    databaseType: resolvedDatabaseType.value,
     columnName,
     columnInfo: props.tableMeta?.columns.find((column) => column.name === columnName),
     rawValue: localFilterTypedValue.value,
@@ -976,6 +1002,35 @@ function cachedStructuredFilterState(): StructuredFilterCacheState | undefined {
   return cached?.scopeKey === structuredFilterScopeKey.value ? cached : undefined;
 }
 
+async function buildStructuredWhereFromRules(rules: StructuredFilterRule[]): Promise<string> {
+  const rulesWithConditions = (
+    await Promise.all(
+      rules.map(async (rule) => {
+        if (rule.disabled) return { rule, condition: null };
+        if (!rule.columnName) return { rule, condition: null };
+        if (filterModeNeedsValue(rule.mode) && !rule.rawValue.trim()) return { rule, condition: null };
+        const columnInfo = filterBuilderColumns.value.find((column) => column.name === rule.columnName);
+        return {
+          rule,
+          condition:
+            (await buildDataGridContextFilterCondition({
+              databaseType: resolvedDatabaseType.value,
+              columnName: rule.columnName,
+              columnInfo,
+              mode: rule.mode,
+              value: filterModeNeedsValue(rule.mode) ? parseFilterValue(rule.rawValue, columnInfo) : null,
+            })) ?? null,
+        };
+      }),
+    )
+  ).filter((item): item is { rule: StructuredFilterRule; condition: string } => !!item.condition);
+
+  return buildGroupedWhere(
+    rulesWithConditions.map((item) => item.condition),
+    rulesWithConditions.map((item) => item.rule),
+  );
+}
+
 function persistStructuredFilterState() {
   structuredFilterStateCache.set(structuredFilterCacheKey.value, {
     scopeKey: structuredFilterScopeKey.value,
@@ -988,10 +1043,16 @@ function persistStructuredFilterState() {
 function loadStructuredFilterStateForScope() {
   const cached = cachedStructuredFilterState();
   if (cached) {
+    const cacheKey = structuredFilterCacheKey.value;
+    const scopeKey = structuredFilterScopeKey.value;
     structuredFilterRules.value = cloneStructuredFilterRules(cached.rules);
-    appliedStructuredWhereInput.value = cached.appliedWhereInput;
     whereFilterInput.value = cached.manualWhereInput;
-    nextTick(() => emit("update:whereInput", currentWhereInput() ?? ""));
+    appliedStructuredWhereInput.value = "";
+    void buildStructuredWhereFromRules(structuredFilterRules.value).then((whereInput) => {
+      if (structuredFilterCacheKey.value !== cacheKey || structuredFilterScopeKey.value !== scopeKey) return;
+      appliedStructuredWhereInput.value = whereInput;
+      nextTick(() => emit("update:whereInput", currentWhereInput() ?? ""));
+    });
     return;
   }
   appliedStructuredWhereInput.value = "";
@@ -1075,31 +1136,7 @@ function buildGroupedWhere(conditions: string[], rules: StructuredFilterRule[]):
 
 async function applyStructuredFilters() {
   if (!canUseWhereSearch.value) return;
-  const rulesWithConditions = (
-    await Promise.all(
-      structuredFilterRules.value.map(async (rule) => {
-        if (!rule.columnName) return { rule, condition: null };
-        if (filterModeNeedsValue(rule.mode) && !rule.rawValue.trim()) return { rule, condition: null };
-        const columnInfo = filterBuilderColumns.value.find((column) => column.name === rule.columnName);
-        return {
-          rule,
-          condition:
-            (await buildDataGridContextFilterCondition({
-              databaseType: props.databaseType,
-              columnName: rule.columnName,
-              columnInfo,
-              mode: rule.mode,
-              value: filterModeNeedsValue(rule.mode) ? parseFilterValue(rule.rawValue, columnInfo) : null,
-            })) ?? null,
-        };
-      }),
-    )
-  ).filter((item): item is { rule: StructuredFilterRule; condition: string } => !!item.condition);
-
-  appliedStructuredWhereInput.value = buildGroupedWhere(
-    rulesWithConditions.map((item) => item.condition),
-    rulesWithConditions.map((item) => item.rule),
-  );
+  appliedStructuredWhereInput.value = await buildStructuredWhereFromRules(structuredFilterRules.value);
   filterBuilderOpen.value = false;
   await applyWhereFilter();
 }
@@ -1327,9 +1364,38 @@ function deleteWhereHistorySuggestion(value: string) {
   whereSuggestionIndex.value = whereSuggestions.value.length ? Math.min(whereSuggestionIndex.value, whereSuggestions.value.length - 1) : -1;
 }
 
+function onWhereFilterInput(event: Event) {
+  const input = event.target instanceof HTMLInputElement ? event.target : null;
+  if (!input) return;
+  const nextValue = input.value;
+  if (
+    insertedSqlSingleQuoteAtCaret({
+      previousValue: previousWhereFilterInputValue,
+      nextValue,
+      selectionStart: input.selectionStart,
+    })
+  ) {
+    const caret = input.selectionStart ?? nextValue.length;
+    const pairedValue = `${nextValue.slice(0, caret)}'${nextValue.slice(caret)}`;
+    whereFilterInput.value = pairedValue;
+    previousWhereFilterInputValue = pairedValue;
+    nextTick(() => input.setSelectionRange(caret, caret));
+    return;
+  }
+  const nextCaret = caretPositionInsideInsertedSqlSingleQuotes({
+    previousValue: previousWhereFilterInputValue,
+    nextValue,
+    selectionStart: input.selectionStart,
+  });
+  previousWhereFilterInputValue = nextValue;
+  if (nextCaret == null) return;
+  nextTick(() => input.setSelectionRange(nextCaret, nextCaret));
+}
+
 watch(whereFilterInput, (val) => {
   emit("update:whereInput", currentWhereInput() ?? "");
   persistStructuredFilterState();
+  previousWhereFilterInputValue = val;
   whereSuggestions.value = [];
   if (!props.tableMeta?.columns?.length) return;
   const trimmed = val.trim();
@@ -2345,6 +2411,7 @@ const canJumpLastPage = computed(() => canGoNextPage.value && (hasKnownTotalRowC
 const totalRowCountBusy = computed(() => props.totalRowCountLoading === true || manualTotalRowCountLoading.value);
 const canCalculateTotalRowCount = computed(() => !isResultsContext.value && !!props.connectionId && (!!props.tableMeta || !!props.countSql));
 const showQueryEditReadyBadge = computed(() => isResultsContext.value && hasData.value && !!props.editable && !!props.tableMeta);
+const showKeylessEditWarning = computed(() => !!props.editable && !!props.tableMeta && canUseKeylessRowPredicate(props.databaseType, props.tableMeta.primaryKeys ?? []));
 const canShowWhereSearch = computed(() => !!props.onExecuteSql && !isResultsContext.value);
 const canUseWhereSearch = computed(() => !!props.tableMeta && !!props.onExecuteSql && !isResultsContext.value);
 type DataGridTableMeta = NonNullable<typeof props.tableMeta>;
@@ -2408,14 +2475,15 @@ function syncOrderByInputWithSort(column: string | null, direction: "asc" | "des
 }
 
 watch(
-  () => [props.sortColumn, props.sortColumnIndex, props.sortDirection] as const,
-  ([column, columnIndex, direction], previous) => {
+  () => [props.sortColumn, props.sortColumnIndex, props.sortDirection, props.sortMode] as const,
+  ([column, columnIndex, direction, mode], previous) => {
     const wasControlledSort = !!previous?.[0] && !!previous?.[2];
     const isControlledSort = !!column && !!direction;
     sortCol.value = column && direction ? column : null;
     sortColIndex.value = typeof columnIndex === "number" && direction ? columnIndex : null;
     sortDir.value = direction ?? "asc";
-    if (isControlledSort) {
+    sortMode.value = mode ?? "database";
+    if (isControlledSort && sortMode.value === "database") {
       syncOrderByInputWithSort(sortCol.value, sortDir.value);
     } else if (wasControlledSort) {
       syncOrderByInputWithSort(null, null);
@@ -2630,6 +2698,7 @@ const {
   dirtyRows,
   newRows,
   deletedRows,
+  pendingChangesVersion,
   pendingChangeCount,
   hasPendingChanges,
   transactionActive,
@@ -2711,7 +2780,7 @@ function closeSqlPreview() {
 }
 
 // Watch for edits — auto-refresh preview when panel is open
-watch([pendingChangeCount, dirtyRows, newRows, deletedRows], () => {
+watch([pendingChangeCount, pendingChangesVersion], () => {
   schedulePreviewRefresh();
 });
 
@@ -2751,6 +2820,8 @@ function canEditCellItem(item: RowItem | undefined, columnIndex: number): boolea
   if (!canEditRowItem(item) || !canEditColumn(columnIndex)) return false;
   if (!item?.isNew) {
     const column = props.result.columns[columnIndex] ?? "";
+    const sourceColumn = props.sourceColumns?.[columnIndex] ?? column;
+    if (isClickHouseExistingRowReadonlyColumn(props.databaseType, sourceColumn, props.tableMeta?.primaryKeys ?? [], props.tableMeta?.columns ?? [])) return false;
     if (isTdengineExistingRowReadonlyColumn(props.databaseType, column, props.tableMeta?.columns ?? [])) return false;
   }
   return true;
@@ -3433,7 +3504,7 @@ async function prefetchDetailSqlCondition() {
 
   try {
     const condition = await buildDataGridContextFilterCondition({
-      databaseType: props.databaseType,
+      databaseType: resolvedDatabaseType.value,
       columnName: detail.column,
       columnInfo: props.tableMeta?.columns.find((column) => column.name === detail.column),
       mode: "equals",
@@ -3491,6 +3562,16 @@ const editorThemeAccessor = () => settingsStore.editorSettings.theme;
 const editorAppAppearance = () => (isDark.value ? "dark" : "light") as import("@/lib/appTheme").AppThemeAppearance;
 const editorFontSize = () => settingsStore.editorSettings.fontSize;
 const editorFontFamily = () => settingsStore.editorSettings.fontFamily;
+const SIDE_DETAIL_EDITOR_MIN_HEIGHT = 160;
+const SIDE_DETAIL_EDITOR_MAX_HEIGHT = 360;
+const SIDE_DETAIL_EDITOR_LINE_HEIGHT = 20;
+const SIDE_DETAIL_EDITOR_SOFT_WRAP_CHARS = 48;
+const sideDetailEditorStyle = computed(() => {
+  if (cellDetailPanelIsBottom.value) return undefined;
+  const lines = detailEditValue.value.split(/\r\n|\r|\n/).reduce((total, line) => total + Math.max(1, Math.ceil(line.length / SIDE_DETAIL_EDITOR_SOFT_WRAP_CHARS)), 0);
+  const height = Math.min(SIDE_DETAIL_EDITOR_MAX_HEIGHT, Math.max(SIDE_DETAIL_EDITOR_MIN_HEIGHT, lines * SIDE_DETAIL_EDITOR_LINE_HEIGHT + 28));
+  return { height: `${height}px` };
+});
 
 function getDetailEditor(): UseCellDetailEditorReturn | null {
   return activeCellDetailTab.value === "valueEditor" ? valueDetailEditor : detailsDetailEditor;
@@ -3691,7 +3772,7 @@ function setDetailNull() {
   detailCell.value = { ...detailCell.value! };
 }
 
-function applyColumnSort(column: string, columnIndex: number, direction: "asc" | "desc" | null) {
+function applyColumnSort(column: string, columnIndex: number, direction: "asc" | "desc" | null, mode: DataGridSortMode = "database") {
   if (getIsResizing()) return;
   currentPage.value = 1;
   resetGridVerticalScroll(true);
@@ -3699,30 +3780,41 @@ function applyColumnSort(column: string, columnIndex: number, direction: "asc" |
     sortCol.value = column;
     sortColIndex.value = columnIndex;
     sortDir.value = direction;
-    syncOrderByInputWithSort(column, direction);
+    sortMode.value = mode;
+    if (mode === "database") {
+      syncOrderByInputWithSort(column, direction);
+    } else {
+      syncOrderByInputWithSort(null, null);
+    }
   } else {
     sortCol.value = null;
     sortColIndex.value = null;
     sortDir.value = "asc";
+    sortMode.value = "database";
     syncOrderByInputWithSort(null, null);
   }
-  emit("sort", column, columnIndex, direction, currentWhereInput());
+  emit("sort", column, columnIndex, direction, currentWhereInput(), mode);
 }
 
 function selectHeaderSort(value: string, column: string, columnIndex: number) {
-  applyColumnSort(column, columnIndex, value === "clear" ? null : (value as DataGridSortDirection));
+  if (value === "clear") {
+    applyColumnSort(column, columnIndex, null, sortMode.value);
+    return;
+  }
+  const [mode, direction] = value.split("-") as [DataGridSortMode, DataGridSortDirection];
+  applyColumnSort(column, columnIndex, direction, mode);
 }
 
-function applyContextSort(direction: "asc" | "desc" | null) {
+function applyContextSort(direction: "asc" | "desc" | null, mode: DataGridSortMode = "database") {
   if (!contextColumn.value || !contextCell.value) return;
-  applyColumnSort(contextColumn.value, contextCell.value.col, direction);
+  applyColumnSort(contextColumn.value, contextCell.value.col, direction, mode);
 }
 
 async function contextFilterCondition(mode: FilterMode): Promise<string | null> {
   if (!contextColumn.value) return null;
   return (
     (await buildDataGridContextFilterCondition({
-      databaseType: props.databaseType,
+      databaseType: resolvedDatabaseType.value,
       columnName: contextColumn.value,
       columnInfo: props.tableMeta?.columns.find((column) => column.name === contextColumn.value),
       mode,
@@ -3780,7 +3872,7 @@ async function applyOrderBySearch() {
     const tableMeta = await waitForTableMeta();
     if (!tableMeta) return;
     const sql = await buildTableSelectSql({
-      databaseType: props.databaseType,
+      databaseType: resolvedDatabaseType.value,
       schema: tableMeta.schema,
       tableName: tableMeta.tableName,
       columns: tableMeta.columns.map((column) => column.name),
@@ -3788,7 +3880,7 @@ async function applyOrderBySearch() {
       orderBy: orderByClause,
       limit: pageSize.value,
       whereInput: currentWhereInput(),
-      includeRowId: usesSyntheticRowIdKey(props.databaseType, tableMeta.primaryKeys),
+      includeRowId: usesSyntheticRowIdKey(resolvedDatabaseType.value, tableMeta.primaryKeys),
     });
     await props.onExecuteSql(sql);
   } catch (e: any) {
@@ -3810,7 +3902,7 @@ async function applyWhereFilter() {
     const tableMeta = await waitForTableMeta();
     if (!tableMeta) return;
     const sql = await buildTableSelectSql({
-      databaseType: props.databaseType,
+      databaseType: resolvedDatabaseType.value,
       schema: tableMeta.schema,
       tableName: tableMeta.tableName,
       columns: tableMeta.columns.map((column) => column.name),
@@ -3818,7 +3910,7 @@ async function applyWhereFilter() {
       orderBy: orderByInput.value.trim() || (sortCol.value ? `${queryColumnRef(sortCol.value)} ${sortDir.value.toUpperCase()}` : undefined),
       limit: pageSize.value,
       whereInput,
-      includeRowId: usesSyntheticRowIdKey(props.databaseType, tableMeta.primaryKeys),
+      includeRowId: usesSyntheticRowIdKey(resolvedDatabaseType.value, tableMeta.primaryKeys),
     });
     await props.onExecuteSql(sql);
   } catch (e: any) {
@@ -4379,6 +4471,9 @@ function drawCanvasGrid() {
     rowCellsUseSelectionVisual,
     cellIsSelected,
     cellCanHover: canEditCellItem,
+    infiniteScrollEnabled: infiniteScrollEnabled.value,
+    pageSize: pageSize.value,
+    currentPage: currentPage.value,
   });
 }
 
@@ -4474,6 +4569,11 @@ const exportProgressState = ref({
   status: "",
   errorMessage: null as string | null,
 });
+const exportCancelHandler = ref<(() => Promise<void>) | null>(null);
+
+async function cancelActiveExport() {
+  await exportCancelHandler.value?.();
+}
 
 // --- Export composable ---
 const {
@@ -4531,9 +4631,11 @@ const {
   selectedRowIds,
   hasRowSelection,
   fullExportResult: props.fullExportResult,
+  queryResultExportRequest: props.queryResultExportRequest,
   allExportResults: computed(() => props.allExportResults),
   exportProgressDialog,
   exportProgressState,
+  exportCancelHandler,
 });
 
 const pageSizeMenuItems = computed(() =>
@@ -4743,25 +4845,6 @@ function openImagePreview(src: string, title: string) {
   imagePreviewOpen.value = true;
 }
 
-function selectionNodeElement(node: Node | null): Element | null {
-  if (!node) return null;
-  return node instanceof Element ? node : node.parentElement;
-}
-
-function hasNativeClipboardSelection(): boolean {
-  const selection = window.getSelection();
-  if (!selection || selection.isCollapsed) return false;
-  const anchorRegion = selectionNodeElement(selection.anchorNode)?.closest("[data-native-clipboard]");
-  const focusRegion = selectionNodeElement(selection.focusNode)?.closest("[data-native-clipboard]");
-  return !!anchorRegion && anchorRegion === focusRegion;
-}
-
-function eventTargetAllowsNativeClipboard(event: KeyboardEvent): boolean {
-  const target = event.target as HTMLElement | null;
-  if (target?.closest("input, textarea, [contenteditable='true'], [role='textbox']")) return true;
-  return clipboardShortcut(event, "c") && hasNativeClipboardSelection();
-}
-
 function onDrawerContextMenu(event: MouseEvent) {
   event.stopPropagation();
   const target = event.target as HTMLElement | null;
@@ -4770,7 +4853,7 @@ function onDrawerContextMenu(event: MouseEvent) {
 }
 
 function clipboardShortcut(event: KeyboardEvent, key: string): boolean {
-  return (event.metaKey || event.ctrlKey) && !event.altKey && event.key.toLowerCase() === key;
+  return isPlainClipboardShortcut(event, key);
 }
 
 let lastPasteEventAt = 0;
@@ -6333,9 +6416,15 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
 
   // 2. Column sort & filter
   if (contextColumn.value) {
-    items.push({ label: t("grid.sortAscending"), action: () => applyContextSort("asc"), icon: ArrowUp }, { label: t("grid.sortDescending"), action: () => applyContextSort("desc"), icon: ArrowDown });
+    items.push(
+      { label: t("grid.sortCurrentPageAscending"), action: () => applyContextSort("asc", "local"), icon: ArrowUp },
+      { label: t("grid.sortCurrentPageDescending"), action: () => applyContextSort("desc", "local"), icon: ArrowDown },
+      { label: "", separator: true },
+      { label: t("grid.sortDatabaseAscending"), action: () => applyContextSort("asc", "database"), icon: Database },
+      { label: t("grid.sortDatabaseDescending"), action: () => applyContextSort("desc", "database"), icon: Database },
+    );
     if (sortCol.value) {
-      items.push({ label: t("grid.clearSort"), action: () => applyContextSort(null), icon: ArrowUpDown });
+      items.push({ label: t("grid.clearSort"), action: () => applyContextSort(null, sortMode.value), icon: ArrowUpDown });
     }
     if (canUseWhereSearch.value) {
       items.push({ label: "", separator: true });
@@ -6548,7 +6637,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                             </Button>
                           </div>
                           <div class="grid grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)_minmax(0,1.2fr)_auto] items-center gap-2">
-                            <Select :model-value="rule.columnName" @update:model-value="(value: any) => updateStructuredFilterRule(rule.id, { columnName: String(value) })">
+                            <Select :model-value="rule.columnName" :disabled="rule.disabled" :class="rule.disabled ? 'opacity-45' : ''" @update:model-value="(value: any) => updateStructuredFilterRule(rule.id, { columnName: String(value) })">
                               <SelectTrigger class="h-8 w-full min-w-0 overflow-hidden text-xs [&_[data-slot=select-value]]:min-w-0 [&_[data-slot=select-value]]:truncate">
                                 <SelectValue :placeholder="t('grid.filterBuilderColumn')" />
                               </SelectTrigger>
@@ -6559,7 +6648,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                               </SelectContent>
                             </Select>
 
-                            <Select :model-value="rule.mode" @update:model-value="(value: any) => updateStructuredFilterRule(rule.id, { mode: value as FilterMode })">
+                            <Select :model-value="rule.mode" :disabled="rule.disabled" :class="rule.disabled ? 'opacity-45' : ''" @update:model-value="(value: any) => updateStructuredFilterRule(rule.id, { mode: value as FilterMode })">
                               <SelectTrigger class="h-8 w-full min-w-0 overflow-hidden text-xs [&_[data-slot=select-value]]:min-w-0 [&_[data-slot=select-value]]:truncate">
                                 <SelectValue />
                               </SelectTrigger>
@@ -6574,17 +6663,25 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                               v-if="filterModeNeedsValue(rule.mode)"
                               :model-value="rule.rawValue"
                               class="h-8 min-w-0 text-xs"
+                              :class="rule.disabled ? 'opacity-45' : ''"
+                              :disabled="rule.disabled"
                               :placeholder="t('grid.filterBuilderValue')"
                               @update:model-value="(value) => updateStructuredFilterRule(rule.id, { rawValue: String(value ?? '') })"
                               @keydown.enter.prevent="applyStructuredFilters"
                             />
-                            <div v-else class="flex h-8 min-w-0 items-center overflow-hidden rounded-md border border-dashed px-2 text-xs text-muted-foreground">
+                            <div v-else class="flex h-8 min-w-0 items-center overflow-hidden rounded-md border border-dashed px-2 text-xs text-muted-foreground" :class="rule.disabled ? 'opacity-45' : ''">
                               <span class="truncate">{{ t("grid.filterBuilderNoValue") }}</span>
                             </div>
 
-                            <Button variant="ghost" size="icon" class="h-8 w-8 shrink-0 text-muted-foreground hover:text-destructive" :disabled="structuredFilterRules.length === 1" @click="removeStructuredFilterRule(rule.id)">
-                              <Trash2 class="h-3.5 w-3.5" />
-                            </Button>
+                            <div class="flex items-center gap-1">
+                              <Button variant="ghost" size="icon" class="h-8 w-8 shrink-0 text-muted-foreground hover:text-foreground" @click="updateStructuredFilterRule(rule.id, { disabled: !rule.disabled })">
+                                <EyeOff v-if="rule.disabled" class="h-3.5 w-3.5" />
+                                <Eye v-else class="h-3.5 w-3.5" />
+                              </Button>
+                              <Button variant="ghost" size="icon" class="h-8 w-8 shrink-0 text-muted-foreground hover:text-destructive" :disabled="structuredFilterRules.length === 1" @click="removeStructuredFilterRule(rule.id)">
+                                <Trash2 class="h-3.5 w-3.5" />
+                              </Button>
+                            </div>
                           </div>
                         </template>
                       </div>
@@ -6617,6 +6714,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                     spellcheck="false"
                     class="flex-1 h-5 min-w-0 text-xs bg-transparent outline-none placeholder:text-muted-foreground/60"
                     placeholder=""
+                    @input="onWhereFilterInput"
                     @keydown="onWhereFilterKeydown"
                     @focus="showWhereHistorySuggestions"
                     @click="updateWhereSuggestionPosition"
@@ -6734,6 +6832,17 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                 </TooltipTrigger>
                 <TooltipContent side="bottom" class="max-w-sm">
                   {{ t("grid.queryEditReadyHint", { table: tableMeta?.tableName }) }}
+                </TooltipContent>
+              </Tooltip>
+              <Tooltip v-if="showKeylessEditWarning">
+                <TooltipTrigger as-child>
+                  <div class="flex h-5 items-center gap-1 rounded border border-amber-500/30 bg-amber-500/10 px-1.5 text-xs font-medium text-amber-700 dark:text-amber-300">
+                    <KeyRound class="h-3 w-3" />
+                    {{ t("grid.keylessEditWarning") }}
+                  </div>
+                </TooltipTrigger>
+                <TooltipContent side="bottom" class="max-w-sm">
+                  {{ t("grid.keylessEditWarningHint") }}
                 </TooltipContent>
               </Tooltip>
               <Button v-if="props.context !== 'results'" variant="ghost" size="sm" class="h-5 text-xs px-1.5 shrink-0" :disabled="isSaving" @click="onToolbarRefresh">
@@ -7432,13 +7541,13 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                       @dblclick.stop="toggleTranspose(item.displayIndex)"
                       @contextmenu="onRowContext(item.id, item.displayIndex)"
                     >
-                      {{ item.displayIndex + 1 }}
+                      {{ infiniteScrollEnabled ? item.displayIndex + 1 : item.displayIndex + 1 + (currentPage - 1) * pageSize }}
                     </div>
                     <div class="shrink-0" :style="{ width: `${horizontalColumnWindow.beforeWidth}px` }" />
                     <div
                       v-for="col in renderedGridColumns"
                       :key="col.actualColIdx"
-                      class="group/cell shrink-0 px-3 py-1 border-r border-border whitespace-nowrap overflow-hidden text-ellipsis relative select-none flex items-center tabular-nums text-[13px]"
+                      class="group/cell shrink-0 px-3 py-1 border-r border-border whitespace-nowrap overflow-hidden text-ellipsis relative select-none inline-block items-center tabular-nums text-[13px]"
                       :style="renderedColumnStyle(col.visibleColIdx)"
                       :class="{
                         'text-muted-foreground italic': isNull(item.data[col.actualColIdx]),
@@ -7726,7 +7835,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
               </div>
 
               <TabsContent value="details" class="m-0 min-h-0 flex-1 flex flex-col">
-                <div data-native-clipboard class="flex-1 min-h-0 overflow-auto p-3 text-xs space-y-3">
+                <div data-native-clipboard class="flex-1 min-h-0 overflow-auto p-3 text-xs" :class="isEditingDetail ? 'flex flex-col gap-3' : 'space-y-3'">
                   <div v-if="cellDetailPanelIsBottom" class="grid grid-cols-[minmax(180px,1.6fr)_repeat(4,minmax(74px,0.55fr))_minmax(160px,1fr)] gap-3 rounded border bg-muted/20 p-2">
                     <div class="min-w-0 space-y-1">
                       <div class="text-muted-foreground">{{ t("grid.columnName") }}</div>
@@ -7791,23 +7900,23 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                       </div>
                     </div>
                   </template>
-                  <div class="space-y-1" :class="cellDetailPanelIsBottom ? 'min-h-0' : ''">
-                    <div class="flex items-center justify-between gap-2">
+                  <div class="space-y-1" :class="[{ 'min-h-0 flex flex-col': cellDetailPanelIsBottom || isEditingDetail }, cellDetailPanelIsBottom && isEditingDetail ? 'flex-1' : '']">
+                    <div class="flex min-h-5 items-center justify-between gap-2">
                       <div class="text-muted-foreground">{{ t("grid.cellValue") }}</div>
                       <div v-if="!isEditingDetail" class="flex items-center gap-1">
-                        <Button v-if="activeCellDetail.formattedJson" :variant="sideDetailJsonView ? 'secondary' : 'ghost'" size="sm" class="h-6 gap-1 px-2 text-xs" :title="t('grid.formattedJson')" @click="sideDetailJsonView = !sideDetailJsonView">
+                        <Button v-if="activeCellDetail.formattedJson" :variant="sideDetailJsonView ? 'secondary' : 'ghost'" size="sm" class="h-5 gap-1 px-1.5 text-xs" :title="t('grid.formattedJson')" @click="sideDetailJsonView = !sideDetailJsonView">
                           <Code2 class="h-3 w-3" />
                           {{ t("grid.formattedJson") }}
                         </Button>
-                        <Button v-if="activeCellDetail.isEditable" variant="ghost" size="icon" class="h-6 w-6" :title="t('grid.editValue')" @click="startDetailEdit">
+                        <Button v-if="activeCellDetail.isEditable" variant="ghost" size="icon" class="h-5 w-5" :title="t('grid.editValue')" @click="startDetailEdit">
                           <Pencil class="h-3 w-3" />
                         </Button>
-                        <Button variant="ghost" size="icon" class="h-6 w-6" :title="t('grid.copyValue')" @click="copyDetailCurrentValue">
+                        <Button variant="ghost" size="icon" class="h-5 w-5" :title="t('grid.copyValue')" @click="copyDetailCurrentValue">
                           <Copy class="h-3 w-3" />
                         </Button>
                         <DropdownMenu v-if="canDownloadDetailBinaryValue(activeCellDetail)">
                           <DropdownMenuTrigger as-child>
-                            <Button variant="ghost" size="icon" class="h-6 w-6" :title="t('grid.downloadBinaryValue')">
+                            <Button variant="ghost" size="icon" class="h-5 w-5" :title="t('grid.downloadBinaryValue')">
                               <Download class="h-3 w-3" />
                             </Button>
                           </DropdownMenuTrigger>
@@ -7820,7 +7929,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                         <!-- Skip hex fallback from backend (unsupported geometry types like TIN/Triangle) -->
                         <Popover v-if="isGeometryColumnType(activeCellDetail.type) && activeCellDetail.value !== null && !isEditingDetail && !isHexGeometry(activeCellDetail.value as string)" v-model:open="sideGeometryPreviewOpen">
                           <PopoverTrigger as-child>
-                            <Button variant="ghost" size="icon" class="h-6 w-6" :title="t('grid.geometryPreview')">
+                            <Button variant="ghost" size="icon" class="h-5 w-5" :title="t('grid.geometryPreview')">
                               <Eye class="h-3 w-3" />
                             </Button>
                           </PopoverTrigger>
@@ -7837,9 +7946,11 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                       </a>
                     </div>
                     <template v-if="isEditingDetail">
-                      <TemporalCellEditor v-if="detailTemporalEditorKind" v-model="detailEditValue" :kind="detailTemporalEditorKind" variant="inline" :commit-on-close="false" @cancel="cancelDetailEdit" @commit="commitDetailEdit" />
-                      <div v-else ref="detailsEditorContainer" data-cell-detail-editor-root class="w-full rounded border overflow-hidden" :class="cellDetailPanelIsBottom ? 'h-28' : 'h-40'" />
-                      <div class="flex gap-1 mt-1">
+                      <div class="min-h-0" :class="cellDetailPanelIsBottom ? 'flex-1' : ''" :style="sideDetailEditorStyle">
+                        <TemporalCellEditor v-if="detailTemporalEditorKind" v-model="detailEditValue" :kind="detailTemporalEditorKind" variant="inline" :commit-on-close="false" @cancel="cancelDetailEdit" @commit="commitDetailEdit" />
+                        <div v-else ref="detailsEditorContainer" data-cell-detail-editor-root class="min-h-0 h-full w-full rounded border overflow-hidden" />
+                      </div>
+                      <div v-if="!cellDetailPanelIsBottom" class="flex shrink-0 gap-1 mt-1">
                         <Button size="sm" class="h-6 text-xs" @click="commitDetailEdit">
                           {{ t("dangerDialog.confirm") }}
                         </Button>
@@ -7861,10 +7972,20 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                   </div>
                 </div>
 
-                <div class="border-t p-2 grid gap-1" :class="cellDetailPanelIsBottom ? 'grid-cols-[repeat(3,max-content)] justify-end' : 'grid-cols-1'">
-                  <Button v-if="activeCellDetail.isEditable && activeCellDetail.value !== null" variant="ghost" size="sm" class="h-7 justify-start text-xs" @click="setDetailNull"> <X class="w-3 h-3 mr-2" /> {{ t("grid.setNull") }} </Button>
-                  <Button variant="ghost" size="sm" class="h-7 justify-start text-xs" @click="copyDetailColumnName"> <Copy class="w-3 h-3 mr-2" /> {{ t("grid.copyColumnName") }} </Button>
-                  <Button variant="ghost" size="sm" class="h-7 justify-start text-xs" :disabled="!canCopyPreparedDetailSqlCondition()" @click="copyDetailSqlCondition"> <Code2 class="w-3 h-3 mr-2" /> {{ t("grid.copySqlCondition") }} </Button>
+                <div class="border-t p-1.5 flex gap-1" :class="cellDetailPanelIsBottom ? 'items-center' : 'flex-col'">
+                  <div v-if="isEditingDetail && cellDetailPanelIsBottom" class="flex shrink-0 gap-1 mr-auto">
+                    <Button size="sm" class="h-6 text-xs" @click="commitDetailEdit">
+                      {{ t("dangerDialog.confirm") }}
+                    </Button>
+                    <Button variant="outline" size="sm" class="h-6 text-xs" @click="cancelDetailEdit">
+                      {{ t("dangerDialog.cancel") }}
+                    </Button>
+                  </div>
+                  <div class="flex gap-1" :class="cellDetailPanelIsBottom ? 'ml-auto shrink-0 justify-end' : 'flex-col'">
+                    <Button v-if="activeCellDetail.isEditable && activeCellDetail.value !== null" variant="ghost" size="sm" class="h-6 justify-start text-xs" @click="setDetailNull"> <X class="w-3 h-3 mr-2" /> {{ t("grid.setNull") }} </Button>
+                    <Button variant="ghost" size="sm" class="h-6 justify-start text-xs" @click="copyDetailColumnName"> <Copy class="w-3 h-3 mr-2" /> {{ t("grid.copyColumnName") }} </Button>
+                    <Button variant="ghost" size="sm" class="h-6 justify-start text-xs" :disabled="!canCopyPreparedDetailSqlCondition()" @click="copyDetailSqlCondition"> <Code2 class="w-3 h-3 mr-2" /> {{ t("grid.copySqlCondition") }} </Button>
+                  </div>
                 </div>
               </TabsContent>
 
@@ -8327,7 +8448,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
     />
     <ImagePreviewDialog v-model:open="imagePreviewOpen" :src="imagePreviewSrc" :title="imagePreviewTitle" />
     <component v-if="previewDialogOpen && previewDialogConfig" :is="previewDialogConfig.component" v-model:open="previewDialogOpen" v-bind="previewDialogConfig.props" />
-    <ExportProgressDialog v-model:open="exportProgressDialog" v-bind="exportProgressState" disable-cancel />
+    <ExportProgressDialog v-model:open="exportProgressDialog" v-bind="exportProgressState" :disable-cancel="!exportCancelHandler" @cancel="cancelActiveExport" />
   </div>
 </template>
 

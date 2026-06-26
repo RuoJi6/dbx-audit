@@ -42,6 +42,48 @@ ORDER BY CASE
   WHEN username = SYS_CONTEXT('USERENV', 'SESSION_USER') THEN 1
   ELSE 2
 END, username`
+const oracleListTablesSQL = `
+SELECT OBJECT_NAME, TABLE_TYPE, COMMENTS
+FROM (
+SELECT t.TABLE_NAME AS OBJECT_NAME,
+       'TABLE' AS TABLE_TYPE,
+       CAST(NULL AS VARCHAR2(4000)) AS COMMENTS
+FROM ALL_TABLES t
+WHERE t.OWNER = :1
+  AND t.NESTED = 'NO'
+UNION ALL
+SELECT o.OBJECT_NAME,
+       'VIEW' AS TABLE_TYPE,
+       CAST(NULL AS VARCHAR2(4000)) AS COMMENTS
+FROM ALL_OBJECTS o
+WHERE o.OWNER = :2
+  AND o.OBJECT_TYPE = 'VIEW'
+)
+ORDER BY OBJECT_NAME`
+const oracleListObjectsSQL = `
+SELECT OBJECT_NAME, OBJECT_TYPE, COMMENTS
+FROM (
+SELECT t.TABLE_NAME AS OBJECT_NAME,
+       'TABLE' AS OBJECT_TYPE,
+       CAST(NULL AS VARCHAR2(4000)) AS COMMENTS
+FROM ALL_TABLES t
+WHERE t.OWNER = :1
+  AND t.NESTED = 'NO'
+UNION ALL
+SELECT o.OBJECT_NAME,
+       o.OBJECT_TYPE,
+       CAST(NULL AS VARCHAR2(4000)) AS COMMENTS
+FROM ALL_OBJECTS o
+WHERE o.OWNER = :2
+  AND o.OBJECT_TYPE IN ('VIEW', 'PROCEDURE', 'FUNCTION', 'PACKAGE')
+)
+ORDER BY CASE OBJECT_TYPE
+  WHEN 'TABLE' THEN 0
+  WHEN 'VIEW' THEN 1
+  WHEN 'PROCEDURE' THEN 2
+  WHEN 'FUNCTION' THEN 3
+  ELSE 4
+END, OBJECT_NAME`
 
 type request struct {
 	ID     json.RawMessage            `json:"id"`
@@ -565,15 +607,7 @@ func (s *server) listTables(schema string) ([]tableInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	rows, err := s.queryRows(`
-SELECT /*+ NO_QUERY_TRANSFORMATION */ o.OBJECT_NAME,
-       CASE o.OBJECT_TYPE WHEN 'VIEW' THEN 'VIEW' ELSE 'TABLE' END AS TABLE_TYPE,
-       c.COMMENTS
-FROM ALL_OBJECTS o
-LEFT JOIN ALL_TAB_COMMENTS c ON c.OWNER = o.OWNER AND c.TABLE_NAME = o.OBJECT_NAME
-WHERE o.OWNER = :1
-  AND o.OBJECT_TYPE IN ('TABLE', 'VIEW')
-ORDER BY o.OBJECT_NAME`, []any{schema})
+	rows, err := s.queryRows(oracleListTablesSQL, []any{schema, schema})
 	if err != nil {
 		if isOraclePGALimitError(err) {
 			return []tableInfo{}, nil
@@ -597,13 +631,7 @@ func (s *server) listObjects(schema string) ([]objectInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	rows, err := s.queryRows(`
-SELECT /*+ NO_QUERY_TRANSFORMATION */ o.OBJECT_NAME, o.OBJECT_TYPE, c.COMMENTS
-FROM ALL_OBJECTS o
-LEFT JOIN ALL_TAB_COMMENTS c ON c.OWNER = o.OWNER AND c.TABLE_NAME = o.OBJECT_NAME
-WHERE o.OWNER = :1
-  AND o.OBJECT_TYPE IN ('TABLE', 'VIEW', 'PROCEDURE', 'FUNCTION', 'PACKAGE')
-ORDER BY o.OBJECT_TYPE, o.OBJECT_NAME`, []any{schema})
+	rows, err := s.queryRows(oracleListObjectsSQL, []any{schema, schema})
 	if err != nil {
 		if isOraclePGALimitError(err) {
 			return []objectInfo{}, nil

@@ -644,6 +644,20 @@ mod tests {
         AuditSample, AuditScanRequest, AuditTableEvidence, AuditTableField, AuditTargetSummary,
     };
     use std::collections::BTreeMap;
+    use std::io::Read;
+
+    fn xlsx_xml_text(bytes: &[u8]) -> String {
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("open xlsx as zip archive");
+        let mut text = String::new();
+        for index in 0..archive.len() {
+            let mut file = archive.by_index(index).expect("read xlsx entry");
+            if !(file.name().ends_with(".xml") || file.name().ends_with(".rels")) {
+                continue;
+            }
+            file.read_to_string(&mut text).expect("read xlsx xml entry");
+        }
+        text
+    }
 
     fn finding() -> AuditFinding {
         AuditFinding {
@@ -810,7 +824,7 @@ mod tests {
     #[test]
     fn builds_legacy_style_xlsx_for_job() {
         let bytes = audit_job_to_xlsx(&job()).expect("xlsx");
-        let text = String::from_utf8_lossy(&bytes);
+        let text = xlsx_xml_text(&bytes);
         for expected in [
             "敏感信息汇总",
             "连接结果概览",

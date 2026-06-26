@@ -11,6 +11,7 @@ import { buildDataGridCopyInsertStatement, buildDataGridCopyUpdateStatements, ty
 import { formatSqlInsert } from "@/lib/exportFormats";
 import { uuid } from "@/lib/utils";
 import type { DatabaseType, QueryResult } from "@/types/database";
+import type { QueryResultExportRequest } from "@/lib/api";
 
 interface RowItem {
   id: number;
@@ -45,6 +46,7 @@ export interface UseDataGridExportOptions {
   selectedRowIds: Ref<Set<number>> | ComputedRef<Set<number>>;
   hasRowSelection: ComputedRef<boolean>;
   fullExportResult?: (onProgress?: (info: { rowsExported: number; totalRows: number | null }) => void) => Promise<QueryResult | undefined>;
+  queryResultExportRequest?: (options: { exportId: string; filePath: string; format: "csv" | "xlsx" }) => Promise<QueryResultExportRequest | undefined>;
   allExportResults?: ComputedRef<Array<{ sheetName: string; result: QueryResult }> | undefined>;
   exportProgressDialog?: Ref<boolean>;
   exportProgressState?: Ref<{
@@ -56,6 +58,7 @@ export interface UseDataGridExportOptions {
     status: string;
     errorMessage: string | null;
   }>;
+  exportCancelHandler?: Ref<(() => Promise<void>) | null>;
 }
 
 interface CopyStatementCache {
@@ -110,9 +113,11 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
     selectedRowIds,
     hasRowSelection,
     fullExportResult,
+    queryResultExportRequest,
     allExportResults,
     exportProgressDialog,
     exportProgressState,
+    exportCancelHandler,
   } = options;
 
   async function copyText(text: string) {
@@ -469,6 +474,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
   async function exportCsv(rowIds?: number[]) {
     await runExclusiveExport(async () => {
       try {
+        if (await exportQueryResultViaBackend("csv", rowIds)) return;
         if (await exportFullTableDataViaBackend("csv", rowIds)) return;
 
         const needsFullExport = !rowIds?.length && !!fullExportResult;
@@ -662,6 +668,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
   async function exportXlsx(rowIds?: number[]) {
     await runExclusiveExport(async () => {
       try {
+        if (await exportQueryResultViaBackend("xlsx", rowIds)) return;
         if (await exportFullTableDataViaBackend("xlsx", rowIds)) return;
 
         let outputPath = "export.xlsx";
@@ -814,37 +821,109 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
     }
     if (exportProgressDialog) exportProgressDialog.value = true;
 
-    await api.startTableExport(
-      {
-        exportId: uuid(),
-        connectionId: connectionId.value,
-        database: database.value,
-        schema: meta.schema,
-        tableName: meta.tableName,
-        filePath: outputPath,
+    const exportId = uuid();
+    if (exportCancelHandler) {
+      exportCancelHandler.value = () => api.cancelTableExport(exportId);
+    }
+
+    try {
+      const progress = await api.startTableExport(
+        {
+          exportId,
+          connectionId: connectionId.value,
+          database: database.value,
+          schema: meta.schema,
+          tableName: meta.tableName,
+          filePath: outputPath,
+          format,
+          columns: columns.value,
+          columnTypes: columnTypes.value,
+          primaryKeys: meta.primaryKeys,
+          whereInput: whereInput.value,
+          orderBy: orderBy.value,
+          skipCount: true,
+          batchSize: exportBatchSize.value,
+        },
+        (progress) => {
+          if (exportProgressState) {
+            exportProgressState.value = {
+              ...exportProgressState.value,
+              tableName: progress.tableName || meta.tableName,
+              rowsExported: progress.rowsExported,
+              totalRows: progress.totalRows,
+              status: progress.status,
+              errorMessage: progress.errorMessage || null,
+            };
+          }
+        },
+      );
+      if (progress.status === "Done") {
+        toast(t("grid.exported"));
+      }
+    } finally {
+      if (exportCancelHandler) exportCancelHandler.value = null;
+    }
+    return true;
+  }
+
+  async function exportQueryResultViaBackend(format: "csv" | "xlsx", rowIds?: number[]): Promise<boolean> {
+    if (rowIds?.length || context.value !== "results" || !queryResultExportRequest) {
+      return false;
+    }
+
+    const extension = format;
+    const filterName = format === "csv" ? "CSV" : "Excel";
+    let outputPath = `query-result.${extension}`;
+    if (isTauriRuntime()) {
+      const { save } = await import("@tauri-apps/plugin-dialog");
+      const path = await save({
+        defaultPath: outputPath,
+        filters: [{ name: filterName, extensions: [extension] }],
+      });
+      if (!path) return true;
+      outputPath = path as string;
+    }
+
+    const exportId = uuid();
+    const request = await queryResultExportRequest({ exportId, filePath: outputPath, format });
+    if (!request) throw new Error("Unable to build query result export request");
+
+    if (exportProgressState) {
+      exportProgressState.value = {
+        title: t("exportProgress.title"),
+        tableName: "Query Result",
         format,
-        columns: columns.value,
-        columnTypes: columnTypes.value,
-        primaryKeys: meta.primaryKeys,
-        whereInput: whereInput.value,
-        orderBy: orderBy.value,
-        skipCount: true,
-        batchSize: exportBatchSize.value,
-      },
-      (progress) => {
+        rowsExported: 0,
+        totalRows: request.totalRows ?? null,
+        status: "Running",
+        errorMessage: null,
+      };
+    }
+    if (exportProgressDialog) exportProgressDialog.value = true;
+    if (exportCancelHandler) {
+      exportCancelHandler.value = () => api.cancelQueryResultExport(exportId, request.executionId);
+    }
+
+    try {
+      const terminalProgress = await api.startQueryResultExport(request, (progress) => {
         if (exportProgressState) {
+          const adjustedTotal = progress.totalRows !== null && progress.rowsExported > progress.totalRows ? progress.rowsExported : progress.totalRows;
           exportProgressState.value = {
             ...exportProgressState.value,
-            tableName: progress.tableName || meta.tableName,
+            tableName: progress.tableName || "Query Result",
             rowsExported: progress.rowsExported,
-            totalRows: progress.totalRows,
+            totalRows: adjustedTotal,
             status: progress.status,
             errorMessage: progress.errorMessage || null,
           };
         }
-      },
-    );
-    toast(t("grid.exported"));
+      });
+      if (terminalProgress.status === "Done") {
+        toast(t("grid.exported"));
+      }
+    } finally {
+      if (exportCancelHandler) exportCancelHandler.value = null;
+    }
     return true;
   }
 

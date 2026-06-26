@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
 import { test } from "vitest";
-import { allEditableColumnsWriteable, allPrimaryKeysPresent, analyzeEditableQuery, analyzeEditableQueryEditability, isBinaryType, queryEditabilityMessageKey } from "../../apps/desktop/src/lib/sqlAnalysis.ts";
+import { allEditableColumnsWriteable, allPrimaryKeysPresent, analyzeEditableQuery, analyzeEditableQueryEditability, isBinaryType, queryEditabilityMessageKey, sourceColumnsForResult } from "../../apps/desktop/src/lib/sqlAnalysis.ts";
 
 test("recognizes a simple single-table SELECT as editable", () => {
   const result = analyzeEditableQueryEditability("select id, name from public.users where active = true order by id");
@@ -100,6 +100,23 @@ test("accepts aliased primary key source columns for row identity", () => {
   assert.equal(allPrimaryKeysPresent(["id"], ["user_id", "name"], analysis), true);
   assert.equal(allEditableColumnsWriteable(analysis, ["user_id", "name"]), true);
   assert.equal(allPrimaryKeysPresent(["id"], ["id", "name"], analyzeEditableQuery("select id, name from users")!), true);
+});
+
+test("maps ClickHouse simple query results when identifier columns are returned", () => {
+  const analysis = analyzeEditableQuery("SELECT id, name, score + 1 AS next_score FROM default.people");
+
+  assert.ok(analysis);
+  assert.equal(allPrimaryKeysPresent(["id"], ["id", "name", "next_score"], analysis), true);
+  assert.equal(allEditableColumnsWriteable(analysis, ["id", "name", "next_score"]), true);
+  assert.deepEqual(sourceColumnsForResult(analysis, ["id", "name", "next_score"]), ["id", "name", undefined]);
+});
+
+test("rejects ClickHouse query result editing when identifier source columns are omitted", () => {
+  const analysis = analyzeEditableQuery("SELECT name FROM default.people");
+
+  assert.ok(analysis);
+  assert.equal(allPrimaryKeysPresent(["id"], ["name"], analysis), false);
+  assert.deepEqual(sourceColumnsForResult(analysis, ["name"]), ["name"]);
 });
 
 test("recognizes binary type declarations with lengths", () => {

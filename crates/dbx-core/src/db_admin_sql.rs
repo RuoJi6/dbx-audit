@@ -466,7 +466,7 @@ fn object_type_keyword(object_type: DatabaseObjectType) -> &'static str {
     match object_type {
         DatabaseObjectType::Table => "TABLE",
         DatabaseObjectType::View => "VIEW",
-        DatabaseObjectType::MaterializedView => "MATERIALIZED_VIEW",
+        DatabaseObjectType::MaterializedView => "MATERIALIZED VIEW",
         DatabaseObjectType::Procedure => "PROCEDURE",
         DatabaseObjectType::Function => "FUNCTION",
     }
@@ -562,7 +562,7 @@ mod tests {
                 schema: None,
                 table_name: "PresetSubjectInfo".to_string(),
             }),
-            "ALTER TABLE \"PresetSubjectInfo\" DELETE WHERE 1 = 1;"
+            "ALTER TABLE `PresetSubjectInfo` DELETE WHERE 1 = 1;"
         );
         assert_eq!(
             build_truncate_table_sql(TableAdminSqlOptions {
@@ -570,7 +570,7 @@ mod tests {
                 schema: None,
                 table_name: "PresetSubjectInfo".to_string(),
             }),
-            "TRUNCATE TABLE \"PresetSubjectInfo\";"
+            "TRUNCATE TABLE `PresetSubjectInfo`;"
         );
         assert_eq!(
             build_empty_table_sql(TableAdminSqlOptions {

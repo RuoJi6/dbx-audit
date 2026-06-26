@@ -320,6 +320,36 @@ func TestPrimaryKeySQLUsesLowPrivilegeDictionary(t *testing.T) {
 	}
 }
 
+func TestColumnSQLUsesLowPrivilegeDictionary(t *testing.T) {
+	sqlText := strings.ToUpper(xuguListColumnsSQL)
+
+	for _, want := range []string{"ALL_COLUMNS", "ALL_TABLES", "ALL_SCHEMAS", "COMMENTS"} {
+		if !strings.Contains(sqlText, want) {
+			t.Fatalf("column listing should query %s, got: %s", want, xuguListColumnsSQL)
+		}
+	}
+	for _, forbidden := range []string{"SYS_COLUMNS", "SYS_TABLES", "SYS_SCHEMAS"} {
+		if strings.Contains(sqlText, forbidden) {
+			t.Fatalf("column listing should not query %s, got: %s", forbidden, xuguListColumnsSQL)
+		}
+	}
+}
+
+func TestIndexSQLUsesLowPrivilegeDictionary(t *testing.T) {
+	sqlText := strings.ToUpper(xuguListIndexesSQL)
+
+	for _, want := range []string{"ALL_INDEXES", "ALL_TABLES", "ALL_SCHEMAS", "KEYS"} {
+		if !strings.Contains(sqlText, want) {
+			t.Fatalf("index listing should query %s, got: %s", want, xuguListIndexesSQL)
+		}
+	}
+	for _, forbidden := range []string{"SYS_INDEXES", "SYS_TABLES", "SYS_SCHEMAS"} {
+		if strings.Contains(sqlText, forbidden) {
+			t.Fatalf("index listing should not query %s, got: %s", forbidden, xuguListIndexesSQL)
+		}
+	}
+}
+
 func TestXuguMetadataAccessErrorDetection(t *testing.T) {
 	if !isXuguMetadataAccessError(errors.New("[E18012] 权限不够")) {
 		t.Fatal("expected E18012 permission error to be treated as metadata access error")
@@ -348,6 +378,21 @@ func TestDecodeXuguScale(t *testing.T) {
 	precision, scale, length = decodeXuguScale("VARCHAR", &charScale)
 	if precision != nil || scale != nil || length == nil || *length != 128 {
 		t.Fatalf("unexpected char scale decode: precision=%v scale=%v length=%v", precision, scale, length)
+	}
+}
+
+func TestAppendDDLStatement(t *testing.T) {
+	got := appendDDLStatement("CREATE TABLE \"T\" (\"ID\" INT)\n", "CREATE INDEX \"IDX\" ON \"T\"(\"ID\");")
+	want := "CREATE TABLE \"T\" (\"ID\" INT);\n\nCREATE INDEX \"IDX\" ON \"T\"(\"ID\");"
+
+	if got != want {
+		t.Fatalf("unexpected DDL append:\ngot:  %q\nwant: %q", got, want)
+	}
+}
+
+func TestQuoteStringLiteralEscapesSingleQuotes(t *testing.T) {
+	if got := quoteStringLiteral("owner's note"); got != "'owner''s note'" {
+		t.Fatalf("unexpected quoted string: %s", got)
 	}
 }
 

@@ -62,9 +62,15 @@ pub(crate) fn data_row_xml(row_number: usize, columns: &[String], row: &[Value])
     format!("<row r=\"{row_number}\">{cells}</row>")
 }
 
+/// Shared ZIP entry options for all XLSX parts. XLSX is a ZIP of XML, and the
+/// `inlineStr` cell encoding is highly repetitive, so Deflate typically shrinks
+/// the file several-fold over `Stored` (matching what Excel/Navicat produce).
+fn xlsx_zip_options() -> zip::write::SimpleFileOptions {
+    zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated)
+}
+
 fn write_zip_entry<W: Write + Seek>(zip: &mut zip::ZipWriter<W>, path: &str, content: &str) -> Result<(), String> {
-    let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-    zip.start_file(path, options).map_err(|err| err.to_string())?;
+    zip.start_file(path, xlsx_zip_options()).map_err(|err| err.to_string())?;
     zip.write_all(content.as_bytes()).map_err(|err| err.to_string())
 }
 
@@ -83,7 +89,9 @@ pub(crate) fn start_streaming_xlsx_workbook<W: Write + Seek>(
     write_zip_entry(&mut zip, "xl/_rels/workbook.xml.rels", &workbook_rels_xml())?;
     write_zip_entry(&mut zip, "xl/styles.xml", styles_xml())?;
 
-    let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    // Begin the sheet1.xml entry with header, frozen pane, column widths and
+    // the header row.
+    let options = xlsx_zip_options();
     zip.start_file("xl/worksheets/sheet1.xml", options).map_err(|err| err.to_string())?;
     let sheet_header = format!(
         concat!(
@@ -489,7 +497,7 @@ pub fn build_xlsx_workbook_multi(sheets: &[XlsxWorksheetData]) -> Result<Vec<u8>
 
     let cursor = Cursor::new(Vec::<u8>::new());
     let mut zip = zip::ZipWriter::new(cursor);
-    let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    let options = xlsx_zip_options();
 
     for (path, content) in files {
         zip.start_file(path, options).map_err(|err| err.to_string())?;
@@ -510,6 +518,31 @@ mod tests {
     use calamine::{open_workbook_auto, Reader};
     use serde_json::json;
     use std::fs;
+    use std::io::Read;
+
+    /// Read and decompress a single entry from an in-memory XLSX (ZIP) buffer.
+    fn read_zip_entry(bytes: &[u8], path: &str) -> String {
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes.to_vec())).expect("open xlsx as zip archive");
+        let mut entry = archive.by_name(path).unwrap_or_else(|_| panic!("missing zip entry: {path}"));
+        let mut content = String::new();
+        entry.read_to_string(&mut content).expect("read zip entry");
+        content
+    }
+
+    /// Assert every entry in the XLSX (ZIP) buffer is Deflate-compressed, which
+    /// is what keeps exported workbooks small (see `xlsx_zip_options`).
+    fn assert_all_entries_deflated(bytes: &[u8]) {
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes.to_vec())).expect("open xlsx as zip archive");
+        for index in 0..archive.len() {
+            let entry = archive.by_index(index).expect("zip entry");
+            assert_eq!(
+                entry.compression(),
+                zip::CompressionMethod::Deflated,
+                "entry {} should be Deflate-compressed",
+                entry.name()
+            );
+        }
+    }
 
     #[test]
     fn builds_xlsx_zip_with_sheet_data() {
@@ -520,16 +553,19 @@ mod tests {
             rows: vec![vec![json!(1), json!("Ada & Bob"), json!(true)], vec![json!(2), json!(null), json!(false)]],
         })
         .expect("build workbook");
-        let text = String::from_utf8_lossy(&workbook);
 
+        // ZIP magic bytes.
         assert_eq!(workbook[0], 0x50);
         assert_eq!(workbook[1], 0x4b);
-        assert!(text.contains("[Content_Types].xml"));
-        assert!(text.contains("xl/worksheets/sheet1.xml"));
-        assert!(text.contains("name=\"Users\""));
-        assert!(text.contains("<c r=\"A2\"><v>1</v></c>"));
-        assert!(text.contains("Ada &amp; Bob"));
-        assert!(text.contains("<c r=\"C2\" t=\"b\"><v>1</v></c>"));
+
+        // Entries are stored compressed; assert on their decompressed contents.
+        let sheet = read_zip_entry(&workbook, "xl/worksheets/sheet1.xml");
+        let workbook_xml = read_zip_entry(&workbook, "xl/workbook.xml");
+        assert!(workbook_xml.contains("name=\"Users\""));
+        assert!(sheet.contains("<c r=\"A2\"><v>1</v></c>"));
+        assert!(sheet.contains("Ada &amp; Bob"));
+        assert!(sheet.contains("<c r=\"C2\" t=\"b\"><v>1</v></c>"));
+        assert_all_entries_deflated(&workbook);
     }
 
     #[test]
@@ -541,8 +577,8 @@ mod tests {
             rows: vec![vec![json!("ok")]],
         })
         .expect("build workbook");
-        let text = String::from_utf8_lossy(&workbook);
-        assert!(text.contains("name=\"bad name with chars and-a-very-\""));
+        let workbook_xml = read_zip_entry(&workbook, "xl/workbook.xml");
+        assert!(workbook_xml.contains("name=\"bad name with chars and-a-very-\""));
     }
 
     #[test]

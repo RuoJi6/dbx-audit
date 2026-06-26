@@ -216,19 +216,10 @@ public class OracleAgent extends BaseDatabaseAgent {
     public List<TableInfo> listTables(String schema) {
         return unchecked(() -> {
             try {
-                String sql = """
-                    SELECT /*+ NO_QUERY_TRANSFORMATION */ o.OBJECT_NAME,
-                        CASE o.OBJECT_TYPE WHEN 'VIEW' THEN 'VIEW' ELSE 'TABLE' END AS TABLE_TYPE,
-                        c.COMMENTS
-                    FROM ALL_OBJECTS o
-                    LEFT JOIN ALL_TAB_COMMENTS c ON c.OWNER = o.OWNER AND c.TABLE_NAME = o.OBJECT_NAME
-                    WHERE o.OWNER = ? AND o.OBJECT_TYPE IN ('TABLE','VIEW')
-                    ORDER BY o.OBJECT_NAME
-                    """.stripIndent().trim();
-
                 List<TableInfo> result = new ArrayList<>();
-                try (var stmt = requireConnected().prepareStatement(sql)) {
+                try (var stmt = requireConnected().prepareStatement(listTablesSql())) {
                     stmt.setString(1, schema);
+                    stmt.setString(2, schema);
                     try (ResultSet rs = stmt.executeQuery()) {
                         while (rs.next()) {
                             result.add(new TableInfo(rs.getString(1), rs.getString(2), rs.getString(3)));
@@ -245,19 +236,36 @@ public class OracleAgent extends BaseDatabaseAgent {
         });
     }
 
+    static String listTablesSql() {
+        return """
+            SELECT OBJECT_NAME, TABLE_TYPE, COMMENTS
+            FROM (
+                SELECT t.TABLE_NAME AS OBJECT_NAME,
+                    'TABLE' AS TABLE_TYPE,
+                    CAST(NULL AS VARCHAR2(4000)) AS COMMENTS
+                FROM ALL_TABLES t
+                WHERE t.OWNER = ?
+                  AND t.NESTED = 'NO'
+                UNION ALL
+                SELECT o.OBJECT_NAME,
+                    'VIEW' AS TABLE_TYPE,
+                    CAST(NULL AS VARCHAR2(4000)) AS COMMENTS
+                FROM ALL_OBJECTS o
+                WHERE o.OWNER = ?
+                  AND o.OBJECT_TYPE = 'VIEW'
+            )
+            ORDER BY OBJECT_NAME
+            """.stripIndent().trim();
+    }
+
     @Override
     public List<ObjectInfo> listObjects(String schema) {
         return unchecked(() -> {
             try {
-                String sql = """
-                    SELECT /*+ NO_QUERY_TRANSFORMATION */ OBJECT_NAME, OBJECT_TYPE FROM ALL_OBJECTS
-                    WHERE OWNER = ? AND OBJECT_TYPE IN ('TABLE', 'VIEW', 'PROCEDURE', 'FUNCTION')
-                    ORDER BY CASE OBJECT_TYPE WHEN 'TABLE' THEN 0 WHEN 'VIEW' THEN 1 WHEN 'PROCEDURE' THEN 2 ELSE 3 END, OBJECT_NAME
-                    """.stripIndent().trim();
-
                 List<ObjectInfo> result = new ArrayList<>();
-                try (var stmt = requireConnected().prepareStatement(sql)) {
+                try (var stmt = requireConnected().prepareStatement(listObjectsSql())) {
                     stmt.setString(1, schema);
+                    stmt.setString(2, schema);
                     try (ResultSet rs = stmt.executeQuery()) {
                         while (rs.next()) {
                             result.add(new ObjectInfo(rs.getString(1), rs.getString(2), schema, null));
@@ -272,6 +280,26 @@ public class OracleAgent extends BaseDatabaseAgent {
                 throw e;
             }
         });
+    }
+
+    static String listObjectsSql() {
+        return """
+            SELECT OBJECT_NAME, OBJECT_TYPE
+            FROM (
+                SELECT t.TABLE_NAME AS OBJECT_NAME,
+                    'TABLE' AS OBJECT_TYPE
+                FROM ALL_TABLES t
+                WHERE t.OWNER = ?
+                  AND t.NESTED = 'NO'
+                UNION ALL
+                SELECT o.OBJECT_NAME,
+                    o.OBJECT_TYPE
+                FROM ALL_OBJECTS o
+                WHERE o.OWNER = ?
+                  AND o.OBJECT_TYPE IN ('VIEW', 'PROCEDURE', 'FUNCTION')
+            )
+            ORDER BY CASE OBJECT_TYPE WHEN 'TABLE' THEN 0 WHEN 'VIEW' THEN 1 WHEN 'PROCEDURE' THEN 2 ELSE 3 END, OBJECT_NAME
+            """.stripIndent().trim();
     }
 
     @Override

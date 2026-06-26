@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, defineAsyncComponent, watch, nextTick, onMounted, onUnmounted } from "vue";
+import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/safeStorage";
 import type { CSSProperties } from "vue";
 import { useI18n } from "vue-i18n";
 import { Check, Columns3, Loader2, Search, Bot, GitBranch, BarChart3, TableProperties, ChevronDown, ChevronUp, Inbox, RefreshCcw, Wrench, Toolbox, ListChecks, Database, FileUp, Download, X, Pin } from "@lucide/vue";
@@ -34,10 +35,13 @@ function preloadDataGridComponent() {
 
 const DataGrid = defineAsyncComponent(loadDataGridComponent);
 const RedisKeyBrowser = defineAsyncComponent(() => import("@/components/redis/RedisKeyBrowser.vue"));
+const RedisDashboard = defineAsyncComponent(() => import("@/components/redis/RedisDashboard.vue"));
 const EtcdKeyBrowser = defineAsyncComponent(() => import("@/components/etcd/EtcdKeyBrowser.vue"));
+const ZooKeeperKeyBrowser = defineAsyncComponent(() => import("@/components/zookeeper/ZooKeeperKeyBrowser.vue"));
 const DocumentBrowser = defineAsyncComponent(() => import("@/components/document/DocumentBrowser.vue"));
 const VectorBrowser = defineAsyncComponent(() => import("@/components/vector/VectorBrowser.vue"));
 const MqAdminConsole = defineAsyncComponent(() => import("@/components/mq/MqAdminConsole.vue"));
+const NacosAdminConsole = defineAsyncComponent(() => import("@/components/nacos/NacosAdminConsole.vue"));
 const ObjectBrowser = defineAsyncComponent(() => import("@/components/objects/ObjectBrowser.vue"));
 const TableStructureEditor = defineAsyncComponent(() => import("@/components/structure/TableStructureEditor.vue"));
 const DatabaseUserAdmin = defineAsyncComponent(() => import("@/components/admin/DatabaseUserAdmin.vue"));
@@ -57,6 +61,7 @@ import { formatShortcut } from "@/lib/shortcutRegistry";
 import { effectiveDatabaseTypeForConnection } from "@/lib/jdbcDialect";
 import { chartableColumnIndexes } from "@/lib/chartData";
 import type { SqlExecutionOverride } from "@/lib/sqlExecutionTarget";
+import type { DataGridSortMode } from "@/lib/dataGridSort";
 import { useTabScroll } from "@/composables/useTabScroll";
 import type { QueryTab, ConnectionConfig, TableInfoTab } from "@/types/database";
 import type { SqlFormatDialect } from "@/lib/sqlFormatter";
@@ -91,6 +96,7 @@ type DataGridHandle = {
 
 type SearchableBrowserHandle = {
   focusSearch: () => boolean;
+  refresh?: () => boolean;
 };
 
 type AuditSampleTarget = {
@@ -126,21 +132,24 @@ const emit = defineEmits<{
   formatError: [];
   reload: [sql?: string, searchText?: string, whereInput?: string, orderBy?: string, limit?: number, offset?: number];
   paginate: [offset: number, limit: number, whereInput?: string, orderBy?: string];
-  sort: [column: string, columnIndex: number, direction: "asc" | "desc" | null, whereInput?: string];
+  sort: [column: string, columnIndex: number, direction: "asc" | "desc" | null, whereInput?: string, mode?: DataGridSortMode];
   executeSql: [sql: string];
   clickTable: [tableName: string];
   viewTableData: [tableName: string];
+  viewTableDdl: [tableName: string];
   openObjectTable: [target: { tableName: string; schema?: string }];
   openAuditSampleTarget: [target: AuditSampleTarget];
   objectSchemaChange: [schema: string | undefined];
   structureEditorSaved: [commentChanged: boolean];
   structureEditorClose: [];
+  openSettings: [initialTab?: string, initialSection?: string];
 }>();
 
 const { t } = useI18n();
 const queryStore = useQueryStore();
 const connectionStore = useConnectionStore();
 const { toast } = useToast();
+const DEFAULT_QUERY_RESULTS_PANE_SIZE = 68;
 
 onMounted(() => {
   const preload = () => preloadDataGridComponent();
@@ -149,6 +158,7 @@ onMounted(() => {
   } else {
     setTimeout(preload, 300);
   }
+  window.addEventListener("dbx-refresh-active-kv-browser", onRefreshActiveKvBrowser);
 });
 
 watch(
@@ -171,6 +181,7 @@ const columnVisibilitySearch = ref("");
 const columnVisibilityOptions = computed(() => dataGridRef.value?.filteredColumnVisibilityOptions(columnVisibilitySearch.value) ?? []);
 const redisKeyBrowserRef = ref<SearchableBrowserHandle>();
 const etcdKeyBrowserRef = ref<SearchableBrowserHandle>();
+const zookeeperKeyBrowserRef = ref<SearchableBrowserHandle>();
 const objectBrowserRef = ref<SearchableBrowserHandle>();
 const activeTableMeta = computed(() => props.activeTab.tableMeta);
 const activeDataTabTableMeta = computed(() => tableMetaForDataTab(props.activeTab));
@@ -268,7 +279,17 @@ const hasTabularResult = computed(() => {
 });
 const canShowResultOutput = computed(() => hasTabularResult.value || props.activeTab.isExecuting);
 const resultsPaneOpen = ref(false);
+const resultsPaneSize = ref(Number(safeLocalStorageGet("dbx-results-pane-size")) || DEFAULT_QUERY_RESULTS_PANE_SIZE);
+const editorPaneSize = computed(() => (resultsPaneOpen.value ? 100 - resultsPaneSize.value : 100));
 const queryRunningElapsed = ref(0);
+
+function onResultsResized(payload: { panes: { size: number }[] }) {
+  const resultsPane = payload.panes[1];
+  if (resultsPane?.size != null && resultsPane.size >= 20 && resultsPane.size <= 85) {
+    resultsPaneSize.value = resultsPane.size;
+    safeLocalStorageSet("dbx-results-pane-size", String(resultsPane.size));
+  }
+}
 let queryRunningElapsedTimer: ReturnType<typeof setInterval> | undefined;
 
 function stopQueryRunningElapsedTimer() {
@@ -292,7 +313,10 @@ const queryRunningElapsedSeconds = computed(() => (queryRunningElapsed.value / 1
 
 watch(() => [props.activeTab.id, props.activeTab.isExecuting, props.activeTab.queryExecutionStartedAt] as const, startQueryRunningElapsedTimer, { immediate: true });
 
-onUnmounted(stopQueryRunningElapsedTimer);
+onUnmounted(() => {
+  stopQueryRunningElapsedTimer();
+  window.removeEventListener("dbx-refresh-active-kv-browser", onRefreshActiveKvBrowser);
+});
 
 watch(
   hasQueryOutput,
@@ -455,6 +479,10 @@ function onHandleViewTableData(tableName: string) {
   emit("viewTableData", tableName);
 }
 
+function onHandleViewTableDdl(tableName: string) {
+  emit("viewTableDdl", tableName);
+}
+
 function onHandleCloseColumnPanel() {
   showColumnInfo.value = false;
   columnInfoColumns.value = [];
@@ -464,15 +492,24 @@ function onHandleCloseColumnPanel() {
 function focusSearch(): boolean {
   if (props.activeTab.mode === "redis") return redisKeyBrowserRef.value?.focusSearch() ?? false;
   if (props.activeTab.mode === "etcd") return etcdKeyBrowserRef.value?.focusSearch() ?? false;
+  if (props.activeTab.mode === "zookeeper") return zookeeperKeyBrowserRef.value?.focusSearch() ?? false;
   if (props.activeTab.mode === "objects") return objectBrowserRef.value?.focusSearch() ?? false;
   if (props.activeTab.mode === "query") return queryEditorRef.value?.openSearch() ?? false;
   return dataGridRef.value?.focusSearch() ?? false;
 }
 
 function refreshData(): boolean {
+  if (props.activeTab.mode === "etcd") return etcdKeyBrowserRef.value?.refresh?.() ?? false;
+  if (props.activeTab.mode === "zookeeper") return zookeeperKeyBrowserRef.value?.refresh?.() ?? false;
   if (!dataGridRef.value) return false;
   void dataGridRef.value.onToolbarRefresh();
   return true;
+}
+
+function onRefreshActiveKvBrowser(event: Event) {
+  const detail = (event as CustomEvent<{ mode?: string; connectionId?: string }>).detail;
+  if (!detail || props.activeTab.mode !== detail.mode || props.activeTab.connectionId !== detail.connectionId) return;
+  void nextTick(() => refreshData());
 }
 
 async function exportResultArchive() {
@@ -542,8 +579,8 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
     </template>
 
     <template v-else-if="activeTab.mode === 'query'">
-      <Splitpanes horizontal class="query-output-splitpanes flex-1 min-h-0 overflow-hidden">
-        <Pane class="min-h-0" :size="resultsPaneOpen ? 40 : 100" :min-size="resultsPaneOpen ? 15 : 100">
+      <Splitpanes horizontal class="query-output-splitpanes flex-1 min-h-0 overflow-hidden" @resized="onResultsResized">
+        <Pane class="min-h-0" :size="editorPaneSize" :min-size="resultsPaneOpen ? 15 : 100">
           <div class="h-full flex flex-col relative">
             <QueryEditor
               ref="queryEditorRef"
@@ -569,6 +606,7 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
               @save="emit('saveSql')"
               @click-table="onHandleClickTable"
               @view-table-data="onHandleViewTableData"
+              @view-table-ddl="onHandleViewTableDdl"
               @click-column="onHandleClickColumn"
               @close-column-panel="onHandleCloseColumnPanel"
             />
@@ -579,7 +617,7 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
             </Button>
           </div>
         </Pane>
-        <Pane v-if="resultsPaneOpen" class="min-h-0" :size="60" :min-size="20">
+        <Pane v-if="resultsPaneOpen" class="min-h-0" :size="resultsPaneSize" :min-size="20">
           <div class="h-full flex flex-col">
             <div v-if="hasQueryOutput" class="flex h-10 shrink-0 items-center gap-1 border-b bg-muted/20 px-2">
               <div class="flex shrink-0 items-center gap-1">
@@ -770,6 +808,7 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
                 :sort-column="activeTab.resultSortColumn"
                 :sort-column-index="activeTab.resultSortColumnIndex"
                 :sort-direction="activeTab.resultSortDirection"
+                :sort-mode="activeTab.resultSortMode"
                 :initial-order-by-input="activeTab.orderByInput"
                 :sql="activeTab.lastExecutedSql || activeTab.sql"
                 :loading="activeTab.isExecuting"
@@ -789,11 +828,12 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
                 :total-row-count-loading="activeTab.resultTotalRowCountLoading"
                 :on-execute-sql="async (sql: string) => emit('executeSql', sql)"
                 :full-export-result="(onProgress?: (info: { rowsExported: number; totalRows: number | null }) => void) => queryStore.fetchTabResultForExport(activeTab.id, onProgress)"
+                :query-result-export-request="(options: { exportId: string; filePath: string; format: 'csv' | 'xlsx' }) => queryStore.buildQueryResultExportRequest(activeTab.id, options)"
                 :all-export-results="allResultExportSheets"
                 @update:order-by-input="(v: string) => (activeTab.orderByInput = v)"
                 @reload="(sql?: string, searchText?: string, whereInput?: string, orderBy?: string, limit?: number, offset?: number) => emit('reload', sql, searchText, whereInput, orderBy, limit, offset)"
                 @paginate="(offset: number, limit: number, whereInput?: string, orderBy?: string) => emit('paginate', offset, limit, whereInput, orderBy)"
-                @sort="(column: string, columnIndex: number, direction: 'asc' | 'desc' | null, whereInput?: string) => emit('sort', column, columnIndex, direction, whereInput)"
+                @sort="(column: string, columnIndex: number, direction: 'asc' | 'desc' | null, whereInput?: string, mode?: DataGridSortMode) => emit('sort', column, columnIndex, direction, whereInput, mode)"
               >
                 <template v-if="activeTab.result?.columns.includes('Error')" #error-actions="{ errorMessage }">
                   <Button variant="outline" size="sm" class="h-7 gap-1.5 px-2.5 text-xs" @click="emit('fixWithAi', String(errorMessage))">
@@ -965,6 +1005,7 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
           :sort-column="activeTab.resultSortColumn"
           :sort-column-index="activeTab.resultSortColumnIndex"
           :sort-direction="activeTab.resultSortDirection"
+          :sort-mode="activeTab.resultSortMode"
           :initial-order-by-input="activeTab.orderByInput"
           :sql="activeTab.sql"
           :loading="activeTab.isExecuting"
@@ -984,7 +1025,7 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
           @update:order-by-input="(v: string) => (activeTab.orderByInput = v)"
           @reload="(sql?: string, searchText?: string, whereInput?: string, orderBy?: string, limit?: number, offset?: number) => emit('reload', sql, searchText, whereInput, orderBy, limit, offset)"
           @paginate="(offset: number, limit: number, whereInput?: string, orderBy?: string) => emit('paginate', offset, limit, whereInput, orderBy)"
-          @sort="(column: string, columnIndex: number, direction: 'asc' | 'desc' | null, whereInput?: string) => emit('sort', column, columnIndex, direction, whereInput)"
+          @sort="(column: string, columnIndex: number, direction: 'asc' | 'desc' | null, whereInput?: string, mode?: DataGridSortMode) => emit('sort', column, columnIndex, direction, whereInput, mode)"
         />
         <QueryLoadingState v-else-if="activeTab.isExecuting" class="h-full" :label-key="queryExecutionLabelKey(activeTab)" :elapsed-seconds="queryRunningElapsedSeconds" show-cancel :cancel-disabled="!canCancelQueryExecution(activeTab)" :cancelling="activeTab.isCancelling" @cancel="emit('cancel')" />
         <div v-else class="h-full flex flex-col items-center justify-center gap-3 text-muted-foreground text-sm">
@@ -1010,10 +1051,24 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
       </div>
     </template>
 
+    <!-- Redis Dashboard: instance info -->
+    <template v-else-if="activeTab.mode === 'redis-dashboard'">
+      <div class="flex-1 min-h-0">
+        <RedisDashboard :key="activeTab.id" :connection-id="activeTab.connectionId" />
+      </div>
+    </template>
+
     <!-- etcd mode: key browser -->
     <template v-else-if="activeTab.mode === 'etcd'">
       <div class="flex-1 min-h-0">
         <EtcdKeyBrowser ref="etcdKeyBrowserRef" :key="activeTab.id" :connection-id="activeTab.connectionId" />
+      </div>
+    </template>
+
+    <!-- ZooKeeper mode: znode browser -->
+    <template v-else-if="activeTab.mode === 'zookeeper'">
+      <div class="flex-1 min-h-0">
+        <ZooKeeperKeyBrowser ref="zookeeperKeyBrowserRef" :key="activeTab.id" :connection-id="activeTab.connectionId" />
       </div>
     </template>
 
@@ -1034,6 +1089,12 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
     <template v-else-if="activeTab.mode === 'mq'">
       <div class="flex-1 min-h-0">
         <MqAdminConsole :key="activeTab.id" :connection-id="activeTab.connectionId" :initial-tenant="activeTab.mqTenant" :read-only="activeConnection?.read_only ?? false" />
+      </div>
+    </template>
+
+    <template v-else-if="activeTab.mode === 'nacos'">
+      <div class="flex-1 min-h-0">
+        <NacosAdminConsole :key="activeTab.id" :connection-id="activeTab.connectionId" :namespace="activeTab.nacosNamespace" :namespace-name="activeTab.nacosNamespaceName" :read-only="activeConnection?.read_only ?? false" />
       </div>
     </template>
 
@@ -1060,6 +1121,7 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
         :table-name="activeTab.structureTableName || ''"
         @saved="(commentChanged) => emit('structureEditorSaved', commentChanged)"
         @close="emit('structureEditorClose')"
+        @open-settings="(initialTab, initialSection) => emit('openSettings', initialTab, initialSection)"
       />
     </template>
 

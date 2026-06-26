@@ -142,12 +142,11 @@ const DATABASE_CAPABILITY_OVERRIDES: Partial<Record<DatabaseType, Partial<Databa
   },
   clickhouse: {
     tableData: {
-      insert: false,
+      insert: true,
       updateRequiresPrimaryKey: true,
       deleteRequiresPrimaryKey: true,
       requiresTransactionalTableForExistingRows: false,
       transaction: false,
-      readonly: true,
     },
   },
   tdengine: {
