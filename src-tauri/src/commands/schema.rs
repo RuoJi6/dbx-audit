@@ -68,8 +68,15 @@ pub async fn list_schemas(
     state: State<'_, Arc<AppState>>,
     connection_id: String,
     database: String,
+    apply_visible_filter: Option<bool>,
 ) -> Result<Vec<String>, String> {
-    dbx_core::schema::list_schemas_core(&state, &connection_id, &database).await
+    dbx_core::schema::list_schemas_core_with_visible_filter(
+        &state,
+        &connection_id,
+        &database,
+        apply_visible_filter.unwrap_or(false),
+    )
+    .await
 }
 
 #[tauri::command]

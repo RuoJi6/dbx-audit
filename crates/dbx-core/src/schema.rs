@@ -584,8 +584,17 @@ async fn list_databases_once(state: &AppState, connection_id: &str) -> Result<Ve
 }
 
 pub async fn list_schemas_core(state: &AppState, connection_id: &str, database: &str) -> Result<Vec<String>, String> {
+    list_schemas_core_with_visible_filter(state, connection_id, database, false).await
+}
+
+pub async fn list_schemas_core_with_visible_filter(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    apply_visible_filter: bool,
+) -> Result<Vec<String>, String> {
     retry_metadata_connection(state, connection_id, Some(database), || {
-        list_schemas_once(state, connection_id, database)
+        list_schemas_once(state, connection_id, database, apply_visible_filter)
     })
     .await
 }
@@ -614,13 +623,19 @@ async fn list_schema_infos_once(
         }
     }
 
-    let schemas = list_schemas_once(state, connection_id, database).await?;
+    let schemas = list_schemas_once(state, connection_id, database, false).await?;
     Ok(schemas.into_iter().map(|name| db::SchemaInfo { name, comment: None }).collect())
 }
 
-async fn list_schemas_once(state: &AppState, connection_id: &str, database: &str) -> Result<Vec<String>, String> {
+async fn list_schemas_once(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    apply_visible_filter: bool,
+) -> Result<Vec<String>, String> {
     let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
     let db_config = connection_config(state, connection_id).await;
+    let visible_schema_filter = visible_schema_filter(db_config.as_ref(), database, apply_visible_filter);
 
     {
         let connections = state.connections.read().await;
@@ -640,13 +655,28 @@ async fn list_schemas_once(state: &AppState, connection_id: &str, database: &str
             let fallback_config = db_config.clone();
             drop(connections);
             let mut client = client.lock().await;
-            match client.list_schemas::<Vec<String>>(database, agent_metadata_timeout(db_config.as_ref())).await {
-                Ok(schemas) if !schemas.is_empty() => return Ok(schemas),
+            match client
+                .list_schemas_filtered::<Vec<String>>(
+                    database,
+                    visible_schema_filter.as_deref(),
+                    agent_metadata_timeout(db_config.as_ref()),
+                )
+                .await
+            {
+                Ok(schemas) if !schemas.is_empty() => {
+                    return Ok(filter_visible_schema_names(schemas, visible_schema_filter.as_deref()))
+                }
                 Ok(schemas) => {
                     if let Some(config) = fallback_config.as_ref() {
                         match native_postgres_metadata_pool(state, connection_id, database, config).await {
-                            Ok(Some(pool)) => return db::postgres::list_schemas(&pool).await,
-                            Ok(None) => return Ok(schemas),
+                            Ok(Some(pool)) => {
+                                return db::postgres::list_schemas(&pool).await.map(|schemas| {
+                                    filter_visible_schema_names(schemas, visible_schema_filter.as_deref())
+                                })
+                            }
+                            Ok(None) => {
+                                return Ok(filter_visible_schema_names(schemas, visible_schema_filter.as_deref()))
+                            }
                             Err(error) => {
                                 log::warn!(
                                     "[schema][agent:list_schemas:fallback-failed] connection_id={} database={} error={}",
@@ -657,16 +687,21 @@ async fn list_schemas_once(state: &AppState, connection_id: &str, database: &str
                             }
                         }
                     }
-                    return Ok(schemas);
+                    return Ok(filter_visible_schema_names(schemas, visible_schema_filter.as_deref()));
                 }
                 Err(agent_error) => {
                     if let Some(config) = fallback_config.as_ref() {
                         if let Some(pool) =
                             native_postgres_metadata_pool(state, connection_id, database, config).await?
                         {
-                            return db::postgres::list_schemas(&pool).await.map_err(|fallback_error| {
-                                format!("{agent_error}\n\nNative PostgreSQL metadata fallback failed: {fallback_error}")
-                            });
+                            return db::postgres::list_schemas(&pool)
+                                .await
+                                .map(|schemas| filter_visible_schema_names(schemas, visible_schema_filter.as_deref()))
+                                .map_err(|fallback_error| {
+                                    format!(
+                                        "{agent_error}\n\nNative PostgreSQL metadata fallback failed: {fallback_error}"
+                                    )
+                                });
                         }
                     }
                     return Err(agent_error);
@@ -679,15 +714,40 @@ async fn list_schemas_once(state: &AppState, connection_id: &str, database: &str
     let pool = connections.get(&pool_key).ok_or("Pool not found")?;
 
     match pool {
-        PoolKind::Postgres(p) => db::postgres::list_schemas(p).await,
+        PoolKind::Mysql(p, mode) if *mode == MysqlMode::OceanBaseOracle => db::ob_oracle::list_schemas(p)
+            .await
+            .map(|schemas| filter_visible_schema_names(schemas, visible_schema_filter.as_deref())),
+        PoolKind::Postgres(p) => db::postgres::list_schemas(p)
+            .await
+            .map(|schemas| filter_visible_schema_names(schemas, visible_schema_filter.as_deref())),
         #[cfg(feature = "duckdb-bundled")]
         PoolKind::DuckDb(con) => {
             let duckdb_attached_names = duckdb_attached_database_names(state, connection_id).await;
             let con = con.lock().map_err(|e| e.to_string())?;
             duckdb_list_schemas_with_attached(&con, database, &duckdb_attached_names)
+                .map(|schemas| filter_visible_schema_names(schemas, visible_schema_filter.as_deref()))
         }
         _ => Ok(vec![]),
     }
+}
+
+fn visible_schema_filter(
+    config: Option<&ConnectionConfig>,
+    database: &str,
+    apply_visible_filter: bool,
+) -> Option<Vec<String>> {
+    if !apply_visible_filter {
+        return None;
+    }
+    config?.visible_schemas.as_ref()?.get(database).cloned()
+}
+
+fn filter_visible_schema_names(schemas: Vec<String>, visible: Option<&[String]>) -> Vec<String> {
+    let Some(visible) = visible else {
+        return schemas;
+    };
+    let visible: std::collections::HashSet<&str> = visible.iter().map(String::as_str).collect();
+    schemas.into_iter().filter(|schema| visible.contains(schema.as_str())).collect()
 }
 
 pub async fn list_tables_core(
@@ -954,8 +1014,21 @@ async fn list_tables_once(
                 .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types))
         }
         PoolKind::Mysql(p, mode) => {
-            dispatch_mysql!(p, mode, db::mysql::list_tables, db::ob_oracle::list_tables, schema)
-                .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types))
+            if *mode == MysqlMode::OceanBaseOracle {
+                let tables = db::ob_oracle::list_tables(p, schema).await?;
+                Ok(filter_table_infos(tables, filter, limit, offset, object_types))
+            } else {
+                db::mysql::list_tables_filtered(
+                    p,
+                    mysql_table_metadata_catalog(database, schema),
+                    filter,
+                    limit,
+                    offset,
+                    object_types,
+                )
+                .await
+                .map(|tables| filter_table_infos(tables, None, None, None, object_types))
+            }
         }
         PoolKind::Postgres(p) if db_config.as_ref().is_some_and(is_questdb_config) => {
             db::questdb::list_tables(p, schema)
@@ -987,7 +1060,7 @@ async fn list_tables_once(
             .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types)),
         PoolKind::VectorDb(client) => db::vector_driver::list_collections(client)
             .await
-            .map(|names| collection_names_to_tables(names, "COLLECTION"))
+            .map(|infos| collection_names_to_tables(infos.into_iter().map(|i| i.name).collect(), "COLLECTION"))
             .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types)),
         _ => Ok(vec![]),
     }
@@ -1156,6 +1229,10 @@ fn normalize_information_schema_table_type(table_type: &str) -> String {
     }
 }
 
+fn mysql_table_metadata_catalog<'a>(database: &'a str, _schema: &str) -> &'a str {
+    database
+}
+
 fn quote_presto_like_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
@@ -1169,9 +1246,10 @@ mod tests {
     use super::db;
     use super::{
         clickhouse_metadata_database, deduplicate_column_infos, filter_mysql_system_databases_for_config,
-        filter_table_infos, is_agent_postgres_metadata_fallback_config, normalize_information_schema_table_type,
+        filter_table_infos, filter_visible_schema_names, is_agent_postgres_metadata_fallback_config,
+        is_retryable_metadata_error, mysql_table_metadata_catalog, normalize_information_schema_table_type,
         oracle_table_comment_from_query_result, oracle_table_comment_sql, presto_like_information_schema_tables_sql,
-        presto_like_tables_from_query_result,
+        presto_like_tables_from_query_result, visible_schema_filter,
     };
     #[cfg(feature = "duckdb-bundled")]
     use super::{
@@ -1179,6 +1257,7 @@ mod tests {
         duckdb_query_tables_in_database,
     };
     use crate::models::connection::{ConnectionConfig, DatabaseType};
+    use std::collections::HashMap;
 
     fn test_column(name: &str, comment: Option<&str>, is_primary_key: bool) -> super::db::ColumnInfo {
         super::db::ColumnInfo {
@@ -1241,6 +1320,42 @@ mod tests {
             one_time: false,
             read_only: false,
         }
+    }
+
+    #[test]
+    fn mysql_table_child_metadata_uses_database_not_schema() {
+        assert_eq!(mysql_table_metadata_catalog("app_db", ""), "app_db");
+        assert_eq!(mysql_table_metadata_catalog("app_db", "public"), "app_db");
+    }
+
+    #[test]
+    fn metadata_retry_recovers_missing_pool_only_as_transient_state() {
+        assert!(is_retryable_metadata_error("Pool not found"));
+        assert!(is_retryable_metadata_error("connection reset by peer"));
+        assert!(!is_retryable_metadata_error("Unknown column 'email' in 'field list'"));
+        assert!(!is_retryable_metadata_error("Access denied for user"));
+    }
+
+    #[test]
+    fn visible_schema_filter_only_applies_when_requested() {
+        let mut config = test_connection_config(DatabaseType::Oracle);
+        config.visible_schemas =
+            Some(HashMap::from([("ORCLPDB1".to_string(), vec!["APP".to_string(), "REPORTING".to_string()])]));
+
+        assert_eq!(visible_schema_filter(Some(&config), "ORCLPDB1", false), None);
+        assert_eq!(
+            visible_schema_filter(Some(&config), "ORCLPDB1", true),
+            Some(vec!["APP".to_string(), "REPORTING".to_string()])
+        );
+        assert_eq!(visible_schema_filter(Some(&config), "OTHER", true), None);
+    }
+
+    #[test]
+    fn filter_visible_schema_names_preserves_database_order() {
+        let schemas = vec!["APP".to_string(), "SYS".to_string(), "REPORTING".to_string()];
+        let visible = vec!["REPORTING".to_string(), "APP".to_string()];
+
+        assert_eq!(filter_visible_schema_names(schemas, Some(&visible)), vec!["APP", "REPORTING"]);
     }
 
     fn test_table_info(name: &str) -> super::db::TableInfo {
@@ -1874,6 +1989,9 @@ async fn list_object_statistics_once(
         }
         PoolKind::Postgres(p) if db_config.as_ref().is_some_and(is_questdb_config) => Ok(vec![]),
         PoolKind::Postgres(p) => db::postgres::list_object_statistics(p, schema).await,
+        PoolKind::ClickHouse(client) => {
+            db::clickhouse_driver::list_object_statistics(client, clickhouse_metadata_database(database, schema)).await
+        }
         _ => Ok(vec![]),
     }
 }
@@ -2161,12 +2279,16 @@ where
 {
     let result = operation().await;
     match result {
-        Err(error) if crate::query::is_connection_error(&error) => {
+        Err(error) if is_retryable_metadata_error(&error) => {
             state.reconnect_pool(connection_id, database).await?;
             operation().await
         }
         _ => result,
     }
+}
+
+fn is_retryable_metadata_error(error: &str) -> bool {
+    error == "Pool not found" || crate::query::is_connection_error(error)
 }
 
 pub async fn get_columns_core(
@@ -2414,7 +2536,11 @@ pub async fn list_indexes_core(
                 if db_config.as_ref().is_some_and(is_manticoresearch_config) {
                     return db::manticoresearch::list_indexes(p, table).await;
                 }
-                dispatch_mysql!(p, mode, db::mysql::list_indexes, db::ob_oracle::list_indexes, schema, table)
+                if *mode == MysqlMode::OceanBaseOracle {
+                    db::ob_oracle::list_indexes(p, schema, table).await
+                } else {
+                    db::mysql::list_indexes(p, mysql_table_metadata_catalog(database, schema), table).await
+                }
             }
             PoolKind::Postgres(p) if db_config.as_ref().is_some_and(is_questdb_config) => {
                 db::questdb::list_indexes(p, schema, table).await
@@ -2460,7 +2586,11 @@ pub async fn list_foreign_keys_core(
 
         match pool {
             PoolKind::Mysql(p, mode) => {
-                dispatch_mysql!(p, mode, db::mysql::list_foreign_keys, db::ob_oracle::list_foreign_keys, schema, table)
+                if *mode == MysqlMode::OceanBaseOracle {
+                    db::ob_oracle::list_foreign_keys(p, schema, table).await
+                } else {
+                    db::mysql::list_foreign_keys(p, mysql_table_metadata_catalog(database, schema), table).await
+                }
             }
             PoolKind::Postgres(p) => db::postgres::list_foreign_keys(p, schema, table).await,
             PoolKind::Sqlite(p) => db::sqlite::list_foreign_keys(p, schema, table).await,
@@ -2500,7 +2630,11 @@ pub async fn list_triggers_core(
 
         match pool {
             PoolKind::Mysql(p, mode) => {
-                dispatch_mysql!(p, mode, db::mysql::list_triggers, db::ob_oracle::list_triggers, schema, table)
+                if *mode == MysqlMode::OceanBaseOracle {
+                    db::ob_oracle::list_triggers(p, schema, table).await
+                } else {
+                    db::mysql::list_triggers(p, mysql_table_metadata_catalog(database, schema), table).await
+                }
             }
             PoolKind::Postgres(p) => db::postgres::list_triggers(p, schema, table).await,
             PoolKind::Sqlite(p) => db::sqlite::list_triggers(p, schema, table).await,
@@ -3264,6 +3398,18 @@ mod ddl_tests {
     }
 
     #[test]
+    fn postgres_table_ddl_includes_generated_identity() {
+        let mut id = column("id", "integer");
+        id.is_nullable = false;
+        id.is_primary_key = true;
+        id.extra = Some("generated by default as identity".to_string());
+
+        let ddl = render_postgres_table_ddl("public", "users", &[id], &[], &[]);
+
+        assert!(ddl.contains("\"id\" integer generated by default as identity NOT NULL"), "ddl: {ddl}");
+    }
+
+    #[test]
     fn sqlserver_table_ddl_includes_column_comments() {
         let mut display_name = column("display]name", "nvarchar(100)");
         display_name.comment = Some("User's display name".to_string());
@@ -3350,11 +3496,21 @@ pub fn render_postgres_table_ddl(
         .iter()
         .map(|c| {
             let mut line = format!("  {} {}", pg_ident(&c.name), c.data_type);
+            let generated_clause = c
+                .extra
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty() && value.to_ascii_lowercase().starts_with("generated "));
+            if let Some(extra) = generated_clause {
+                line.push_str(&format!(" {extra}"));
+            }
             if !c.is_nullable {
                 line.push_str(" NOT NULL");
             }
-            if let Some(ref def) = c.column_default {
-                line.push_str(&format!(" DEFAULT {def}"));
+            if generated_clause.is_none() {
+                if let Some(ref def) = c.column_default {
+                    line.push_str(&format!(" DEFAULT {def}"));
+                }
             }
             line
         })

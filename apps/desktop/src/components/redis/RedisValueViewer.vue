@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, nextTick, onBeforeUnmount, onMounted } from "vue";
 import { useI18n } from "vue-i18n";
+import { onClickOutside } from "@vueuse/core";
 import { DynamicScroller, DynamicScrollerItem, RecycleScroller } from "vue-virtual-scroller";
 import { Braces, Copy, Eye, FileText, Terminal, Trash2, Save, RefreshCw, Plus, Loader2, Pencil, WrapText, IndentIncrease, IndentDecrease } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
@@ -48,6 +49,10 @@ const showMemberDetail = ref(false);
 const editingTtl = ref(false);
 const ttlInput = ref("");
 const ttlInputEl = ref<InstanceType<typeof Input>>();
+const editTtlWrapper = ref<HTMLElement>();
+onClickOutside(editTtlWrapper, () => {
+  if (editingTtl.value) cancelEditTtl();
+});
 const collectionItems = ref<any[]>([]);
 const scanCursor = ref<number | undefined>(undefined);
 const selectedMemberTitle = ref("");
@@ -789,10 +794,9 @@ onBeforeUnmount(() => {
             <Badge v-if="data.ttl > 0" variant="outline" class="text-xs cursor-pointer text-muted-foreground hover:bg-accent" @click="startEditTtl">TTL: {{ formatTtl(data.ttl, t) }}</Badge>
             <Badge v-else-if="data.ttl === -1" variant="outline" class="text-xs cursor-pointer text-muted-foreground hover:bg-accent" @click="startEditTtl">{{ t("redis.noExpiry") }}</Badge>
           </template>
-          <div v-else class="flex items-center gap-1">
-            <Input ref="ttlInputEl" v-model="ttlInput" class="h-6 w-20 text-xs" placeholder="seconds (-1=no expiry)" @keydown.enter="saveTtl" @keydown.escape="cancelEditTtl" @blur="cancelEditTtl" />
-            <!-- mousedown fires before blur so saveTtl starts first; .prevent keeps focus on the Input so blur doesn't cancel the edit prematurely -->
-            <Button variant="ghost" size="icon" class="h-6 w-6" @mousedown.prevent="saveTtl"><Save class="h-3 w-3" /></Button>
+          <div ref="editTtlWrapper" v-else class="flex items-center gap-1">
+            <Input ref="ttlInputEl" v-model="ttlInput" class="h-6 w-20 text-xs" placeholder="seconds (-1=no expiry)" @keydown.enter="saveTtl" @keydown.escape="cancelEditTtl" />
+            <Button variant="ghost" size="icon" class="h-6 w-6" @click="saveTtl"><Save class="h-3 w-3" /></Button>
           </div>
         </div>
       </div>

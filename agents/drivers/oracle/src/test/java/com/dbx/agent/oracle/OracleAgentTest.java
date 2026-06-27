@@ -7,6 +7,7 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
 import java.sql.SQLException;
+import java.util.List;
 import java.util.Locale;
 
 class OracleAgentTest extends JdbcFakeExecutionBehaviorTest {
@@ -63,6 +64,22 @@ class OracleAgentTest extends JdbcFakeExecutionBehaviorTest {
         Assertions.assertTrue(sql.contains("ALL_USERS"));
         Assertions.assertFalse(sql.contains("ALL_TABLES"));
         Assertions.assertFalse(sql.contains("ALL_VIEWS"));
+    }
+
+    @Test
+    void listDatabasesSqlCanApplyVisibleSchemaFilter() {
+        String sql = OracleAgent.listDatabasesSql(2).toUpperCase(Locale.ROOT);
+
+        Assertions.assertTrue(sql.contains("ALL_USERS"), sql);
+        Assertions.assertTrue(sql.contains("USERNAME IN (?,?)"), sql);
+        Assertions.assertFalse(sql.contains("ALL_TABLES"), sql);
+    }
+
+    @Test
+    void listSchemasWithEmptyVisibleFilterSkipsMetadataQuery() {
+        OracleAgent agent = new OracleAgent();
+
+        Assertions.assertEquals(List.of(), agent.listSchemas(List.of()));
     }
 
     @Test

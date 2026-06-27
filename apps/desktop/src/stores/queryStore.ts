@@ -27,7 +27,7 @@ import {
 import { redisCommandResultToQueryResult } from "@/lib/redisQueryResult";
 import { nextRedisCommandDb } from "@/lib/redisCommandSession";
 import { isRedisMutatingCommand } from "@/lib/redisCommandTable";
-import { supportsDatabaseFeature } from "@/lib/databaseCapabilities";
+import { usesAgentCursorForQuery } from "@/lib/databaseDriverManifest";
 import { canUseKeylessRowPredicate, editableRowIdentifierColumns } from "@/lib/tableEditing";
 import { TABLE_DATA_EXPORT_PAGE_SIZE } from "@/lib/tableDataExport";
 import { tableMetaForDataTab } from "@/lib/tableDataTabMeta";
@@ -1451,7 +1451,7 @@ export const useQueryStore = defineStore("query", () => {
       }
       const conn = connStore.getConfig(tab.connectionId);
       const effectiveDbType = effectiveDatabaseTypeForConnection(conn);
-      const useAgentCursor = conn?.db_type === "jdbc" || supportsDatabaseFeature(conn?.db_type, "driverManagement");
+      const useAgentCursor = usesAgentCursorForQuery(conn?.db_type);
       const queryTimeoutSecs = queryTimeoutSecsForConnection(conn);
       const settingsStore = useSettingsStore();
       console.info("[DBX][executeTabSql:previous-session-close:start]", { traceId, elapsed: elapsed() });
@@ -2195,6 +2195,7 @@ export const useQueryStore = defineStore("query", () => {
             databaseType: effectiveDbType,
             schema: tableMeta.schema,
             tableName: tableMeta.tableName,
+            tableType: tableMeta.tableType,
             columns: tableMeta.columns.map((column) => column.name),
             primaryKeys,
             whereInput: tab.whereInput,
@@ -2241,12 +2242,14 @@ export const useQueryStore = defineStore("query", () => {
     const conn = connStore.getConfig(tab.connectionId);
     const effectiveDbType = effectiveDatabaseTypeForConnection(conn);
     const queryTimeoutSecs = queryTimeoutSecsForConnection(conn);
-    const useAgentCursor = conn?.db_type === "jdbc" || supportsDatabaseFeature(conn?.db_type, "driverManagement");
+    const useAgentCursor = usesAgentCursorForQuery(conn?.db_type);
     const queryBaseSql = tab.resultBaseSql ?? sql;
-    const exportRowLimit = useSettingsStore().editorSettings.exportRowLimit;
+    const exportSettings = useSettingsStore().editorSettings;
+    const exportRowLimit = exportSettings.exportRowLimitEnabled ? exportSettings.exportRowLimit : Number.POSITIVE_INFINITY;
+    const agentExportMaxRows = exportSettings.exportRowLimitEnabled ? exportSettings.exportRowLimit : 2_147_483_647;
     // Use the already-computed total row count as a progress estimate so the
     // export dialog shows a moving bar instead of a stuck 0 while paginating.
-    const totalRows = typeof tab.resultTotalRowCount === "number" ? tab.resultTotalRowCount : null;
+    const totalRows = typeof tab.resultTotalRowCount === "number" ? Math.min(tab.resultTotalRowCount, exportRowLimit) : null;
     const pageLimit = Math.max(tab.resultPageLimit ?? 0, TABLE_DATA_EXPORT_PAGE_SIZE);
     const rows: QueryResult["rows"] = [];
     let columns: string[] = [];
@@ -2271,7 +2274,7 @@ export const useQueryStore = defineStore("query", () => {
         if (typeof plan.pageLimit !== "number" || typeof plan.pageOffset !== "number") return tab.result;
         const executionOptions = plan.useAgentResultSession
           ? {
-              maxRows: exportRowLimit,
+              maxRows: agentExportMaxRows,
               fetchSize: plan.pageLimit,
               pageSize: plan.pageLimit,
               resultSessionId: sessionId,
@@ -2319,9 +2322,10 @@ export const useQueryStore = defineStore("query", () => {
     const settings = useSettingsStore().editorSettings;
     const effectiveDbType = effectiveDatabaseTypeForConnection(conn);
     if (!effectiveDbType) return undefined;
-    const useAgentCursor = conn?.db_type === "jdbc" || supportsDatabaseFeature(conn?.db_type, "driverManagement");
+    const useAgentCursor = usesAgentCursorForQuery(conn?.db_type);
     const queryBaseSql = tab.resultBaseSql ?? sql;
-    const totalRows = typeof tab.resultTotalRowCount === "number" ? tab.resultTotalRowCount : null;
+    const rowLimit = settings.exportRowLimitEnabled ? settings.exportRowLimit : null;
+    const totalRows = typeof tab.resultTotalRowCount === "number" ? (rowLimit === null ? tab.resultTotalRowCount : Math.min(tab.resultTotalRowCount, rowLimit)) : null;
     const clientSessionId = tabClientSessionId(tab, "export");
 
     return {
@@ -2336,7 +2340,7 @@ export const useQueryStore = defineStore("query", () => {
       filePath: options.filePath,
       format: options.format,
       pageSize: settings.exportBatchSize,
-      rowLimit: settings.exportRowLimitEnabled ? settings.exportRowLimit : null,
+      rowLimit,
       totalRows,
       timeoutSecs: queryTimeoutSecsForConnection(conn),
       keysetOptimizationEnabled: settings.queryExportKeysetOptimizationEnabled,

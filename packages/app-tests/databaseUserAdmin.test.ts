@@ -17,13 +17,14 @@ import {
   postgresCreateRoleSql,
   postgresDropRoleSql,
   postgresGrantPrivilegesSql,
+  postgresListRolesSql,
   postgresPrivilegeTargetSql,
   postgresRevokePrivilegesSql,
   postgresRoleLabel,
+  postgresShowGrantsSql,
   quoteMySqlIdentifier,
   quoteMySqlString,
   quotePostgresIdentifier,
-
   usersFromMySqlGranteeResult,
   usersFromMySqlUserResult,
   usersFromPostgresRolesResult,
@@ -160,4 +161,15 @@ test("parses PostgreSQL role rows", () => {
       { user: "readonly", host: "ROLE", plugin: "" },
     ],
   );
+});
+
+test("builds PostgreSQL role metadata SQL without directly requiring rolbypassrls", () => {
+  const listSql = postgresListRolesSql();
+  const grantsSql = postgresShowGrantsSql({ user: "reporter", host: "LOGIN" });
+
+  assert.match(listSql, /row_to_json\(r\)::text LIKE '%"rolbypassrls":true%'/);
+  assert.match(grantsSql, /row_to_json\(r\)::text LIKE '%"rolbypassrls":true%'/);
+  assert.doesNotMatch(listSql, /r\.rolbypassrls/);
+  assert.doesNotMatch(grantsSql, /r\.rolbypassrls/);
+  assert.match(grantsSql, /AS rolbypassrls/);
 });

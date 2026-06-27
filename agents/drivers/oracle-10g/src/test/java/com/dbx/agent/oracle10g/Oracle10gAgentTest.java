@@ -101,6 +101,15 @@ class Oracle10gAgentTest extends JdbcFakeExecutionBehaviorTest {
     }
 
     @Test
+    void listDatabasesSqlCanApplyVisibleSchemaFilter() {
+        String sql = Oracle10gAgent.listDatabasesSql(2).toUpperCase(Locale.ROOT);
+
+        Assertions.assertTrue(sql.contains("ALL_TABLES"), sql);
+        Assertions.assertTrue(sql.contains("ALL_VIEWS"), sql);
+        Assertions.assertTrue(sql.contains("OWNER IN (?,?)"), sql);
+    }
+
+    @Test
     void listObjectsSqlUsesSplitDictionaryQuery() {
         String sql = Oracle10gAgent.listObjectsSql().toUpperCase(Locale.ROOT);
 

@@ -120,6 +120,8 @@ pub struct AiConfig {
     pub context_window: Option<u32>,
     #[serde(default)]
     pub codex_cli_path: Option<String>,
+    #[serde(default)]
+    pub codex_cli_env: HashMap<String, String>,
 }
 
 fn default_enable_thinking() -> bool {
@@ -441,12 +443,17 @@ pub fn supports_temperature(config: &AiConfig) -> bool {
 
 fn add_temperature_if_supported_for_config(body: &mut serde_json::Value, config: &AiConfig, temperature: Option<f32>) {
     if supports_temperature(config) {
-        body["temperature"] = json!(temperature.unwrap_or(0.2));
+        body["temperature"] = temperature_value(temperature);
     }
 }
 
 pub fn add_temperature_if_supported(body: &mut serde_json::Value, request: &AiCompletionRequest) {
     add_temperature_if_supported_for_config(body, &request.config, request.temperature);
+}
+
+fn temperature_value(temperature: Option<f32>) -> serde_json::Value {
+    let value = ((temperature.unwrap_or(0.2) as f64) * 100.0).round() / 100.0;
+    json!(value)
 }
 
 fn responses_text(data: &serde_json::Value) -> String {
@@ -681,7 +688,7 @@ pub async fn call_claude(client: &reqwest::Client, request: AiCompletionRequest)
     let body = json!({
         "model": request.config.model,
         "max_tokens": request.max_tokens.unwrap_or(2048),
-        "temperature": request.temperature.unwrap_or(0.2),
+        "temperature": temperature_value(request.temperature),
         "system": claude_system_prompt(&request.system_prompt),
         "messages": request.messages,
     });
@@ -786,7 +793,7 @@ pub async fn call_gemini(client: &reqwest::Client, request: AiCompletionRequest)
         "contents": contents,
         "generationConfig": {
             "maxOutputTokens": request.max_tokens.unwrap_or(2048),
-            "temperature": request.temperature.unwrap_or(0.2),
+            "temperature": temperature_value(request.temperature),
         },
     });
 
@@ -906,7 +913,7 @@ pub async fn test_connection_core(config: &AiConfig) -> Result<AiTestConnectionR
             let body = json!({
                 "model": &model,
                 "max_tokens": 16,
-                "temperature": 0.0,
+                "temperature": temperature_value(Some(0.0)),
                 "system": CLAUDE_DEFAULT_SYSTEM,
                 "messages": [{ "role": "user", "content": TEST_PROMPT }],
                 "stream": true,
@@ -932,7 +939,7 @@ pub async fn test_connection_core(config: &AiConfig) -> Result<AiTestConnectionR
                 .query(&[("key", config.api_key.as_str()), ("alt", "sse")])
                 .json(&json!({
                     "contents": [{ "parts": [{ "text": TEST_PROMPT }], "role": "user" }],
-                    "generationConfig": { "maxOutputTokens": 16, "temperature": 0.0 },
+                    "generationConfig": { "maxOutputTokens": 16, "temperature": temperature_value(Some(0.0)) },
                 }))
                 .send()
                 .await
@@ -1110,7 +1117,7 @@ async fn stream_claude(
     let body = json!({
         "model": request.config.model,
         "max_tokens": request.max_tokens.unwrap_or(2048),
-        "temperature": request.temperature.unwrap_or(0.2),
+        "temperature": temperature_value(request.temperature),
         "system": claude_system_prompt(&request.system_prompt),
         "messages": request.messages,
         "stream": true,
@@ -1375,7 +1382,7 @@ async fn stream_gemini(
         "contents": contents,
         "generationConfig": {
             "maxOutputTokens": request.max_tokens.unwrap_or(2048),
-            "temperature": request.temperature.unwrap_or(0.2),
+            "temperature": temperature_value(request.temperature),
         },
     });
 
@@ -2099,8 +2106,8 @@ mod tests {
         add_temperature_if_supported_for_config, build_ai_http_client, claude_headers, claude_system_prompt,
         gemini_text, is_kimi_model, openai_response_text, openai_stream_reasoning, openai_stream_text,
         parse_model_list_response, resolve_endpoint, resolve_model_list_endpoint, responses_max_output_tokens,
-        responses_text, supports_temperature, validate_config, AiApiStyle, AiAuthMethod, AiConfig, AiModelInfo,
-        AiProvider, AiReasoningLevel, AUTHORIZATION, CLAUDE_DEFAULT_SYSTEM, TEST_PROMPT,
+        responses_text, supports_temperature, temperature_value, validate_config, AiApiStyle, AiAuthMethod, AiConfig,
+        AiModelInfo, AiProvider, AiReasoningLevel, AUTHORIZATION, CLAUDE_DEFAULT_SYSTEM, TEST_PROMPT,
     };
 
     #[test]
@@ -2118,6 +2125,7 @@ mod tests {
         assert_eq!(config.proxy_url, "");
         assert!(config.enable_thinking);
         assert_eq!(config.auth_method, AiAuthMethod::ApiKey);
+        assert!(config.codex_cli_env.is_empty());
     }
 
     #[test]
@@ -2135,6 +2143,7 @@ mod tests {
             reasoning_level: AiReasoningLevel::Default,
             context_window: None,
             codex_cli_path: None,
+            codex_cli_env: Default::default(),
         };
 
         let err = build_ai_http_client(&config, 1).unwrap_err();
@@ -2157,6 +2166,7 @@ mod tests {
             reasoning_level: AiReasoningLevel::Default,
             context_window: None,
             codex_cli_path: None,
+            codex_cli_env: Default::default(),
         };
 
         build_ai_http_client(&config, 1).unwrap();
@@ -2177,6 +2187,7 @@ mod tests {
             reasoning_level: AiReasoningLevel::Default,
             context_window: None,
             codex_cli_path: None,
+            codex_cli_env: Default::default(),
         };
 
         build_ai_http_client(&config, 1).unwrap();
@@ -2197,6 +2208,7 @@ mod tests {
             reasoning_level: AiReasoningLevel::Default,
             context_window: None,
             codex_cli_path: None,
+            codex_cli_env: Default::default(),
         };
 
         assert_eq!(
@@ -2217,6 +2229,7 @@ mod tests {
             reasoning_level: AiReasoningLevel::Default,
             context_window: None,
             codex_cli_path: None,
+            codex_cli_env: Default::default(),
         };
 
         assert_eq!(resolve_endpoint(&ollama), "http://localhost:11434/v1/chat/completions");
@@ -2238,6 +2251,7 @@ mod tests {
             reasoning_level: AiReasoningLevel::Default,
             context_window: None,
             codex_cli_path: None,
+            codex_cli_env: Default::default(),
         };
         assert_eq!(resolve_model_list_endpoint(&openai).unwrap(), "https://api.openai.com/v1/models");
 
@@ -2254,6 +2268,7 @@ mod tests {
             reasoning_level: AiReasoningLevel::Default,
             context_window: None,
             codex_cli_path: None,
+            codex_cli_env: Default::default(),
         };
         assert_eq!(resolve_model_list_endpoint(&claude).unwrap(), "https://api.anthropic.com/v1/models");
     }
@@ -2274,6 +2289,7 @@ mod tests {
             reasoning_level: AiReasoningLevel::Default,
             context_window: None,
             codex_cli_path: None,
+            codex_cli_env: Default::default(),
         };
         assert_eq!(resolve_endpoint(&config), "https://api.example.com/v1/chat/completions");
         assert_eq!(resolve_model_list_endpoint(&config).unwrap(), "https://api.example.com/v1/models");
@@ -2329,6 +2345,7 @@ mod tests {
             reasoning_level: AiReasoningLevel::Default,
             context_window: None,
             codex_cli_path: None,
+            codex_cli_env: Default::default(),
         };
 
         let api_key_headers = claude_headers(&config).unwrap();
@@ -2386,6 +2403,14 @@ mod tests {
     }
 
     #[test]
+    fn temperature_value_rounds_f32_to_provider_safe_precision() {
+        assert_eq!(temperature_value(Some(0.15)), serde_json::json!(0.15));
+        assert_eq!(temperature_value(Some(0.149)), serde_json::json!(0.15));
+        assert_eq!(temperature_value(None), serde_json::json!(0.2));
+        assert_eq!(serde_json::to_string(&temperature_value(Some(0.15))).unwrap(), "0.15");
+    }
+
+    #[test]
     fn omits_temperature_for_openai_reasoning_models() {
         let mut config = AiConfig {
             provider: AiProvider::Openai,
@@ -2400,6 +2425,7 @@ mod tests {
             reasoning_level: AiReasoningLevel::Default,
             context_window: None,
             codex_cli_path: None,
+            codex_cli_env: Default::default(),
         };
 
         assert!(!supports_temperature(&config));
@@ -2466,6 +2492,7 @@ mod tests {
             reasoning_level: AiReasoningLevel::Default,
             context_window: None,
             codex_cli_path: None,
+            codex_cli_env: Default::default(),
         };
         let mut body = serde_json::json!({
             "model": &config.model,

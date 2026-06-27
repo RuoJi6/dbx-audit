@@ -1,6 +1,6 @@
 import type { ConnectionConfig } from "./connections.js";
 import type { TableInfo, ColumnInfo, QueryOptions, QueryResult } from "./database.js";
-import { evaluateMongoAggregateSafety, evaluateMongoWriteSafety, inferMongoColumns, mongoDocumentsToQueryResult, parseMongoAggregateCommand, parseMongoCountDocumentsCommand, parseMongoFindCommand, parseMongoGetIndexesCommand, parseMongoWriteCommand, type MongoWriteCommand } from "./database.js";
+import { collectionListToTableInfos, evaluateMongoAggregateSafety, evaluateMongoWriteSafety, inferMongoColumns, mongoDocumentsToQueryResult, parseMongoAggregateCommand, parseMongoCountDocumentsCommand, parseMongoFindCommand, parseMongoGetIndexesCommand, parseMongoWriteCommand, type CollectionInfo, type MongoWriteCommand } from "./database.js";
 import { sqlSafetyFromEnv } from "./sql-safety.js";
 
 const baseUrl = process.env.DBX_WEB_URL!.replace(/\/+$/, "");
@@ -93,8 +93,8 @@ export async function listTables(config: ConnectionConfig, schema?: string): Pro
       method: "POST",
       body: JSON.stringify({ connectionId: config.id, database: config.database || "" }),
     });
-    const collections = (await res.json()) as string[];
-    return collections.map((name) => ({ name, type: "COLLECTION" }));
+    const collections = (await res.json()) as Array<string | CollectionInfo>;
+    return collectionListToTableInfos(collections);
   }
   const params = new URLSearchParams({
     connection_id: config.id,

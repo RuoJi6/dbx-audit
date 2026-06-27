@@ -20,6 +20,7 @@ pub struct SchemaQuery {
     pub offset: Option<usize>,
     pub object_type: Option<dbx_core::db::ObjectSourceKind>,
     pub object_types: Option<String>,
+    pub apply_visible_filter: Option<bool>,
 }
 
 pub async fn list_databases(
@@ -90,7 +91,14 @@ pub async fn list_schemas(
     Query(q): Query<SchemaQuery>,
 ) -> Result<Json<Vec<String>>, AppError> {
     let database = q.database.as_deref().unwrap_or("");
-    let result = dbx_core::schema::list_schemas_core(&state.app, &q.connection_id, database).await.map_err(AppError)?;
+    let result = dbx_core::schema::list_schemas_core_with_visible_filter(
+        &state.app,
+        &q.connection_id,
+        database,
+        q.apply_visible_filter.unwrap_or(false),
+    )
+    .await
+    .map_err(AppError)?;
     Ok(Json(result))
 }
 

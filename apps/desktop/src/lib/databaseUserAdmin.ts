@@ -171,6 +171,7 @@ export function usersFromMySqlGranteeResult(result: QueryResult): DatabaseUserId
 }
 
 export function postgresListRolesSql(): string {
+  const bypassRls = postgresRoleBypassRlsSql("r");
   return `
 SELECT
   r.rolname AS user,
@@ -180,7 +181,7 @@ SELECT
     CASE WHEN r.rolcreatedb THEN 'CREATEDB' END,
     CASE WHEN r.rolcreaterole THEN 'CREATEROLE' END,
     CASE WHEN r.rolreplication THEN 'REPLICATION' END,
-    CASE WHEN r.rolbypassrls THEN 'BYPASSRLS' END
+    CASE WHEN ${bypassRls} THEN 'BYPASSRLS' END
   ) AS plugin
 FROM pg_catalog.pg_roles r
 ORDER BY r.rolname;`.trim();
@@ -192,11 +193,12 @@ export function usersFromPostgresRolesResult(result: QueryResult): DatabaseUserI
 
 export function postgresShowGrantsSql(user: DatabaseUserIdentity): string {
   const role = quoteSqlString(user.user);
+  const bypassRls = postgresRoleBypassRlsSql("r");
   return `
 WITH target AS (
-  SELECT oid, rolname, rolsuper, rolcreatedb, rolcreaterole, rolcanlogin, rolreplication, rolbypassrls
-  FROM pg_catalog.pg_roles
-  WHERE rolname = ${role}
+  SELECT oid, rolname, rolsuper, rolcreatedb, rolcreaterole, rolcanlogin, rolreplication, ${bypassRls} AS rolbypassrls
+  FROM pg_catalog.pg_roles r
+  WHERE r.rolname = ${role}
 )
 SELECT line
 FROM (
@@ -328,6 +330,10 @@ function postgresPrivilegesForScope(scope: PrivilegeScope): readonly string[] {
   if (scope === "schema") return POSTGRES_SCHEMA_PRIVILEGES;
   if (scope === "table") return POSTGRES_TABLE_PRIVILEGES;
   return [];
+}
+
+function postgresRoleBypassRlsSql(alias: string): string {
+  return `row_to_json(${alias})::text LIKE '%"rolbypassrls":true%'`;
 }
 
 export const mysqlUserAdminProvider: DatabaseUserAdminProvider = {

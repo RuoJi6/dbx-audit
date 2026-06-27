@@ -1,7 +1,7 @@
 import { ref } from "vue";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { isSchemaAware as isSchemaAwareType, isSingleDatabase, usesTreeSchemaMode } from "@/lib/databaseCapabilities";
-import { filterDatabaseNamesForConnection } from "@/lib/visibleDatabases";
+import { filterSchemaNamesForConnection } from "@/lib/visibleDatabases";
 import type { ConnectionConfig } from "@/types/database";
 import * as api from "@/lib/api";
 
@@ -9,8 +9,8 @@ export function hasSchemaOptionsCacheEntry(options: Record<string, string[]>, ke
   return Object.prototype.hasOwnProperty.call(options, key);
 }
 
-export function schemaOptionsForConnection(schemaNames: string[], connection: Pick<ConnectionConfig, "db_type" | "driver_profile" | "visible_databases"> | undefined): string[] {
-  return filterDatabaseNamesForConnection(schemaNames, connection);
+export function schemaOptionsForConnection(schemaNames: string[], connection: Pick<ConnectionConfig, "db_type" | "driver_profile" | "visible_databases" | "visible_schemas"> | undefined, database = ""): string[] {
+  return filterSchemaNamesForConnection(schemaNames, connection, database);
 }
 
 export function useSchemaOptions() {
@@ -39,7 +39,7 @@ export function useSchemaOptions() {
     loadingSchemaOptions.value[key] = true;
     try {
       await connectionStore.ensureConnected(connectionId);
-      schemaOptions.value[key] = schemaOptionsForConnection(await api.listSchemas(connectionId, database), connection);
+      schemaOptions.value[key] = schemaOptionsForConnection(await api.listSchemas(connectionId, database), connection, database);
     } catch (e) {
       schemaOptions.value[key] = [];
       throw e;

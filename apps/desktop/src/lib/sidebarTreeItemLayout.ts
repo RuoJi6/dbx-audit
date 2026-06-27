@@ -6,6 +6,24 @@ const fullWidthLabelTypes: Set<TreeNodeType> = new Set(["table", "view", "materi
 
 const emptyContainerTypes: Set<TreeNodeType> = new Set(["saved-sql-root", "saved-sql-folder"]);
 
+const pinnableTypes: Set<TreeNodeType> = new Set([
+  "connection-group",
+  "database",
+  "linked-server",
+  "linked-server-catalog",
+  "linked-server-schema",
+  "schema",
+  "table",
+  "view",
+  "materialized_view",
+  "redis-db",
+  "mongo-db",
+  "mongo-collection",
+  "vector-collection",
+  "elasticsearch-index",
+  "nacos-namespace",
+]);
+
 export function treeItemPaddingLeft(depth: number): string {
   return `${depth * 16 + 8}px`;
 }
@@ -22,4 +40,8 @@ export function canTreeNodeShowExpander({ type, childCount }: { type: TreeNodeTy
   if (!canTreeNodeExpand(type)) return false;
   if (childCount === 0 && emptyContainerTypes.has(type)) return false;
   return true;
+}
+
+export function canTreeNodePin(type: TreeNodeType): boolean {
+  return pinnableTypes.has(type);
 }

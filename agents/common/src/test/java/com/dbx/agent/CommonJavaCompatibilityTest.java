@@ -123,6 +123,42 @@ class CommonJavaCompatibilityTest {
     }
 
     @Test
+    void jsonRpcServerDispatchesTableReadSessionMethods() {
+        TableReadDispatchAgent agent = new TableReadDispatchAgent();
+        JsonRpcServer server = new JsonRpcServer(agent);
+
+        String startResponse = server.handleRequest(
+            "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"" + AgentProtocol.METHOD_START_TABLE_READ + "\",\"params\":{\"sql\":\"select * from orders\",\"schema\":\"public\",\"pageSize\":2,\"fetchSize\":8,\"maxRows\":20,\"timeoutSecs\":3}}"
+        );
+        JsonObject startJson = JsonParser.parseString(startResponse).getAsJsonObject();
+
+        assertTrue(startJson.has("result"));
+        assertEquals("select * from orders", agent.lastSql);
+        assertEquals("public", agent.lastSchema);
+        assertEquals(new QueryPageOptions(2, 8, 20, 3), agent.lastOptions);
+        assertEquals("table-session", startJson.getAsJsonObject("result").get("session_id").getAsString());
+
+        String fetchResponse = server.handleRequest(
+            "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"" + AgentProtocol.METHOD_FETCH_TABLE_READ_PAGE + "\",\"params\":{\"sessionId\":\"table-session\",\"pageSize\":4}}"
+        );
+        JsonObject fetchJson = JsonParser.parseString(fetchResponse).getAsJsonObject();
+
+        assertTrue(fetchJson.has("result"));
+        assertEquals("table-session", agent.fetchedSessionId);
+        assertEquals(4, agent.fetchedPageSize);
+        assertFalse(fetchJson.getAsJsonObject("result").get("has_more").getAsBoolean());
+
+        String closeResponse = server.handleRequest(
+            "{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"" + AgentProtocol.METHOD_CLOSE_TABLE_READ_SESSION + "\",\"params\":{\"sessionId\":\"table-session\"}}"
+        );
+        JsonObject closeJson = JsonParser.parseString(closeResponse).getAsJsonObject();
+
+        assertTrue(closeJson.get("result").getAsBoolean());
+        assertEquals("table-session", agent.closedSessionId);
+    }
+
+
+    @Test
     void exposesJavaFriendlyDefaultsAndModels() {
         ConnectParams params = new ConnectParams("localhost", 5432, "demo", "user", "secret", "ssl=false", "", false);
         assertEquals("localhost", params.getHost());
@@ -169,6 +205,9 @@ class CommonJavaCompatibilityTest {
         assertEquals("SET SCHEMA \"public\"", agent.setSchemaSQL("public"));
         assertThrows(IllegalStateException.class, () ->
             agent.executeQueryPage("select 1", "public")
+        );
+        assertThrows(IllegalStateException.class, () ->
+            agent.startTableRead("select 1", "public", new QueryPageOptions())
         );
         assertEquals(0L, agent.executeQuery("select 1", "public").getAffected_rows());
 
@@ -390,6 +429,52 @@ class CommonJavaCompatibilityTest {
         public List<TableInfo> listTables(String schema) {
             lastSchema = schema;
             return super.listTables(schema);
+        }
+    }
+
+    private static final class TableReadDispatchAgent extends MinimalAgent {
+        private String lastSql;
+        private String lastSchema;
+        private QueryPageOptions lastOptions;
+        private String fetchedSessionId;
+        private int fetchedPageSize;
+        private String closedSessionId;
+
+        @Override
+        public QueryPageResult startTableRead(String sql, String schema, QueryPageOptions options) {
+            lastSql = sql;
+            lastSchema = schema;
+            lastOptions = options;
+            return new QueryPageResult(
+                Collections.singletonList("id"),
+                Collections.singletonList(Collections.singletonList(1)),
+                0L,
+                5L,
+                false,
+                "table-session",
+                true
+            );
+        }
+
+        @Override
+        public QueryPageResult fetchTableReadPage(String sessionId, int pageSize) {
+            fetchedSessionId = sessionId;
+            fetchedPageSize = pageSize;
+            return new QueryPageResult(
+                Collections.singletonList("id"),
+                Collections.singletonList(Collections.singletonList(2)),
+                0L,
+                0L,
+                false,
+                null,
+                false
+            );
+        }
+
+        @Override
+        public boolean closeTableReadSession(String sessionId) {
+            closedSessionId = sessionId;
+            return "table-session".equals(sessionId);
         }
     }
 

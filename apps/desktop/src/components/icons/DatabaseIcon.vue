@@ -80,6 +80,7 @@ const assetIcons: Record<string, string> = {
   qdrant: "qdrant",
   milvus: "milvus.png",
   weaviate: "weaviate.png",
+  chromadb: "chromadb",
   mq: "pulsar",
   pulsar: "pulsar",
   nacos: "nacos.png",

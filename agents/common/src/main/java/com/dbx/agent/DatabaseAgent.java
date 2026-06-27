@@ -3,7 +3,10 @@ package com.dbx.agent;
 import java.sql.Connection;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 public interface DatabaseAgent {
     void connect(ConnectParams params);
@@ -13,6 +16,14 @@ public interface DatabaseAgent {
     List<DatabaseInfo> listDatabases();
 
     List<String> listSchemas();
+
+    default List<String> listSchemas(List<String> visibleSchemas) {
+        if (visibleSchemas == null) {
+            return listSchemas();
+        }
+        Set<String> visible = new HashSet<>(visibleSchemas);
+        return listSchemas().stream().filter(visible::contains).collect(Collectors.toList());
+    }
 
     List<TableInfo> listTables(String schema);
 
@@ -89,6 +100,29 @@ public interface DatabaseAgent {
 
     default boolean closeQuerySession(String sessionId) {
         return JdbcExecutor.INSTANCE.closeQuerySession(sessionId);
+    }
+
+    default QueryPageResult startTableRead(String sql, String schema, QueryPageOptions options) {
+        Connection conn = getConnection();
+        if (conn == null) {
+            throw new IllegalStateException("Not connected");
+        }
+        return JdbcExecutor.INSTANCE.startTableRead(
+            conn,
+            sql,
+            schema,
+            this::setSchemaSQL,
+            options,
+            JdbcExecutor.INSTANCE::defaultResultValue
+        );
+    }
+
+    default QueryPageResult fetchTableReadPage(String sessionId, int pageSize) {
+        return JdbcExecutor.INSTANCE.fetchTableReadPage(sessionId, pageSize);
+    }
+
+    default boolean closeTableReadSession(String sessionId) {
+        return JdbcExecutor.INSTANCE.closeTableReadSession(sessionId);
     }
 
     /**

@@ -36,7 +36,7 @@ pub async fn mongo_list_collections(
     state: State<'_, Arc<AppState>>,
     connection_id: String,
     database: String,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<dbx_core::db::vector_driver::CollectionInfo>, String> {
     dbx_core::mongo_ops::mongo_list_collections_core(&state, &connection_id, &database).await
 }
 

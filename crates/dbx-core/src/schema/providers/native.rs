@@ -22,6 +22,7 @@ pub(in crate::schema) async fn list_databases(
 
 pub(in crate::schema) async fn list_schemas(pool: &PoolKind) -> Result<Vec<String>, String> {
     match pool {
+        PoolKind::Mysql(p, mode) if *mode == MysqlMode::OceanBaseOracle => db::ob_oracle::list_schemas(p).await,
         PoolKind::Postgres(p) => db::postgres::list_schemas(p).await,
         _ => Ok(vec![]),
     }
@@ -59,7 +60,7 @@ pub(in crate::schema) async fn list_tables(
             db::elasticsearch_driver::list_indices(client).await.map(|names| collection_names_to_tables(names, "INDEX"))
         }
         PoolKind::VectorDb(client) => {
-            db::vector_driver::list_collections(client).await.map(|names| collection_names_to_tables(names, "COLLECTION"))
+            db::vector_driver::list_collections(client).await.map(|infos| collection_names_to_tables(infos.into_iter().map(|i| i.name).collect(), "COLLECTION"))
         }
         _ => Ok(vec![]),
     }

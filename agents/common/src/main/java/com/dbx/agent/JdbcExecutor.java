@@ -23,6 +23,7 @@ public final class JdbcExecutor {
     public static final long QUERY_SESSION_IDLE_TIMEOUT_MILLIS = 10 * 60 * 1000L;
 
     private final ConcurrentHashMap<String, QuerySession> sessions = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, QuerySession> tableReadSessions = new ConcurrentHashMap<>();
 
     private JdbcExecutor() {
     }
@@ -177,8 +178,31 @@ public final class JdbcExecutor {
         QueryPageOptions options,
         ResultValueReader valueReader
     ) {
+        return executePage(conn, sql, schema, setSchemaSql, options, valueReader, sessions);
+    }
+
+    public QueryPageResult startTableRead(
+        Connection conn,
+        String sql,
+        String schema,
+        Function<String, String> setSchemaSql,
+        QueryPageOptions options,
+        ResultValueReader valueReader
+    ) {
+        return executePage(conn, sql, schema, setSchemaSql, options, valueReader, tableReadSessions);
+    }
+
+    private QueryPageResult executePage(
+        Connection conn,
+        String sql,
+        String schema,
+        Function<String, String> setSchemaSql,
+        QueryPageOptions options,
+        ResultValueReader valueReader,
+        ConcurrentHashMap<String, QuerySession> targetSessions
+    ) {
         return unchecked(() -> {
-            expireIdleQuerySessions();
+            expireIdleSessions(targetSessions, System.currentTimeMillis(), QUERY_SESSION_IDLE_TIMEOUT_MILLIS);
             String trimmedSql = trimSql(sql);
             String upperSql = trimmedSql.toUpperCase(Locale.ROOT).trim();
             long start = System.currentTimeMillis();
@@ -242,8 +266,8 @@ public final class JdbcExecutor {
                     Math.max(options.getMaxRows(), 1),
                     valueReader
                 );
-                sessions.put(sessionId, session);
-                return readSessionPage(session, options.getPageSize(), elapsed);
+                targetSessions.put(sessionId, session);
+                return readSessionPage(targetSessions, session, options.getPageSize(), elapsed);
             } catch (Exception e) {
                 try {
                     stmt.close();
@@ -256,24 +280,28 @@ public final class JdbcExecutor {
 
     public QueryPageResult fetchPage(String sessionId, int pageSize) {
         expireIdleQuerySessions();
-        QuerySession session = sessions.get(sessionId);
-        if (session == null) {
-            throw new IllegalArgumentException("Query session not found");
-        }
-        synchronized (session) {
-            return readSessionPage(session, pageSize, 0L);
-        }
+        return fetchSessionPage(sessions, sessionId, pageSize, "Query session not found");
     }
 
     public boolean closeQuerySession(String sessionId) {
-        return closeSession(sessionId);
+        return closeSession(sessions, sessionId);
+    }
+
+    public QueryPageResult fetchTableReadPage(String sessionId, int pageSize) {
+        expireIdleTableReadSessions();
+        return fetchSessionPage(tableReadSessions, sessionId, pageSize, "Table read session not found");
+    }
+
+    public boolean closeTableReadSession(String sessionId) {
+        return closeSession(tableReadSessions, sessionId);
     }
 
     public void closeAllQuerySessions() {
-        List<String> ids = new ArrayList<>(sessions.keySet());
-        for (String id : ids) {
-            closeSession(id);
-        }
+        closeAllSessions(sessions);
+    }
+
+    public void closeAllTableReadSessions() {
+        closeAllSessions(tableReadSessions);
     }
 
     public int expireIdleQuerySessions() {
@@ -281,17 +309,33 @@ public final class JdbcExecutor {
     }
 
     public int expireIdleQuerySessions(long nowMillis, long idleTimeoutMillis) {
+        return expireIdleSessions(sessions, nowMillis, idleTimeoutMillis);
+    }
+
+    public int expireIdleTableReadSessions() {
+        return expireIdleTableReadSessions(System.currentTimeMillis(), QUERY_SESSION_IDLE_TIMEOUT_MILLIS);
+    }
+
+    public int expireIdleTableReadSessions(long nowMillis, long idleTimeoutMillis) {
+        return expireIdleSessions(tableReadSessions, nowMillis, idleTimeoutMillis);
+    }
+
+    private int expireIdleSessions(
+        ConcurrentHashMap<String, QuerySession> targetSessions,
+        long nowMillis,
+        long idleTimeoutMillis
+    ) {
         if (idleTimeoutMillis < 0) {
             return 0;
         }
         int closed = 0;
-        List<QuerySession> snapshot = new ArrayList<>(sessions.values());
+        List<QuerySession> snapshot = new ArrayList<>(targetSessions.values());
         for (QuerySession session : snapshot) {
             boolean expired;
             synchronized (session) {
                 expired = nowMillis - session.lastAccessedAtMillis >= idleTimeoutMillis;
             }
-            if (expired && closeSession(session.id)) {
+            if (expired && closeSession(targetSessions, session.id)) {
                 closed += 1;
             }
         }
@@ -409,7 +453,27 @@ public final class JdbcExecutor {
         return value == null ? null : value.getString();
     }
 
-    private QueryPageResult readSessionPage(QuerySession session, int pageSize, long executionTimeMs) {
+    private QueryPageResult fetchSessionPage(
+        ConcurrentHashMap<String, QuerySession> targetSessions,
+        String sessionId,
+        int pageSize,
+        String missingMessage
+    ) {
+        QuerySession session = targetSessions.get(sessionId);
+        if (session == null) {
+            throw new IllegalArgumentException(missingMessage);
+        }
+        synchronized (session) {
+            return readSessionPage(targetSessions, session, pageSize, 0L);
+        }
+    }
+
+    private QueryPageResult readSessionPage(
+        ConcurrentHashMap<String, QuerySession> targetSessions,
+        QuerySession session,
+        int pageSize,
+        long executionTimeMs
+    ) {
         return unchecked(() -> {
             session.lastAccessedAtMillis = System.currentTimeMillis();
             int effectivePageSize = Math.max(pageSize, 1);
@@ -422,7 +486,7 @@ public final class JdbcExecutor {
 
             while (rows.size() < effectivePageSize && session.rowsRead < session.maxRows) {
                 if (!session.resultSet.next()) {
-                    closeSession(session.id);
+                    closeSession(targetSessions, session.id);
                     return new QueryPageResult(session.columns, session.columnTypes, rows, 0L, executionTimeMs, false, null, false);
                 }
                 rows.add(rowValues(session.resultSet, session.valueReader, session.typeNameByIndex));
@@ -431,13 +495,13 @@ public final class JdbcExecutor {
 
             if (session.rowsRead >= session.maxRows) {
                 boolean truncated = session.resultSet.next();
-                closeSession(session.id);
+                closeSession(targetSessions, session.id);
                 return new QueryPageResult(session.columns, session.columnTypes, rows, 0L, executionTimeMs, truncated, null, false);
             }
 
             boolean hasMore = session.resultSet.next();
             if (!hasMore) {
-                closeSession(session.id);
+                closeSession(targetSessions, session.id);
                 return new QueryPageResult(session.columns, session.columnTypes, rows, 0L, executionTimeMs, false, null, false);
             }
 
@@ -447,8 +511,15 @@ public final class JdbcExecutor {
         });
     }
 
-    private boolean closeSession(String sessionId) {
-        QuerySession session = sessions.remove(sessionId);
+    private void closeAllSessions(ConcurrentHashMap<String, QuerySession> targetSessions) {
+        List<String> ids = new ArrayList<>(targetSessions.keySet());
+        for (String id : ids) {
+            closeSession(targetSessions, id);
+        }
+    }
+
+    private boolean closeSession(ConcurrentHashMap<String, QuerySession> targetSessions, String sessionId) {
+        QuerySession session = targetSessions.remove(sessionId);
         if (session == null) {
             return false;
         }

@@ -10,6 +10,7 @@ import { copyToClipboard } from "@/lib/clipboard";
 import { buildDataGridCopyInsertStatement, buildDataGridCopyUpdateStatements, type DataGridTableMeta } from "@/lib/dataGridSql";
 import { formatSqlInsert } from "@/lib/exportFormats";
 import { uuid } from "@/lib/utils";
+import { useSettingsStore } from "@/stores/settingsStore";
 import type { DatabaseType, QueryResult } from "@/types/database";
 import type { QueryResultExportRequest } from "@/lib/api";
 
@@ -825,6 +826,8 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
     if (exportCancelHandler) {
       exportCancelHandler.value = () => api.cancelTableExport(exportId);
     }
+    const editorSettings = useSettingsStore().editorSettings;
+    const rowLimit = editorSettings.exportRowLimitEnabled ? editorSettings.exportRowLimit : null;
 
     try {
       const progress = await api.startTableExport(
@@ -841,8 +844,9 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
           primaryKeys: meta.primaryKeys,
           whereInput: whereInput.value,
           orderBy: orderBy.value,
-          skipCount: true,
+          skipCount: false,
           batchSize: exportBatchSize.value,
+          rowLimit,
         },
         (progress) => {
           if (exportProgressState) {

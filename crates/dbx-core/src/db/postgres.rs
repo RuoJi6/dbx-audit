@@ -12,6 +12,7 @@ use std::fs::File;
 use std::future::Future;
 use std::io::BufReader;
 use std::str::FromStr;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_postgres::config::SslMode;
@@ -555,6 +556,10 @@ fn pg_pool_error_to_string(err: PoolError) -> String {
 
 fn should_retry_postgres_text_query(err: &tokio_postgres::Error) -> bool {
     let message = err.as_db_error().map(ToString::to_string).unwrap_or_else(|| err.to_string()).to_ascii_lowercase();
+    should_retry_postgres_text_query_message(&message)
+}
+
+fn should_retry_postgres_text_query_message(message: &str) -> bool {
     message.contains("no binary output function")
         || message.contains("no binary send function")
         || message.contains("cannot display a value of type")
@@ -704,6 +709,91 @@ async fn execute_select_query(
         Err(err) if should_retry_postgres_text_query(&err) => execute_select_text(client, sql, start, row_limit).await,
         Err(err) => Err(pg_error_to_string(err)),
     }
+}
+
+pub async fn stream_query_rows(
+    pool: &Pool,
+    sql: &str,
+    max_rows: Option<usize>,
+    cancelled: &AtomicBool,
+    mut on_row: impl FnMut(&[serde_json::Value]) -> Result<(), String>,
+) -> Result<u64, String> {
+    let client =
+        pool.get().await.map_err(|e| format!("PostgreSQL connection failed: {}", pg_pool_error_to_string(e)))?;
+    match stream_query_rows_on_client(&client, sql, max_rows, cancelled, &mut on_row).await {
+        Ok(rows) => Ok(rows),
+        Err(error) if should_retry_postgres_text_query_message(&error.to_ascii_lowercase()) => {
+            stream_query_rows_text_on_client(&client, sql, max_rows, cancelled, &mut on_row).await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn stream_query_rows_on_client(
+    client: &deadpool_postgres::Client,
+    sql: &str,
+    max_rows: Option<usize>,
+    cancelled: &AtomicBool,
+    on_row: &mut impl FnMut(&[serde_json::Value]) -> Result<(), String>,
+) -> Result<u64, String> {
+    let stmt = client.prepare_cached(sql).await.map_err(pg_error_to_string)?;
+    let column_types: Vec<String> = stmt.columns().iter().map(|c| c.type_().name().to_string()).collect();
+    let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = Vec::new();
+    let stream = client.query_raw(&stmt, params).await.map_err(pg_error_to_string)?;
+    tokio::pin!(stream);
+    let row_limit = max_rows.unwrap_or(usize::MAX);
+    let mut rows_exported = 0_u64;
+
+    while let Some(row_result) = stream.next().await {
+        if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(crate::query::canceled_error());
+        }
+        if rows_exported as usize >= row_limit {
+            break;
+        }
+        let row = row_result.map_err(pg_error_to_string)?;
+        let values: Vec<serde_json::Value> = (0..row.columns().len())
+            .map(|i| pg_value_to_json(&row, i, column_types.get(i).map(String::as_str).unwrap_or("")))
+            .collect();
+        on_row(&values)?;
+        rows_exported += 1;
+    }
+
+    Ok(rows_exported)
+}
+
+async fn stream_query_rows_text_on_client(
+    client: &deadpool_postgres::Client,
+    sql: &str,
+    max_rows: Option<usize>,
+    cancelled: &AtomicBool,
+    on_row: &mut impl FnMut(&[serde_json::Value]) -> Result<(), String>,
+) -> Result<u64, String> {
+    let messages = client.simple_query(sql).await.map_err(pg_error_to_string)?;
+    let row_limit = max_rows.unwrap_or(usize::MAX);
+    let mut rows_exported = 0_u64;
+
+    for message in messages {
+        if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(crate::query::canceled_error());
+        }
+        if rows_exported as usize >= row_limit {
+            break;
+        }
+        if let SimpleQueryMessage::Row(row) = message {
+            let mut values = Vec::with_capacity(row.len());
+            for i in 0..row.len() {
+                values.push(match row.try_get(i).map_err(pg_error_to_string)? {
+                    Some(value) => serde_json::Value::String(value.to_string()),
+                    None => serde_json::Value::Null,
+                });
+            }
+            on_row(&values)?;
+            rows_exported += 1;
+        }
+    }
+
+    Ok(rows_exported)
 }
 
 pub async fn connect(url: &str, fallback_timeout: Duration) -> Result<Pool, String> {

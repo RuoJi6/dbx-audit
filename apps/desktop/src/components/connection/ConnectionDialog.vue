@@ -34,11 +34,13 @@ import { copyToClipboard } from "@/lib/clipboard";
 import { showAgentDriverInstallHint, type AgentDriverInstallState } from "@/lib/agentDriverInstallHint";
 import { prestoSqlBuiltinDriverPaths } from "@/lib/prestoSqlBuiltinDriver";
 import { SQLITE_DATABASE_FILE_EXTENSIONS } from "@/lib/databaseFileDetection";
+import { connectionAttemptOriginalErrorMessage, connectionAttemptTimeoutMessage, connectionAttemptTimeoutMs } from "@/lib/connectionAttemptTimeout";
 import { ArrowLeft, ArrowDown, ArrowUp, CheckSquare, ChevronRight, CircleHelp, Copy, ExternalLink, FilePlus2, FolderOpen, GripVertical, Grid3X3, KeyRound, Link2, List, ListFilter, Loader2, Pipette, Plus, Search, ShieldCheck, Square, Trash2 } from "@lucide/vue";
 import { buildDraftVisibleDatabasesConnectionId, connectionCanChooseVisibleDatabases, initialVisibleDatabaseSelection, visibleDatabaseSelectionIsStale } from "@/lib/connectionVisibleDatabases";
-import { canSaveVisibleDatabaseSelection, filterDatabaseNamesForConnection, isSystemDatabaseName, normalizeVisibleDatabaseSelection, buildDraftVisibleSchemasConnectionId } from "@/lib/visibleDatabases";
+import { canSaveVisibleDatabaseSelection, connectionUsesVisibleSchemaFilter, filterDatabaseNamesForConnection, isSystemDatabaseName, normalizeVisibleDatabaseSelection, buildDraftVisibleSchemasConnectionId, normalizeVisibleSchemaSelection } from "@/lib/visibleDatabases";
 import { isSchemaAware } from "@/lib/databaseFeatureSupport";
 import VisibleSchemasDialog from "@/components/sidebar/VisibleSchemasDialog.vue";
+import { oceanbaseModeConnectionPatch, oceanbaseSubModeFromConfig } from "@/lib/oceanbaseConnectionMode";
 
 type DbOption = { value: string; label: string };
 type DbCategory = { key: string; title: string; options: DbOption[] };
@@ -56,6 +58,7 @@ type JdbcDriverSelectItem = {
 const NACOS_DEFAULT_CONSOLE_URL = "http://127.0.0.1:8085";
 const NACOS_LEGACY_SERVER_PORT = "8848";
 const NACOS_DOCKER_CONSOLE_PORT = "8085";
+const DEFAULT_SSH_USER = "root";
 
 type LegacyTransportFields = {
   ssh_enabled?: boolean;
@@ -164,7 +167,7 @@ function defaultSshTunnel(): SshTunnelConfig {
     enabled: true,
     host: "",
     port: 22,
-    user: "",
+    user: DEFAULT_SSH_USER,
     password: "",
     key_path: "",
     key_passphrase: "",
@@ -182,7 +185,7 @@ function normalizeSshTunnel(hop: Partial<SshTunnelConfig>): SshTunnelConfig {
     enabled: hop.enabled !== false,
     host: hop.host || "",
     port: Number(hop.port) || 22,
-    user: hop.user || "",
+    user: hop.user?.trim() || DEFAULT_SSH_USER,
     password: hop.password || "",
     key_path: hop.key_path || "",
     key_passphrase: hop.key_passphrase || "",
@@ -435,6 +438,7 @@ const driverProfiles: Record<
   qdrant: { type: "qdrant", port: 6333, user: "", label: "Qdrant", icon: "qdrant" },
   milvus: { type: "milvus", port: 19530, user: "root", label: "Milvus", icon: "milvus" },
   weaviate: { type: "weaviate", port: 8080, user: "", label: "Weaviate", icon: "weaviate" },
+  chromadb: { type: "chromadb", port: 8000, user: "", label: "ChromaDB", icon: "chromadb" },
   mariadb: { type: "mysql", port: 3306, user: "root", label: "MariaDB", icon: "mariadb" },
   tidb: { type: "mysql", port: 4000, user: "root", label: "TiDB", icon: "tidb" },
   oceanbase: { type: "mysql", port: 2881, user: "root", label: "OceanBase", icon: "oceanbase" },
@@ -716,7 +720,7 @@ function isNacosAdminEndpointNotFound(message: string): boolean {
   return /Nacos admin endpoint was not found/i.test(message);
 }
 
-async function tryNacosDockerConsoleFallback(config: ConnectionConfig, originalError: string): Promise<string | null> {
+async function tryNacosDockerConsoleFallback(config: ConnectionConfig, originalError: string, runId: number): Promise<string | null> {
   if (config.db_type !== "nacos" || !isNacosAdminEndpointNotFound(originalError)) return null;
   const fallbackUrl = dockerNacosConsoleFallbackUrl(nacosServerAddr.value);
   if (!fallbackUrl || fallbackUrl === nacosServerAddr.value.trim()) return null;
@@ -725,11 +729,45 @@ async function tryNacosDockerConsoleFallback(config: ConnectionConfig, originalE
   nacosServerAddr.value = fallbackUrl;
   try {
     const fallbackConfig = connectionConfigForSubmit(config.id);
-    const message = await api.testConnection(fallbackConfig);
+    const message = await testConnectionWithTimeout(fallbackConfig, runId);
     return `${message} ${t("connection.nacosConsoleUrlAutoAdjusted", { from: previousUrl.trim(), to: fallbackUrl })}`;
   } catch {
     nacosServerAddr.value = previousUrl;
     return null;
+  }
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  return String(error);
+}
+
+async function testConnectionWithTimeout(config: ConnectionConfig, runId: number): Promise<string> {
+  const timeoutMs = connectionAttemptTimeoutMs(config);
+  const timeoutMessage = connectionAttemptTimeoutMessage(timeoutMs);
+  const promise = api.testConnection(config);
+  let timedOut = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  void promise.catch((error) => {
+    if (!timedOut) return;
+    if (runId !== testRunId) return;
+    testResult.value = {
+      ok: false,
+      message: connectionAttemptOriginalErrorMessage(timeoutMessage, errorMessage(error)),
+    };
+  });
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<string>((_, reject) => {
+        timer = setTimeout(() => {
+          timedOut = true;
+          reject(new Error(timeoutMessage));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 
@@ -848,13 +886,15 @@ watch(
     if (config) {
       const legacyConfig = config as LegacyConnectionConfig;
       const profile = profileForConfig(config);
+      const oceanbaseMode = profile === "oceanbase" ? oceanbaseSubModeFromConfig(config) : "mysql";
+      const oceanbasePatch = profile === "oceanbase" ? oceanbaseModeConnectionPatch(oceanbaseMode) : null;
       editingId.value = config.id;
       const profileConfig = driverProfiles[profile];
       form.value = {
         name: config.name,
-        db_type: profileConfig?.type || config.db_type,
-        driver_profile: profile,
-        driver_label: config.driver_label || driverProfiles[profile]?.label || config.db_type,
+        db_type: oceanbasePatch?.db_type || profileConfig?.type || config.db_type,
+        driver_profile: oceanbasePatch?.driver_profile || profile,
+        driver_label: config.driver_label || oceanbasePatch?.driver_label || driverProfiles[profile]?.label || config.db_type,
         url_params: config.url_params || "",
         host: config.db_type === "h2" ? config.host || h2FilePathFromJdbcUrl(config.connection_string) : config.host,
         port: profile === "tdengine" && (config.port === 0 || config.port === 6030) ? 6041 : config.port,
@@ -904,7 +944,7 @@ watch(
       selectedTransportLayerId.value = form.value.transport_layers?.[0]?.id || null;
       selectedType.value = profile;
       if (profile === "oceanbase") {
-        oceanbaseSubMode.value = config.driver_profile === "oceanbase-oracle" ? "oracle" : "mysql";
+        oceanbaseSubMode.value = oceanbaseMode;
       }
       if (profile === "gbase8a" || profile === "gbase8s") {
         selectedType.value = "gbase";
@@ -1026,6 +1066,7 @@ const iconTypeMap: Record<string, string> = {
   qdrant: "qdrant",
   milvus: "milvus",
   weaviate: "weaviate",
+  chromadb: "chromadb",
   mariadb: "mariadb",
   tidb: "tidb",
   oceanbase: "oceanbase",
@@ -1095,6 +1136,7 @@ const dbOptions: DbOption[] = [
   { value: "qdrant", label: "Qdrant" },
   { value: "milvus", label: "Milvus" },
   { value: "weaviate", label: "Weaviate" },
+  { value: "chromadb", label: "ChromaDB" },
   { value: "dm", label: "DM (Dameng)" },
   { value: "opengauss", label: "openGauss" },
   { value: "turso", label: "Turso" },
@@ -1201,7 +1243,7 @@ const sqliteExtensionPaths = computed({
     form.value.url_params = setSqliteExtensionPaths(form.value.url_params, value);
   },
 });
-const tlsCapableDatabaseTypes = new Set<DatabaseType>(["mysql", "postgres", "redshift", "gaussdb", "kwdb", "opengauss", "questdb", "redis", "etcd", "clickhouse", "elasticsearch", "qdrant", "milvus", "weaviate", "influxdb"]);
+const tlsCapableDatabaseTypes = new Set<DatabaseType>(["mysql", "postgres", "redshift", "gaussdb", "kwdb", "opengauss", "questdb", "redis", "etcd", "clickhouse", "elasticsearch", "qdrant", "milvus", "weaviate", "chromadb", "influxdb"]);
 const supportsTlsToggle = computed(() => tlsCapableDatabaseTypes.has(form.value.db_type));
 const supportsCaCertificatePath = computed(() => form.value.db_type === "clickhouse");
 const supportsGenericUrlParams = computed(() => form.value.db_type !== "manticoresearch");
@@ -1281,6 +1323,7 @@ const canUseTransportLayers = computed(() => form.value.db_type !== "sqlite" && 
 const shouldShowAgentDriverInstallHint = computed(() => showAgentDriverInstallHint(form.value.db_type, agentDrivers.value, form.value.driver_profile));
 const h2DriverMissing = computed(() => form.value.db_type === "h2" && isH2FileMode.value && agentDrivers.value.find((d) => d.db_type === "h2")?.installed !== true);
 const canChooseVisibleDatabases = computed(() => connectionCanChooseVisibleDatabases(form.value));
+const visibleFilterUsesSchemas = computed(() => connectionUsesVisibleSchemaFilter(form.value));
 const hasVisibleDatabaseFilter = computed(() => Array.isArray(form.value.visible_databases));
 const visibleDatabaseSummary = computed(() => {
   const configured = form.value.visible_databases;
@@ -1288,6 +1331,7 @@ const visibleDatabaseSummary = computed(() => {
   return t("visibleDatabases.selectedCount", { selected: configured.length, total: visibleDatabaseNames.value.length });
 });
 const listedVisibleDatabaseNames = computed(() => {
+  if (visibleFilterUsesSchemas.value) return visibleDatabaseNames.value;
   const connection = connectionConfigSnapshotForVisibleDatabases();
   if (visibleDatabaseShowSystem.value) return visibleDatabaseNames.value;
   return filterDatabaseNamesForConnection(visibleDatabaseNames.value, connection);
@@ -1301,6 +1345,7 @@ const visibleDatabaseSelectedCount = computed(() => visibleDatabaseSelection.val
 const visibleDatabaseTotalCount = computed(() => listedVisibleDatabaseNames.value.length);
 const visibleDatabaseCanSave = computed(() => canSaveVisibleDatabaseSelection([...visibleDatabaseSelection.value]));
 const visibleDatabaseHasSystemDatabases = computed(() => {
+  if (visibleFilterUsesSchemas.value) return false;
   const connection = connectionConfigSnapshotForVisibleDatabases();
   return visibleDatabaseNames.value.some((database) => isSystemDatabaseName(connection.db_type, database));
 });
@@ -1310,12 +1355,32 @@ const hasVisibleSchemaFilter = computed(() => {
   const key = visibleSchemasDatabaseKey.value;
   return Array.isArray(form.value.visible_schemas?.[key]);
 });
+const visibleSchemaObjectSelection = computed(() => {
+  const configured = form.value.visible_schemas?.[visibleSchemasDatabaseKey.value];
+  if (Array.isArray(configured)) return configured;
+  if (visibleFilterUsesSchemas.value && Array.isArray(form.value.visible_databases)) return form.value.visible_databases;
+  return undefined;
+});
 const visibleSchemaSummary = computed(() => {
   const key = visibleSchemasDatabaseKey.value;
   const configured = form.value.visible_schemas?.[key];
   if (!configured?.length) return t("visibleSchemas.showAll");
   return t("visibleSchemas.selectedCount", { selected: configured.length, total: visibleSchemaNames.value.length });
 });
+const hasVisibleObjectFilter = computed(() => (visibleFilterUsesSchemas.value ? Array.isArray(visibleSchemaObjectSelection.value) : hasVisibleDatabaseFilter.value));
+const visibleObjectSummary = computed(() => {
+  if (!visibleFilterUsesSchemas.value) return visibleDatabaseSummary.value;
+  const configured = visibleSchemaObjectSelection.value;
+  if (!Array.isArray(configured)) return t("visibleSchemas.showAll");
+  return t("visibleSchemas.selectedCount", { selected: configured.length, total: visibleDatabaseNames.value.length });
+});
+const visibleObjectTitleKey = computed(() => (visibleFilterUsesSchemas.value ? "visibleSchemas.title" : "visibleDatabases.title"));
+const visibleObjectDescriptionKey = computed(() => (visibleFilterUsesSchemas.value ? "visibleSchemas.description" : "visibleDatabases.description"));
+const visibleObjectSearchPlaceholderKey = computed(() => (visibleFilterUsesSchemas.value ? "visibleSchemas.searchPlaceholder" : "visibleDatabases.searchPlaceholder"));
+const visibleObjectSelectedCountKey = computed(() => (visibleFilterUsesSchemas.value ? "visibleSchemas.selectedCount" : "visibleDatabases.selectedCount"));
+const visibleObjectEmptySelectionKey = computed(() => (visibleFilterUsesSchemas.value ? "visibleSchemas.emptySelection" : "visibleDatabases.emptySelection"));
+const visibleObjectLoadFailedKey = computed(() => (visibleFilterUsesSchemas.value ? "visibleSchemas.loadFailed" : "visibleDatabases.loadFailed"));
+const visibleObjectSaveKey = computed(() => (visibleFilterUsesSchemas.value ? "visibleSchemas.save" : "visibleDatabases.save"));
 const testResultMessage = computed(() => {
   if (!testResult.value) return "";
   return testResult.value.ok ? t("connection.testSuccess") : testResult.value.message;
@@ -1375,7 +1440,7 @@ async function testConnection() {
   testResult.value = null;
   const config = connectionConfigForSubmit(editingId.value || uuid());
   try {
-    const msg = await api.testConnection(config);
+    const msg = await testConnectionWithTimeout(config, runId);
     if (runId !== testRunId) return;
     if (config.db_type === "mongodb" && /legacy driver/i.test(msg)) {
       mongoDriverMode.value = "legacy";
@@ -1384,7 +1449,7 @@ async function testConnection() {
   } catch (e: any) {
     if (runId !== testRunId) return;
     const message = mongodbAuthFailureHint(String(e));
-    const fallbackMessage = await tryNacosDockerConsoleFallback(config, message);
+    const fallbackMessage = await tryNacosDockerConsoleFallback(config, message, runId);
     if (runId !== testRunId) return;
     testResult.value = fallbackMessage ? { ok: true, message: fallbackMessage } : { ok: false, message };
   } finally {
@@ -1427,6 +1492,9 @@ function generateConnectionName(): string {
 
 function connectionConfigForSubmit(id: string): ConnectionConfig {
   const config = { ...form.value, id } as LegacyConnectionConfig;
+  if (selectedType.value === "oceanbase") {
+    Object.assign(config, oceanbaseModeConnectionPatch(oceanbaseSubMode.value));
+  }
   if (!config.name?.trim()) {
     config.name = generateConnectionName();
   }
@@ -1626,7 +1694,11 @@ function connectionConfigForSubmit(id: string): ConnectionConfig {
   delete legacy.proxy_port;
   delete legacy.proxy_username;
   delete legacy.proxy_password;
-  config.visible_databases = Array.isArray(config.visible_databases) && config.visible_databases.length > 0 ? config.visible_databases : undefined;
+  if (connectionUsesVisibleSchemaFilter(config)) {
+    config.visible_databases = undefined;
+  } else {
+    config.visible_databases = Array.isArray(config.visible_databases) && config.visible_databases.length > 0 ? config.visible_databases : undefined;
+  }
   if (config.visible_schemas && Object.keys(config.visible_schemas).length === 0) config.visible_schemas = undefined;
   return config as ConnectionConfig;
 }
@@ -1894,9 +1966,10 @@ async function openVisibleDatabasesPicker() {
     await api.connectDb(draftConfig);
     const names = await loadVisibleDatabaseNames(draftId, draftConfig);
     visibleDatabaseNames.value = names;
-    const initialSelection = initialVisibleDatabaseSelection(names, form.value.visible_databases, draftConfig);
+    const configuredSchemas = visibleSchemaObjectSelection.value;
+    const initialSelection = visibleFilterUsesSchemas.value ? (Array.isArray(configuredSchemas) ? normalizeVisibleSchemaSelection(configuredSchemas, names) : names) : initialVisibleDatabaseSelection(names, form.value.visible_databases, draftConfig);
     visibleDatabaseSelection.value = new Set(initialSelection);
-    visibleDatabaseShowSystem.value = initialSelection.some((database) => isSystemDatabaseName(draftConfig.db_type, database));
+    visibleDatabaseShowSystem.value = !visibleFilterUsesSchemas.value && initialSelection.some((database) => isSystemDatabaseName(draftConfig.db_type, database));
     showVisibleDatabasesDialog.value = true;
   } catch (e: any) {
     visibleDatabaseNames.value = [];
@@ -1910,7 +1983,7 @@ async function openVisibleDatabasesPicker() {
 }
 
 async function loadVisibleDatabaseNames(connectionId: string, config: ConnectionConfig): Promise<string[]> {
-  if (config.db_type === "oracle" || config.db_type === "dameng") {
+  if (connectionUsesVisibleSchemaFilter(config)) {
     return api.listSchemas(connectionId, config.database || "");
   }
   if (config.db_type === "redis") {
@@ -1938,7 +2011,12 @@ function clearVisibleDatabaseSelection() {
 }
 
 function showAllVisibleDatabases() {
-  form.value.visible_databases = undefined;
+  if (visibleFilterUsesSchemas.value) {
+    handleDraftSchemasShowAll();
+    form.value.visible_databases = undefined;
+  } else {
+    form.value.visible_databases = undefined;
+  }
   visibleDatabaseSelection.value = new Set();
   visibleDatabaseNames.value = [];
   showVisibleDatabasesDialog.value = false;
@@ -1946,7 +2024,16 @@ function showAllVisibleDatabases() {
 
 function saveVisibleDatabaseSelection() {
   if (!visibleDatabaseCanSave.value) return;
-  form.value.visible_databases = normalizeVisibleDatabaseSelection([...visibleDatabaseSelection.value], visibleDatabaseNames.value);
+  if (visibleFilterUsesSchemas.value) {
+    const key = visibleSchemasDatabaseKey.value;
+    form.value.visible_databases = undefined;
+    form.value.visible_schemas = {
+      ...form.value.visible_schemas,
+      [key]: normalizeVisibleSchemaSelection([...visibleDatabaseSelection.value], visibleDatabaseNames.value),
+    };
+  } else {
+    form.value.visible_databases = normalizeVisibleDatabaseSelection([...visibleDatabaseSelection.value], visibleDatabaseNames.value);
+  }
   showVisibleDatabasesDialog.value = false;
 }
 
@@ -1989,7 +2076,7 @@ async function openVisibleSchemasPicker() {
 
 function handleDraftSchemasSave(selectedNames: string[]) {
   const key = visibleSchemasDatabaseKey.value;
-  form.value.visible_schemas = { ...(form.value.visible_schemas || {}), [key]: selectedNames };
+  form.value.visible_schemas = { ...form.value.visible_schemas, [key]: selectedNames };
 }
 
 function handleDraftSchemasShowAll() {
@@ -2244,7 +2331,7 @@ function validateTransportLayers(config: LegacyConnectionConfig) {
       throw new Error(t("connection.sshHopInvalidPort", { hop: label }));
     }
     if (layer.type === "ssh") {
-      if (!layer.user?.trim()) throw new Error(t("connection.sshHopInvalidUser", { hop: label }));
+      layer.user = layer.user?.trim() || DEFAULT_SSH_USER;
       // Auth credentials are optional: the backend probes "none" authentication
       // first, so hops that require no credential (e.g. passwordless SSH proxies)
       // are valid with password, key, and agent all left empty.
@@ -3967,9 +4054,9 @@ function openExternalUrl(url: string) {
           <Button v-if="canChooseVisibleDatabases" variant="outline" class="shrink-0" :disabled="isTesting || isSaving || isLoadingVisibleDatabases || !hasRequiredConnectionTarget" @click="openVisibleDatabasesPicker">
             <Loader2 v-if="isLoadingVisibleDatabases" class="mr-1.5 h-4 w-4 animate-spin" />
             <ListFilter v-else class="mr-1.5 h-4 w-4" />
-            {{ hasVisibleDatabaseFilter ? visibleDatabaseSummary : t("contextMenu.selectVisibleDatabases") }}
+            {{ hasVisibleObjectFilter ? visibleObjectSummary : visibleFilterUsesSchemas ? t("contextMenu.configureVisibleObjects") : t("contextMenu.selectVisibleDatabases") }}
           </Button>
-          <Button v-if="canChooseVisibleSchemas" variant="outline" class="shrink-0" :disabled="isTesting || isSaving || isLoadingVisibleSchemas || !hasRequiredConnectionTarget" @click="openVisibleSchemasPicker">
+          <Button v-if="canChooseVisibleSchemas && !visibleFilterUsesSchemas" variant="outline" class="shrink-0" :disabled="isTesting || isSaving || isLoadingVisibleSchemas || !hasRequiredConnectionTarget" @click="openVisibleSchemasPicker">
             <Loader2 v-if="isLoadingVisibleSchemas" class="mr-1.5 h-4 w-4 animate-spin" />
             <ListFilter v-else class="mr-1.5 h-4 w-4" />
             {{ hasVisibleSchemaFilter ? visibleSchemaSummary : t("visibleSchemas.showAll") }}
@@ -3988,21 +4075,21 @@ function openExternalUrl(url: string) {
   <Dialog v-model:open="showVisibleDatabasesDialog">
     <DialogContent class="sm:max-w-[460px]">
       <DialogHeader>
-        <DialogTitle>{{ t("visibleDatabases.title") }}</DialogTitle>
+        <DialogTitle>{{ t(visibleObjectTitleKey) }}</DialogTitle>
         <p class="text-sm text-muted-foreground">
-          {{ t("visibleDatabases.description", { connection: form.name || selectedProfile().label }) }}
+          {{ t(visibleObjectDescriptionKey, { connection: form.name || selectedProfile().label }) }}
         </p>
       </DialogHeader>
 
       <div class="flex items-center gap-2 rounded-md border bg-background px-2">
         <Search class="h-4 w-4 shrink-0 text-muted-foreground" />
-        <Input v-model="visibleDatabaseSearchText" :placeholder="t('visibleDatabases.searchPlaceholder')" class="h-8 border-0 px-0 shadow-none focus-visible:ring-0" :disabled="isLoadingVisibleDatabases || !!visibleDatabaseError" />
+        <Input v-model="visibleDatabaseSearchText" :placeholder="t(visibleObjectSearchPlaceholderKey)" class="h-8 border-0 px-0 shadow-none focus-visible:ring-0" :disabled="isLoadingVisibleDatabases || !!visibleDatabaseError" />
       </div>
 
       <div class="flex items-center justify-between text-xs text-muted-foreground">
         <span>
           {{
-            t("visibleDatabases.selectedCount", {
+            t(visibleObjectSelectedCountKey, {
               selected: visibleDatabaseSelectedCount,
               total: visibleDatabaseTotalCount,
             })
@@ -4021,7 +4108,7 @@ function openExternalUrl(url: string) {
         </div>
       </div>
       <p v-if="!isLoadingVisibleDatabases && !visibleDatabaseError && !visibleDatabaseCanSave" class="text-xs text-destructive">
-        {{ t("visibleDatabases.emptySelection") }}
+        {{ t(visibleObjectEmptySelectionKey) }}
       </p>
 
       <label v-if="visibleDatabaseHasSystemDatabases" class="flex h-8 items-center gap-2 rounded-md px-1 text-xs text-muted-foreground">
@@ -4035,7 +4122,7 @@ function openExternalUrl(url: string) {
           {{ t("common.loading") }}
         </div>
         <div v-else-if="visibleDatabaseError" class="p-3 text-sm text-destructive">
-          {{ t("visibleDatabases.loadFailed", { message: visibleDatabaseError }) }}
+          {{ t(visibleObjectLoadFailedKey, { message: visibleDatabaseError }) }}
         </div>
         <div v-else-if="!filteredVisibleDatabaseNames.length" class="p-3 text-sm text-muted-foreground">
           {{ t("grid.noSearchResults") }}
@@ -4058,7 +4145,7 @@ function openExternalUrl(url: string) {
       <DialogFooter>
         <Button variant="outline" @click="showVisibleDatabasesDialog = false">{{ t("dangerDialog.cancel") }}</Button>
         <Button :disabled="isLoadingVisibleDatabases || !!visibleDatabaseError || !visibleDatabaseCanSave" @click="saveVisibleDatabaseSelection">
-          {{ t("visibleDatabases.save") }}
+          {{ t(visibleObjectSaveKey) }}
         </Button>
       </DialogFooter>
     </DialogContent>

@@ -238,10 +238,12 @@ type triggerInfo struct {
 }
 
 type server struct {
-	db            *sql.DB
-	params        connectParams
-	sessions      map[string]*querySession
-	nextSessionID int64
+	db                     *sql.DB
+	params                 connectParams
+	sessions               map[string]*querySession
+	tableReadSessions      map[string]*querySession
+	nextSessionID          int64
+	nextTableReadSessionID int64
 }
 
 func main() {
@@ -271,7 +273,7 @@ func main() {
 }
 
 func newServer() *server {
-	return &server{sessions: map[string]*querySession{}}
+	return &server{sessions: map[string]*querySession{}, tableReadSessions: map[string]*querySession{}}
 }
 
 func (s *server) handleLine(line string) (response, bool) {
@@ -323,7 +325,7 @@ func (s *server) dispatch(method string, params map[string]json.RawMessage) (any
 		result, err := s.listDatabases()
 		return result, false, err
 	case "list_schemas":
-		result, err := s.listSchemas()
+		result, err := s.listSchemas(stringSliceParam(params, "visible_schemas"))
 		return result, false, err
 	case "list_tables":
 		schema := stringParam(params, "schema")
@@ -369,6 +371,18 @@ func (s *server) dispatch(method string, params map[string]json.RawMessage) (any
 		return result, false, err
 	case "close_query_session":
 		return s.closeQuerySession(stringParam(params, "sessionId")), false, nil
+	case "start_table_read":
+		var opts queryOptions
+		if err := decodeParams(params, &opts); err != nil {
+			return nil, false, err
+		}
+		result, err := s.startTableRead(opts, intParam(params, "pageSize"))
+		return result, false, err
+	case "fetch_table_read_page":
+		result, err := s.fetchTableReadPage(stringParam(params, "sessionId"), intParam(params, "pageSize"))
+		return result, false, err
+	case "close_table_read_session":
+		return s.closeTableReadSession(stringParam(params, "sessionId")), false, nil
 	case "list_indexes":
 		schema := stringParam(params, "schema")
 		table := stringParam(params, "table")
@@ -570,8 +584,11 @@ func (s *server) currentSchemaDatabase() ([]databaseInfo, error) {
 	return []databaseInfo{{Name: schema}}, nil
 }
 
-func (s *server) listSchemas() ([]string, error) {
-	databases, err := s.listDatabases()
+func (s *server) listSchemas(visibleSchemas []string) ([]string, error) {
+	if visibleSchemas != nil && len(visibleSchemas) == 0 {
+		return []string{}, nil
+	}
+	databases, err := s.listDatabasesFiltered(visibleSchemas)
 	if err != nil {
 		return nil, err
 	}
@@ -580,6 +597,55 @@ func (s *server) listSchemas() ([]string, error) {
 		result = append(result, database.Name)
 	}
 	return emptyIfNil(result), nil
+}
+
+func (s *server) listDatabasesFiltered(visibleSchemas []string) ([]databaseInfo, error) {
+	if visibleSchemas == nil {
+		return s.listDatabases()
+	}
+	sqlText, args := oracleListDatabasesSQLWithVisibleSchemas(visibleSchemas)
+	rows, err := s.queryRows(sqlText, args)
+	if err != nil {
+		if isOraclePGALimitError(err) {
+			return s.currentSchemaDatabase()
+		}
+		return nil, err
+	}
+	defer rows.Close()
+	var result []databaseInfo
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		result = append(result, databaseInfo{Name: name})
+	}
+	if err := rows.Err(); err != nil {
+		if isOraclePGALimitError(err) {
+			return s.currentSchemaDatabase()
+		}
+		return nil, err
+	}
+	return emptyIfNil(result), nil
+}
+
+func oracleListDatabasesSQLWithVisibleSchemas(visibleSchemas []string) (string, []any) {
+	if len(visibleSchemas) == 0 {
+		return oracleListDatabasesSQL, nil
+	}
+	placeholders := make([]string, 0, len(visibleSchemas))
+	args := make([]any, 0, len(visibleSchemas))
+	for i, schema := range visibleSchemas {
+		placeholders = append(placeholders, fmt.Sprintf(":%d", i+1))
+		args = append(args, schema)
+	}
+	sqlText := strings.Replace(
+		oracleListDatabasesSQL,
+		"\nORDER BY CASE",
+		"\n  AND username IN ("+strings.Join(placeholders, ",")+")\nORDER BY CASE",
+		1,
+	)
+	return sqlText, args
 }
 
 func (s *server) currentSchema() (string, error) {
@@ -1189,6 +1255,71 @@ func (s *server) storeQuerySession(session *querySession) string {
 	return sessionID
 }
 
+func (s *server) startTableRead(opts queryOptions, pageSize int) (queryPageResult, error) {
+	start := time.Now()
+	if strings.TrimSpace(opts.Schema) != "" {
+		if err := s.setSchema(opts.Schema); err != nil {
+			return queryPageResult{}, err
+		}
+	}
+	sqlText := trimStatementSQL(opts.SQL)
+	if !isQuerySQL(sqlText) {
+		return queryPageResult{}, errors.New("table read requires a SELECT query")
+	}
+	rows, err := s.queryRows(sqlText, nil)
+	if err != nil {
+		return queryPageResult{}, err
+	}
+	columns, err := rows.Columns()
+	if err != nil {
+		rows.Close()
+		return queryPageResult{}, err
+	}
+	maxRows := opts.MaxRows
+	if maxRows <= 0 {
+		maxRows = defaultMaxRows
+	}
+	session := &querySession{rows: rows, columns: columns, remaining: maxRows}
+	result, err := readQuerySessionPage(session, pageSize)
+	result.ExecutionTimeMS = time.Since(start).Milliseconds()
+	if err != nil {
+		rows.Close()
+		return queryPageResult{}, err
+	}
+	if result.HasMore {
+		sessionID := s.storeTableReadSession(session)
+		result.SessionID = &sessionID
+	} else {
+		rows.Close()
+	}
+	return result, nil
+}
+
+func (s *server) fetchTableReadPage(sessionID string, pageSize int) (queryPageResult, error) {
+	session := s.tableReadSessions[sessionID]
+	if session == nil {
+		return queryPageResult{Columns: []string{}, Rows: [][]any{}, SessionID: nil, HasMore: false}, nil
+	}
+	result, err := readQuerySessionPage(session, pageSize)
+	if err != nil {
+		s.closeTableReadSession(sessionID)
+		return queryPageResult{}, err
+	}
+	if result.HasMore {
+		result.SessionID = &sessionID
+	} else {
+		s.closeTableReadSession(sessionID)
+	}
+	return result, nil
+}
+
+func (s *server) storeTableReadSession(session *querySession) string {
+	s.nextTableReadSessionID++
+	sessionID := fmt.Sprintf("oracle-go-table-%d", s.nextTableReadSessionID)
+	s.tableReadSessions[sessionID] = session
+	return sessionID
+}
+
 func (s *server) closeQuerySession(sessionID string) bool {
 	session := s.sessions[sessionID]
 	if session == nil {
@@ -1199,9 +1330,22 @@ func (s *server) closeQuerySession(sessionID string) bool {
 	return true
 }
 
+func (s *server) closeTableReadSession(sessionID string) bool {
+	session := s.tableReadSessions[sessionID]
+	if session == nil {
+		return false
+	}
+	session.rows.Close()
+	delete(s.tableReadSessions, sessionID)
+	return true
+}
+
 func (s *server) closeAllQuerySessions() {
 	for sessionID := range s.sessions {
 		s.closeQuerySession(sessionID)
+	}
+	for sessionID := range s.tableReadSessions {
+		s.closeTableReadSession(sessionID)
 	}
 }
 
@@ -1349,6 +1493,17 @@ func stringParam(params map[string]json.RawMessage, key string) string {
 	}
 	var value string
 	_ = json.Unmarshal(params[key], &value)
+	return value
+}
+
+func stringSliceParam(params map[string]json.RawMessage, key string) []string {
+	if params == nil || len(params[key]) == 0 {
+		return nil
+	}
+	var value []string
+	if err := json.Unmarshal(params[key], &value); err != nil {
+		return nil
+	}
 	return value
 }
 

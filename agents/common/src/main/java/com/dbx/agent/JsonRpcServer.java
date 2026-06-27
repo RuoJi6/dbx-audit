@@ -105,7 +105,7 @@ public final class JsonRpcServer {
         }
         if (AgentProtocol.METHOD_LIST_SCHEMAS.equals(method)) {
             switchCatalog(params);
-            return agent.listSchemas();
+            return agent.listSchemas(stringListOrNull(params, "visible_schemas"));
         }
         if (AgentProtocol.METHOD_LIST_TABLES.equals(method)) {
             switchCatalog(params);
@@ -179,6 +179,27 @@ public final class JsonRpcServer {
         if (AgentProtocol.METHOD_CLOSE_QUERY_SESSION.equals(method)) {
             return agent.closeQuerySession(params.get("sessionId").getAsString());
         }
+        if (AgentProtocol.METHOD_START_TABLE_READ.equals(method)) {
+            return agent.startTableRead(
+                params.get("sql").getAsString(),
+                stringOrNull(params, "schema"),
+                new QueryPageOptions(
+                    intOrDefault(params, "pageSize", 100),
+                    intOrNull(params, "fetchSize"),
+                    intOrDefault(params, "maxRows", JdbcExecutor.DEFAULT_MAX_ROWS),
+                    intOrDefault(params, "timeoutSecs", 0)
+                )
+            );
+        }
+        if (AgentProtocol.METHOD_FETCH_TABLE_READ_PAGE.equals(method)) {
+            return agent.fetchTableReadPage(
+                params.get("sessionId").getAsString(),
+                intOrDefault(params, "pageSize", 100)
+            );
+        }
+        if (AgentProtocol.METHOD_CLOSE_TABLE_READ_SESSION.equals(method)) {
+            return agent.closeTableReadSession(params.get("sessionId").getAsString());
+        }
         if (AgentProtocol.METHOD_GET_EXPLAIN_INFO.equals(method)) {
             String plan = agent.getExplainInfo(
                 params.get("sql").getAsString(),
@@ -199,12 +220,14 @@ public final class JsonRpcServer {
         }
         if (AgentProtocol.METHOD_DISCONNECT.equals(method)) {
             JdbcExecutor.INSTANCE.closeAllQuerySessions();
+            JdbcExecutor.INSTANCE.closeAllTableReadSessions();
             agent.disconnect();
             lastConnectParams = null;
             return Collections.singletonMap("ok", true);
         }
         if (AgentProtocol.METHOD_SHUTDOWN.equals(method)) {
             JdbcExecutor.INSTANCE.closeAllQuerySessions();
+            JdbcExecutor.INSTANCE.closeAllTableReadSessions();
             agent.disconnect();
             lastConnectParams = null;
             System.exit(0);
@@ -254,6 +277,7 @@ public final class JsonRpcServer {
         }
 
         JdbcExecutor.INSTANCE.closeAllQuerySessions();
+        JdbcExecutor.INSTANCE.closeAllTableReadSessions();
         try {
             agent.disconnect();
         } catch (Exception ignored) {
@@ -269,6 +293,8 @@ public final class JsonRpcServer {
             && !AgentProtocol.METHOD_VALIDATE_CONNECTION.equals(method)
             && !AgentProtocol.METHOD_FETCH_QUERY_PAGE.equals(method)
             && !AgentProtocol.METHOD_CLOSE_QUERY_SESSION.equals(method)
+            && !AgentProtocol.METHOD_FETCH_TABLE_READ_PAGE.equals(method)
+            && !AgentProtocol.METHOD_CLOSE_TABLE_READ_SESSION.equals(method)
             && !AgentProtocol.METHOD_DISCONNECT.equals(method)
             && !AgentProtocol.METHOD_SHUTDOWN.equals(method);
     }
@@ -287,6 +313,15 @@ public final class JsonRpcServer {
             return null;
         }
         return element.getAsString();
+    }
+
+    private List<String> stringListOrNull(JsonObject object, String key) {
+        JsonElement element = object.get(key);
+        if (element == null || element instanceof JsonNull) {
+            return null;
+        }
+        Type listType = new TypeToken<List<String>>() {}.getType();
+        return gson.fromJson(element, listType);
     }
 
     private static Integer intOrNull(JsonObject object, String key) {

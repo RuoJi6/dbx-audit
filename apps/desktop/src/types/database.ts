@@ -14,6 +14,7 @@ export type DatabaseType =
   | "qdrant"
   | "milvus"
   | "weaviate"
+  | "chromadb"
   | "doris"
   | "starrocks"
   | "manticoresearch"
@@ -544,7 +545,7 @@ export interface TreeNode {
   hiddenChildren?: TreeNode[];
   savedSqlId?: string;
   savedSqlFolderId?: string;
-  meta?: ColumnInfo | IndexInfo | ForeignKeyInfo | TriggerInfo;
+  meta?: ColumnInfo | IndexInfo | ForeignKeyInfo | TriggerInfo | VectorCollectionMeta;
   loadMore?: {
     parentId: string;
     offset: number;
@@ -681,4 +682,14 @@ export interface SavedSqlFile {
 export interface SavedSqlLibrary {
   folders: SavedSqlFolder[];
   files: SavedSqlFile[];
+}
+
+export interface VectorCollectionMeta {
+  dimension?: number;
+}
+
+export interface CollectionInfo {
+  name: string;
+  id: string;
+  dimension?: number;
 }

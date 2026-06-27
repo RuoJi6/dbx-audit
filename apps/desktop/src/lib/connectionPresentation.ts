@@ -133,6 +133,7 @@ export function connectionUrlPlaceholder(dbType: DatabaseType): string {
     case "qdrant":
     case "milvus":
     case "weaviate":
+    case "chromadb":
       return "http://user:password@host:port";
 
     case "dameng":

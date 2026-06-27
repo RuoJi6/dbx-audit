@@ -131,6 +131,9 @@ pub enum AgentMethod {
     ExecuteQueryPage,
     FetchQueryPage,
     CloseQuerySession,
+    StartTableRead,
+    FetchTableReadPage,
+    CloseTableReadSession,
     GetExplainInfo,
     ExecuteTransaction,
     Disconnect,
@@ -138,7 +141,7 @@ pub enum AgentMethod {
 }
 
 impl AgentMethod {
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 26] = [
         Self::Handshake,
         Self::Connect,
         Self::TestConnection,
@@ -158,6 +161,9 @@ impl AgentMethod {
         Self::ExecuteQueryPage,
         Self::FetchQueryPage,
         Self::CloseQuerySession,
+        Self::StartTableRead,
+        Self::FetchTableReadPage,
+        Self::CloseTableReadSession,
         Self::GetExplainInfo,
         Self::ExecuteTransaction,
         Self::Disconnect,
@@ -185,12 +191,42 @@ impl AgentMethod {
             Self::ExecuteQueryPage => "execute_query_page",
             Self::FetchQueryPage => "fetch_query_page",
             Self::CloseQuerySession => "close_query_session",
+            Self::StartTableRead => "start_table_read",
+            Self::FetchTableReadPage => "fetch_table_read_page",
+            Self::CloseTableReadSession => "close_table_read_session",
             Self::GetExplainInfo => "get_explain_info",
             Self::ExecuteTransaction => "execute_transaction",
             Self::Disconnect => "disconnect",
             Self::Shutdown => "shutdown",
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentTableReadStartParams {
+    pub sql: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub database: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
+    pub page_size: usize,
+    pub max_rows: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fetch_size: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentTableReadPageParams {
+    pub session_id: String,
+    pub page_size: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentTableReadCloseParams {
+    pub session_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -544,12 +580,20 @@ impl AgentDriverClient {
         database: &str,
         timeout_duration: Option<Duration>,
     ) -> Result<T, String> {
-        self.call_method_with_timeout(
-            AgentMethod::ListSchemas,
-            serde_json::json!({ "database": database }),
-            timeout_duration,
-        )
-        .await
+        self.list_schemas_filtered(database, None, timeout_duration).await
+    }
+
+    pub async fn list_schemas_filtered<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        database: &str,
+        visible_schemas: Option<&[String]>,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, String> {
+        let mut params = serde_json::json!({ "database": database });
+        if let Some(visible_schemas) = visible_schemas {
+            params["visible_schemas"] = serde_json::json!(visible_schemas);
+        }
+        self.call_method_with_timeout(AgentMethod::ListSchemas, params, timeout_duration).await
     }
 
     pub async fn list_tables<T: DeserializeOwned + Send + 'static>(
@@ -754,6 +798,38 @@ impl AgentDriverClient {
         session_id: &str,
     ) -> Result<T, String> {
         self.call_method(AgentMethod::CloseQuerySession, agent_close_query_session_params(session_id)).await
+    }
+
+    pub async fn start_table_read<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        params: AgentTableReadStartParams,
+    ) -> Result<T, String> {
+        self.call_method(AgentMethod::StartTableRead, serde_json::to_value(params).map_err(|e| e.to_string())?).await
+    }
+
+    pub async fn fetch_table_read_page<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        session_id: &str,
+        page_size: usize,
+    ) -> Result<T, String> {
+        self.call_method(
+            AgentMethod::FetchTableReadPage,
+            serde_json::to_value(AgentTableReadPageParams { session_id: session_id.to_string(), page_size })
+                .map_err(|e| e.to_string())?,
+        )
+        .await
+    }
+
+    pub async fn close_table_read_session<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        session_id: &str,
+    ) -> Result<T, String> {
+        self.call_method(
+            AgentMethod::CloseTableReadSession,
+            serde_json::to_value(AgentTableReadCloseParams { session_id: session_id.to_string() })
+                .map_err(|e| e.to_string())?,
+        )
+        .await
     }
 
     pub async fn execute_transaction<T: DeserializeOwned + Send + 'static>(
@@ -1108,7 +1184,8 @@ mod tests {
         agent_proxy_env_vars, agent_schema_params, agent_schema_table_params, agent_supports_capability,
         agent_transaction_params, format_agent_process_error, is_unsupported_handshake_error, mongo_collection_params,
         mongo_database_params, mongo_document_id_params, read_agent_line, AgentCapability, AgentDriverClient,
-        AgentHandshake, AgentKvMethod, AgentMethod, MongoAgentMethod, StderrTail, AGENT_PROTOCOL_VERSION,
+        AgentHandshake, AgentKvMethod, AgentMethod, AgentTableReadCloseParams, AgentTableReadPageParams,
+        AgentTableReadStartParams, MongoAgentMethod, StderrTail, AGENT_PROTOCOL_VERSION,
     };
     use std::io::Cursor;
 
@@ -1272,6 +1349,9 @@ mod tests {
         assert_eq!(AgentMethod::ExecuteQueryPage.as_str(), "execute_query_page");
         assert_eq!(AgentMethod::FetchQueryPage.as_str(), "fetch_query_page");
         assert_eq!(AgentMethod::CloseQuerySession.as_str(), "close_query_session");
+        assert_eq!(AgentMethod::StartTableRead.as_str(), "start_table_read");
+        assert_eq!(AgentMethod::FetchTableReadPage.as_str(), "fetch_table_read_page");
+        assert_eq!(AgentMethod::CloseTableReadSession.as_str(), "close_table_read_session");
         assert_eq!(AgentMethod::ExecuteTransaction.as_str(), "execute_transaction");
         assert_eq!(AgentMethod::Disconnect.as_str(), "disconnect");
         assert_eq!(AgentMethod::Shutdown.as_str(), "shutdown");
@@ -1328,6 +1408,44 @@ mod tests {
     #[test]
     fn exposes_kv_protocol_wrapper() {
         let _call_kv_method = AgentDriverClient::call_kv_method::<serde_json::Value>;
+    }
+
+    #[test]
+    fn exposes_table_read_protocol_wrappers() {
+        let _start_table_read = AgentDriverClient::start_table_read::<serde_json::Value>;
+        let _fetch_table_read_page = AgentDriverClient::fetch_table_read_page::<serde_json::Value>;
+        let _close_table_read_session = AgentDriverClient::close_table_read_session::<serde_json::Value>;
+    }
+
+    #[test]
+    fn serializes_table_read_params_with_agent_field_names() {
+        let start = serde_json::to_value(AgentTableReadStartParams {
+            sql: "SELECT * FROM users".to_string(),
+            database: Some("ORCL".to_string()),
+            schema: Some("APP".to_string()),
+            page_size: 500,
+            max_rows: 1000,
+            fetch_size: Some(500),
+        })
+        .unwrap();
+        assert_eq!(
+            start,
+            serde_json::json!({
+                "sql": "SELECT * FROM users",
+                "database": "ORCL",
+                "schema": "APP",
+                "pageSize": 500,
+                "maxRows": 1000,
+                "fetchSize": 500,
+            })
+        );
+
+        let page = serde_json::to_value(AgentTableReadPageParams { session_id: "table-1".to_string(), page_size: 250 })
+            .unwrap();
+        assert_eq!(page, serde_json::json!({ "sessionId": "table-1", "pageSize": 250 }));
+
+        let close = serde_json::to_value(AgentTableReadCloseParams { session_id: "table-1".to_string() }).unwrap();
+        assert_eq!(close, serde_json::json!({ "sessionId": "table-1" }));
     }
 
     #[test]

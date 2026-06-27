@@ -90,6 +90,7 @@ pub fn supports_sql_query(database_type: DatabaseType) -> bool {
             | DatabaseType::Qdrant
             | DatabaseType::Milvus
             | DatabaseType::Weaviate
+            | DatabaseType::ChromaDb
             | DatabaseType::InfluxDb
             | DatabaseType::Neo4j
             | DatabaseType::Etcd

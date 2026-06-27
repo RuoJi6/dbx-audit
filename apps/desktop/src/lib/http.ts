@@ -30,6 +30,7 @@ import type {
   SavedSqlFolder,
   SavedSqlLibrary,
 } from "@/types/database";
+import type { CollectionInfo } from "@/types/database";
 import type { SchemaDiffPreparation, SchemaDiffPreparationOptions, TableDiff, FunctionDiff, SequenceDiff, RuleDiff, OwnerDiff } from "@/lib/schemaDiff";
 import type { SidebarObjectKind } from "@/lib/databaseObjectCapabilities";
 import type { AiConfig, AiTestConnectionResult } from "@/stores/settingsStore";
@@ -478,8 +479,8 @@ export async function deleteSchemaCachePrefix(prefix: string): Promise<void> {
   return del(`/api/schema/cache-prefix?${qs({ prefix })}`);
 }
 
-export async function listSchemas(connectionId: string, database: string): Promise<string[]> {
-  return get(`/api/schema/schemas?${qs({ connection_id: connectionId, database })}`);
+export async function listSchemas(connectionId: string, database: string, applyVisibleFilter = false): Promise<string[]> {
+  return get(`/api/schema/schemas?${qs({ connection_id: connectionId, database, apply_visible_filter: applyVisibleFilter || undefined })}`);
 }
 
 export async function listSchemaInfos(connectionId: string, database: string): Promise<SchemaInfo[]> {
@@ -1684,7 +1685,7 @@ export async function mongoListDatabases(connectionId: string): Promise<string[]
   return post("/api/mongo/list-databases", { connectionId });
 }
 
-export async function mongoListCollections(connectionId: string, database: string): Promise<string[]> {
+export async function mongoListCollections(connectionId: string, database: string): Promise<CollectionInfo[]> {
   return post("/api/mongo/list-collections", { connectionId, database });
 }
 
@@ -1701,10 +1702,11 @@ export async function mongoDropCollection(connectionId: string, database: string
 }
 
 export async function elasticsearchListIndices(connectionId: string): Promise<string[]> {
-  return mongoListCollections(connectionId, "default");
+  const collections = await mongoListCollections(connectionId, "default");
+  return collections.map((c) => c.name);
 }
 
-export async function vectorListCollections(connectionId: string): Promise<string[]> {
+export async function vectorListCollections(connectionId: string): Promise<CollectionInfo[]> {
   return mongoListCollections(connectionId, "default");
 }
 

@@ -61,7 +61,12 @@ const rowsText = computed(() => {
 
         <!-- Progress bar -->
         <div class="w-full bg-muted rounded-full h-2 overflow-hidden">
-          <div v-if="status === 'Running' || status === 'Writing'" class="h-full bg-primary rounded-full transition-[width] duration-300" :class="{ 'animate-pulse': !totalRows }" :style="{ width: totalRows ? `${progressPercent}%` : '50%' }" />
+          <template v-if="status === 'Running' || status === 'Writing'">
+            <div v-if="totalRows" class="h-full bg-primary rounded-full transition-[width] duration-300" :style="{ width: `${progressPercent}%` }" />
+            <div v-else class="h-full w-full overflow-hidden rounded-full">
+              <div class="export-progress-indeterminate h-full rounded-full bg-primary" />
+            </div>
+          </template>
           <div v-else-if="status === 'Done'" class="h-full bg-green-500 rounded-full" style="width: 100%" />
         </div>
 
@@ -111,3 +116,22 @@ const rowsText = computed(() => {
     </DialogContent>
   </Dialog>
 </template>
+
+<style scoped>
+.export-progress-indeterminate {
+  width: 42%;
+  animation: export-progress-slide 1.15s ease-in-out infinite;
+}
+
+@keyframes export-progress-slide {
+  0% {
+    transform: translateX(-110%);
+  }
+  50% {
+    transform: translateX(70%);
+  }
+  100% {
+    transform: translateX(250%);
+  }
+}
+</style>
