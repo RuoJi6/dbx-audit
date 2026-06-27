@@ -32,22 +32,6 @@ impl NacosOpenApiAdmin {
         if cfg.tls_skip_verify {
             builder = builder.danger_accept_invalid_certs(true);
         }
-        if let Some(connect_override) = cfg.connect_override.as_ref() {
-            let url =
-                reqwest::Url::parse(&cfg.server_addr).map_err(|e| format!("Nacos server address is invalid: {e}"))?;
-            let host = url.host_str().ok_or("Nacos server address host is empty")?;
-            let _port = url.port_or_known_default().ok_or("Nacos server address port is empty")?;
-            builder = builder.resolve(
-                host,
-                std::net::SocketAddr::new(
-                    connect_override
-                        .host
-                        .parse()
-                        .map_err(|e| format!("Nacos transport override host must be an IP address: {e}"))?,
-                    connect_override.port,
-                ),
-            );
-        }
         let http = builder.build().map_err(|e| format!("Failed to build Nacos HTTP client: {e}"))?;
         Ok(Self { cfg, http, token: Mutex::new(None) })
     }
@@ -329,7 +313,26 @@ impl NacosOpenApiAdmin {
         let start = ((page_no.saturating_sub(1)) * page_size) as usize;
         let end = start.saturating_add(page_size as usize).min(matched.len());
         let items = if start < matched.len() { matched[start..end].to_vec() } else { Vec::new() };
-        Ok(NacosConfigList { page_no, page_size, total_count, items })
+        Ok(self.enrich_missing_config_formats(NacosConfigList { page_no, page_size, total_count, items }).await)
+    }
+
+    async fn enrich_missing_config_formats(&self, mut list: NacosConfigList) -> NacosConfigList {
+        for item in list.items.iter_mut() {
+            if item.config_type.is_some() {
+                continue;
+            }
+            let detail = self
+                .get_config(NacosConfigKey {
+                    namespace: Some(item.namespace.clone()),
+                    data_id: item.data_id.clone(),
+                    group: item.group.clone(),
+                })
+                .await;
+            if let Ok(detail) = detail {
+                item.config_type = detail.config_type;
+            }
+        }
+        list
     }
 }
 
@@ -340,6 +343,7 @@ impl NacosAdmin for NacosOpenApiAdmin {
         let _ = self.access_token().await?;
         Ok(NacosConnectionInfo {
             server_addr: self.cfg.server_addr.clone(),
+            display_server_addr: self.cfg.display_server_addr.clone(),
             namespace: self.cfg.namespace.clone(),
             server_version: extract_server_version(&raw),
             auth: match self.cfg.auth {
@@ -452,7 +456,8 @@ impl NacosAdmin for NacosOpenApiAdmin {
         let group_filter = query.group.clone();
         let group = group_filter.clone().unwrap_or_default();
         let value = self.get_config_list_value(&namespace, &search, &group, page_no, page_size).await?;
-        let parsed = parse_config_list(value, namespace.clone(), page_no, page_size);
+        let parsed =
+            self.enrich_missing_config_formats(parse_config_list(value, namespace.clone(), page_no, page_size)).await;
         if data_id_filter.is_some() && parsed.items.is_empty() {
             let fallback =
                 self.list_configs_by_client_filter(namespace, group_filter, data_id_filter, page_no, page_size).await?;

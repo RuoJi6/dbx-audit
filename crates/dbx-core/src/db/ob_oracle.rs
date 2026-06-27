@@ -29,19 +29,22 @@ fn get_opt_i32(row: &mysql_async::Row, idx: usize) -> Option<i32> {
     row_get::<i32, _>(row, idx).or_else(|| row_get::<i64, _>(row, idx).and_then(|v| i32::try_from(v).ok()))
 }
 
+fn list_user_schemas_sql() -> &'static str {
+    "SELECT USERNAME FROM ALL_USERS \
+     WHERE USERNAME NOT IN ('SYS','LBACSYS','__public') \
+     ORDER BY USERNAME"
+}
+
 pub async fn list_databases(pool: &mysql_async::Pool) -> Result<Vec<DatabaseInfo>, String> {
     let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
-    let result = conn
-        .query_iter(
-            "SELECT USERNAME FROM ALL_USERS \
-             WHERE USERNAME NOT IN ('SYS','LBACSYS','ORAAUDITOR','__public') \
-             ORDER BY USERNAME",
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+    let result = conn.query_iter(list_user_schemas_sql()).await.map_err(|e| e.to_string())?;
     let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
 
     Ok(rows.iter().map(|row| DatabaseInfo { name: get_str(row, 0) }).collect())
+}
+
+pub async fn list_schemas(pool: &mysql_async::Pool) -> Result<Vec<String>, String> {
+    list_databases(pool).await.map(|databases| databases.into_iter().map(|database| database.name).collect())
 }
 
 pub async fn list_tables(pool: &mysql_async::Pool, schema: &str) -> Result<Vec<TableInfo>, String> {
@@ -288,5 +291,10 @@ mod tests {
         assert!(sql.contains("ALL_OBJECTS"));
         assert!(sql.contains("'PACKAGE'"));
         assert!(sql.contains("'PACKAGE BODY'"));
+    }
+
+    #[test]
+    fn ob_oracle_user_schema_sql_keeps_auditor_schema_available() {
+        assert!(!list_user_schemas_sql().contains("ORAAUDITOR"));
     }
 }

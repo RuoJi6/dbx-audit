@@ -18,7 +18,9 @@ const props = defineProps<{
   connectionId: string;
   database: string;
   collection: string;
+  collectionLabel?: string;
   databaseType?: DatabaseType;
+  dimension?: number;
 }>();
 
 const loading = ref(false);
@@ -32,8 +34,19 @@ const operationMode = ref<VectorOperationMode>("browse");
 const requestText = ref(defaultRequestText(props.databaseType, props.database, props.collection, operationMode.value));
 let loadingTimer: ReturnType<typeof setInterval> | undefined;
 
-const productLabel = computed(() => (props.databaseType === "milvus" ? "Milvus" : props.databaseType === "weaviate" ? "Weaviate" : "Qdrant"));
-const collectionLabel = computed(() => props.collection || t("vector.collectionFallback"));
+const productLabel = computed(() => {
+  switch (props.databaseType) {
+    case "milvus":
+      return "Milvus";
+    case "weaviate":
+      return "Weaviate";
+    case "chromadb":
+      return "ChromaDB";
+    default:
+      return "Qdrant";
+  }
+});
+const collectionLabel = computed(() => props.collectionLabel || props.collection || t("vector.collectionFallback"));
 const executeLabel = computed(() => (operationMode.value === "browse" ? t("vector.run") : t("vector.apply")));
 const operationIcon = computed(() => (operationMode.value === "delete" ? Trash2 : operationMode.value === "upsert" ? Save : Play));
 
@@ -113,6 +126,18 @@ function defaultRequestText(databaseType: DatabaseType | undefined, database: st
       )}`;
     }
     return `GET /v1/objects?class=${encodeURIComponent(collectionName)}&limit=100`;
+  }
+  if (databaseType === "chromadb") {
+    const collectionId = collection || "collection-id";
+    if (mode === "delete") {
+      return `POST /api/v2/tenants/default_tenant/databases/default_database/collections/${encodeURIComponent(collectionId)}/delete\n${JSON.stringify({ ids: ["id1"] }, null, 2)}`;
+    }
+    if (mode === "upsert") {
+      const dim = props.dimension || 4;
+      const emb = Array.from({ length: dim }, (_, i) => +(i * 0.1 + 0.1).toFixed(1));
+      return `POST /api/v2/tenants/default_tenant/databases/default_database/collections/${encodeURIComponent(collectionId)}/upsert\n${JSON.stringify({ ids: ["id1"], embeddings: [emb], documents: ["sample document"], metadatas: [{}] }, null, 2)}`;
+    }
+    return `POST /api/v2/tenants/default_tenant/databases/default_database/collections/${encodeURIComponent(collectionId)}/get\n${JSON.stringify({ limit: 100, include: ["documents", "metadatas"] }, null, 2)}`;
   }
   const collectionPath = pathSegment(collection);
   if (mode === "delete") {
@@ -238,7 +263,10 @@ function setOperationMode(mode: VectorOperationMode) {
     <div class="flex shrink-0 items-center justify-between gap-3 border-b px-3 py-2">
       <div class="min-w-0">
         <div class="truncate text-sm font-semibold">{{ collectionLabel }}</div>
-        <div class="truncate text-xs text-muted-foreground">{{ t("vector.productCollection", { product: productLabel }) }}</div>
+        <div class="truncate text-xs text-muted-foreground">
+          {{ t("vector.productCollection", { product: productLabel }) }}
+          <span v-if="dimension != null" class="ml-1.5 inline-flex items-center rounded border bg-muted/50 px-1.5 py-px text-[11px] font-medium text-foreground/80">{{ dimension }}d</span>
+        </div>
       </div>
       <div class="flex shrink-0 items-center gap-1.5">
         <div class="mr-1 flex h-7 overflow-hidden rounded-md border bg-muted/30 p-0.5">

@@ -9,6 +9,7 @@ use crate::db::mongo_driver::MongoDocumentResult;
 use crate::models::connection::DatabaseType;
 use crate::object_source_sql::{build_executable_object_source_statements, EditableObjectSourceSqlInput};
 use crate::query::{agent_execute_query_params, should_discard_pool_after_error, QueryExecutionOptions};
+use crate::sql::split_sql_statements;
 #[cfg(feature = "duckdb-bundled")]
 use crate::sql::starts_with_executable_sql_keyword;
 use crate::sql_dialect::{qualified_transfer_table, quote_transfer_identifier};
@@ -142,6 +143,17 @@ fn is_postgres_sequence_default(default_value: Option<&str>) -> bool {
     default_value.is_some_and(|value| value.to_ascii_lowercase().contains("nextval("))
 }
 
+fn is_postgres_generated_extra(extra: Option<&str>) -> bool {
+    extra.is_some_and(|value| value.trim().to_ascii_lowercase().starts_with("generated "))
+}
+
+fn is_postgres_identity_extra(extra: Option<&str>) -> bool {
+    extra.is_some_and(|value| {
+        let normalized = value.trim().to_ascii_lowercase();
+        normalized.starts_with("generated ") && normalized.contains(" identity")
+    })
+}
+
 fn rewrite_postgres_schema_qualified_references(input: &str, source_schema: &str, target_schema: &str) -> String {
     if source_schema.trim().is_empty() || source_schema == target_schema {
         return input.to_string();
@@ -182,6 +194,11 @@ fn postgres_default_clause(
 ) -> Option<String> {
     if !is_postgres_compat_transfer(source_db, target_db) {
         return None;
+    }
+    if is_postgres_generated_extra(column.extra.as_deref()) {
+        if let Some(extra) = column.extra.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+            return Some(extra.to_string());
+        }
     }
     let default_value = column.column_default.as_deref()?.trim();
     if default_value.is_empty() {
@@ -346,6 +363,16 @@ fn postgres_order_by_expression(columns: &[String], db_type: &DatabaseType) -> O
     Some(columns.iter().map(|column| quote_identifier(column, db_type)).collect::<Vec<_>>().join(", "))
 }
 
+fn oracle_rownum_page_sql(col_list: &str, base_sql: String, offset: u64, limit: usize) -> String {
+    if offset == 0 {
+        return format!("SELECT {col_list} FROM ({base_sql}) WHERE ROWNUM <= {limit}");
+    }
+    let end = offset + limit as u64;
+    format!(
+        "SELECT {col_list} FROM (SELECT dbx_inner.*, ROWNUM AS \"__dbx_row_num\" FROM ({base_sql}) dbx_inner WHERE ROWNUM <= {end}) WHERE \"__dbx_row_num\" > {offset}"
+    )
+}
+
 fn postgres_index_column_sql(column: &str) -> String {
     if is_simple_identifier(column) {
         quote_identifier(column, &DatabaseType::Postgres)
@@ -413,8 +440,13 @@ fn generate_postgres_index_ddl(indexes: &[db::IndexInfo], table: &str, schema: &
     statements
 }
 
-fn generate_postgres_foreign_key_ddl(foreign_keys: &[db::ForeignKeyInfo], table: &str, schema: &str) -> Vec<String> {
-    let full_table = qualified_table(table, schema, &DatabaseType::Postgres);
+fn generate_postgres_foreign_key_ddl(
+    foreign_keys: &[db::ForeignKeyInfo],
+    table: &str,
+    source_schema: &str,
+    target_schema: &str,
+) -> Vec<String> {
+    let full_table = qualified_table(table, target_schema, &DatabaseType::Postgres);
     let mut grouped: HashMap<&str, Vec<&db::ForeignKeyInfo>> = HashMap::new();
     let mut order = Vec::new();
 
@@ -440,7 +472,11 @@ fn generate_postgres_foreign_key_ddl(foreign_keys: &[db::ForeignKeyInfo], table:
             .map(|foreign_key| quote_identifier(&foreign_key.ref_column, &DatabaseType::Postgres))
             .collect::<Vec<_>>()
             .join(", ");
-        let referenced_schema = group[0].ref_schema.as_deref().unwrap_or(schema);
+        let referenced_schema = match group[0].ref_schema.as_deref() {
+            Some(ref_schema) if ref_schema == source_schema => target_schema,
+            Some(ref_schema) => ref_schema,
+            None => target_schema,
+        };
         let referenced_table = qualified_table(&group[0].ref_table, referenced_schema, &DatabaseType::Postgres);
         statements.push(format!(
             "ALTER TABLE {full_table} ADD CONSTRAINT {} FOREIGN KEY ({columns}) REFERENCES {referenced_table} ({ref_columns})",
@@ -455,7 +491,10 @@ fn generate_postgres_sequence_sync_sql(columns: &[db::ColumnInfo], table: &str, 
     let full_table = qualified_table(table, schema, &DatabaseType::Postgres);
     columns
         .iter()
-        .filter(|column| is_postgres_sequence_default(column.column_default.as_deref()))
+        .filter(|column| {
+            is_postgres_sequence_default(column.column_default.as_deref())
+                || is_postgres_identity_extra(column.extra.as_deref())
+        })
         .map(|column| {
             let quoted_column = quote_identifier(&column.name, &DatabaseType::Postgres);
             format!(
@@ -572,7 +611,7 @@ fn generate_postgres_materialized_view_ddls(view: &PostgresMaterializedViewSourc
     ]
 }
 
-fn rewrite_postgres_routine_schema(source: &str, target_schema: &str) -> Option<String> {
+fn rewrite_postgres_routine_schema(source: &str, source_schema: &str, target_schema: &str) -> Option<String> {
     let re = Regex::new(
         r#"(?is)^(\s*CREATE\s+(?:OR\s+REPLACE\s+)?(?:(?:NON)?EDITIONABLE\s+)?(?:FUNCTION|PROCEDURE)\s+)((?:"(?:""|[^"])+"|[A-Za-z_][\w$]*)(?:\s*\.\s*(?:"(?:""|[^"])+"|[A-Za-z_][\w$]*))?)"#,
     )
@@ -592,7 +631,8 @@ fn rewrite_postgres_routine_schema(source: &str, target_schema: &str) -> Option<
         quote_identifier(target_schema, &DatabaseType::Postgres),
         quote_identifier(name, &DatabaseType::Postgres)
     );
-    Some(format!("{}{}{}{}", &source[..full.start()], prefix, replacement, &source[full.end()..]))
+    let rewritten = format!("{}{}{}{}", &source[..full.start()], prefix, replacement, &source[full.end()..]);
+    Some(rewrite_postgres_schema_qualified_references(&rewritten, source_schema, target_schema))
 }
 
 fn rewrite_postgres_trigger_table_schema(
@@ -614,10 +654,11 @@ fn rewrite_postgres_trigger_table_schema(
     ];
     for pattern in candidate_patterns {
         if source.contains(&pattern) {
-            return source.replacen(&pattern, &format!(" ON {qualified_target_table} "), 1);
+            let rewritten = source.replacen(&pattern, &format!(" ON {qualified_target_table} "), 1);
+            return rewrite_postgres_schema_qualified_references(&rewritten, source_schema, target_schema);
         }
     }
-    source.to_string()
+    rewrite_postgres_schema_qualified_references(source, source_schema, target_schema)
 }
 
 pub fn escape_value(val: &serde_json::Value, db_type: &DatabaseType) -> String {
@@ -673,6 +714,10 @@ pub fn escape_value_typed(val: &serde_json::Value, db_type: &DatabaseType, colum
             _ => n.to_string(),
         },
         serde_json::Value::String(s) => {
+            if let Some(binary_literal) = format_postgres_binary_sql_literal(s, db_type, column_type) {
+                return binary_literal;
+            }
+
             let literal = format_literal_string(s, db_type, column_type);
             let escaped = if is_postgres_family_target(db_type) {
                 literal.replace('\'', "''")
@@ -704,6 +749,29 @@ fn is_mysql_bit_type(column_type: &str) -> bool {
     let trimmed = column_type.trim();
     let lower = trimmed.to_ascii_lowercase();
     lower == "bit" || lower.starts_with("bit(") || lower.starts_with("bit ")
+}
+
+fn is_binary_transfer_column_type(column_type: &str) -> bool {
+    let lower = column_type.trim().to_ascii_lowercase();
+    let base = lower.split(['(', ' ', '\t', '\n']).next().unwrap_or("");
+    matches!(base, "binary" | "varbinary" | "blob" | "tinyblob" | "mediumblob" | "longblob" | "bytea" | "image")
+}
+
+fn format_postgres_binary_sql_literal(
+    value: &str,
+    db_type: &DatabaseType,
+    column_type: Option<&str>,
+) -> Option<String> {
+    if !matches!(db_type, DatabaseType::Postgres) || !column_type.is_some_and(is_binary_transfer_column_type) {
+        return None;
+    }
+
+    let hex = value.strip_prefix("0x").or_else(|| value.strip_prefix("0X"))?;
+    if hex.len() % 2 != 0 || !hex.as_bytes().iter().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+
+    Some(format!("decode('{hex}', 'hex')"))
 }
 
 pub fn format_pg_array_sql_literal(arr: &[serde_json::Value]) -> String {
@@ -1458,9 +1526,23 @@ fn can_reuse_source_table_ddl(
 ) -> bool {
     preserves_target_table_name
         && !matches!(target_db_type, DatabaseType::ClickHouse)
-        && ((source_db_type == target_db_type)
+        && (source_db_type == target_db_type
             || (is_mysql_family_target(source_db_type) && is_mysql_family_target(target_db_type))
             || (is_postgres_family_target(source_db_type) && is_postgres_family_target(target_db_type)))
+}
+
+fn rewrite_transfer_source_table_ddl(
+    sql: &str,
+    source_schema: &str,
+    target_schema: &str,
+    source_db_type: &DatabaseType,
+    target_db_type: &DatabaseType,
+) -> String {
+    if is_postgres_family_target(source_db_type) && is_postgres_family_target(target_db_type) {
+        rewrite_postgres_schema_qualified_references(sql, source_schema, target_schema)
+    } else {
+        sql.to_string()
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1551,7 +1633,11 @@ pub fn pagination_sql(
     let col_list = columns.iter().map(|c| quote_identifier(c, db_type)).collect::<Vec<_>>().join(", ");
 
     match db_type {
-        DatabaseType::SqlServer | DatabaseType::Oracle | DatabaseType::Dameng => {
+        DatabaseType::Oracle => {
+            let base_sql = format!("SELECT {col_list} FROM {full_table}");
+            oracle_rownum_page_sql(&col_list, base_sql, offset, limit)
+        }
+        DatabaseType::SqlServer | DatabaseType::Dameng => {
             format!(
                 "SELECT {col_list} FROM {full_table} ORDER BY (SELECT NULL) OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY"
             )
@@ -1580,7 +1666,12 @@ pub fn pagination_sql_with_order(
     let order_expression = postgres_order_by_expression(order_by_columns, db_type);
 
     match db_type {
-        DatabaseType::SqlServer | DatabaseType::Oracle | DatabaseType::Dameng => {
+        DatabaseType::Oracle => {
+            let order_by = order_expression.map(|value| format!(" ORDER BY {value}")).unwrap_or_default();
+            let base_sql = format!("SELECT {col_list} FROM {full_table}{order_by}");
+            oracle_rownum_page_sql(&col_list, base_sql, offset, limit)
+        }
+        DatabaseType::SqlServer | DatabaseType::Dameng => {
             let order_by = order_expression.unwrap_or_else(|| "(SELECT NULL)".to_string());
             format!(
                 "SELECT {col_list} FROM {full_table} ORDER BY {order_by} OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY"
@@ -1621,7 +1712,12 @@ pub fn pagination_sql_with_filter_order(
         .or_else(|| postgres_order_by_expression(default_order_columns, db_type));
 
     match db_type {
-        DatabaseType::SqlServer | DatabaseType::Oracle | DatabaseType::Dameng => {
+        DatabaseType::Oracle => {
+            let order_by = order_expression.map(|value| format!(" ORDER BY {value}")).unwrap_or_default();
+            let base_sql = format!("SELECT {col_list} FROM {full_table}{where_clause}{order_by}");
+            oracle_rownum_page_sql(&col_list, base_sql, offset, limit)
+        }
+        DatabaseType::SqlServer | DatabaseType::Dameng => {
             let order_by = order_expression.unwrap_or_else(|| "(SELECT NULL)".to_string());
             format!(
                 "SELECT {col_list} FROM {full_table}{where_clause} ORDER BY {order_by} OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY"
@@ -1667,7 +1763,11 @@ pub fn keyset_pagination_sql(
     let where_clause = keyset_where_clause(primary_keys, last_pk_values, db_type);
 
     match db_type {
-        DatabaseType::SqlServer | DatabaseType::Oracle | DatabaseType::Dameng => {
+        DatabaseType::Oracle => {
+            let base_sql = format!("SELECT {col_list} FROM {full_table}{where_clause} ORDER BY {order}");
+            oracle_rownum_page_sql(&col_list, base_sql, 0, limit)
+        }
+        DatabaseType::SqlServer | DatabaseType::Dameng => {
             format!(
                 "SELECT {col_list} FROM {full_table}{where_clause} ORDER BY {order} OFFSET 0 ROWS FETCH NEXT {limit} ROWS ONLY"
             )
@@ -1870,6 +1970,63 @@ fn mongo_columns_from_documents(documents: &[serde_json::Value]) -> Vec<db::Colu
 
 pub async fn execute_on_pool(state: &AppState, pool_key: &str, sql: &str) -> Result<db::QueryResult, String> {
     execute_on_pool_with_max_rows(state, pool_key, sql, None).await
+}
+
+async fn execute_transfer_ddl_on_pool(
+    state: &AppState,
+    pool_key: &str,
+    sql: &str,
+    db_type: &DatabaseType,
+) -> Result<(), String> {
+    for statement in transfer_ddl_statements(sql, db_type) {
+        execute_on_pool(state, pool_key, &statement).await?;
+    }
+    Ok(())
+}
+
+fn transfer_ddl_statements(sql: &str, db_type: &DatabaseType) -> Vec<String> {
+    if matches!(db_type, DatabaseType::Postgres) {
+        let statements = split_sql_statements(sql);
+        if statements.is_empty() {
+            vec![sql.trim().to_string()]
+        } else {
+            statements
+                .into_iter()
+                .map(|statement| sanitize_postgres_transfer_ddl_statement(&statement))
+                .filter(|statement| !is_postgres_post_table_index_statement(statement))
+                .collect()
+        }
+    } else {
+        vec![sql.to_string()]
+    }
+}
+
+fn sanitize_postgres_transfer_ddl_statement(statement: &str) -> String {
+    if !statement.trim_start().to_ascii_uppercase().starts_with("CREATE TABLE ") {
+        return statement.to_string();
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    for line in statement.lines() {
+        if line.to_ascii_uppercase().contains(" FOREIGN KEY ") {
+            if let Some(previous) = lines.last_mut() {
+                let trimmed_len = previous.trim_end_matches(char::is_whitespace).len();
+                if previous[..trimmed_len].ends_with(',') {
+                    previous.truncate(trimmed_len - 1);
+                }
+            }
+            continue;
+        }
+        lines.push(line.to_string());
+    }
+    lines.join("\n")
+}
+
+fn is_postgres_post_table_index_statement(statement: &str) -> bool {
+    let normalized = statement.trim_start().to_ascii_uppercase();
+    normalized.starts_with("CREATE INDEX ")
+        || normalized.starts_with("CREATE UNIQUE INDEX ")
+        || normalized.starts_with("COMMENT ON INDEX ")
 }
 
 pub async fn execute_on_pool_with_max_rows(
@@ -2484,11 +2641,11 @@ async fn get_postgres_grant_statements_for_transfer(
          relation_grants AS ( \
              SELECT format( \
                  'GRANT %s ON %s %I.%I TO %s%s', \
-                 string_agg(a.privilege_type, ', ' ORDER BY a.privilege_type), \
+                 string_agg(privilege_type, ', ' ORDER BY privilege_type), \
                  CASE WHEN relkind = 'S' THEN 'SEQUENCE' ELSE 'TABLE' END, \
                  {target_schema}, relname, \
-                 CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(grantee.rolname) END, \
-                 CASE WHEN bool_or(a.is_grantable) THEN ' WITH GRANT OPTION' ELSE '' END \
+                 CASE WHEN grantee = 0 THEN 'PUBLIC' ELSE quote_ident(rolname) END, \
+                 CASE WHEN bool_or(is_grantable) THEN ' WITH GRANT OPTION' ELSE '' END \
              ) AS stmt \
              FROM ( \
                  SELECT c.relname, c.relkind, a.grantee, a.privilege_type, a.is_grantable, grantee.rolname \
@@ -2503,11 +2660,11 @@ async fn get_postgres_grant_statements_for_transfer(
          routine_grants AS ( \
              SELECT format( \
                  'GRANT %s ON %s %I.%I(%s) TO %s%s', \
-                 string_agg(a.privilege_type, ', ' ORDER BY a.privilege_type), \
+                 string_agg(privilege_type, ', ' ORDER BY privilege_type), \
                  CASE WHEN prokind = 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END, \
                  {target_schema}, proname, identity_args, \
-                 CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(grantee.rolname) END, \
-                 CASE WHEN bool_or(a.is_grantable) THEN ' WITH GRANT OPTION' ELSE '' END \
+                 CASE WHEN grantee = 0 THEN 'PUBLIC' ELSE quote_ident(rolname) END, \
+                 CASE WHEN bool_or(is_grantable) THEN ' WITH GRANT OPTION' ELSE '' END \
              ) AS stmt \
              FROM ( \
                  SELECT p.proname, p.prokind, pg_get_function_identity_arguments(p.oid) AS identity_args, a.grantee, a.privilege_type, a.is_grantable, grantee.rolname \
@@ -2999,7 +3156,7 @@ where
         let can_reuse_source_ddl =
             can_reuse_source_table_ddl(source_db_type, target_db_type, preserves_target_table_name);
         let ddl = if can_reuse_source_ddl {
-            crate::schema::get_table_ddl_core(
+            let source_ddl = crate::schema::get_table_ddl_core(
                 &state,
                 &request.source_connection_id,
                 &request.source_database,
@@ -3018,7 +3175,14 @@ where
                     source_db_type,
                     table_comment.as_deref(),
                 )
-            })
+            });
+            rewrite_transfer_source_table_ddl(
+                &source_ddl,
+                &request.source_schema,
+                &request.target_schema,
+                source_db_type,
+                target_db_type,
+            )
         } else {
             generate_create_table_ddl(
                 &columns,
@@ -3031,7 +3195,7 @@ where
             )
         };
         log::info!("[transfer] creating target table: {}", ddl.chars().take(200).collect::<String>());
-        let table_exists = match execute_on_pool(state, target_pool_key, &ddl).await {
+        let table_exists = match execute_transfer_ddl_on_pool(state, target_pool_key, &ddl, target_db_type).await {
             Ok(_) => true,
             Err(e) => {
                 let err_lower = e.to_lowercase();
@@ -3184,8 +3348,12 @@ where
                 .await
                 .map_err(|e| format!("Failed to create PostgreSQL index for {target_table}: {e}"))?;
         }
-        for statement in generate_postgres_foreign_key_ddl(&source_foreign_keys, &target_table, &request.target_schema)
-        {
+        for statement in generate_postgres_foreign_key_ddl(
+            &source_foreign_keys,
+            &target_table,
+            &request.source_schema,
+            &request.target_schema,
+        ) {
             execute_on_pool(state, target_pool_key, &statement)
                 .await
                 .map_err(|e| format!("Failed to create PostgreSQL foreign key for {target_table}: {e}"))?;
@@ -3372,7 +3540,7 @@ where
         let rewritten_source = match object.object_type {
             db::ObjectSourceKind::View | db::ObjectSourceKind::MaterializedView => object.source.clone(),
             db::ObjectSourceKind::Procedure | db::ObjectSourceKind::Function => {
-                rewrite_postgres_routine_schema(&object.source, &request.target_schema)
+                rewrite_postgres_routine_schema(&object.source, &request.source_schema, &request.target_schema)
                     .unwrap_or_else(|| object.source.clone())
             }
             db::ObjectSourceKind::Sequence | db::ObjectSourceKind::Package | db::ObjectSourceKind::PackageBody => {
@@ -3795,6 +3963,52 @@ mod tests {
     }
 
     #[test]
+    fn postgres_transfer_ddl_splits_reused_multi_statement_table_ddl() {
+        let ddl =
+            "CREATE TABLE \"public\".\"items\" (\"id\" integer);\nCOMMENT ON TABLE \"public\".\"items\" IS 'items';";
+
+        let statements = transfer_ddl_statements(ddl, &DatabaseType::Postgres);
+
+        assert_eq!(
+            statements,
+            vec![
+                "CREATE TABLE \"public\".\"items\" (\"id\" integer)".to_string(),
+                "COMMENT ON TABLE \"public\".\"items\" IS 'items'".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn postgres_transfer_ddl_skips_reused_index_statements() {
+        let ddl = "CREATE TABLE \"public\".\"items\" (\"id\" integer);\n\
+                   CREATE INDEX \"items_lower_idx\" ON \"public\".\"items\" USING btree (\"lower(name)\");\n\
+                   COMMENT ON INDEX \"public\".\"items_lower_idx\" IS 'lookup';";
+
+        let statements = transfer_ddl_statements(ddl, &DatabaseType::Postgres);
+
+        assert_eq!(statements, vec!["CREATE TABLE \"public\".\"items\" (\"id\" integer)".to_string()]);
+    }
+
+    #[test]
+    fn postgres_transfer_ddl_removes_inline_foreign_keys_from_reused_table_ddl() {
+        let ddl = "CREATE TABLE \"public\".\"audit_logs\" (\n  \"id\" integer,\n  \"user_id\" integer,\n  CONSTRAINT \"audit_logs_user_id_fkey\" FOREIGN KEY (\"user_id\") REFERENCES \"users\"(\"id\")\n);";
+
+        let statements = transfer_ddl_statements(ddl, &DatabaseType::Postgres);
+
+        assert_eq!(
+            statements,
+            vec!["CREATE TABLE \"public\".\"audit_logs\" (\n  \"id\" integer,\n  \"user_id\" integer\n)".to_string()]
+        );
+    }
+
+    #[test]
+    fn non_postgres_transfer_ddl_keeps_statement_text_intact() {
+        let ddl = "CREATE TABLE `items` (`id` int);\nALTER TABLE `items` COMMENT = 'items';";
+
+        assert_eq!(transfer_ddl_statements(ddl, &DatabaseType::Mysql), vec![ddl.to_string()]);
+    }
+
+    #[test]
     fn clickhouse_comment_ddl_uses_alter_table() {
         let cols = vec![db::ColumnInfo { comment: Some("日志消息".to_string()), ..test_column("message", "text") }];
 
@@ -3867,10 +4081,23 @@ mod tests {
     }
 
     #[test]
-    fn clickhouse_transfer_does_not_reuse_source_table_ddl() {
+    fn transfer_reuses_source_table_ddl_only_when_target_shape_matches() {
         assert!(!can_reuse_source_table_ddl(&DatabaseType::ClickHouse, &DatabaseType::ClickHouse, true));
         assert!(can_reuse_source_table_ddl(&DatabaseType::Postgres, &DatabaseType::Postgres, true));
         assert!(!can_reuse_source_table_ddl(&DatabaseType::Postgres, &DatabaseType::Postgres, false));
+    }
+
+    #[test]
+    fn postgres_transfer_reused_table_ddl_rewrites_target_schema() {
+        let ddl =
+            "CREATE TABLE \"src\".\"items\" (\"id\" integer);\nCOMMENT ON COLUMN \"src\".\"items\".\"id\" IS 'id';";
+
+        let rewritten =
+            rewrite_transfer_source_table_ddl(ddl, "src", "dst", &DatabaseType::Postgres, &DatabaseType::Postgres);
+
+        assert!(rewritten.contains("CREATE TABLE \"dst\".\"items\""));
+        assert!(rewritten.contains("COMMENT ON COLUMN \"dst\".\"items\".\"id\""));
+        assert!(!rewritten.contains("\"src\".\"items\""));
     }
 
     #[test]
@@ -4046,6 +4273,28 @@ mod tests {
     }
 
     #[test]
+    fn oracle_filtered_pagination_uses_rownum_for_legacy_compatibility() {
+        let sql = pagination_sql_with_filter_order(
+            &[String::from("id"), String::from("status")],
+            "users",
+            "APP",
+            &DatabaseType::Oracle,
+            10_000,
+            2_000,
+            Some("WHERE status = 'active'"),
+            Some("\"id\" DESC"),
+            &[String::from("id")],
+        );
+
+        assert_eq!(
+            sql,
+            "SELECT \"id\", \"status\" FROM (SELECT dbx_inner.*, ROWNUM AS \"__dbx_row_num\" FROM (SELECT \"id\", \"status\" FROM \"APP\".\"users\" WHERE (status = 'active') ORDER BY \"id\" DESC) dbx_inner WHERE ROWNUM <= 12000) WHERE \"__dbx_row_num\" > 10000"
+        );
+        assert!(!sql.contains("OFFSET"));
+        assert!(!sql.contains("FETCH NEXT"));
+    }
+
+    #[test]
     fn filtered_count_preserves_where() {
         let sql = count_sql_with_where("users", "public", &DatabaseType::SapHana, Some("WHERE status = 'active'"));
 
@@ -4087,6 +4336,26 @@ mod tests {
             "SELECT \"id\", \"name\" FROM \"SYSDBA\".\"users\" WHERE \"id\" > 25 ORDER BY \"id\" ASC OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY"
         );
         assert!(!sql.contains(" LIMIT "));
+    }
+
+    #[test]
+    fn oracle_keyset_pagination_uses_rownum_for_legacy_compatibility() {
+        let sql = keyset_pagination_sql(
+            &[String::from("id"), String::from("name")],
+            "users",
+            "APP",
+            &DatabaseType::Oracle,
+            &[String::from("id")],
+            &[json!(25)],
+            100,
+        );
+
+        assert_eq!(
+            sql,
+            "SELECT \"id\", \"name\" FROM (SELECT \"id\", \"name\" FROM \"APP\".\"users\" WHERE \"id\" > 25 ORDER BY \"id\" ASC) WHERE ROWNUM <= 100"
+        );
+        assert!(!sql.contains("OFFSET"));
+        assert!(!sql.contains("FETCH NEXT"));
     }
 
     #[test]
@@ -4141,7 +4410,7 @@ mod tests {
         ];
 
         let index_sql = generate_postgres_index_ddl(&indexes, "users", "public");
-        let foreign_key_sql = generate_postgres_foreign_key_ddl(&foreign_keys, "orders", "public");
+        let foreign_key_sql = generate_postgres_foreign_key_ddl(&foreign_keys, "orders", "public", "archive");
 
         assert_eq!(
             index_sql,
@@ -4153,7 +4422,7 @@ mod tests {
         assert_eq!(
             foreign_key_sql,
             vec![
-                "ALTER TABLE \"public\".\"orders\" ADD CONSTRAINT \"orders_user_id_fkey\" FOREIGN KEY (\"user_id\", \"tenant_id\") REFERENCES \"public\".\"users\" (\"id\", \"tenant_id\")".to_string()
+                "ALTER TABLE \"archive\".\"orders\" ADD CONSTRAINT \"orders_user_id_fkey\" FOREIGN KEY (\"user_id\", \"tenant_id\") REFERENCES \"archive\".\"users\" (\"id\", \"tenant_id\")".to_string()
             ]
         );
     }
@@ -4161,18 +4430,44 @@ mod tests {
     #[test]
     fn postgres_sequence_sync_sql_uses_table_max_values() {
         let sql = generate_postgres_sequence_sync_sql(
-            &[db::ColumnInfo {
-                name: "id".to_string(),
-                data_type: "integer".to_string(),
-                is_nullable: false,
-                column_default: Some("nextval('public.users_id_seq'::regclass)".to_string()),
-                is_primary_key: true,
-                extra: None,
-                comment: None,
-                numeric_precision: None,
-                numeric_scale: None,
-                character_maximum_length: None,
-            }],
+            &[
+                db::ColumnInfo {
+                    name: "id".to_string(),
+                    data_type: "integer".to_string(),
+                    is_nullable: false,
+                    column_default: Some("nextval('public.users_id_seq'::regclass)".to_string()),
+                    is_primary_key: true,
+                    extra: None,
+                    comment: None,
+                    numeric_precision: None,
+                    numeric_scale: None,
+                    character_maximum_length: None,
+                },
+                db::ColumnInfo {
+                    name: "identity_id".to_string(),
+                    data_type: "integer".to_string(),
+                    is_nullable: false,
+                    column_default: None,
+                    is_primary_key: false,
+                    extra: Some("generated by default as identity".to_string()),
+                    comment: None,
+                    numeric_precision: None,
+                    numeric_scale: None,
+                    character_maximum_length: None,
+                },
+                db::ColumnInfo {
+                    name: "computed_id".to_string(),
+                    data_type: "integer".to_string(),
+                    is_nullable: false,
+                    column_default: None,
+                    is_primary_key: false,
+                    extra: Some("generated always as (identity_id + 1) stored".to_string()),
+                    comment: None,
+                    numeric_precision: None,
+                    numeric_scale: None,
+                    character_maximum_length: None,
+                },
+            ],
             "users",
             "public",
         );
@@ -4180,7 +4475,8 @@ mod tests {
         assert_eq!(
             sql,
             vec![
-                "SELECT setval(pg_get_serial_sequence('\"public\".\"users\"', 'id'), GREATEST(COALESCE(MAX(\"id\"), 0), 1), MAX(\"id\") IS NOT NULL) FROM \"public\".\"users\"".to_string()
+                "SELECT setval(pg_get_serial_sequence('\"public\".\"users\"', 'id'), GREATEST(COALESCE(MAX(\"id\"), 0), 1), MAX(\"id\") IS NOT NULL) FROM \"public\".\"users\"".to_string(),
+                "SELECT setval(pg_get_serial_sequence('\"public\".\"users\"', 'identity_id'), GREATEST(COALESCE(MAX(\"identity_id\"), 0), 1), MAX(\"identity_id\") IS NOT NULL) FROM \"public\".\"users\"".to_string()
             ]
         );
     }
@@ -4188,12 +4484,14 @@ mod tests {
     #[test]
     fn postgres_routine_schema_rewrite_targets_destination_schema() {
         let rewritten = rewrite_postgres_routine_schema(
-            "CREATE OR REPLACE FUNCTION public.bump_counter(id integer)\nRETURNS integer\nLANGUAGE plpgsql\nAS $$ BEGIN RETURN id + 1; END; $$",
+            "CREATE OR REPLACE FUNCTION public.bump_counter(id integer)\nRETURNS integer\nLANGUAGE plpgsql\nAS $$ BEGIN INSERT INTO public.audit_logs(user_id) VALUES (id); RETURN id + 1; END; $$",
+            "public",
             "archive",
         )
         .unwrap();
 
         assert!(rewritten.starts_with("CREATE OR REPLACE FUNCTION \"archive\".\"bump_counter\"("));
+        assert!(rewritten.contains("INSERT INTO \"archive\".audit_logs"));
     }
 
     #[test]
@@ -4206,6 +4504,7 @@ mod tests {
         );
 
         assert!(rewritten.contains(" ON \"archive\".\"users\" "));
+        assert!(rewritten.contains("EXECUTE FUNCTION \"archive\".bump_counter()"));
     }
 
     #[test]
@@ -4389,6 +4688,24 @@ mod tests {
             sql,
             r#"INSERT INTO "public"."files" ("path") VALUES
 ('C:\tmp\file.txt')"#
+        );
+    }
+
+    #[test]
+    fn postgres_insert_formats_bytea_prefixed_hex_as_binary_literal() {
+        let sql = generate_insert_typed(
+            &[String::from("id"), String::from("payload"), String::from("note")],
+            &[Some(String::from("integer")), Some(String::from("BYTEA")), Some(String::from("text"))],
+            &[vec![json!(1), json!("0x48656c6c6f"), json!("0x48656c6c6f")]],
+            "files",
+            "public",
+            &DatabaseType::Postgres,
+        );
+
+        assert_eq!(
+            sql,
+            r#"INSERT INTO "public"."files" ("id", "payload", "note") VALUES
+(1, decode('48656c6c6f', 'hex'), '0x48656c6c6f')"#
         );
     }
 
@@ -4659,5 +4976,28 @@ mod tests {
         );
 
         assert!(ddl.contains("GENERATED BY DEFAULT AS IDENTITY"), "ddl: {ddl}");
+    }
+
+    #[test]
+    fn postgres_create_table_preserves_identity_from_column_extra() {
+        let cols = vec![db::ColumnInfo {
+            data_type: "integer".to_string(),
+            extra: Some("generated by default as identity".to_string()),
+            is_primary_key: true,
+            is_nullable: false,
+            ..test_column("id", "integer")
+        }];
+
+        let ddl = generate_create_table_ddl(
+            &cols,
+            "t",
+            "public",
+            "public",
+            &DatabaseType::Postgres,
+            &DatabaseType::Postgres,
+            None,
+        );
+
+        assert!(ddl.contains("\"id\" integer generated by default as identity NOT NULL"), "ddl: {ddl}");
     }
 }

@@ -155,7 +155,7 @@ async function loadTables() {
   loadingTables.value = true;
   try {
     if (isMongoConnection(sourceConnectionId.value)) {
-      sourceTables.value = await api.mongoListCollections(sourceConnectionId.value, sourceDatabase.value);
+      sourceTables.value = (await api.mongoListCollections(sourceConnectionId.value, sourceDatabase.value)).map((c) => c.name);
       selectedTables.value = new Set(sourceTables.value);
       return;
     }

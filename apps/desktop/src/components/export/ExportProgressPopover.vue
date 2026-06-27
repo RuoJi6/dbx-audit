@@ -102,7 +102,10 @@ function toggleShowAll() {
 
             <!-- Progress bar -->
             <div v-if="isActive(task.status)" class="w-full bg-muted rounded-full h-1.5 overflow-hidden">
-              <div class="h-full bg-primary rounded-full transition-[width] duration-300" :class="{ 'animate-pulse': !task.totalRows }" :style="{ width: task.totalRows ? `${progressPercent(task.totalRows, task.rowsExported)}%` : '50%' }" />
+              <div v-if="task.totalRows" class="h-full bg-primary rounded-full transition-[width] duration-300" :style="{ width: `${progressPercent(task.totalRows, task.rowsExported)}%` }" />
+              <div v-else class="h-full w-full overflow-hidden rounded-full">
+                <div class="export-progress-indeterminate h-full rounded-full bg-primary" />
+              </div>
             </div>
             <div v-else-if="task.status === 'Done'" class="w-full bg-muted rounded-full h-1.5 overflow-hidden">
               <div class="h-full bg-green-500 rounded-full" style="width: 100%" />
@@ -142,3 +145,22 @@ function toggleShowAll() {
     </PopoverContent>
   </Popover>
 </template>
+
+<style scoped>
+.export-progress-indeterminate {
+  width: 42%;
+  animation: export-progress-slide 1.15s ease-in-out infinite;
+}
+
+@keyframes export-progress-slide {
+  0% {
+    transform: translateX(-110%);
+  }
+  50% {
+    transform: translateX(70%);
+  }
+  100% {
+    transform: translateX(250%);
+  }
+}
+</style>

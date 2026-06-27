@@ -63,7 +63,7 @@ import { chartableColumnIndexes } from "@/lib/chartData";
 import type { SqlExecutionOverride } from "@/lib/sqlExecutionTarget";
 import type { DataGridSortMode } from "@/lib/dataGridSort";
 import { useTabScroll } from "@/composables/useTabScroll";
-import type { QueryTab, ConnectionConfig, TableInfoTab } from "@/types/database";
+import type { QueryTab, ConnectionConfig, TableInfoTab, TreeNode, VectorCollectionMeta } from "@/types/database";
 import type { SqlFormatDialect } from "@/lib/sqlFormatter";
 
 type DataGridHandle = {
@@ -186,6 +186,25 @@ const objectBrowserRef = ref<SearchableBrowserHandle>();
 const activeTableMeta = computed(() => props.activeTab.tableMeta);
 const activeDataTabTableMeta = computed(() => tableMetaForDataTab(props.activeTab));
 const activeEffectiveDatabaseType = computed(() => effectiveDatabaseTypeForConnection(props.activeConnection));
+
+function findNodeInTree(nodes: TreeNode[], id: string): TreeNode | undefined {
+  for (const node of nodes) {
+    if (node.id === id) return node;
+    if (node.children) {
+      const found = findNodeInTree(node.children, id);
+      if (found) return found;
+    }
+  }
+  return undefined;
+}
+
+const activeTabDimension = computed(() => {
+  const tab = props.activeTab;
+  if (!tab.connectionId || tab.mode !== "vector") return undefined;
+  const nodeId = `${tab.connectionId}:__vector_collection:${tab.sql}`;
+  const meta = findNodeInTree(connectionStore.treeNodes, nodeId)?.meta;
+  return meta && "dimension" in meta ? (meta as VectorCollectionMeta).dimension : undefined;
+});
 
 const activeSqlFormatDialect = computed<SqlFormatDialect>(() => {
   switch (activeEffectiveDatabaseType.value) {
@@ -1082,7 +1101,7 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
     <!-- Vector mode: Qdrant and Milvus collections -->
     <template v-else-if="activeTab.mode === 'vector'">
       <div class="flex-1 min-h-0">
-        <VectorBrowser :key="activeTab.id" :connection-id="activeTab.connectionId" :database="activeTab.database" :collection="activeTab.sql" :database-type="activeEffectiveDatabaseType" />
+        <VectorBrowser :key="activeTab.id" :connection-id="activeTab.connectionId" :database="activeTab.database" :collection="activeTab.sql" :collection-label="activeTab.title" :database-type="activeEffectiveDatabaseType" :dimension="activeTabDimension" />
       </div>
     </template>
 

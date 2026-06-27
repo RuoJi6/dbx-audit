@@ -54,6 +54,18 @@ public abstract class PostgresLikeAgent extends AbstractJdbcAgent {
         );
     }
 
+    @Override
+    public QueryPageResult startTableRead(String sql, String schema, QueryPageOptions options) {
+        return JdbcExecutor.INSTANCE.startTableRead(
+            requireConnected(),
+            sql,
+            schema,
+            this::setSchemaSQL,
+            options,
+            geometryAwareResolver()
+        );
+    }
+
     /**
      * Wrap {@link AbstractJdbcAgent#resultValue} so PostGIS-style {@code geometry}
      * and {@code geography} columns are decoded into WKT (matching the native

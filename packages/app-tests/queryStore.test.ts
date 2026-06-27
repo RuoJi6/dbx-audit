@@ -1790,7 +1790,7 @@ test("agent-session query export raises maxRows to the configured export limit",
   setActivePinia(createPinia());
   const connectionStore = useConnectionStore();
   const settingsStore = useSettingsStore();
-  settingsStore.updateEditorSettings({ exportRowLimit: 50_000 });
+  settingsStore.updateEditorSettings({ exportRowLimit: 50_000, exportRowLimitEnabled: true });
   const store = useQueryStore();
   const originalFetch = globalThis.fetch;
   const executeBodies: any[] = [];
@@ -1856,6 +1856,83 @@ test("agent-session query export raises maxRows to the configured export limit",
       assert.equal(body.maxRows, 50_000);
     }
     assert.equal(exported?.rows.length, 20_000);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreStorage();
+  }
+});
+
+test("query export stops at the configured row limit when enabled", async () => {
+  const restoreStorage = installMemoryStorage();
+  setActivePinia(createPinia());
+  const connectionStore = useConnectionStore();
+  const settingsStore = useSettingsStore();
+  settingsStore.updateEditorSettings({ exportRowLimit: 15_000, exportRowLimitEnabled: true });
+  const store = useQueryStore();
+  const originalFetch = globalThis.fetch;
+  const planLimits: number[] = [];
+  const executeMaxRows: number[] = [];
+
+  connectionStore.addEphemeralConnection(conn("conn-1"));
+  const tabId = store.createTab("conn-1", "analytics", "Query", "query", "public");
+  const tab = store.tabs.find((item) => item.id === tabId);
+  assert.ok(tab);
+  tab.lastExecutedSql = "SELECT * FROM events";
+  tab.result = {
+    columns: ["id"],
+    rows: [[1]],
+    affected_rows: 0,
+    execution_time_ms: 1,
+    truncated: false,
+    has_more: true,
+  };
+
+  globalThis.fetch = withConnectionHealthMock(async (input, init) => {
+    const url = String(input);
+    if (url === "/api/query/prepare-pagination-plan") {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      const pagination = body.options.pagination;
+      planLimits.push(pagination.limit);
+      return new Response(
+        JSON.stringify({
+          sqlToExecute: `SELECT * FROM events LIMIT ${pagination.limit} OFFSET ${pagination.offset}`,
+          pageLimit: pagination.limit,
+          pageOffset: pagination.offset,
+          useAgentResultSession: false,
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (url === "/api/query/execute-multi") {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      executeMaxRows.push(body.maxRows);
+      const start = executeMaxRows.length === 1 ? 1 : 10_001;
+      return new Response(
+        JSON.stringify([
+          {
+            columns: ["id"],
+            rows: Array.from({ length: body.maxRows }, (_, index) => [start + index]),
+            affected_rows: 0,
+            execution_time_ms: 1,
+            has_more: true,
+          },
+        ]),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (url === "/api/query/close-client-session") {
+      return new Response(JSON.stringify(true), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    return new Response("unexpected request", { status: 500 });
+  });
+
+  try {
+    const exported = await store.fetchTabResultForExport(tabId);
+
+    assert.deepEqual(planLimits, [10_000, 5_000]);
+    assert.deepEqual(executeMaxRows, [10_000, 5_000]);
+    assert.equal(exported?.rows.length, 15_000);
+    assert.deepEqual(exported?.rows.at(-1), [15_000]);
   } finally {
     globalThis.fetch = originalFetch;
     restoreStorage();
@@ -1955,6 +2032,45 @@ test("buildQueryResultExportRequest uses exportRowLimit when enabled", async () 
 
     assert.equal(request?.pageSize, 2500);
     assert.equal(request?.rowLimit, 200000);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreStorage();
+  }
+});
+
+test("buildQueryResultExportRequest caps progress total when export row limit is enabled", async () => {
+  const restoreStorage = installMemoryStorage();
+  setActivePinia(createPinia());
+  const connectionStore = useConnectionStore();
+  const settingsStore = useSettingsStore();
+  settingsStore.updateEditorSettings({ exportBatchSize: 2500, exportRowLimit: 100000, exportRowLimitEnabled: true });
+  const store = useQueryStore();
+  const originalFetch = globalThis.fetch;
+
+  connectionStore.addEphemeralConnection(conn("conn-1"));
+  const tabId = store.createTab("conn-1", "analytics", "Query", "query", "public");
+  const tab = store.tabs.find((item) => item.id === tabId);
+  assert.ok(tab);
+  tab.lastExecutedSql = "SELECT * FROM events";
+  tab.resultTotalRowCount = 120000;
+  tab.result = {
+    columns: ["id"],
+    rows: [[1]],
+    affected_rows: 0,
+    execution_time_ms: 1,
+  };
+
+  globalThis.fetch = withConnectionHealthMock(async () => new Response("unexpected request", { status: 500 }));
+
+  try {
+    const request = await store.buildQueryResultExportRequest(tabId, {
+      exportId: "export-3",
+      filePath: "C:\\tmp\\events.csv",
+      format: "csv",
+    });
+
+    assert.equal(request?.rowLimit, 100000);
+    assert.equal(request?.totalRows, 100000);
   } finally {
     globalThis.fetch = originalFetch;
     restoreStorage();

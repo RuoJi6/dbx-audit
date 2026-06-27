@@ -832,11 +832,12 @@ impl AppState {
                 db::elasticsearch_driver::test_connection(&mut client, connect_timeout).await?;
                 PoolKind::Elasticsearch(client)
             }
-            DatabaseType::Qdrant | DatabaseType::Milvus | DatabaseType::Weaviate => {
+            DatabaseType::Qdrant | DatabaseType::Milvus | DatabaseType::Weaviate | DatabaseType::ChromaDb => {
                 let kind = match db_config.db_type {
                     DatabaseType::Qdrant => db::vector_driver::VectorDbKind::Qdrant,
                     DatabaseType::Milvus => db::vector_driver::VectorDbKind::Milvus,
                     DatabaseType::Weaviate => db::vector_driver::VectorDbKind::Weaviate,
+                    DatabaseType::ChromaDb => db::vector_driver::VectorDbKind::ChromaDb,
                     _ => unreachable!(),
                 };
                 let client = db::vector_driver::VectorClient::new(
@@ -1117,7 +1118,7 @@ impl AppState {
         }
 
         let (host, port) = self.connection_host_port(connection_id, config).await?;
-        Ok(nacos_config.with_connect_override(&host, port))
+        nacos_config.with_server_endpoint(&host, port)
     }
 
     async fn remove_stale_connection_pool(&self, pool_key: &str) -> bool {
@@ -2140,7 +2141,11 @@ fn base_pool_key_for(
             || (include_elasticsearch_single_pool
                 && matches!(
                     db_type,
-                    DatabaseType::Elasticsearch | DatabaseType::Qdrant | DatabaseType::Milvus | DatabaseType::Weaviate
+                    DatabaseType::Elasticsearch
+                        | DatabaseType::Qdrant
+                        | DatabaseType::Milvus
+                        | DatabaseType::Weaviate
+                        | DatabaseType::ChromaDb
                 ));
         is_single && (!database_capabilities::is_agent_type(db_type) || shares_database_pool_with_connection(db_type))
     });
@@ -3476,6 +3481,40 @@ mod tests {
 
         assert_eq!(nacos_config.server_addr, "https://nacos.aliyuncs.com:8848");
         assert!(nacos_config.connect_override.is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn nacos_admin_config_rewrites_server_addr_to_forwarded_endpoint() {
+        let (state, dir) = test_app_state().await;
+        let mut config = mysql_config(None);
+        config.id = "proxied-nacos".to_string();
+        config.db_type = DatabaseType::Nacos;
+        config.host = "192.168.2.51".to_string();
+        config.port = 10840;
+        config.external_config = Some(serde_json::json!({
+            "serverAddr": "http://192.168.2.51:10840",
+            "namespace": "public",
+            "contextPath": "",
+            "auth": { "kind": "none" }
+        }));
+        config.transport_layers = vec![TransportLayerConfig::Proxy(ProxyTunnelConfig {
+            id: "proxy".to_string(),
+            name: String::new(),
+            enabled: true,
+            proxy_type: ProxyType::Socks5,
+            host: "127.0.0.1".to_string(),
+            port: 65000,
+            username: String::new(),
+            password: String::new(),
+        })];
+
+        let nacos_config = state.nacos_admin_config_for_connection("proxied-nacos", &config).await.unwrap();
+
+        assert!(nacos_config.server_addr.starts_with("http://127.0.0.1:"));
+        assert_ne!(nacos_config.server_addr, "http://192.168.2.51:10840");
+        assert!(nacos_config.connect_override.is_none());
+        state.proxy_tunnels.stop_tunnel("proxied-nacos:transport:0").await;
         let _ = std::fs::remove_dir_all(dir);
     }
 

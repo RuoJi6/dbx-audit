@@ -158,7 +158,7 @@ pub async fn list_databases(
 pub async fn list_collections(
     State(state): State<Arc<WebState>>,
     Json(req): Json<MongoCollectionRequest>,
-) -> Result<Json<Vec<String>>, AppError> {
+) -> Result<Json<Vec<dbx_core::db::vector_driver::CollectionInfo>>, AppError> {
     let result = dbx_core::mongo_ops::mongo_list_collections_core(&state.app, &req.connection_id, &req.database)
         .await
         .map_err(AppError)?;

@@ -17,6 +17,7 @@ const SYSTEM_DATABASE_RULES: Partial<Record<DatabaseType, ReadonlySet<string>>> 
   vastbase: new Set(["template0", "template1"]),
   redshift: new Set(["template0", "template1"]),
   clickhouse: new Set(["information_schema", "system"]),
+  tdengine: new Set(["information_schema", "performance_schema"]),
   sqlserver: new Set(["master", "model", "msdb", "tempdb"]),
   mongodb: new Set(["admin", "config", "local"]),
   oracle: new Set([
@@ -98,13 +99,20 @@ export function filterDatabaseNamesForConnection(databaseNames: string[], connec
   return databaseNames.filter((name) => !isSystemDatabaseName(connection?.db_type, name));
 }
 
+export function connectionUsesVisibleSchemaFilter(connection: Pick<ConnectionConfig, "db_type"> | undefined): boolean {
+  return connection?.db_type === "oracle" || connection?.db_type === "dameng" || connection?.db_type === "oceanbase-oracle";
+}
+
 export function visibleSchemaFilterIsEnabled(visibleSchemas: Record<string, string[]> | undefined, database: string): boolean {
   return Array.isArray(visibleSchemas?.[database]);
 }
 
-export function filterSchemaNamesForConnection(schemaNames: string[], connection: Pick<ConnectionConfig, "db_type" | "visible_schemas"> | undefined, database: string): string[] {
+export function filterSchemaNamesForConnection(schemaNames: string[], connection: Pick<ConnectionConfig, "db_type" | "visible_schemas" | "visible_databases"> | undefined, database: string): string[] {
   const visibleSchemas = connection?.visible_schemas;
   if (!visibleSchemaFilterIsEnabled(visibleSchemas, database)) {
+    if (connectionUsesVisibleSchemaFilter(connection) && visibleDatabaseFilterIsEnabled(connection?.visible_databases)) {
+      return filterVisibleDatabaseNames(schemaNames, connection?.visible_databases);
+    }
     return schemaNames.filter((name) => !isSystemDatabaseName(connection?.db_type, name));
   }
   const visible = new Set(visibleSchemas![database]);

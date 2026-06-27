@@ -1073,7 +1073,10 @@ async fn run_document_scan(
             dbx_core::mongo_ops::mongo_list_collections_core(&state, &request.connection_id, database)
                 .await?
                 .into_iter()
-                .filter(|collection| request.include_system || !is_system_document_collection(db_type, collection))
+                .filter(|collection| {
+                    request.include_system || !is_system_document_collection(db_type, &collection.name)
+                })
+                .map(|collection| collection.name)
                 .collect::<Vec<_>>()
         } else {
             request

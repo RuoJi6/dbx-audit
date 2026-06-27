@@ -49,6 +49,12 @@ const capabilityByType: Partial<Record<DatabaseType, Partial<TableMetadataCapabi
     triggers: false,
     ddl: false,
   },
+  chromadb: {
+    indexes: false,
+    foreignKeys: false,
+    triggers: false,
+    ddl: false,
+  },
   influxdb: {
     indexes: false,
     foreignKeys: false,

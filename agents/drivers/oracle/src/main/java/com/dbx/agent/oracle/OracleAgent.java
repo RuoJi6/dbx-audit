@@ -140,9 +140,14 @@ public class OracleAgent extends BaseDatabaseAgent {
     }
 
     static String listDatabasesSql() {
+        return listDatabasesSql(0);
+    }
+
+    static String listDatabasesSql(int visibleSchemaCount) {
         String placeholders = SYSTEM_SCHEMAS.stream()
             .map(schema -> "'" + schema + "'")
             .collect(Collectors.joining(","));
+        String visibleSchemaClause = visibleSchemaCount <= 0 ? "" : "  AND username IN (" + "?,".repeat(visibleSchemaCount).replaceAll(",$", "") + ")\n";
         return """
             SELECT username AS owner
             FROM all_users
@@ -151,12 +156,13 @@ public class OracleAgent extends BaseDatabaseAgent {
               AND username NOT LIKE 'APEX_%%'
               AND username NOT LIKE 'FLOWS_%%'
               AND username NOT LIKE '%%$%%'
+            %s
             ORDER BY CASE
                 WHEN username = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') THEN 0
                 WHEN username = SYS_CONTEXT('USERENV', 'SESSION_USER') THEN 1
                 ELSE 2
             END, username
-            """.formatted(placeholders).stripIndent().trim();
+            """.formatted(placeholders, visibleSchemaClause).stripIndent().trim();
     }
 
     static boolean isPgaLimitError(SQLException error) {
@@ -210,6 +216,30 @@ public class OracleAgent extends BaseDatabaseAgent {
             result.add(database.getName());
         }
         return result;
+    }
+
+    @Override
+    public List<String> listSchemas(List<String> visibleSchemas) {
+        if (visibleSchemas == null) {
+            return listSchemas();
+        }
+        if (visibleSchemas.isEmpty()) {
+            return List.of();
+        }
+        return unchecked(() -> {
+            List<String> result = new ArrayList<>();
+            try (var stmt = requireConnected().prepareStatement(listDatabasesSql(visibleSchemas.size()))) {
+                for (int i = 0; i < visibleSchemas.size(); i++) {
+                    stmt.setString(i + 1, visibleSchemas.get(i));
+                }
+                try (ResultSet rs = stmt.executeQuery()) {
+                    while (rs.next()) {
+                        result.add(rs.getString(1));
+                    }
+                }
+            }
+            return result;
+        });
     }
 
     @Override
@@ -536,6 +566,18 @@ public class OracleAgent extends BaseDatabaseAgent {
     @Override
     public QueryPageResult executeQueryPage(String sql, String schema, QueryPageOptions options) {
         return JdbcExecutor.INSTANCE.executePage(
+            requireConnected(),
+            prepareExecutableSql(sql),
+            schema,
+            this::setSchemaSQL,
+            options,
+            OracleAgent::stringResultValue
+        );
+    }
+
+    @Override
+    public QueryPageResult startTableRead(String sql, String schema, QueryPageOptions options) {
+        return JdbcExecutor.INSTANCE.startTableRead(
             requireConnected(),
             prepareExecutableSql(sql),
             schema,

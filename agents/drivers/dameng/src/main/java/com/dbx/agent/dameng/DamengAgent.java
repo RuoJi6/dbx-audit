@@ -422,6 +422,18 @@ public final class DamengAgent extends BaseDatabaseAgent {
     }
 
     @Override
+    public QueryPageResult startTableRead(String sql, String schema, QueryPageOptions options) {
+        return JdbcExecutor.INSTANCE.startTableRead(
+            requireConnected(),
+            sql,
+            schema,
+            this::setSchemaSQL,
+            options,
+            this::stringResultValue
+        );
+    }
+
+    @Override
     public String setSchemaSQL(String schema) {
         return "SET SCHEMA " + JdbcIdentifiers.INSTANCE.doubleQuote(schema);
     }

@@ -838,6 +838,7 @@ async function exportTableData(row: ObjectBrowserRow, format: "csv" | "xlsx") {
 
     task = addExportTask(row.name, format, filePath);
     const currentTask = task;
+    const rowLimit = settingsStore.editorSettings.exportRowLimitEnabled ? settingsStore.editorSettings.exportRowLimit : null;
     const request: api.TableExportRequest = {
       exportId: currentTask.exportId,
       connectionId: props.connection.id,
@@ -848,6 +849,7 @@ async function exportTableData(row: ObjectBrowserRow, format: "csv" | "xlsx") {
       format,
       columns: queryColumns,
       batchSize: settingsStore.editorSettings.exportBatchSize,
+      rowLimit,
     };
 
     const terminalProgress = await api.startTableExport(request, (progress) => {

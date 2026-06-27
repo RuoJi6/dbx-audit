@@ -331,6 +331,7 @@ describe("supportsExecutionTargetPicker", () => {
     expect(supportsExecutionTargetPicker("qdrant")).toBe(false);
     expect(supportsExecutionTargetPicker("milvus")).toBe(false);
     expect(supportsExecutionTargetPicker("weaviate")).toBe(false);
+    expect(supportsExecutionTargetPicker("chromadb")).toBe(false);
     expect(supportsExecutionTargetPicker("etcd")).toBe(false);
     expect(supportsExecutionTargetPicker("zookeeper")).toBe(false);
     expect(supportsExecutionTargetPicker("mq")).toBe(false);

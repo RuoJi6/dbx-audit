@@ -24,6 +24,7 @@ import java.sql.ResultSet;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.Properties;
@@ -107,19 +108,7 @@ public final class Oracle10gAgent extends BaseDatabaseAgent {
     public List<DatabaseInfo> listDatabases() {
         return unchecked(() -> {
             List<DatabaseInfo> result = new ArrayList<>();
-            String placeholders = quotedSystemSchemas();
-            String sql = "SELECT owner FROM ("
-                + " SELECT SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') AS owner FROM DUAL"
-                + " UNION"
-                + " SELECT DISTINCT owner FROM all_tables"
-                + " UNION"
-                + " SELECT DISTINCT owner FROM all_views"
-                + " )"
-                + " WHERE owner IS NOT NULL"
-                + " AND owner NOT IN (" + placeholders + ")"
-                + " AND owner NOT LIKE 'APEX_%'"
-                + " AND owner NOT LIKE 'FLOWS_%'"
-                + " ORDER BY owner";
+            String sql = listDatabasesSql(0);
             try (Statement stmt = requireConnected().createStatement();
                  ResultSet rs = stmt.executeQuery(sql)) {
                 while (rs.next()) {
@@ -130,12 +119,61 @@ public final class Oracle10gAgent extends BaseDatabaseAgent {
         });
     }
 
+    static String listDatabasesSql(int visibleSchemaCount) {
+        StringBuilder sql = new StringBuilder()
+            .append("SELECT owner FROM (")
+            .append(" SELECT SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') AS owner FROM DUAL")
+            .append(" UNION")
+            .append(" SELECT DISTINCT owner FROM all_tables")
+            .append(" UNION")
+            .append(" SELECT DISTINCT owner FROM all_views")
+            .append(" )")
+            .append(" WHERE owner IS NOT NULL")
+            .append(" AND owner NOT IN (").append(quotedSystemSchemas()).append(")")
+            .append(" AND owner NOT LIKE 'APEX_%'")
+            .append(" AND owner NOT LIKE 'FLOWS_%'");
+        if (visibleSchemaCount > 0) {
+            sql.append(" AND owner IN (");
+            for (int i = 0; i < visibleSchemaCount; i++) {
+                if (i > 0) sql.append(",");
+                sql.append("?");
+            }
+            sql.append(")");
+        }
+        sql.append(" ORDER BY owner");
+        return sql.toString();
+    }
+
     @Override
     public List<String> listSchemas() {
         return unchecked(() -> {
             List<String> result = new ArrayList<>();
             for (DatabaseInfo database : listDatabases()) {
                 result.add(database.getName());
+            }
+            return result;
+        });
+    }
+
+    @Override
+    public List<String> listSchemas(List<String> visibleSchemas) {
+        if (visibleSchemas == null) {
+            return listSchemas();
+        }
+        if (visibleSchemas.isEmpty()) {
+            return Collections.emptyList();
+        }
+        return unchecked(() -> {
+            List<String> result = new ArrayList<>();
+            try (PreparedStatement stmt = requireConnected().prepareStatement(listDatabasesSql(visibleSchemas.size()))) {
+                for (int i = 0; i < visibleSchemas.size(); i++) {
+                    stmt.setString(i + 1, visibleSchemas.get(i));
+                }
+                try (ResultSet rs = stmt.executeQuery()) {
+                    while (rs.next()) {
+                        result.add(rs.getString(1));
+                    }
+                }
             }
             return result;
         });
@@ -423,6 +461,18 @@ public final class Oracle10gAgent extends BaseDatabaseAgent {
     @Override
     public QueryPageResult executeQueryPage(String sql, String schema, QueryPageOptions options) {
         return JdbcExecutor.INSTANCE.executePage(
+            requireConnected(),
+            prepareExecutableSql(sql),
+            schema,
+            this::setSchemaSQL,
+            options,
+            this::stringResultValue
+        );
+    }
+
+    @Override
+    public QueryPageResult startTableRead(String sql, String schema, QueryPageOptions options) {
+        return JdbcExecutor.INSTANCE.startTableRead(
             requireConnected(),
             prepareExecutableSql(sql),
             schema,

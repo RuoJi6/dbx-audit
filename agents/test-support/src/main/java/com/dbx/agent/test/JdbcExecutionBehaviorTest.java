@@ -86,6 +86,32 @@ public abstract class JdbcExecutionBehaviorTest extends JdbcConnectedAgentTest {
     }
 
     @Test
+    void fetchesTableReadPagesFromTheSameJdbcSession() {
+        withAgent("dbx-agent-table-read-session-pages", agent -> {
+            QueryPageResult first = agent.startTableRead(rowsSql(5), null, new QueryPageOptions(2, 2, 10));
+
+            assertEquals(Arrays.asList(Collections.singletonList(1L), Collections.singletonList(2L)), first.getRows());
+            assertTrue(first.getHas_more());
+            assertFalse(first.getTruncated());
+            String sessionId = first.getSession_id();
+            assertNotNull(sessionId);
+
+            QueryPageResult second = agent.fetchTableReadPage(sessionId, 2);
+
+            assertEquals(Arrays.asList(Collections.singletonList(3L), Collections.singletonList(4L)), second.getRows());
+            assertTrue(second.getHas_more());
+            assertFalse(second.getTruncated());
+
+            QueryPageResult third = agent.fetchTableReadPage(sessionId, 2);
+
+            assertEquals(Collections.singletonList(Collections.singletonList(5L)), third.getRows());
+            assertFalse(third.getHas_more());
+            assertFalse(third.getTruncated());
+            assertFalse(agent.closeTableReadSession(sessionId));
+        });
+    }
+
+    @Test
     void closesJdbcResultSessionsExplicitly() {
         withAgent("dbx-agent-session-close", agent -> {
             QueryPageResult first = agent.executeQueryPage(rowsSql(5), null, new QueryPageOptions(2, 2, 10));

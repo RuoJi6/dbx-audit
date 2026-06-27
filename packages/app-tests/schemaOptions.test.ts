@@ -21,3 +21,27 @@ test("schema options keep default system-schema filtering without explicit filte
     ["CAM"],
   );
 });
+
+test("schema options respect visible schemas for OceanBase Oracle mode", () => {
+  assert.deepEqual(
+    schemaOptionsForConnection(
+      ["ORAAUDITOR", "APP", "SYS"],
+      {
+        db_type: "oceanbase-oracle",
+        visible_schemas: { SYS: ["ORAAUDITOR"] },
+      },
+      "SYS",
+    ),
+    ["ORAAUDITOR"],
+  );
+});
+
+test("schema options support legacy visible database filters for OceanBase Oracle mode", () => {
+  assert.deepEqual(
+    schemaOptionsForConnection(["ORAAUDITOR", "APP", "SYS"], {
+      db_type: "oceanbase-oracle",
+      visible_databases: ["ORAAUDITOR"],
+    }),
+    ["ORAAUDITOR"],
+  );
+});

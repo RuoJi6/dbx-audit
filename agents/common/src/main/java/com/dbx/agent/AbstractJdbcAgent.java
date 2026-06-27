@@ -139,6 +139,28 @@ public abstract class AbstractJdbcAgent extends BaseDatabaseAgent {
     }
 
     @Override
+    public QueryPageResult startTableRead(String sql, String schema, QueryPageOptions options) {
+        return JdbcExecutor.INSTANCE.startTableRead(
+            requireConnected(),
+            sql,
+            schema,
+            this::setSchemaSQL,
+            options,
+            this::resultValue
+        );
+    }
+
+    @Override
+    public QueryPageResult fetchTableReadPage(String sessionId, int pageSize) {
+        return JdbcExecutor.INSTANCE.fetchTableReadPage(sessionId, pageSize);
+    }
+
+    @Override
+    public boolean closeTableReadSession(String sessionId) {
+        return JdbcExecutor.INSTANCE.closeTableReadSession(sessionId);
+    }
+
+    @Override
     public QueryResult executeTransaction(List<String> statements, String schema) {
         return TransactionExecutor.executeUpdateStatements(requireConnected(), statements, schema, this::setSchemaSQL);
     }

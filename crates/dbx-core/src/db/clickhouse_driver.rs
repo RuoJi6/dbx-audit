@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use super::{http_client_builder, with_connection_timeout};
 use crate::query::MAX_ROWS;
 use crate::sql::starts_with_executable_sql_keyword;
-use crate::types::{ColumnInfo, DatabaseInfo, IndexInfo, QueryResult, TableInfo};
+use crate::types::{ColumnInfo, DatabaseInfo, IndexInfo, ObjectStatistics, QueryResult, TableInfo};
 
 pub struct ChClient {
     http: HttpClient,
@@ -154,6 +154,15 @@ fn json_value_as_u64(value: Option<&serde_json::Value>) -> Option<u64> {
     value.and_then(|value| value.as_u64().or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok())))
 }
 
+fn json_value_as_i64(value: Option<&serde_json::Value>) -> Option<i64> {
+    value.and_then(|value| {
+        value
+            .as_i64()
+            .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
+            .or_else(|| value.as_str().and_then(|text| text.parse::<i64>().ok()))
+    })
+}
+
 fn split_clickhouse_expression_list(value: &str) -> Vec<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -219,6 +228,28 @@ fn clickhouse_index_from_skipping_row(row: &[serde_json::Value]) -> IndexInfo {
     }
 }
 
+fn clickhouse_object_statistics_from_row(row: &[serde_json::Value], database: &str) -> Option<ObjectStatistics> {
+    let name = row.first().and_then(|value| value.as_str()).unwrap_or("").trim();
+    (!name.is_empty()).then(|| ObjectStatistics {
+        name: name.to_string(),
+        schema: Some(database.to_string()),
+        estimated_rows: json_value_as_i64(row.get(1)),
+        total_bytes: json_value_as_i64(row.get(2)),
+    })
+}
+
+fn clickhouse_table_info_from_row(row: &[serde_json::Value]) -> TableInfo {
+    let engine = row.get(1).and_then(|v| v.as_str()).unwrap_or("");
+    let table_type = if engine.contains("View") { "VIEW" } else { "BASE TABLE" };
+    TableInfo {
+        name: row.first().and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        table_type: table_type.to_string(),
+        comment: row.get(2).and_then(|v| v.as_str()).filter(|value| !value.is_empty()).map(str::to_string),
+        parent_schema: None,
+        parent_name: None,
+    }
+}
+
 fn limited_query_result(result: ChJsonResult, execution_time_ms: u128, max_rows: Option<usize>) -> QueryResult {
     let columns: Vec<String> = result.meta.iter().map(|c| c.name.clone()).collect();
     let column_types: Vec<String> = result.meta.iter().map(|c| c._type.clone()).collect();
@@ -261,26 +292,30 @@ pub async fn list_databases(client: &ChClient) -> Result<Vec<DatabaseInfo>, Stri
 }
 
 pub async fn list_tables(client: &ChClient, database: &str) -> Result<Vec<TableInfo>, String> {
+    let database_lit = clickhouse_literal(database);
+    let sql_with_comment =
+        format!("SELECT name, engine, comment FROM system.tables WHERE database = '{database_lit}' ORDER BY name");
+    let result = match ch_query(client, &sql_with_comment, Some(database)).await {
+        Ok(result) => result,
+        Err(error) => {
+            log::debug!("Falling back to ClickHouse table list without comments: {error}");
+            let sql = format!("SELECT name, engine FROM system.tables WHERE database = '{database_lit}' ORDER BY name");
+            ch_query(client, &sql, Some(database)).await?
+        }
+    };
+    Ok(result.data.iter().map(|row| clickhouse_table_info_from_row(row)).collect())
+}
+
+pub async fn list_object_statistics(client: &ChClient, database: &str) -> Result<Vec<ObjectStatistics>, String> {
+    let database_lit = clickhouse_literal(database);
     let sql = format!(
-        "SELECT name, engine FROM system.tables WHERE database = '{}' ORDER BY name",
-        database.replace('\'', "\\'")
+        "SELECT name, total_rows, total_bytes \
+         FROM system.tables \
+         WHERE database = '{database_lit}' \
+         ORDER BY name"
     );
     let result = ch_query(client, &sql, Some(database)).await?;
-    Ok(result
-        .data
-        .iter()
-        .map(|row| {
-            let engine = row.get(1).and_then(|v| v.as_str()).unwrap_or("");
-            let table_type = if engine.contains("View") { "VIEW" } else { "BASE TABLE" };
-            TableInfo {
-                name: row[0].as_str().unwrap_or("").to_string(),
-                table_type: table_type.to_string(),
-                comment: None,
-                parent_schema: None,
-                parent_name: None,
-            }
-        })
-        .collect())
+    Ok(result.data.iter().filter_map(|row| clickhouse_object_statistics_from_row(row, database)).collect())
 }
 
 pub async fn get_columns(client: &ChClient, database: &str, table: &str) -> Result<Vec<ColumnInfo>, String> {
@@ -454,5 +489,59 @@ mod tests {
         assert_eq!(index.columns, vec!["lower(email)"]);
         assert_eq!(index.index_type.as_deref(), Some("bloom_filter GRANULARITY 4"));
         assert!(!index.is_primary);
+    }
+
+    #[test]
+    fn maps_clickhouse_object_statistics_row() {
+        let row = vec![
+            serde_json::Value::String("events".to_string()),
+            serde_json::Value::String("1234".to_string()),
+            serde_json::Value::Number(8192.into()),
+        ];
+
+        let stat = clickhouse_object_statistics_from_row(&row, "analytics").expect("stat row");
+
+        assert_eq!(stat.name, "events");
+        assert_eq!(stat.schema.as_deref(), Some("analytics"));
+        assert_eq!(stat.estimated_rows, Some(1234));
+        assert_eq!(stat.total_bytes, Some(8192));
+    }
+
+    #[test]
+    fn skips_clickhouse_object_statistics_rows_without_name() {
+        let row = vec![
+            serde_json::Value::String(" ".to_string()),
+            serde_json::Value::Number(1.into()),
+            serde_json::Value::Number(2.into()),
+        ];
+
+        assert!(clickhouse_object_statistics_from_row(&row, "analytics").is_none());
+    }
+
+    #[test]
+    fn maps_clickhouse_table_info_with_comment() {
+        let row = vec![
+            serde_json::Value::String("events".to_string()),
+            serde_json::Value::String("MergeTree".to_string()),
+            serde_json::Value::String("event stream".to_string()),
+        ];
+
+        let table = clickhouse_table_info_from_row(&row);
+
+        assert_eq!(table.name, "events");
+        assert_eq!(table.table_type, "BASE TABLE");
+        assert_eq!(table.comment.as_deref(), Some("event stream"));
+    }
+
+    #[test]
+    fn maps_clickhouse_table_info_without_comment_column() {
+        let row =
+            vec![serde_json::Value::String("active_users".to_string()), serde_json::Value::String("View".to_string())];
+
+        let table = clickhouse_table_info_from_row(&row);
+
+        assert_eq!(table.name, "active_users");
+        assert_eq!(table.table_type, "VIEW");
+        assert_eq!(table.comment, None);
     }
 }
