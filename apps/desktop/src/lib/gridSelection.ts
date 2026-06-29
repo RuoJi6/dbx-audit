@@ -17,6 +17,13 @@ export interface SelectionData {
   rows: GridCellValue[][];
 }
 
+export interface SelectionSummary {
+  cellCount: number;
+  rowCount: number;
+  numericCount: number;
+  sum: number;
+}
+
 export function parseClipboardTable(text: string): string[][] {
   const normalized = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").replace(/\n$/, "");
   if (!normalized) return [[""]];
@@ -82,6 +89,28 @@ export function extractColumnsSelection(columns: readonly string[], rows: readon
   return {
     columns: normalizedIndexes.map((index) => columns[index]),
     rows: rows.map((row) => normalizedIndexes.map((index) => row[index] ?? null)),
+  };
+}
+
+export function summarizeSelection(selection: SelectionData): SelectionSummary {
+  let numericCount = 0;
+  let sum = 0;
+
+  for (const row of selection.rows) {
+    for (const value of row) {
+      const numericValue = typeof value === "number" ? value : typeof value === "string" && value.trim() !== "" ? Number(value) : Number.NaN;
+      if (Number.isFinite(numericValue)) {
+        numericCount += 1;
+        sum += numericValue;
+      }
+    }
+  }
+
+  return {
+    cellCount: selection.rows.reduce((count, row) => count + row.length, 0),
+    rowCount: selection.rows.length,
+    numericCount,
+    sum,
   };
 }
 

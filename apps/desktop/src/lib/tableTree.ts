@@ -601,7 +601,7 @@ export function buildGroupedObjectTreeNodes({ nodeId, connectionId, database, sc
           database,
           schema,
           objects: items,
-          objectType: def.objectTypes[0] as "TABLE" | "VIEW",
+          objectType: def.objectTypes[0] as "TABLE" | "VIEW" | "MATERIALIZED_VIEW",
         })
       : sortDatabaseObjectsByName(items, (obj) => obj.name).map((obj) => {
           const childSchema = obj.schema ? normalizeDatabaseObjectName(obj.schema) : schema;

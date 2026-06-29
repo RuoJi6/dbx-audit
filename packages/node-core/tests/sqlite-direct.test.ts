@@ -113,7 +113,9 @@ test("lists and describes SQLite tables without the DBX bridge", async () => {
 test("routes SSH transport layer connections through the DBX bridge", async () => {
   const dir = mkdtempSync(join(tmpdir(), "dbx-mcp-bridge-home-"));
   const originalHome = process.env.HOME;
+  const originalDbxDataDir = process.env.DBX_DATA_DIR;
   process.env.HOME = dir;
+  process.env.DBX_DATA_DIR = dir;
 
   try {
     await assert.rejects(() => executeQuery(mysqlSshConfig(), "select 1"), /DBX desktop app is not running/);
@@ -122,6 +124,8 @@ test("routes SSH transport layer connections through the DBX bridge", async () =
   } finally {
     if (originalHome === undefined) delete process.env.HOME;
     else process.env.HOME = originalHome;
+    if (originalDbxDataDir === undefined) delete process.env.DBX_DATA_DIR;
+    else process.env.DBX_DATA_DIR = originalDbxDataDir;
     rmSync(dir, { recursive: true, force: true });
   }
 });

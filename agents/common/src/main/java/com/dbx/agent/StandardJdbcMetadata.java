@@ -90,6 +90,26 @@ public final class StandardJdbcMetadata {
         return result;
     }
 
+    public List<String> listDataTypes(Connection conn) {
+        return unchecked(() -> {
+            Set<String> seen = new LinkedHashSet<>();
+            List<String> names = new ArrayList<>();
+            try (ResultSet rs = conn.getMetaData().getTypeInfo()) {
+                while (rs.next()) {
+                    String name = rs.getString("TYPE_NAME");
+                    if (name == null || name.trim().isEmpty()) {
+                        continue;
+                    }
+                    String trimmed = name.trim();
+                    if (seen.add(trimmed.toLowerCase(Locale.ROOT))) {
+                        names.add(trimmed);
+                    }
+                }
+            }
+            return names;
+        });
+    }
+
     public CompletionAssistantResponse completionAssistantSearch(
         Connection conn,
         JdbcAgentProfile profile,

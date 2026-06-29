@@ -54,6 +54,20 @@ test("object browser rows normalize PostgreSQL sequence objects", () => {
   );
 });
 
+test("object browser rows normalize space separated materialized views", () => {
+  const rows = buildObjectBrowserRows({
+    objects: [{ name: "user_summary_mv", object_type: "MATERIALIZED VIEW", schema: "APP" }],
+    database: "dameng",
+    fallbackSchema: "APP",
+    needsSchema: true,
+  });
+
+  assert.deepEqual(
+    rows.map((row) => ({ id: row.id, type: row.type })),
+    [{ id: "APP:user_summary_mv:MATERIALIZED_VIEW:0", type: "MATERIALIZED_VIEW" }],
+  );
+});
+
 test("object browser search matches names, types, and comments but not schema names", () => {
   const rows = buildObjectBrowserRows({
     objects: [

@@ -248,6 +248,7 @@ mod tests {
             redis_sentinel_tls: false,
             redis_cluster_nodes: String::new(),
             redis_key_separator: dbx_core::models::connection::default_redis_key_separator(),
+            redis_scan_page_size: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
@@ -604,12 +605,7 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
                         extension
                     })
                     .collect();
-                match db::sqlite::connect_path_create_if_missing_with_extensions(
-                    &expand_tilde(&config.host),
-                    extensions,
-                )
-                .await
-                {
+                match db::sqlite::connect_path_with_extensions(&expand_tilde(&config.host), extensions).await {
                     Ok(_) => Ok("Connection successful".to_string()),
                     Err(e) => Err(e),
                 }
@@ -778,6 +774,7 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
                     &url,
                     username,
                     password,
+                    config.url_params.clone(),
                     Some(&config.ca_cert_path),
                     connect_timeout,
                 )?;
@@ -873,8 +870,7 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
                 })
                 .collect();
             PoolKind::Sqlite(
-                db::sqlite::connect_path_create_if_missing_with_extensions(&expand_tilde(&db_config.host), extensions)
-                    .await?,
+                db::sqlite::connect_path_with_extensions(&expand_tilde(&db_config.host), extensions).await?,
             )
         }
         DatabaseType::Redis => {
@@ -1062,6 +1058,7 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
                 &url,
                 username,
                 password,
+                db_config.url_params,
                 Some(&db_config.ca_cert_path),
                 connect_timeout,
             )?;

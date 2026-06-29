@@ -28,4 +28,4 @@ echo Java runtime not found. Install Java or the optional DBX JDBC runtime. >&2
 exit /b 127
 
 :run
-"%JAVA_BIN%" -Dfile.encoding=UTF-8 -Dsun.stdout.encoding=UTF-8 -Dsun.stderr.encoding=UTF-8 -jar "%~dp0..\lib\dbx-jdbc-plugin.jar"
+"%JAVA_BIN%" -XX:+IgnoreUnrecognizedVMOptions --add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED %DBX_JAVA_OPTS% -Dfile.encoding=UTF-8 -Dsun.stdout.encoding=UTF-8 -Dsun.stderr.encoding=UTF-8 -jar "%~dp0..\lib\dbx-jdbc-plugin.jar"

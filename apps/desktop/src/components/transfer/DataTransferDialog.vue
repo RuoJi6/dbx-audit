@@ -10,14 +10,15 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { useConnectionStore } from "@/stores/connectionStore";
 import DatabaseIcon from "@/components/icons/DatabaseIcon.vue";
 import * as api from "@/lib/api";
-import type { TransferProgress, TransferMode, TransferTableNameCase } from "@/lib/api";
+import type { TransferMode, TransferTableNameCase } from "@/lib/api";
 import type { DatabaseType } from "@/types/database";
 import { isSchemaAware, supportsTransfer } from "@/lib/databaseCapabilities";
 import { databaseOptionsForConnection } from "@/composables/useDatabaseOptions";
-import { nextTransferTerminalState } from "@/lib/transferProgressState";
-import { ArrowRightLeft, Check, X, Loader2, Square, CheckSquare } from "@lucide/vue";
+import { useExportTracker } from "@/composables/useExportTracker";
+import { ArrowRightLeft, Loader2, Square, CheckSquare } from "@lucide/vue";
 
 const { t } = useI18n();
+const { startDataTransferTask } = useExportTracker();
 const open = defineModel<boolean>("open", { default: false });
 
 const props = defineProps<{
@@ -52,15 +53,7 @@ const createTable = ref(true);
 const transferMode = ref<TransferMode>("append");
 const targetTableNameCase = ref<TransferTableNameCase>("preserve");
 const batchSize = ref(1000);
-
-// Transfer state
-const isTransferring = ref(false);
-const transferProgress = ref<Map<string, TransferProgress>>(new Map());
-const currentTable = ref("");
-const overallDone = ref(false);
-const overallError = ref(false);
-const overallCancelled = ref(false);
-const transferId = ref("");
+const isSubmitting = ref(false);
 
 const filteredTables = computed(() => {
   const q = tableSearch.value.toLowerCase();
@@ -252,33 +245,27 @@ function resetState() {
   transferMode.value = "append";
   targetTableNameCase.value = "preserve";
   batchSize.value = 1000;
-  isTransferring.value = false;
-  transferProgress.value.clear();
-  currentTable.value = "";
-  overallDone.value = false;
-  overallError.value = false;
-  overallCancelled.value = false;
+  isSubmitting.value = false;
 }
 
 async function startTransfer() {
-  isTransferring.value = true;
-  overallDone.value = false;
-  overallError.value = false;
-  overallCancelled.value = false;
-  transferProgress.value.clear();
-
-  transferId.value = uuid();
+  if (!canStart.value || isSubmitting.value) return;
+  isSubmitting.value = true;
 
   const effectiveSourceSchema = sourceSchema.value || sourceDatabase.value;
   const effectiveTargetSchema = targetSchema.value || targetDatabase.value;
+  const sourceDatabaseName = sourceDatabase.value;
+  const targetConnection = targetConnectionId.value;
+  const targetDatabaseName = targetDatabase.value;
+  const shouldRefreshTargetTree = createTable.value;
 
   const request: api.TransferRequest = {
-    transferId: transferId.value,
+    transferId: uuid(),
     sourceConnectionId: sourceConnectionId.value,
-    sourceDatabase: sourceDatabase.value,
+    sourceDatabase: sourceDatabaseName,
     sourceSchema: effectiveSourceSchema,
-    targetConnectionId: targetConnectionId.value,
-    targetDatabase: targetDatabase.value,
+    targetConnectionId: targetConnection,
+    targetDatabase: targetDatabaseName,
     targetSchema: effectiveTargetSchema,
     tables: [...selectedTables.value],
     createTable: createTable.value,
@@ -287,38 +274,16 @@ async function startTransfer() {
     batchSize: batchSize.value,
   };
 
-  try {
-    await api.startTransfer(request, (progress) => {
-      if (progress.table) {
-        transferProgress.value.set(progress.table, progress);
-        transferProgress.value = new Map(transferProgress.value);
-        currentTable.value = progress.table;
+  startDataTransferTask(request, `${sourceDatabaseName} → ${targetDatabaseName}`, {
+    formatOverlapError: (tables) => t("transfer.targetTableBusy", { tables: tables.join(", ") }),
+    onDone: async () => {
+      if (shouldRefreshTargetTree) {
+        await store.refreshObjectListTreeNode(targetConnection, targetDatabaseName, effectiveTargetSchema);
       }
-
-      const nextState = nextTransferTerminalState(
-        {
-          done: overallDone.value,
-          cancelled: overallCancelled.value,
-          error: overallError.value,
-        },
-        progress,
-      );
-      overallDone.value = nextState.done;
-      overallCancelled.value = nextState.cancelled;
-      overallError.value = nextState.error;
-    });
-    if (createTable.value && !overallError.value && !overallCancelled.value) {
-      await store.refreshObjectListTreeNode(targetConnectionId.value, targetDatabase.value, targetSchema.value);
-    }
-  } catch (e: any) {
-    overallError.value = true;
-  }
-}
-
-async function cancelTransfer() {
-  if (transferId.value) {
-    await api.cancelTransfer(transferId.value);
-  }
+    },
+  });
+  open.value = false;
+  resetState();
 }
 
 function getConnectionName(id: string) {
@@ -328,29 +293,6 @@ function getConnectionName(id: string) {
 function getConnectionType(id: string): DatabaseType {
   return store.connections.find((c) => c.id === id)?.db_type ?? "mysql";
 }
-
-const processedStatuses = new Set<TransferProgress["status"]>(["tableDone", "done", "error", "cancelled"]);
-
-function formatRowCount(count: number) {
-  return count.toLocaleString();
-}
-
-function formatTableRows(progress: TransferProgress) {
-  if (typeof progress.totalRows === "number") {
-    return `${formatRowCount(progress.rowsTransferred)} / ${formatRowCount(progress.totalRows)}`;
-  }
-  return formatRowCount(progress.rowsTransferred);
-}
-
-const completedTables = computed(() => [...transferProgress.value.values()].filter((p) => processedStatuses.has(p.status)).length);
-
-const failedTables = computed(() => [...transferProgress.value.values()].filter((p) => p.status === "error").length);
-
-const totalTransferred = computed(() => [...transferProgress.value.values()].reduce((sum, p) => sum + p.rowsTransferred, 0));
-
-const knownTotalRows = computed(() => [...transferProgress.value.values()].reduce((sum, p) => sum + (typeof p.totalRows === "number" ? p.totalRows : 0), 0));
-
-const overallRowsLabel = computed(() => (knownTotalRows.value > 0 ? `${formatRowCount(totalTransferred.value)} / ${formatRowCount(knownTotalRows.value)}` : formatRowCount(totalTransferred.value)));
 </script>
 
 <template>
@@ -364,8 +306,7 @@ const overallRowsLabel = computed(() => (knownTotalRows.value > 0 ? `${formatRow
       </DialogHeader>
 
       <div class="flex-1 min-h-0 overflow-auto">
-        <!-- Config View -->
-        <div v-if="!isTransferring" class="grid gap-4 py-3">
+        <div class="grid gap-4 py-3">
           <!-- Source Section -->
           <div class="space-y-3">
             <div class="text-xs font-medium text-muted-foreground uppercase tracking-wider">
@@ -546,86 +487,17 @@ const overallRowsLabel = computed(() => (knownTotalRows.value > 0 ? `${formatRow
             </div>
           </div>
         </div>
-
-        <!-- Progress View -->
-        <div v-else class="py-3 space-y-3">
-          <div class="flex items-center justify-between text-xs text-muted-foreground">
-            <span>
-              {{ t("transfer.overallProgress") }}: {{ completedTables }} / {{ selectedTables.size }} {{ t("transfer.tables").toLowerCase() }} · {{ overallRowsLabel }}
-              {{ t("grid.rows", { count: "" }).trim() }}
-            </span>
-            <span v-if="overallDone && !failedTables" class="text-green-600 font-medium">{{ t("transfer.completed") }}</span>
-            <span v-else-if="overallDone && failedTables" class="text-amber-600 font-medium">
-              {{ t("transfer.completedWithErrors", { count: failedTables }) }}
-            </span>
-            <span v-else-if="overallCancelled" class="text-yellow-600 font-medium">{{ t("transfer.cancelled") }}</span>
-            <span v-else-if="overallError" class="text-destructive font-medium">{{ t("transfer.failed") }}</span>
-          </div>
-
-          <div class="w-full bg-muted rounded-full h-2 overflow-hidden">
-            <div
-              class="h-full rounded-full transition-[width] duration-300"
-              :class="overallError ? 'bg-destructive' : overallCancelled ? 'bg-yellow-500' : overallDone && failedTables ? 'bg-amber-500' : 'bg-primary'"
-              :style="{
-                width: `${selectedTables.size ? (completedTables / selectedTables.size) * 100 : 0}%`,
-              }"
-            />
-          </div>
-
-          <div class="border rounded-md max-h-[280px] overflow-y-auto">
-            <div v-for="table in [...selectedTables]" :key="table" class="flex items-center justify-between px-2.5 py-1.5 text-xs border-b last:border-b-0">
-              <span class="truncate">{{ table }}</span>
-              <div class="flex items-center gap-1.5 shrink-0 text-muted-foreground">
-                <template v-if="transferProgress.get(table)">
-                  <template v-if="transferProgress.get(table)!.status === 'running'">
-                    <Loader2 class="w-3 h-3 animate-spin text-primary" />
-                    <span>{{ formatTableRows(transferProgress.get(table)!) }}</span>
-                  </template>
-                  <template v-else-if="transferProgress.get(table)!.status === 'tableDone' || transferProgress.get(table)!.status === 'done'">
-                    <Check class="w-3 h-3 text-green-500" />
-                    <span>{{ formatTableRows(transferProgress.get(table)!) }}</span>
-                  </template>
-                  <template v-else-if="transferProgress.get(table)!.status === 'error'">
-                    <X class="w-3 h-3 text-destructive" />
-                    <span>{{ formatTableRows(transferProgress.get(table)!) }}</span>
-                    <span class="max-w-[520px] whitespace-normal break-words text-destructive" :title="transferProgress.get(table)!.error ?? ''">
-                      {{ transferProgress.get(table)!.error }}
-                    </span>
-                  </template>
-                  <template v-else-if="transferProgress.get(table)!.status === 'cancelled'">
-                    <X class="w-3 h-3 text-yellow-500" />
-                    <span>{{ t("transfer.cancelled") }}</span>
-                  </template>
-                </template>
-                <span v-else class="text-muted-foreground/40">—</span>
-              </div>
-            </div>
-          </div>
-
-          <!-- Status message -->
-        </div>
       </div>
 
       <DialogFooter>
-        <template v-if="!isTransferring">
-          <Button variant="outline" size="sm" @click="open = false">
-            {{ t("transfer.cancel") }}
-          </Button>
-          <Button size="sm" :disabled="!canStart" @click="startTransfer">
-            <ArrowRightLeft class="w-3.5 h-3.5 mr-1.5" />
-            {{ t("transfer.start") }}
-          </Button>
-        </template>
-        <template v-else-if="overallDone || overallCancelled || overallError">
-          <Button size="sm" @click="open = false">
-            {{ t("common.close") }}
-          </Button>
-        </template>
-        <template v-else>
-          <Button variant="destructive" size="sm" @click="cancelTransfer">
-            {{ t("transfer.cancel") }}
-          </Button>
-        </template>
+        <Button variant="outline" size="sm" @click="open = false">
+          {{ t("transfer.cancel") }}
+        </Button>
+        <Button size="sm" :disabled="!canStart || isSubmitting" @click="startTransfer">
+          <Loader2 v-if="isSubmitting" class="w-3.5 h-3.5 mr-1.5 animate-spin" />
+          <ArrowRightLeft v-else class="w-3.5 h-3.5 mr-1.5" />
+          {{ t("transfer.start") }}
+        </Button>
       </DialogFooter>
     </DialogContent>
   </Dialog>

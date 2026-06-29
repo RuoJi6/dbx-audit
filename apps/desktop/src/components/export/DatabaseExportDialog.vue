@@ -17,9 +17,11 @@ import { isTauriRuntime } from "@/lib/tauriRuntime";
 import { useToast } from "@/composables/useToast";
 import { Input } from "@/components/ui/input";
 import { Download, Square, CheckSquare, Search, X } from "@lucide/vue";
+import { useExportTracker } from "@/composables/useExportTracker";
 
 const { t } = useI18n();
 const { toast } = useToast();
+const { addDatabaseExportTask, updateDatabaseExportTask } = useExportTracker();
 const open = defineModel<boolean>("open", { default: false });
 const store = useConnectionStore();
 
@@ -203,9 +205,12 @@ async function startExport() {
     batchSize: 1000,
   };
 
+  addDatabaseExportTask(exportId.value, database.value || "database", filePath);
+
   try {
     await api.exportDatabaseSql(request, (progress) => {
       exportProgress.value = { ...progress };
+      updateDatabaseExportTask(progress.exportId, progress);
       if (progress.status === "Done") {
         exportDone.value = true;
         isExporting.value = false;
@@ -220,6 +225,18 @@ async function startExport() {
     });
   } catch (e: any) {
     exportError.value = e?.message || String(e);
+    const lastProgress = exportProgress.value as api.ExportProgress | null;
+    const fallbackProgress: api.ExportProgress = {
+      exportId: exportId.value,
+      currentObject: database.value || "database",
+      objectIndex: lastProgress?.objectIndex ?? 0,
+      totalObjects: lastProgress?.totalObjects ?? 0,
+      rowsExported: lastProgress?.rowsExported ?? 0,
+      totalRows: lastProgress?.totalRows ?? null,
+      status: "Error",
+      error: exportError.value,
+    };
+    updateDatabaseExportTask(exportId.value, fallbackProgress);
     isExporting.value = false;
   }
 }
@@ -489,6 +506,9 @@ watch(
           </Button>
         </template>
         <template v-else-if="isExporting">
+          <Button variant="outline" size="sm" @click="open = false">
+            {{ t("databaseExport.runInBackground") }}
+          </Button>
           <Button variant="destructive" size="sm" @click="cancelExport">
             <X class="w-3.5 h-3.5 mr-1.5" />
             {{ t("transfer.cancel") }}

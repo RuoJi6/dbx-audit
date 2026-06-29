@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, onBeforeUnmount, ref, watch } from "vue";
 import { RecycleScroller } from "vue-virtual-scroller";
 import { useSqlHighlighter } from "@/composables/useSqlHighlighter";
 import {
@@ -17,6 +17,7 @@ import {
   Eraser,
   Eye,
   FileCode,
+  GripVertical,
   ListTree,
   Upload,
   Loader2,
@@ -66,7 +67,7 @@ import { useSettingsStore } from "@/stores/settingsStore";
 import { useQueryStore } from "@/stores/queryStore";
 import QueryEditor from "@/components/editor/QueryEditor.vue";
 import DdlViewDialog from "./DdlViewDialog.vue";
-import type { SqlFormatDialect } from "@/lib/sqlFormatter";
+import { formatSqlForDisplay, sqlFormatDialectForDbType, type SqlFormatDialect } from "@/lib/sqlFormatter";
 import { isCancelSearchShortcut } from "@/lib/keyboardShortcuts";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import {
@@ -82,7 +83,8 @@ import {
   type ObjectBrowserSortKey,
 } from "@/lib/objectBrowserRows";
 
-type ObjectFilter = "all" | "tables" | "views" | "procedures" | "functions" | "sequences" | "packages";
+type ObjectFilter = "all" | "tables" | "views" | "materializedViews" | "procedures" | "functions" | "sequences" | "packages";
+type ObjectBrowserColumnKey = "select" | "name" | "type" | "estimatedRows" | "totalBytes" | "created_at" | "updated_at" | "comment";
 
 const props = defineProps<{
   connection: ConnectionConfig;
@@ -120,6 +122,7 @@ const sourceRow = ref<ObjectBrowserRow | null>(null);
 const sourceEditing = ref(false);
 const effectiveDatabaseType = computed(() => effectiveDatabaseTypeForConnection(props.connection) ?? props.connection.db_type);
 const tableStructureDatabaseType = computed(() => tableStructureDatabaseTypeForConnection(props.connection) ?? props.connection.db_type);
+const sourceEditableText = ref("");
 const sourceDraft = ref("");
 const sourceSaving = ref(false);
 const sourceSaveError = ref("");
@@ -148,14 +151,26 @@ const selectedTableIds = ref<Set<string>>(new Set());
 const expandedPartitionParentIds = ref<Set<string>>(new Set());
 const showBatchDropConfirm = ref(false);
 const batchDropPreviewSql = ref("");
+const objectColumnWidths = ref<Record<ObjectBrowserColumnKey, number>>({
+  select: 34,
+  name: 360,
+  type: 110,
+  estimatedRows: 110,
+  totalBytes: 100,
+  created_at: 150,
+  updated_at: 150,
+  comment: 260,
+});
 let loadId = 0;
+let stopColumnResize: (() => void) | null = null;
 
 // Export via background tracker
 const { addTask: addExportTask } = useExportTracker();
 
 const needsSchema = computed(() => isSchemaAware(props.connection.db_type) && !connectionUsesDatabaseObjectTreeMode(props.connection));
 const tableCount = computed(() => rows.value.filter((row) => row.type === "TABLE").length);
-const viewCount = computed(() => rows.value.filter((row) => row.type === "VIEW" || row.type === "MATERIALIZED_VIEW").length);
+const viewCount = computed(() => rows.value.filter((row) => row.type === "VIEW").length);
+const materializedViewCount = computed(() => rows.value.filter((row) => row.type === "MATERIALIZED_VIEW").length);
 const procedureCount = computed(() => rows.value.filter((row) => row.type === "PROCEDURE").length);
 const functionCount = computed(() => rows.value.filter((row) => row.type === "FUNCTION").length);
 const sequenceCount = computed(() => rows.value.filter((row) => row.type === "SEQUENCE").length);
@@ -165,31 +180,14 @@ const canOpenDiagram = computed(() => !!props.database && supportsSchemaDiagram(
 const canOpenTableImport = computed(() => !!props.database && supportsTableImport(effectiveDatabaseType.value));
 const supportsTruncateTable = computed(() => supportsTableTruncate(effectiveDatabaseType.value));
 const sourceDialect = computed(() => codeMirrorSqlDialect(effectiveDatabaseType.value));
-const sourceFormatDialect = computed<SqlFormatDialect>(() => {
-  switch (effectiveDatabaseType.value) {
-    case "mysql":
-    case "postgres":
-    case "sqlite":
-    case "sqlserver":
-      return effectiveDatabaseType.value;
-    case "rqlite":
-    case "turso":
-      return "sqlite";
-    case "gaussdb":
-    case "kwdb":
-    case "opengauss":
-    case "questdb":
-      return "postgres";
-    default:
-      return "generic";
-  }
-});
+const sourceFormatDialect = computed<SqlFormatDialect>(() => sqlFormatDialectForDbType(effectiveDatabaseType.value));
 const objectFilters = computed<ObjectFilter[]>(() =>
   (
     [
       ["all", rows.value.length],
       ["tables", tableCount.value],
       ["views", viewCount.value],
+      ["materializedViews", materializedViewCount.value],
       ["procedures", procedureCount.value],
       ["functions", functionCount.value],
       ["sequences", sequenceCount.value],
@@ -202,12 +200,22 @@ const objectFilters = computed<ObjectFilter[]>(() =>
 const showObjectFilter = computed(() => objectFilters.value.length > 2);
 const hasCreatedAt = computed(() => rows.value.some((row) => row.created_at?.trim()));
 const hasUpdatedAt = computed(() => rows.value.some((row) => row.updated_at?.trim()));
+const objectBrowserColumns = computed<ObjectBrowserColumnKey[]>(() => {
+  const columns: ObjectBrowserColumnKey[] = ["select", "name", "type", "estimatedRows", "totalBytes"];
+  if (hasCreatedAt.value) columns.push("created_at");
+  if (hasUpdatedAt.value) columns.push("updated_at");
+  columns.push("comment");
+  return columns;
+});
 const gridTemplateColumns = computed(() => {
-  const columns = ["34px", "minmax(160px,1fr)", "110px", "110px", "100px"];
-  if (hasCreatedAt.value) columns.push("150px");
-  if (hasUpdatedAt.value) columns.push("150px");
-  columns.push("minmax(160px,0.7fr)");
-  return columns.join(" ");
+  return objectBrowserColumns.value
+    .map((key, index, columns) => {
+      const width = objectColumnWidths.value[key];
+      if (key === "select") return `${width}px`;
+      if (index === columns.length - 1) return `minmax(${width}px,1fr)`;
+      return `${width}px`;
+    })
+    .join(" ");
 });
 const partitionRowsByParentId = computed(() => {
   const groups = new Map<string, ObjectBrowserRow[]>();
@@ -239,7 +247,8 @@ function iconFor(row: ObjectBrowserRow) {
 }
 
 function typeLabel(type: ObjectBrowserRow["type"]) {
-  if (type === "VIEW" || type === "MATERIALIZED_VIEW") return t("objects.view");
+  if (type === "MATERIALIZED_VIEW") return t("common.materializedView");
+  if (type === "VIEW") return t("objects.view");
   if (type === "PROCEDURE") return t("objects.procedure");
   if (type === "FUNCTION") return t("objects.function");
   if (type === "SEQUENCE") return t("objects.sequence");
@@ -262,9 +271,53 @@ function toggleSort(key: ObjectBrowserSortKey) {
   sortDirection.value = initialObjectBrowserSortDirection(key);
 }
 
+function minimumColumnWidth(key: ObjectBrowserColumnKey) {
+  if (key === "select") return 34;
+  if (key === "name" || key === "comment") return 120;
+  return 72;
+}
+
+function onObjectColumnResizeStart(key: ObjectBrowserColumnKey, event: MouseEvent) {
+  event.preventDefault();
+  event.stopPropagation();
+  stopColumnResize?.();
+
+  const startX = event.clientX;
+  const startWidth = objectColumnWidths.value[key];
+  const minWidth = minimumColumnWidth(key);
+  document.body.classList.add("select-none", "cursor-col-resize");
+
+  const onMove = (moveEvent: MouseEvent) => {
+    objectColumnWidths.value = {
+      ...objectColumnWidths.value,
+      [key]: Math.max(minWidth, startWidth + moveEvent.clientX - startX),
+    };
+  };
+  const onUp = () => {
+    document.removeEventListener("mousemove", onMove);
+    document.removeEventListener("mouseup", onUp);
+    document.body.classList.remove("select-none", "cursor-col-resize");
+    stopColumnResize = null;
+  };
+
+  stopColumnResize = onUp;
+  document.addEventListener("mousemove", onMove);
+  document.addEventListener("mouseup", onUp);
+}
+
+function resetObjectColumnWidth(key: ObjectBrowserColumnKey, width: number, event: MouseEvent) {
+  event.preventDefault();
+  event.stopPropagation();
+  objectColumnWidths.value = {
+    ...objectColumnWidths.value,
+    [key]: width,
+  };
+}
+
 function rowMatchesObjectFilter(row: ObjectBrowserRow) {
   if (objectFilter.value === "tables") return row.type === "TABLE";
-  if (objectFilter.value === "views") return row.type === "VIEW" || row.type === "MATERIALIZED_VIEW";
+  if (objectFilter.value === "views") return row.type === "VIEW";
+  if (objectFilter.value === "materializedViews") return row.type === "MATERIALIZED_VIEW";
   if (objectFilter.value === "procedures") return row.type === "PROCEDURE";
   if (objectFilter.value === "functions") return row.type === "FUNCTION";
   if (objectFilter.value === "sequences") return row.type === "SEQUENCE";
@@ -359,6 +412,7 @@ async function openSource(row: ObjectBrowserRow) {
   sourceContent.value = "";
   sourceError.value = "";
   sourceEditing.value = false;
+  sourceEditableText.value = "";
   sourceDraft.value = "";
   sourceSaveError.value = "";
   sourceLoading.value = true;
@@ -371,7 +425,8 @@ async function openSource(row: ObjectBrowserRow) {
       name: row.name,
       source: result.source,
     });
-    sourceContent.value = editable;
+    sourceEditableText.value = editable;
+    sourceContent.value = await formatSqlForDisplay(editable, sourceFormatDialect.value, settingsStore.editorSettings.sqlFormatter);
     sourceDraft.value = editable;
     sourceEditing.value = row.type !== "SEQUENCE";
   } catch (e: any) {
@@ -384,15 +439,19 @@ async function openSource(row: ObjectBrowserRow) {
 async function openViewDdl(row: ObjectBrowserRow) {
   if (row.type !== "VIEW" && row.type !== "MATERIALIZED_VIEW") return;
   try {
-    const result = await api.getObjectSource(props.connection.id, props.database, row.schema || selectedSchema.value || props.database, row.name, "VIEW");
-    const ddl = await buildViewDdl({
-      databaseType: effectiveDatabaseType.value,
-      schema: row.schema || selectedSchema.value || props.database,
-      name: row.name,
-      source: result.source,
-    });
+    const schema = row.schema || selectedSchema.value || props.database;
+    const ddl =
+      row.type === "MATERIALIZED_VIEW"
+        ? await api.getTableDdl(props.connection.id, props.database, schema, row.name, "MATERIALIZED_VIEW")
+        : await buildViewDdl({
+            databaseType: effectiveDatabaseType.value,
+            schema,
+            name: row.name,
+            source: (await api.getObjectSource(props.connection.id, props.database, schema, row.name, "VIEW")).source,
+          });
+    const formatted = await formatSqlForDisplay(ddl, sourceFormatDialect.value, settingsStore.editorSettings.sqlFormatter);
     const tabId = queryStore.createTab(props.connection.id, props.database, `DDL - ${row.name}`);
-    queryStore.updateSql(tabId, ddl);
+    queryStore.updateSql(tabId, formatted);
   } catch (e: any) {
     toast(e?.message || String(e), 5000);
   }
@@ -564,6 +623,7 @@ function closeSource() {
   sourceContent.value = "";
   sourceError.value = "";
   sourceEditing.value = false;
+  sourceEditableText.value = "";
   sourceDraft.value = "";
   sourceSaveError.value = "";
 }
@@ -738,11 +798,16 @@ async function confirmBatchDropTables() {
 async function exportStructure(row: ObjectBrowserRow) {
   try {
     const schema = row.schema || selectedSchema.value || props.database;
-    const ddl = await api.getTableDdl(props.connection.id, props.database, schema, row.name, row.type === "VIEW" || row.type === "MATERIALIZED_VIEW" ? "VIEW" : undefined);
+    const ddl = await api.getTableDdl(props.connection.id, props.database, schema, row.name, tableDdlObjectType(row.type));
     await saveFileContent(ddl + "\n", `${row.name}.sql`, "SQL", "sql");
   } catch (e: any) {
     console.error("Export structure failed:", e);
   }
+}
+
+function tableDdlObjectType(type: ObjectBrowserRow["type"]): ObjectSourceKind | undefined {
+  if (type === "VIEW" || type === "MATERIALIZED_VIEW") return type;
+  return undefined;
 }
 
 async function exportDataLegacy(row: ObjectBrowserRow, format: "json" | "sql") {
@@ -974,8 +1039,8 @@ async function copySource() {
 }
 
 function editSource() {
-  if (!sourceRow.value || !sourceContent.value) return;
-  sourceDraft.value = sourceContent.value;
+  if (!sourceRow.value || !sourceEditableText.value) return;
+  sourceDraft.value = sourceEditableText.value;
   sourceSaveError.value = "";
   sourceEditing.value = true;
 }
@@ -1117,6 +1182,7 @@ function onSchemaChange(value: any) {
 function filterCount(filter: ObjectFilter) {
   if (filter === "tables") return tableCount.value;
   if (filter === "views") return viewCount.value;
+  if (filter === "materializedViews") return materializedViewCount.value;
   if (filter === "procedures") return procedureCount.value;
   if (filter === "functions") return functionCount.value;
   if (filter === "sequences") return sequenceCount.value;
@@ -1125,7 +1191,22 @@ function filterCount(filter: ObjectFilter) {
 }
 
 function filterLabel(filter: ObjectFilter) {
-  const key = filter === "tables" ? "objects.tables" : filter === "views" ? "objects.views" : filter === "procedures" ? "objects.procedures" : filter === "functions" ? "objects.functions" : filter === "sequences" ? "objects.sequences" : filter === "packages" ? "objects.packages" : "objects.all";
+  const key =
+    filter === "tables"
+      ? "objects.tables"
+      : filter === "views"
+        ? "objects.views"
+        : filter === "materializedViews"
+          ? "tree.materializedViews"
+          : filter === "procedures"
+            ? "objects.procedures"
+            : filter === "functions"
+              ? "objects.functions"
+              : filter === "sequences"
+                ? "objects.sequences"
+                : filter === "packages"
+                  ? "objects.packages"
+                  : "objects.all";
   return `${t(key)} ${filterCount(filter)}`;
 }
 
@@ -1148,6 +1229,10 @@ function onSearchKeydown(event: KeyboardEvent) {
 }
 
 defineExpose({ focusSearch });
+
+onBeforeUnmount(() => {
+  stopColumnResize?.();
+});
 
 watch(
   () => [props.connection.id, props.database, props.schema] as const,
@@ -1357,38 +1442,94 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
     </div>
     <div v-else class="flex min-h-0 flex-1 flex-col">
       <div class="grid h-7 shrink-0 items-center gap-3 border-b bg-muted/40 px-3 text-xs font-medium text-muted-foreground" :style="{ gridTemplateColumns }">
-        <button class="flex h-6 w-6 items-center justify-center rounded-sm hover:bg-accent" type="button" :disabled="visibleSelectableRows.length === 0" @click="toggleVisibleTableSelection">
-          <CheckSquare v-if="allVisibleTablesSelected" class="h-3.5 w-3.5 text-primary" />
-          <Square v-else class="h-3.5 w-3.5" />
-        </button>
-        <button class="flex min-w-0 items-center gap-1 truncate text-left" type="button" @click="toggleSort('name')">
-          <span class="truncate">{{ t("objects.name") }}</span>
-          <component :is="sortIconFor('name')" v-if="sortIconFor('name')" class="h-3 w-3 shrink-0" />
-        </button>
-        <button class="flex min-w-0 items-center gap-1 truncate text-left" type="button" @click="toggleSort('type')">
-          <span class="truncate">{{ t("objects.type") }}</span>
-          <component :is="sortIconFor('type')" v-if="sortIconFor('type')" class="h-3 w-3 shrink-0" />
-        </button>
-        <button class="flex min-w-0 items-center justify-end gap-1 truncate text-right" type="button" :title="t('objects.statisticsHint')" @click="toggleSort('estimatedRows')">
-          <span class="truncate">{{ t("objects.rows") }}</span>
-          <component :is="sortIconFor('estimatedRows')" v-if="sortIconFor('estimatedRows')" class="h-3 w-3 shrink-0" />
-        </button>
-        <button class="flex min-w-0 items-center justify-end gap-1 truncate text-right" type="button" :title="t('objects.statisticsHint')" @click="toggleSort('totalBytes')">
-          <span class="truncate">{{ t("objects.size") }}</span>
-          <component :is="sortIconFor('totalBytes')" v-if="sortIconFor('totalBytes')" class="h-3 w-3 shrink-0" />
-        </button>
-        <button v-if="hasCreatedAt" class="flex min-w-0 items-center gap-1 truncate text-left" type="button" @click="toggleSort('created_at')">
-          <span class="truncate">{{ t("objects.createdAt") }}</span>
-          <component :is="sortIconFor('created_at')" v-if="sortIconFor('created_at')" class="h-3 w-3 shrink-0" />
-        </button>
-        <button v-if="hasUpdatedAt" class="flex min-w-0 items-center gap-1 truncate text-left" type="button" @click="toggleSort('updated_at')">
-          <span class="truncate">{{ t("objects.updatedAt") }}</span>
-          <component :is="sortIconFor('updated_at')" v-if="sortIconFor('updated_at')" class="h-3 w-3 shrink-0" />
-        </button>
-        <button class="flex min-w-0 items-center gap-1 truncate text-left" type="button" @click="toggleSort('comment')">
-          <span class="truncate">{{ t("objects.comment") }}</span>
-          <component :is="sortIconFor('comment')" v-if="sortIconFor('comment')" class="h-3 w-3 shrink-0" />
-        </button>
+        <div class="relative flex min-w-0 items-center">
+          <button class="flex h-6 w-6 items-center justify-center rounded-sm hover:bg-accent" type="button" :disabled="visibleSelectableRows.length === 0" @click="toggleVisibleTableSelection">
+            <CheckSquare v-if="allVisibleTablesSelected" class="h-3.5 w-3.5 text-primary" />
+            <Square v-else class="h-3.5 w-3.5" />
+          </button>
+          <div class="absolute -right-2 top-0 bottom-0 z-10 flex w-3 cursor-col-resize items-center justify-center text-muted-foreground/70 hover:bg-primary/30 hover:text-primary" @mousedown="onObjectColumnResizeStart('select', $event)" @dblclick="resetObjectColumnWidth('select', 34, $event)">
+            <GripVertical class="h-3 w-3" />
+          </div>
+        </div>
+        <div class="relative flex min-w-0 items-center">
+          <button class="flex min-w-0 items-center gap-1 truncate pr-4 text-left" type="button" @click="toggleSort('name')">
+            <span class="truncate">{{ t("objects.name") }}</span>
+            <component :is="sortIconFor('name')" v-if="sortIconFor('name')" class="h-3 w-3 shrink-0" />
+          </button>
+          <div class="absolute -right-2 top-0 bottom-0 z-10 flex w-3 cursor-col-resize items-center justify-center text-muted-foreground/70 hover:bg-primary/30 hover:text-primary" @mousedown="onObjectColumnResizeStart('name', $event)" @dblclick="resetObjectColumnWidth('name', 360, $event)">
+            <GripVertical class="h-3 w-3" />
+          </div>
+        </div>
+        <div class="relative flex min-w-0 items-center">
+          <button class="flex min-w-0 items-center gap-1 truncate pr-4 text-left" type="button" @click="toggleSort('type')">
+            <span class="truncate">{{ t("objects.type") }}</span>
+            <component :is="sortIconFor('type')" v-if="sortIconFor('type')" class="h-3 w-3 shrink-0" />
+          </button>
+          <div class="absolute -right-2 top-0 bottom-0 z-10 flex w-3 cursor-col-resize items-center justify-center text-muted-foreground/70 hover:bg-primary/30 hover:text-primary" @mousedown="onObjectColumnResizeStart('type', $event)" @dblclick="resetObjectColumnWidth('type', 110, $event)">
+            <GripVertical class="h-3 w-3" />
+          </div>
+        </div>
+        <div class="relative flex min-w-0 items-center justify-end">
+          <button class="flex min-w-0 items-center justify-end gap-1 truncate pr-4 text-right" type="button" :title="t('objects.statisticsHint')" @click="toggleSort('estimatedRows')">
+            <span class="truncate">{{ t("objects.rows") }}</span>
+            <component :is="sortIconFor('estimatedRows')" v-if="sortIconFor('estimatedRows')" class="h-3 w-3 shrink-0" />
+          </button>
+          <div
+            class="absolute -right-2 top-0 bottom-0 z-10 flex w-3 cursor-col-resize items-center justify-center text-muted-foreground/70 hover:bg-primary/30 hover:text-primary"
+            @mousedown="onObjectColumnResizeStart('estimatedRows', $event)"
+            @dblclick="resetObjectColumnWidth('estimatedRows', 110, $event)"
+          >
+            <GripVertical class="h-3 w-3" />
+          </div>
+        </div>
+        <div class="relative flex min-w-0 items-center justify-end">
+          <button class="flex min-w-0 items-center justify-end gap-1 truncate pr-4 text-right" type="button" :title="t('objects.statisticsHint')" @click="toggleSort('totalBytes')">
+            <span class="truncate">{{ t("objects.size") }}</span>
+            <component :is="sortIconFor('totalBytes')" v-if="sortIconFor('totalBytes')" class="h-3 w-3 shrink-0" />
+          </button>
+          <div
+            class="absolute -right-2 top-0 bottom-0 z-10 flex w-3 cursor-col-resize items-center justify-center text-muted-foreground/70 hover:bg-primary/30 hover:text-primary"
+            @mousedown="onObjectColumnResizeStart('totalBytes', $event)"
+            @dblclick="resetObjectColumnWidth('totalBytes', 100, $event)"
+          >
+            <GripVertical class="h-3 w-3" />
+          </div>
+        </div>
+        <div v-if="hasCreatedAt" class="relative flex min-w-0 items-center">
+          <button class="flex min-w-0 items-center gap-1 truncate pr-4 text-left" type="button" @click="toggleSort('created_at')">
+            <span class="truncate">{{ t("objects.createdAt") }}</span>
+            <component :is="sortIconFor('created_at')" v-if="sortIconFor('created_at')" class="h-3 w-3 shrink-0" />
+          </button>
+          <div
+            class="absolute -right-2 top-0 bottom-0 z-10 flex w-3 cursor-col-resize items-center justify-center text-muted-foreground/70 hover:bg-primary/30 hover:text-primary"
+            @mousedown="onObjectColumnResizeStart('created_at', $event)"
+            @dblclick="resetObjectColumnWidth('created_at', 150, $event)"
+          >
+            <GripVertical class="h-3 w-3" />
+          </div>
+        </div>
+        <div v-if="hasUpdatedAt" class="relative flex min-w-0 items-center">
+          <button class="flex min-w-0 items-center gap-1 truncate pr-4 text-left" type="button" @click="toggleSort('updated_at')">
+            <span class="truncate">{{ t("objects.updatedAt") }}</span>
+            <component :is="sortIconFor('updated_at')" v-if="sortIconFor('updated_at')" class="h-3 w-3 shrink-0" />
+          </button>
+          <div
+            class="absolute -right-2 top-0 bottom-0 z-10 flex w-3 cursor-col-resize items-center justify-center text-muted-foreground/70 hover:bg-primary/30 hover:text-primary"
+            @mousedown="onObjectColumnResizeStart('updated_at', $event)"
+            @dblclick="resetObjectColumnWidth('updated_at', 150, $event)"
+          >
+            <GripVertical class="h-3 w-3" />
+          </div>
+        </div>
+        <div class="relative flex min-w-0 items-center">
+          <button class="flex min-w-0 items-center gap-1 truncate pr-4 text-left" type="button" @click="toggleSort('comment')">
+            <span class="truncate">{{ t("objects.comment") }}</span>
+            <component :is="sortIconFor('comment')" v-if="sortIconFor('comment')" class="h-3 w-3 shrink-0" />
+          </button>
+          <div class="absolute -right-2 top-0 bottom-0 z-10 flex w-3 cursor-col-resize items-center justify-center text-muted-foreground/70 hover:bg-primary/30 hover:text-primary" @mousedown="onObjectColumnResizeStart('comment', $event)" @dblclick="resetObjectColumnWidth('comment', 260, $event)">
+            <GripVertical class="h-3 w-3" />
+          </div>
+        </div>
       </div>
       <RecycleScroller class="object-browser-scroller min-h-0 flex-1" :items="filteredRows" :item-size="34" :buffer="600" :skip-hover="true" key-field="id">
         <template #default="{ item }">
@@ -1558,7 +1699,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
     </DialogContent>
   </Dialog>
 
-  <DdlViewDialog v-if="ddlDialogTarget" :connection-id="props.connection.id" :database="props.database" :schema="ddlDialogTarget.schema || selectedSchema" :table-name="ddlDialogTarget.name" :dialect="sourceDialect" v-model:open="showDdlDialog" />
+  <DdlViewDialog v-if="ddlDialogTarget" :connection-id="props.connection.id" :database="props.database" :schema="ddlDialogTarget.schema || selectedSchema" :table-name="ddlDialogTarget.name" :dialect="sourceDialect" :format-dialect="sourceFormatDialect" v-model:open="showDdlDialog" />
 </template>
 
 <style scoped>

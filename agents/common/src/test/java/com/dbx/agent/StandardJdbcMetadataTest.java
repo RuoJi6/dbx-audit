@@ -109,6 +109,26 @@ class StandardJdbcMetadataTest {
     }
 
     @Test
+    void listsDataTypesFromJdbcTypeInfo() {
+        Connection conn = connection(
+            rows(),
+            rows(),
+            rows(),
+            rows(),
+            rows(),
+            rows(),
+            UnsupportedSchemaCall.NONE,
+            null,
+            null,
+            null,
+            null,
+            rows(row("TYPE_NAME", "INTEGER"), row("TYPE_NAME", "VARCHAR"), row("TYPE_NAME", "integer"))
+        );
+
+        assertEquals(Arrays.asList("INTEGER", "VARCHAR"), StandardJdbcMetadata.INSTANCE.listDataTypes(conn));
+    }
+
+    @Test
     void listTablesUsesDriverTableTypesWithinProfileAllowList() {
         AtomicReference<String[]> capturedTypes = new AtomicReference<>();
         Connection conn = connection(
@@ -370,6 +390,36 @@ class StandardJdbcMetadataTest {
         AtomicReference<Object[]> capturedTableArgs,
         AtomicReference<Object[]> capturedColumnArgs
     ) {
+        return connection(
+            schemas,
+            tables,
+            primaryKeys,
+            columns,
+            indexes,
+            foreignKeys,
+            unsupportedSchemaCall,
+            tableTypes,
+            capturedTableTypes,
+            capturedTableArgs,
+            capturedColumnArgs,
+            null
+        );
+    }
+
+    private static Connection connection(
+        ResultSet schemas,
+        ResultSet tables,
+        ResultSet primaryKeys,
+        ResultSet columns,
+        ResultSet indexes,
+        ResultSet foreignKeys,
+        UnsupportedSchemaCall unsupportedSchemaCall,
+        ResultSet tableTypes,
+        AtomicReference<String[]> capturedTableTypes,
+        AtomicReference<Object[]> capturedTableArgs,
+        AtomicReference<Object[]> capturedColumnArgs,
+        ResultSet dataTypes
+    ) {
         DatabaseMetaData meta = proxy(DatabaseMetaData.class, new MethodHandler() {
             @Override
             public Object handle(Method method, Object[] args) {
@@ -391,6 +441,9 @@ class StandardJdbcMetadataTest {
                 }
                 if ("getTableTypes".equals(name) && tableTypes != null) {
                     return tableTypes;
+                }
+                if ("getTypeInfo".equals(name) && dataTypes != null) {
+                    return dataTypes;
                 }
                 if ("getPrimaryKeys".equals(name)) {
                     return primaryKeys;

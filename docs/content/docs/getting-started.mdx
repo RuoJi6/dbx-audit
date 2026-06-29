@@ -183,6 +183,7 @@ Use source mode when contributing or debugging DBX locally.
 
 - [Node.js](https://nodejs.org/) >= 18
 - [pnpm](https://pnpm.io/)
+- Make
 - [Rust](https://www.rust-lang.org/tools/install) >= 1.77
 
 ### System Dependencies
@@ -198,21 +199,22 @@ Use source mode when contributing or debugging DBX locally.
 ```bash
 git clone https://github.com/t8y2/dbx.git
 cd dbx
-pnpm install
-pnpm dev:tauri
+make
 ```
+
+`make` installs root dependencies when needed and starts the local Tauri desktop development environment.
 
 For the web version:
 
 ```bash
-pnpm dev:web
-pnpm dev:backend
+make dev-web
+make dev-backend
 ```
 
 ### Build Desktop Packages
 
 ```bash
-pnpm tauri build
+make package
 ```
 
 Desktop installers are written to `src-tauri/target/release/bundle/`.

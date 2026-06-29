@@ -244,7 +244,7 @@ FROM (
     )
   FROM target t
   CROSS JOIN pg_catalog.pg_namespace n
-  WHERE n.nspname NOT LIKE 'pg\\_%' ESCAPE '\\'
+  WHERE n.nspname NOT LIKE 'pg~_%' ESCAPE '~'
     AND n.nspname <> 'information_schema'
     AND (has_schema_privilege(t.rolname, n.oid, 'USAGE') OR has_schema_privilege(t.rolname, n.oid, 'CREATE'))
   UNION ALL

@@ -3,6 +3,9 @@ import { useI18n } from "vue-i18n";
 import { isTauriRuntime } from "@/lib/tauriRuntime";
 import { useToast } from "@/composables/useToast";
 import * as api from "@/lib/api";
+import { useSettingsStore } from "@/stores/settingsStore";
+import type { UpdateDownloadSource as SettingsUpdateDownloadSource } from "@/stores/settingsStore";
+import type { UpdateDownloadProgress } from "@/lib/tauri";
 
 export function shouldOpenUpdateDialog(options: { silent?: boolean }) {
   return options.silent !== true;
@@ -10,6 +13,23 @@ export function shouldOpenUpdateDialog(options: { silent?: boolean }) {
 
 export function canDownloadAndInstallUpdate(info: api.UpdateInfo | null, isDesktop: boolean) {
   return isDesktop && info?.update_available === true && info.portable_mode !== true;
+}
+
+export function normalizeUpdateDownloadSource(value: unknown): SettingsUpdateDownloadSource {
+  return value === "cnb" ? "cnb" : "official";
+}
+
+export function tagVersion(version: string): string {
+  const trimmed = version.trim();
+  return trimmed.startsWith("v") ? trimmed : `v${trimmed}`;
+}
+
+export function resolveUpdateReleaseUrl(info: api.UpdateInfo | null, source: unknown, fallbackUrl: string): string {
+  const normalizedSource = normalizeUpdateDownloadSource(source);
+  if (normalizedSource === "cnb" && info?.latest_version) {
+    return `https://cnb.cool/dbxio.com/dbx/-/releases/tag/${tagVersion(info.latest_version)}`;
+  }
+  return info?.release_url || fallbackUrl;
 }
 
 export async function resolveUpdaterProxy(): Promise<string | undefined> {
@@ -25,6 +45,7 @@ export async function resolveUpdaterProxy(): Promise<string | undefined> {
 export function useAppUpdater() {
   const { t } = useI18n();
   const { toast } = useToast();
+  const settingsStore = useSettingsStore();
 
   const checkingUpdates = ref(false);
   const updateInfo = ref<api.UpdateInfo | null>(null);
@@ -78,7 +99,7 @@ export function useAppUpdater() {
   }
 
   function openLatestRelease() {
-    const url = updateInfo.value?.release_url || latestReleaseUrl;
+    const url = resolveUpdateReleaseUrl(updateInfo.value, settingsStore.editorSettings.updateDownloadSource, latestReleaseUrl);
     openUrl(url);
   }
 
@@ -90,27 +111,21 @@ export function useAppUpdater() {
     }
     isDownloadingUpdate.value = true;
     downloadProgress.value = 0;
+    let unlisten: (() => void) | undefined;
+    const latestVersion = updateInfo.value?.latest_version;
     try {
-      const { check } = await import("@tauri-apps/plugin-updater");
-      const proxy = await resolveUpdaterProxy();
-      const update = await check(proxy ? { proxy } : undefined);
-      if (!update) return;
-      let totalBytes = 0;
-      let downloadedBytes = 0;
-      await update.downloadAndInstall((event) => {
-        if (event.event === "Started" && event.data.contentLength) {
-          totalBytes = event.data.contentLength;
-        } else if (event.event === "Progress") {
-          downloadedBytes += event.data.chunkLength;
-          downloadProgress.value = totalBytes > 0 ? Math.round((downloadedBytes / totalBytes) * 100) : 0;
-        } else if (event.event === "Finished") {
-          downloadProgress.value = 100;
-        }
+      const { listen } = await import("@tauri-apps/api/event");
+      unlisten = await listen<UpdateDownloadProgress>("update-download-progress", (event) => {
+        const total = event.payload.total ?? 0;
+        downloadProgress.value = total > 0 ? Math.round((event.payload.downloaded / total) * 100) : 0;
       });
+      await api.downloadAndInstallUpdate(normalizeUpdateDownloadSource(settingsStore.editorSettings.updateDownloadSource), latestVersion);
+      downloadProgress.value = 100;
       updateReady.value = true;
     } catch (e: any) {
       toast(t("updates.downloadFailed", { error: e?.message || String(e) }), 5000);
     } finally {
+      unlisten?.();
       isDownloadingUpdate.value = false;
     }
   }

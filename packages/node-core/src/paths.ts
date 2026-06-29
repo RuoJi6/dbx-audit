@@ -1,5 +1,5 @@
 import { homedir, platform } from "node:os";
-import { join } from "node:path";
+import { join, posix, win32 } from "node:path";
 
 export function appDataDir(): string {
   // 支持 DBX_DATA_DIR 环境变量（与 Rust 侧 data_dir.rs 保持一致）
@@ -18,11 +18,11 @@ export function appDataDirFromInputs(options: { platform: NodeJS.Platform; home:
 
   switch (options.platform) {
     case "darwin":
-      return join(options.home, "Library", "Application Support", "com.dbx.app");
+      return posix.join(options.home, "Library", "Application Support", "com.dbx.app");
     case "win32":
-      return join(options.appData || join(options.home, "AppData", "Roaming"), "com.dbx.app");
+      return win32.join(options.appData || win32.join(options.home, "AppData", "Roaming"), "com.dbx.app");
     default:
-      return join(options.home, ".local", "share", "com.dbx.app");
+      return posix.join(options.home, ".local", "share", "com.dbx.app");
   }
 }
 

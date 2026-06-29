@@ -17,6 +17,7 @@ import { useI18n } from "vue-i18n";
 import * as api from "@/lib/api";
 import { buildNacosConfigDeleteConfirm, buildNacosConfigExportFileName, buildNacosConfigHistoryRollbackConfirm, buildNacosInstanceConfirm, createNacosSaveAsCopy, resolveNacosConfigCopyText } from "@/lib/nacosAdmin";
 import { copyToClipboard, readTextFromClipboard } from "@/lib/clipboard";
+import { trimmedSelectionLayer } from "@/lib/codemirrorTrimmedSelectionLayer";
 import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/safeStorage";
 import { editorFontTheme, loadEditorTheme } from "@/lib/editorThemes";
 import { isTauriRuntime } from "@/lib/tauriRuntime";
@@ -48,6 +49,7 @@ const configLoading = ref(false);
 const configError = ref("");
 const configGroup = ref("");
 const configDataId = ref("");
+const configAppName = ref("");
 const configPageNo = ref(1);
 const configPageSize = ref(20);
 const configs = ref<NacosConfigItem[]>([]);
@@ -178,7 +180,7 @@ async function configLanguageExtension(format: string): Promise<Extension[]> {
 async function mountConfigEditor() {
   await nextTick();
   if (!configEditorHost.value || configEditorView.value || !selectedConfig.value) return;
-  const [{ EditorState, Prec }, { EditorView, keymap }, { basicSetup }, { defaultKeymap, historyKeymap }, { search: cmSearch }, language] = await Promise.all([
+  const [{ EditorState, Prec }, { EditorView, keymap }, { basicSetup }, { defaultKeymap, historyKeymap, indentWithTab }, { search: cmSearch }, language] = await Promise.all([
     import("@codemirror/state"),
     import("@codemirror/view"),
     import("codemirror"),
@@ -202,17 +204,14 @@ async function mountConfigEditor() {
           },
         }),
         basicSetup,
-        Prec.highest(
-          keymap.of([
-            { key: "Mod-f", run: () => configSearchPanelRef.value?.openSearch() ?? false, preventDefault: true },
-            { key: "Mod-h", run: () => configSearchPanelRef.value?.openReplace() ?? false, preventDefault: true },
-          ]),
-        ),
+        trimmedSelectionLayer(),
+        Prec.highest(keymap.of([{ key: "Mod-f", run: () => configSearchPanelRef.value?.openSearch() ?? false, preventDefault: true }, { key: "Mod-h", run: () => configSearchPanelRef.value?.openReplace() ?? false, preventDefault: true }, indentWithTab])),
         keymap.of([...defaultKeymap, ...historyKeymap]),
         configEditorLanguage.of(language),
         configEditorTheme.of(theme),
         configEditorFontTheme.of(editorFontTheme(EditorView, editorSettings.fontSize, editorSettings.fontFamily, { fixedHeight: true, scrollable: true })),
         EditorView.lineWrapping,
+        EditorState.readOnly.of(!!props.readOnly),
         EditorView.editable.of(!props.readOnly),
         EditorView.updateListener.of((update) => {
           if (!update.docChanged) return;
@@ -228,6 +227,8 @@ async function mountConfigEditor() {
           },
           ".cm-content": {
             minHeight: "100%",
+            userSelect: "text",
+            WebkitUserSelect: "text",
           },
           ".cm-lineNumbers .cm-gutterElement": {
             padding: "0 10px 0 8px",
@@ -370,6 +371,7 @@ async function loadConfigs(page = configPageNo.value) {
       namespace: namespace.value || undefined,
       group: configGroup.value.trim() || undefined,
       dataId: configDataId.value.trim() || undefined,
+      appName: configAppName.value.trim() || undefined,
       pageNo: configPageNo.value,
       pageSize: configPageSize.value,
     });
@@ -881,9 +883,10 @@ onBeforeUnmount(() => {
     <Splitpanes v-if="activeTab === 'configs'" class="nacos-admin-splitpanes min-h-0 flex-1" @resized="handleNacosSplitResized">
       <Pane :size="nacosSplitSize" min-size="24">
         <div class="flex h-full min-h-0 flex-col">
-          <div class="grid shrink-0 grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto_auto] gap-2 border-b p-2">
+          <div class="grid shrink-0 grid-cols-[minmax(0,1fr)_minmax(0,1fr)_minmax(0,1fr)_auto_auto] gap-2 border-b p-2">
             <Input v-model="configDataId" class="h-8 min-w-0" placeholder="dataId" @keyup.enter="loadConfigsWithRetry(1)" />
             <Input v-model="configGroup" class="h-8 min-w-0" :placeholder="t('nacos.allGroups')" @keyup.enter="loadConfigsWithRetry(1)" />
+            <Input v-model="configAppName" class="h-8 min-w-0" :placeholder="t('nacos.application')" @keyup.enter="loadConfigsWithRetry(1)" />
             <Button size="sm" variant="outline" class="h-8 w-9 px-0" :title="t('nacos.load')" :disabled="configLoading" @click="loadConfigsWithRetry(1)">
               <Loader2 v-if="configLoading" class="h-3.5 w-3.5 animate-spin" />
               <RefreshCw v-else class="h-3.5 w-3.5" />
@@ -894,16 +897,17 @@ onBeforeUnmount(() => {
           </div>
           <div v-if="configError" class="border-b px-3 py-2 text-xs text-destructive">{{ configError }}</div>
           <div class="min-h-0 flex-1 overflow-auto">
-            <div class="sticky top-0 z-10 grid grid-cols-[minmax(0,1fr)_128px_84px] border-b bg-muted/70 px-3 py-2 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-              <span>dataID</span>
-              <span>{{ t("nacos.group") }}</span>
-              <span>{{ t("nacos.format") }}</span>
+            <div class="sticky top-0 z-20 grid grid-cols-4 border-b bg-muted px-3 py-2 text-[11px] font-medium uppercase tracking-wide text-muted-foreground shadow-sm">
+              <span class="truncate pr-3">dataID</span>
+              <span class="truncate pr-3">{{ t("nacos.group") }}</span>
+              <span class="truncate pr-3">{{ t("nacos.application") }}</span>
+              <span class="truncate">{{ t("nacos.format") }}</span>
             </div>
             <button
               v-for="item in configs"
               :key="`${item.namespace}:${item.group}:${item.dataId}`"
               type="button"
-              class="grid w-full grid-cols-[minmax(0,1fr)_128px_84px] items-center border-b px-3 py-2.5 text-left text-sm transition-colors hover:bg-accent/50"
+              class="grid w-full grid-cols-4 items-center border-b px-3 py-2.5 text-left text-sm transition-colors hover:bg-accent/50"
               :class="{ 'bg-accent': selectedConfig?.dataId === item.dataId && selectedConfig?.group === item.group }"
               @click="selectConfig(item)"
             >
@@ -912,6 +916,7 @@ onBeforeUnmount(() => {
                 <span class="truncate font-medium text-foreground">{{ item.dataId }}</span>
               </span>
               <span class="truncate pr-3 text-xs text-muted-foreground" :title="item.group || 'DEFAULT_GROUP'">{{ item.group || "DEFAULT_GROUP" }}</span>
+              <span class="truncate pr-3 text-xs text-muted-foreground" :title="item.appName || '-'">{{ item.appName || "-" }}</span>
               <span class="truncate text-xs text-muted-foreground" :title="configFormatLabel(item)">{{ configFormatLabel(item) }}</span>
             </button>
             <div v-if="!configLoading && configs.length === 0" class="flex h-full items-center justify-center text-sm text-muted-foreground">{{ t("nacos.noConfigs") }}</div>

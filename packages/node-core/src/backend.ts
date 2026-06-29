@@ -1,7 +1,8 @@
 import { addConnection as desktopAddConnection, findConnection as desktopFindConnection, loadConnections as desktopLoadConnections, removeConnection as desktopRemoveConnection } from "./connections.js";
-import { closeDatabaseResources as desktopCloseDatabaseResources, describeTable as desktopDescribeTable, executeQuery as desktopExecuteQuery, listTables as desktopListTables } from "./database.js";
+import { closeDatabaseResources as desktopCloseDatabaseResources, describeTable as desktopDescribeTable, executeQuery as desktopExecuteQuery, executeRedisCommand as desktopExecuteRedisCommand, listTables as desktopListTables } from "./database.js";
 import type { ConnectionConfig } from "./connections.js";
 import type { ColumnInfo, QueryOptions, QueryResult, TableInfo } from "./database.js";
+import type { RedisCommandOptions, RedisCommandResult } from "./redis-command.js";
 
 export interface Backend {
   loadConnections(): Promise<ConnectionConfig[]>;
@@ -11,6 +12,7 @@ export interface Backend {
   listTables(config: ConnectionConfig, schema?: string): Promise<TableInfo[]>;
   describeTable(config: ConnectionConfig, table: string, schema?: string): Promise<ColumnInfo[]>;
   executeQuery(config: ConnectionConfig, sql: string, options?: QueryOptions): Promise<QueryResult>;
+  executeRedisCommand?(config: ConnectionConfig, db: number, command: string, options?: RedisCommandOptions): Promise<RedisCommandResult>;
   close?(): Promise<void>;
 }
 
@@ -27,6 +29,7 @@ export async function createBackend(env: NodeJS.ProcessEnv = process.env): Promi
     listTables: desktopListTables,
     describeTable: desktopDescribeTable,
     executeQuery: desktopExecuteQuery,
+    executeRedisCommand: desktopExecuteRedisCommand,
     close: desktopCloseDatabaseResources,
   };
 }

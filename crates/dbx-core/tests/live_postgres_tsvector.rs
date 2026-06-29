@@ -84,6 +84,7 @@ async fn postgres_tsvector_generated_columns_are_readable_and_omitted_from_inser
         qualified_table_name: None,
         columns: result.columns.clone(),
         column_types: result.column_types.iter().map(|value| Some(value.clone())).collect(),
+        column_extras: Vec::new(),
         rows: result.rows.clone(),
         batch_size: Some(10),
     })

@@ -60,6 +60,30 @@ func TestCloseMissingQuerySessionReturnsFalse(t *testing.T) {
 	}
 }
 
+func TestListDataTypesReturnsXuguTypes(t *testing.T) {
+	s := newServer()
+	resp, shutdown := s.handleLine(`{"jsonrpc":"2.0","id":9,"method":"list_data_types","params":{"database":"demo"}}`)
+	if shutdown {
+		t.Fatal("list_data_types should not shut down the server")
+	}
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
+	}
+	data, err := json.Marshal(resp.Result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result []string
+	if err := json.Unmarshal(data, &result); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"INTEGER", "VARCHAR", "NUMERIC", "INT"} {
+		if !contains(result, want) {
+			t.Fatalf("expected data type %q in %v", want, result)
+		}
+	}
+}
+
 func TestEmptyResultSlicesMarshalAsArrays(t *testing.T) {
 	data, err := json.Marshal(queryResult{})
 	if err != nil {
@@ -323,7 +347,7 @@ func TestPrimaryKeySQLUsesLowPrivilegeDictionary(t *testing.T) {
 func TestColumnSQLUsesLowPrivilegeDictionary(t *testing.T) {
 	sqlText := strings.ToUpper(xuguListColumnsSQL)
 
-	for _, want := range []string{"ALL_COLUMNS", "ALL_TABLES", "ALL_SCHEMAS", "COMMENTS"} {
+	for _, want := range []string{"ALL_COLUMNS", "ALL_TABLES", "ALL_SCHEMAS", "COMMENTS", `"VARYING"`} {
 		if !strings.Contains(sqlText, want) {
 			t.Fatalf("column listing should query %s, got: %s", want, xuguListColumnsSQL)
 		}
@@ -378,6 +402,29 @@ func TestDecodeXuguScale(t *testing.T) {
 	precision, scale, length = decodeXuguScale("VARCHAR", &charScale)
 	if precision != nil || scale != nil || length == nil || *length != 128 {
 		t.Fatalf("unexpected char scale decode: precision=%v scale=%v length=%v", precision, scale, length)
+	}
+}
+
+func TestNormalizeXuguColumnTypeUsesVaryingFlag(t *testing.T) {
+	tests := []struct {
+		name     string
+		dataType string
+		varying  any
+		want     string
+	}{
+		{name: "varying char", dataType: "CHAR", varying: true, want: "VARCHAR"},
+		{name: "fixed char", dataType: "CHAR", varying: false, want: "CHAR"},
+		{name: "varying binary", dataType: "BINARY", varying: true, want: "VARBINARY"},
+		{name: "fixed binary", dataType: "BINARY", varying: false, want: "BINARY"},
+		{name: "other varying type", dataType: "NUMERIC", varying: true, want: "NUMERIC"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := normalizeXuguColumnType(tt.dataType, tt.varying); got != tt.want {
+				t.Fatalf("normalizeXuguColumnType(%q, %v) = %q, want %q", tt.dataType, tt.varying, got, tt.want)
+			}
+		})
 	}
 }
 

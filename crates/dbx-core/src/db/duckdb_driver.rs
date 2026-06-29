@@ -39,6 +39,8 @@ fn validate_duckdb_path(path: &str) -> Result<(), String> {
         return Err(format!("Database file path is a directory, not a file: {}", path));
     }
     if !path_obj.exists() {
+        // DuckDB creates a new database file on open when the parent directory
+        // exists. Only reject paths whose parent directory is missing.
         if let Some(parent) = path_obj.parent() {
             if !parent.as_os_str().is_empty() && !parent.exists() {
                 return Err(format!("Parent directory does not exist: {}", parent.display()));

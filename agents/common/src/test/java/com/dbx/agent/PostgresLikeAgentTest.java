@@ -45,6 +45,42 @@ class PostgresLikeAgentTest {
     }
 
     @Test
+    void mapsPgCatalogBooleanNullableValues() {
+        TestPostgresLikeAgent agent = new TestPostgresLikeAgent(preparedConnection(
+            resultSet(
+                new String[]{"column_name"},
+                new Object[][]{{"id"}}
+            ),
+            resultSet(
+                new String[]{
+                    "column_name",
+                    "data_type",
+                    "is_nullable",
+                    "column_default",
+                    "column_comment",
+                    "numeric_precision",
+                    "numeric_scale",
+                    "character_maximum_length"
+                },
+                new Object[][]{
+                    {"id", "integer", false, null, null, null, null, null},
+                    {"name", "character varying(255)", true, null, "display name", null, null, 255}
+                }
+            )
+        ));
+        agent.connect(new ConnectParams());
+
+        List<ColumnInfo> columns = agent.getColumns("public", "base_airspace");
+
+        assertEquals(2, columns.size());
+        assertTrue(columns.get(0).getIs_primary_key());
+        assertFalse(columns.get(0).getIs_nullable());
+        assertEquals("name", columns.get(1).getName());
+        assertTrue(columns.get(1).getIs_nullable());
+        assertEquals(Integer.valueOf(255), columns.get(1).getCharacter_maximum_length());
+    }
+
+    @Test
     void postgisGeometryTypeNameDetection() {
         assertTrue(PostgresLikeAgent.isPostgisGeometryTypeName("geometry"));
         assertTrue(PostgresLikeAgent.isPostgisGeometryTypeName("GEOMETRY"));
@@ -85,15 +121,25 @@ class PostgresLikeAgentTest {
     }
 
     private static final class TestPostgresLikeAgent extends PostgresLikeAgent {
+        private final Connection connection;
+
         private TestPostgresLikeAgent() {
+            this(null);
+        }
+
+        private TestPostgresLikeAgent(Connection connection) {
             super(new PostgresLikeAgentProfile(
                 PostgresLikeAgentTest.class.getName(),
                 "jdbc:test://{host}:{port}/{database}"
             ));
+            this.connection = connection;
         }
 
         @Override
         protected Connection openConnection(ConnectParams params) {
+            if (connection != null) {
+                return connection;
+            }
             return MetadataSqlFake.connection();
         }
 
@@ -112,6 +158,145 @@ class PostgresLikeAgentTest {
                 return rs.getObject(index);
             };
         }
+    }
+
+    private static Connection preparedConnection(ResultSet... resultSets) {
+        int[] resultSetIndex = {0};
+        return proxy(Connection.class, new MethodHandler() {
+            @Override
+            public Object handle(Method method, Object[] args) {
+                String name = method.getName();
+                if ("prepareStatement".equals(name)) {
+                    return proxy(PreparedStatement.class, new MethodHandler() {
+                        @Override
+                        public Object handle(Method method, Object[] args) {
+                            String name = method.getName();
+                            if ("executeQuery".equals(name)) {
+                                int current = Math.min(resultSetIndex[0], resultSets.length - 1);
+                                resultSetIndex[0] += 1;
+                                return resultSets[current];
+                            }
+                            if ("setString".equals(name) || "close".equals(name)) {
+                                return null;
+                            }
+                            return defaultValue(method.getReturnType());
+                        }
+                    });
+                }
+                if ("isClosed".equals(name)) {
+                    return false;
+                }
+                if ("close".equals(name)) {
+                    return null;
+                }
+                return defaultValue(method.getReturnType());
+            }
+        });
+    }
+
+    private static ResultSet resultSet(String[] columns, Object[][] rows) {
+        int[] index = {-1};
+        boolean[] wasNull = {false};
+        return proxy(ResultSet.class, new MethodHandler() {
+            @Override
+            public Object handle(Method method, Object[] args) {
+                String name = method.getName();
+                if ("next".equals(name)) {
+                    index[0] += 1;
+                    return index[0] < rows.length;
+                }
+                if ("getString".equals(name)) {
+                    Object value = columnValue(columns, rows[index[0]], args[0]);
+                    wasNull[0] = value == null;
+                    return value == null ? null : String.valueOf(value);
+                }
+                if ("getBoolean".equals(name)) {
+                    Object value = columnValue(columns, rows[index[0]], args[0]);
+                    wasNull[0] = value == null;
+                    if (value instanceof Boolean) {
+                        return value;
+                    }
+                    if (value instanceof Number) {
+                        return ((Number) value).intValue() != 0;
+                    }
+                    String text = String.valueOf(value);
+                    return "1".equals(text)
+                        || "t".equalsIgnoreCase(text)
+                        || "true".equalsIgnoreCase(text)
+                        || "yes".equalsIgnoreCase(text);
+                }
+                if ("getInt".equals(name)) {
+                    Object value = columnValue(columns, rows[index[0]], args[0]);
+                    wasNull[0] = value == null;
+                    if (value instanceof Number) {
+                        return ((Number) value).intValue();
+                    }
+                    return value == null ? 0 : Integer.parseInt(String.valueOf(value));
+                }
+                if ("getObject".equals(name)) {
+                    Object value = columnValue(columns, rows[index[0]], args[0]);
+                    wasNull[0] = value == null;
+                    return value;
+                }
+                if ("wasNull".equals(name)) {
+                    return wasNull[0];
+                }
+                if ("close".equals(name)) {
+                    return null;
+                }
+                return defaultValue(method.getReturnType());
+            }
+        });
+    }
+
+    private static Object columnValue(String[] columns, Object[] row, Object key) {
+        if (key instanceof Number) {
+            return row[((Number) key).intValue() - 1];
+        }
+        for (int i = 0; i < columns.length; i++) {
+            if (columns[i].equalsIgnoreCase(String.valueOf(key))) {
+                return row[i];
+            }
+        }
+        return null;
+    }
+
+    private static <T> T proxy(Class<T> type, final MethodHandler handler) {
+        InvocationHandler invocationHandler = new InvocationHandler() {
+            @Override
+            public Object invoke(Object proxy, Method method, Object[] args) {
+                return handler.handle(method, args);
+            }
+        };
+        return type.cast(Proxy.newProxyInstance(type.getClassLoader(), new Class<?>[]{type}, invocationHandler));
+    }
+
+    private static Object defaultValue(Class<?> type) {
+        if (Boolean.TYPE.equals(type)) {
+            return false;
+        }
+        if (Byte.TYPE.equals(type)) {
+            return (byte) 0;
+        }
+        if (Short.TYPE.equals(type)) {
+            return (short) 0;
+        }
+        if (Integer.TYPE.equals(type)) {
+            return 0;
+        }
+        if (Long.TYPE.equals(type)) {
+            return 0L;
+        }
+        if (Float.TYPE.equals(type)) {
+            return 0f;
+        }
+        if (Double.TYPE.equals(type)) {
+            return 0.0d;
+        }
+        if (Character.TYPE.equals(type)) {
+            return '\0';
+        }
+        return null;
     }
 
     private static final class GeometryResultSet {
@@ -257,44 +442,6 @@ class PostgresLikeAgentTest {
                     return defaultValue(method.getReturnType());
                 }
             });
-        }
-
-        private static <T> T proxy(Class<T> type, final MethodHandler handler) {
-            InvocationHandler invocationHandler = new InvocationHandler() {
-                @Override
-                public Object invoke(Object proxy, Method method, Object[] args) {
-                    return handler.handle(method, args);
-                }
-            };
-            return type.cast(Proxy.newProxyInstance(type.getClassLoader(), new Class<?>[]{type}, invocationHandler));
-        }
-
-        private static Object defaultValue(Class<?> type) {
-            if (Boolean.TYPE.equals(type)) {
-                return false;
-            }
-            if (Byte.TYPE.equals(type)) {
-                return (byte) 0;
-            }
-            if (Short.TYPE.equals(type)) {
-                return (short) 0;
-            }
-            if (Integer.TYPE.equals(type)) {
-                return 0;
-            }
-            if (Long.TYPE.equals(type)) {
-                return 0L;
-            }
-            if (Float.TYPE.equals(type)) {
-                return 0f;
-            }
-            if (Double.TYPE.equals(type)) {
-                return 0.0d;
-            }
-            if (Character.TYPE.equals(type)) {
-                return '\0';
-            }
-            return null;
         }
     }
 

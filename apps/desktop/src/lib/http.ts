@@ -49,6 +49,7 @@ import type {
   DriverInstallProgress,
   JavaRuntimeConfig,
   UpdateInfo,
+  UpdateDownloadSource,
   RedisDatabaseInfo,
   RedisValue,
   RedisScanResult,
@@ -57,6 +58,7 @@ import type {
   RedisNodeEndpoint,
   KvValue,
   KvListPrefixResponse,
+  KvListPrefixOptions,
   KvGetResponse,
   KvPutOptions,
   KvPutResponse,
@@ -403,6 +405,10 @@ export async function loadSavedSqlLibrary(): Promise<SavedSqlLibrary> {
   return get("/api/saved-sql");
 }
 
+export async function loadSavedSqlFile(id: string): Promise<SavedSqlFile | null> {
+  return get(`/api/saved-sql/${encodeURIComponent(id)}`);
+}
+
 export async function saveSavedSqlFolder(folder: SavedSqlFolder): Promise<SavedSqlFolder> {
   return post("/api/saved-sql/folders", folder);
 }
@@ -525,6 +531,10 @@ export async function getObjectSource(connectionId: string, database: string, sc
 
 export async function getColumns(connectionId: string, database: string, schema: string, table: string): Promise<ColumnInfo[]> {
   return get(`/api/schema/columns?${qs({ connection_id: connectionId, database, schema, table })}`);
+}
+
+export async function listDataTypes(connectionId: string, database: string): Promise<string[]> {
+  return get(`/api/schema/data-types?${qs({ connection_id: connectionId, database })}`);
 }
 
 export async function listIndexes(connectionId: string, database: string, schema: string, table: string): Promise<IndexInfo[]> {
@@ -1143,7 +1153,7 @@ export async function startTransfer(request: TransferRequest, onProgress: (progr
     es.onmessage = (e) => {
       const progress: TransferProgress = JSON.parse(e.data);
       onProgress(progress);
-      if (progress.status === "done" || progress.status === "cancelled") {
+      if (progress.status === "done" || progress.status === "error" || progress.status === "cancelled") {
         es.close();
         resolve();
       }
@@ -1597,8 +1607,8 @@ export async function etcdDelete(connectionId: string, key: string): Promise<KvD
 // ZooKeeper
 // ---------------------------------------------------------------------------
 
-export async function zookeeperListPrefix(connectionId: string, prefix: string, limit: number, continuation?: string | null): Promise<KvListPrefixResponse> {
-  return post("/api/zookeeper/list-prefix", { connectionId, prefix, limit, continuation });
+export async function zookeeperListPrefix(connectionId: string, prefix: string, limit: number, continuation?: string | null, options?: KvListPrefixOptions | null): Promise<KvListPrefixResponse> {
+  return post("/api/zookeeper/list-prefix", { connectionId, prefix, limit, continuation, recursive: options?.recursive ?? null });
 }
 
 export async function zookeeperGet(connectionId: string, key: string): Promise<KvGetResponse> {
@@ -1804,6 +1814,10 @@ export async function installMcpServer(): Promise<string> {
 
 export async function getSystemProxyUrl(): Promise<string | null> {
   return null;
+}
+
+export async function downloadAndInstallUpdate(_source: UpdateDownloadSource, _latestVersion?: string): Promise<void> {
+  throw new Error("In-app update installation is only available in the desktop app.");
 }
 
 export async function getAppVersion(): Promise<string> {

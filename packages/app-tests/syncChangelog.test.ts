@@ -1,7 +1,16 @@
 import { strict as assert } from "node:assert";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { test } from "vitest";
 
-const syncChangelog = await import("../../.github/scripts/sync-changelog.mjs");
+const syncChangelog = await importScript(".github/scripts/sync-changelog.mjs");
+
+function importScript(path: string): Promise<Record<string, unknown>> {
+  const source = readFileSync(resolve(path), "utf8")
+    .replace(/^#!.*\r?\n/, "")
+    .replace("if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1]))", "if (false)");
+  return import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
+}
 
 test("translateToEnglish reuses cached release translations when source hash is unchanged", async () => {
   const cnJson = syncChangelog.buildReleasesJson(

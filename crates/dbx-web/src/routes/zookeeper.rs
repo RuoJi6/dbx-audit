@@ -28,6 +28,7 @@ pub struct ZooKeeperListPrefixRequest {
     pub prefix: String,
     pub limit: usize,
     pub continuation: Option<String>,
+    pub recursive: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -50,12 +51,13 @@ pub async fn list_prefix(
     State(state): State<Arc<WebState>>,
     Json(req): Json<ZooKeeperListPrefixRequest>,
 ) -> Result<Json<dbx_core::agent_kv::KvListPrefixResponse>, AppError> {
-    let result = dbx_core::agent_kv::kv_list_prefix_core(
+    let result = dbx_core::agent_kv::kv_list_prefix_core_with_options(
         &state.app,
         &req.connection_id,
         &req.prefix,
         req.limit,
         req.continuation.as_deref(),
+        req.recursive,
     )
     .await
     .map_err(AppError)?;

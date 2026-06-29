@@ -23,9 +23,10 @@ export type ObjectBrowserSortDirection = "asc" | "desc";
 
 export function normalizeObjectBrowserType(type: string): ObjectBrowserRow["type"] {
   const value = type.toUpperCase();
-  if (value.includes("PACKAGE BODY") || value.includes("PACKAGE_BODY")) return "PACKAGE_BODY";
-  if (value.includes("PACKAGE")) return "PACKAGE";
-  if (value.includes("MATERIALIZED_VIEW")) return "MATERIALIZED_VIEW";
+  const normalized = value.replace(/[\s-]+/g, "_");
+  if (normalized.includes("PACKAGE_BODY")) return "PACKAGE_BODY";
+  if (normalized.includes("PACKAGE")) return "PACKAGE";
+  if (normalized.includes("MATERIALIZED_VIEW")) return "MATERIALIZED_VIEW";
   if (value.includes("VIEW")) return "VIEW";
   if (value.includes("SEQ")) return "SEQUENCE";
   if (value.includes("PROC")) return "PROCEDURE";

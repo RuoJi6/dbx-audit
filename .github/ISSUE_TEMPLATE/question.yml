@@ -1,8 +1,38 @@
 name: "❓ Question / 问题咨询"
 description: Usage questions, configuration issues, or feedback you're not sure is a bug. / 使用疑问、配置问题或不确定是否为 bug 的反馈。
-title: "[❓ Question] "
+title: "[Question] "
 labels: ["question"]
 body:
+  - type: input
+    id: database
+    attributes:
+      label: 数据库类型和版本
+      description: 如果问题与数据库无关，请填写“无关”。否则请注明数据库类型、版本或发行版。
+      placeholder: "例如：PostgreSQL 16.2 / MySQL 8.0 / Redis 7.2 / 无关"
+    validations:
+      required: true
+
+  - type: input
+    id: app-version
+    attributes:
+      label: DBX 版本
+      placeholder: "例如：v0.1.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: 操作系统
+      multiple: true
+      options:
+        - macOS
+        - Windows
+        - Linux
+        - 其他
+    validations:
+      required: true
+
   - type: textarea
     id: goal
     attributes:
@@ -16,8 +46,7 @@ body:
     id: context
     attributes:
       label: 环境信息
-      description: 数据库类型和版本、操作系统、DBX 版本等。
+      description: 连接方式、特殊环境、已尝试的排查方式等。
       placeholder: |
-        DBX 版本：
-        操作系统：
-        数据库：
+        连接方式：
+        补充环境：

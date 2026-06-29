@@ -7,6 +7,7 @@ import Database from "better-sqlite3";
 import { sqlSafetyFromEnv } from "./sql-safety.js";
 import { isDirectQueryType } from "./diagnostics.js";
 import { bridgePortFilePath } from "./paths.js";
+import { parseRedisCommandArgv, classifyRedisCommand, type RedisCommandOptions, type RedisCommandResult, type RedisCommandSafety } from "./redis-command.js";
 
 export interface TableInfo {
   name: string;
@@ -169,6 +170,11 @@ function firstProxyLayer(config: ConnectionConfig): ProxyLayer | undefined {
   return config.transport_layers?.find((layer): layer is ProxyLayer => layer.type === "proxy" && layer.enabled !== false && !!layer.host);
 }
 
+function hasDirectRedisSupport(config: ConnectionConfig): boolean {
+  const mode = config.redis_connection_mode || "standalone";
+  return config.db_type === "redis" && mode === "standalone" && !hasActiveSshLayer(config);
+}
+
 async function connectionEndpoint(config: ConnectionConfig): Promise<{ host: string; port: number }> {
   const proxy = firstProxyLayer(config);
   if (!proxy) return { host: config.host, port: config.port };
@@ -291,6 +297,10 @@ function decodeUrlParamPart(value: string): string {
   } catch {
     return value;
   }
+}
+
+function urlParams(config: ConnectionConfig): URLSearchParams {
+  return new URLSearchParams((config.url_params || "").trim().replace(/^\?/, ""));
 }
 
 function connectViaProxy(config: ConnectionConfig, proxy: ProxyLayer): Promise<Socket> {
@@ -657,6 +667,96 @@ export async function executeQuery(config: ConnectionConfig, sql: string, option
     resolveTimeoutMs(options),
   );
   return convertBridgeQueryResult(result, options);
+}
+
+export async function executeRedisCommand(config: ConnectionConfig, db: number, command: string, options?: RedisCommandOptions): Promise<RedisCommandResult> {
+  if (config.db_type !== "redis") {
+    throw new Error("Connection is not Redis.");
+  }
+  if (hasDirectRedisSupport(config)) {
+    return executeRedisCommandDirect(config, db, command, options);
+  }
+  return withTimeout(
+    bridgeDataRequest<RedisCommandResult>("/data/redis/execute-command", {
+      connection_name: config.name,
+      db,
+      command,
+      skip_safety_check: options?.skipSafetyCheck ?? false,
+    }),
+    resolveTimeoutMs(options),
+  );
+}
+
+async function executeRedisCommandDirect(config: ConnectionConfig, db: number, commandText: string, options?: RedisCommandOptions): Promise<RedisCommandResult> {
+  const argv = parseRedisCommandArgv(commandText);
+  const command = argv[0].toUpperCase();
+  const safety = classifyRedisCommand(command) as RedisCommandSafety;
+  if (!options?.skipSafetyCheck && safety === "blocked") {
+    throw new Error(`Redis command is blocked for safety: ${command}`);
+  }
+
+  const { Redis } = await import("ioredis");
+  const endpoint = await connectionEndpoint(config);
+  const tls = await redisTlsOptions(config);
+  const client = new Redis({
+    host: endpoint.host,
+    port: endpoint.port,
+    username: config.username || undefined,
+    password: config.password || undefined,
+    db,
+    tls,
+    lazyConnect: true,
+    enableReadyCheck: false,
+    maxRetriesPerRequest: 0,
+    enableOfflineQueue: false,
+    connectTimeout: Math.min(resolveTimeoutMs(options), 10_000),
+    commandTimeout: resolveTimeoutMs(options),
+  });
+
+  try {
+    await client.connect();
+    const value = await client.call(command, ...argv.slice(1));
+    return { command, safety, value: redisValueToJson(value) };
+  } finally {
+    client.disconnect();
+  }
+}
+
+async function redisTlsOptions(config: ConnectionConfig): Promise<import("node:tls").ConnectionOptions | undefined> {
+  if (!config.ssl) return undefined;
+  const params = urlParams(config);
+  const tls: import("node:tls").ConnectionOptions = {
+    servername: config.host,
+  };
+  if ((params.get("insecure") || "").toLowerCase() === "true") {
+    tls.rejectUnauthorized = false;
+  }
+  if (config.ca_cert_path) tls.ca = await readFile(config.ca_cert_path);
+  if (config.client_cert_path) tls.cert = await readFile(config.client_cert_path);
+  if (config.client_key_path) tls.key = await readFile(config.client_key_path);
+  return tls;
+}
+
+function redisValueToJson(value: unknown): unknown {
+  if (Buffer.isBuffer(value)) return redisTextToJson(value.toString("utf8"));
+  if (Array.isArray(value)) return value.map(redisValueToJson);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, redisValueToJson(item)]));
+  }
+  if (typeof value === "string") return redisTextToJson(value);
+  return value;
+}
+
+function redisTextToJson(value: string): unknown {
+  const trimmed = value.trim();
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    try {
+      return JSON.parse(trimmed);
+    } catch {
+      return value;
+    }
+  }
+  return value;
 }
 
 export async function listTables(config: ConnectionConfig, schema?: string): Promise<TableInfo[]> {

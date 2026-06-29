@@ -466,6 +466,29 @@ final class ZooKeeperAgentTest {
     }
 
     @Test
+    void listPrefixPaginatesDirectChildrenWhenRecursiveIsFalse() throws Exception {
+        try (TestingServer server = new TestingServer()) {
+            connect(server);
+            result(request(2, "kv_put", "{\"key\":\"/app/c/deep\",\"value\":{\"encoding\":\"utf8\",\"data\":\"c\"}}"));
+            result(request(3, "kv_put", "{\"key\":\"/app/a/deep\",\"value\":{\"encoding\":\"utf8\",\"data\":\"a\"}}"));
+            result(request(4, "kv_put", "{\"key\":\"/app/b/deep\",\"value\":{\"encoding\":\"utf8\",\"data\":\"b\"}}"));
+
+            JsonObject first = result(request(5, "kv_list_prefix", "{\"prefix\":\"/app\",\"recursive\":false,\"limit\":2}"));
+            String continuation = first.get("continuation").getAsString();
+            JsonObject second = result(request(
+                6,
+                "kv_list_prefix",
+                "{\"prefix\":\"/app\",\"recursive\":false,\"limit\":2,\"continuation\":\"" + continuation + "\"}"
+            ));
+
+            Assertions.assertEquals(List.of("/app/a", "/app/b"), listedKeys(first));
+            Assertions.assertFalse(continuation.isBlank());
+            Assertions.assertEquals(List.of("/app/c"), listedKeys(second));
+            Assertions.assertTrue(second.get("continuation").isJsonNull());
+        }
+    }
+
+    @Test
     void listPrefixRejectsContinuationForDifferentRequest() throws Exception {
         try (TestingServer server = new TestingServer()) {
             connect(server);

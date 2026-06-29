@@ -432,10 +432,17 @@ export interface AiMessage {
   content: string;
 }
 
+export interface AiTaskContract {
+  action?: string;
+  mode?: string;
+  userRequest?: string;
+}
+
 export interface AiCompletionRequest {
   config: AiConfig;
   systemPrompt: string;
   messages: AiMessage[];
+  taskContract?: AiTaskContract;
   maxTokens?: number;
   temperature?: number;
 }
@@ -740,6 +747,10 @@ export async function listSchemaInfos(connectionId: string, database: string): P
 
 export async function getColumns(connectionId: string, database: string, schema: string, table: string): Promise<ColumnInfo[]> {
   return invoke("get_columns", { connectionId, database, schema, table });
+}
+
+export async function listDataTypes(connectionId: string, database: string): Promise<string[]> {
+  return invoke("list_data_types", { connectionId, database });
 }
 
 export async function executeQuery(
@@ -1213,6 +1224,10 @@ export async function loadSavedSqlLibrary(): Promise<SavedSqlLibrary> {
   return invoke("load_saved_sql_library");
 }
 
+export async function loadSavedSqlFile(id: string): Promise<SavedSqlFile | null> {
+  return invoke("load_saved_sql_file", { id });
+}
+
 export async function saveSavedSqlFolder(folder: SavedSqlFolder): Promise<SavedSqlFolder> {
   return invoke("save_saved_sql_folder", { folder });
 }
@@ -1272,6 +1287,13 @@ export interface UpdateInfo {
   release_notes: string;
 }
 
+export type UpdateDownloadSource = "official" | "cnb";
+
+export interface UpdateDownloadProgress {
+  downloaded: number;
+  total: number | null;
+}
+
 export interface McpServerStatus {
   installed: boolean;
   npm_available: boolean;
@@ -1299,6 +1321,10 @@ export async function checkForUpdates(): Promise<UpdateInfo> {
 
 export async function getSystemProxyUrl(): Promise<string | null> {
   return invoke("get_system_proxy_url");
+}
+
+export async function downloadAndInstallUpdate(source: UpdateDownloadSource, latestVersion?: string): Promise<void> {
+  return invoke("download_and_install_update", { source, latestVersion });
 }
 
 export async function getAppVersion(): Promise<string> {
@@ -1504,6 +1530,10 @@ export interface KvListPrefixResponse {
   revision?: number | null;
 }
 
+export interface KvListPrefixOptions {
+  recursive?: boolean | null;
+}
+
 export interface KvGetResponse {
   found: boolean;
   key?: string | null;
@@ -1549,8 +1579,8 @@ export async function etcdDelete(connectionId: string, key: string): Promise<KvD
 }
 
 // --- ZooKeeper ---
-export async function zookeeperListPrefix(connectionId: string, prefix: string, limit: number, continuation?: string | null): Promise<KvListPrefixResponse> {
-  return invoke("zookeeper_list_prefix", { connectionId, prefix, limit, continuation });
+export async function zookeeperListPrefix(connectionId: string, prefix: string, limit: number, continuation?: string | null, options?: KvListPrefixOptions | null): Promise<KvListPrefixResponse> {
+  return invoke("zookeeper_list_prefix", { connectionId, prefix, limit, continuation, recursive: options?.recursive ?? null });
 }
 
 export async function zookeeperGet(connectionId: string, key: string): Promise<KvGetResponse> {
@@ -1780,7 +1810,7 @@ export async function startTransfer(request: TransferRequest, onProgress: (progr
         unlisten = await listen<TransferProgress>("transfer-progress", (event) => {
           if (event.payload.transferId !== request.transferId) return;
           onProgress(event.payload);
-          if (event.payload.status === "done" || event.payload.status === "cancelled") {
+          if (event.payload.status === "done" || event.payload.status === "error" || event.payload.status === "cancelled") {
             unlisten?.();
             resolve();
           }

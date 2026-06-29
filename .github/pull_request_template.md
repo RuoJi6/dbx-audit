@@ -23,11 +23,10 @@
 
 <!-- 说明如何验证你的改动，例如：命令、测试用例、手动操作步骤 -->
 
-- [ ] `pnpm check` 通过
-- [ ] `cargo check --no-default-features` 通过
+- [ ] `make check` 通过
+- [ ] `make cargo-check-fast` 通过
 - [ ] 相关测试通过
 
 ## 关联 Issue
 
 <!-- 如有，填写 `Close #xxx` 或 `Related #xxx` -->
-

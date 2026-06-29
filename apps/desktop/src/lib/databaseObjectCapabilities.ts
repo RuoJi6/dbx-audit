@@ -29,6 +29,7 @@ const DATABASE_TYPE_OBJECTS = new Map<DatabaseType, SidebarObjectKind[]>([
   ["redshift", POSTGRES_LIKE_OBJECTS],
   // oracle
   ["oracle", ORACLE_OBJECTS],
+  ["dameng", ORACLE_OBJECTS],
   ["oceanbase-oracle", ORACLE_OBJECTS],
   // table and view
   ["sqlite", TABLE_VIEW_OBJECTS],
@@ -69,9 +70,10 @@ export function sidebarObjectKindsForDatabase(dbType?: DatabaseType): SidebarObj
 
 export function normalizeSidebarObjectKind(type: string): SidebarObjectKind {
   const value = type.toUpperCase();
-  if (value.includes("PACKAGE BODY") || value.includes("PACKAGE_BODY")) return "PACKAGE_BODY";
-  if (value.includes("PACKAGE")) return "PACKAGE";
-  if (value.includes("MATERIALIZED_VIEW")) return "MATERIALIZED_VIEW";
+  const normalized = value.replace(/[\s-]+/g, "_");
+  if (normalized.includes("PACKAGE_BODY")) return "PACKAGE_BODY";
+  if (normalized.includes("PACKAGE")) return "PACKAGE";
+  if (normalized.includes("MATERIALIZED_VIEW")) return "MATERIALIZED_VIEW";
   if (value.includes("VIEW")) return "VIEW";
   if (value.includes("SEQ")) return "SEQUENCE";
   if (value.includes("PROC")) return "PROCEDURE";

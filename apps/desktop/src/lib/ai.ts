@@ -6,6 +6,7 @@ import { currentLocale, type Locale } from "@/i18n";
 import { aiTableMentionKey, type AiTableMention } from "@/lib/aiTableMentions";
 import { aiSkillForAction } from "@/lib/aiSkills";
 import { isSchemaAware } from "@/lib/databaseCapabilities";
+import { effectiveDatabaseTypeForConnection } from "@/lib/jdbcDialect";
 
 import type { AgentEvent } from "@/lib/tauri";
 
@@ -47,33 +48,39 @@ export interface AiRequestInput {
   context: AiContext;
 }
 
-function buildAgentRequest(input: AiRequestInput, history?: api.AiMessage[]): { messages: api.AiMessage[]; systemPrompt: string; maxTokens: number; temperature: number } {
+function buildAgentRequest(input: AiRequestInput, history?: api.AiMessage[]): { messages: api.AiMessage[]; systemPrompt: string; taskContract: api.AiTaskContract; maxTokens: number; temperature: number } {
   const isZh = isChineseLocale(currentLocale());
   const skill = aiSkillForAction(input.action);
   const systemPrompt = buildSystemPrompt(input.action, input.context, input.mode);
   const instruction = isZh ? skill.userInstruction.zh : skill.userInstruction.en;
   const userPrompt = [`Action: ${input.action}`, instruction, "", "User request:", input.instruction.trim() || "(No extra instruction provided.)"].join("\n");
+  const taskContract: api.AiTaskContract = {
+    action: input.action,
+    mode: input.mode || "ask",
+    userRequest: input.instruction.trim(),
+  };
 
   const messages: api.AiMessage[] = [...(history || []), { role: "user", content: userPrompt }];
 
   const params = actionParams(input.action);
   const maxTokens = input.config.enableThinking ? Math.max(params.maxTokens, 8192) : params.maxTokens;
-  return { messages, systemPrompt, maxTokens, temperature: params.temperature };
+  return { messages, systemPrompt, taskContract, maxTokens, temperature: params.temperature };
 }
 
 export async function runAiAction(input: AiRequestInput, history?: api.AiMessage[]): Promise<string> {
-  const { messages, systemPrompt, maxTokens, temperature } = buildAgentRequest(input, history);
+  const { messages, systemPrompt, taskContract, maxTokens, temperature } = buildAgentRequest(input, history);
   return api.aiComplete({
     config: input.config,
     systemPrompt,
     messages,
+    taskContract,
     maxTokens,
     temperature,
   });
 }
 
 export async function runAiStream(input: AiRequestInput, history: api.AiMessage[] | undefined, onDelta: (delta: string) => void, sessionId?: string, onReasoningDelta?: (delta: string) => void): Promise<void> {
-  const { messages, systemPrompt, maxTokens, temperature } = buildAgentRequest(input, history);
+  const { messages, systemPrompt, taskContract, maxTokens, temperature } = buildAgentRequest(input, history);
   const sid = sessionId || uuid();
 
   await api.aiStream(
@@ -82,6 +89,7 @@ export async function runAiStream(input: AiRequestInput, history: api.AiMessage[
       config: input.config,
       systemPrompt,
       messages,
+      taskContract,
       maxTokens,
       temperature,
     },
@@ -95,7 +103,7 @@ export async function runAiStream(input: AiRequestInput, history: api.AiMessage[
 }
 
 export async function runAgentStream(input: AiRequestInput, history: api.AiMessage[] | undefined, onEvent: (event: AgentEvent) => void, sessionId?: string): Promise<string> {
-  const { messages, systemPrompt, maxTokens, temperature } = buildAgentRequest(input, history);
+  const { messages, systemPrompt, taskContract, maxTokens, temperature } = buildAgentRequest(input, history);
   const sid = sessionId || uuid();
 
   return api.aiAgentStream(
@@ -104,6 +112,7 @@ export async function runAgentStream(input: AiRequestInput, history: api.AiMessa
       config: input.config,
       systemPrompt,
       messages,
+      taskContract,
       maxTokens,
       temperature,
     },
@@ -178,6 +187,9 @@ function buildBasePromptLines(isZh: boolean): string[] {
     isZh ? "你是 DBX 内置的数据库助手。用中文回复。" : "You are DBX's built-in database assistant. Reply in English.",
     isZh ? "精确、保守，根据当前数据库方言生成 SQL。" : "Be precise, conservative, and adapt SQL to the active database dialect.",
     isZh ? "严格使用当前数据库方言；标识符引用、分页、日期函数、字符串拼接、LIMIT/TOP/OFFSET 语法必须匹配数据库类型。" : "Strictly use the active database dialect; identifier quoting, pagination, date functions, string concatenation, and LIMIT/TOP/OFFSET syntax must match the database type.",
+    isZh
+      ? '标识符引用必须匹配当前连接类型：MySQL/MariaDB 用反引号 `name`，PostgreSQL/SQLite/Oracle 等用双引号 "name"，SQL Server 用方括号 [name]；不要因为用户口头提到其他数据库而切换方言。'
+      : 'Identifier quoting must match the active connection type: MySQL/MariaDB use backticks `name`, PostgreSQL/SQLite/Oracle and similar dialects use double quotes "name", and SQL Server uses brackets [name]. Do not switch dialects merely because the user mentions another database in prose.',
     isZh
       ? "对于普通数据查询，优先使用下面已加载的 Schema 上下文，不要为了重复确认已给出的结构而查询 information_schema 或系统表。但当用户询问某表的字段详情、列信息时，应使用 get_columns 工具获取最权威完整的定义。"
       : "For ordinary data queries, prefer the loaded schema context below. Do not query information_schema or system tables merely to rediscover structure already provided. However, when the user asks for detailed column/field information of a specific table, use the get_columns tool for the authoritative and complete definition.",
@@ -262,6 +274,7 @@ function formatSchema(context: AiContext): string {
 export async function buildAiContext(tab: QueryTab, connection: ConnectionConfig, options: { maxTables?: number; maxColumnsPerTable?: number; mentionedTables?: AiTableMention[] } = {}): Promise<AiContext> {
   const maxTables = options.maxTables ?? 50;
   const maxColumnsPerTable = options.maxColumnsPerTable ?? 40;
+  const databaseType = aiDatabaseTypeForConnection(connection);
   const tables: AiSchemaTable[] = [];
   const tableKeys = new Set<string>();
   let truncated = false;
@@ -310,7 +323,7 @@ export async function buildAiContext(tab: QueryTab, connection: ConnectionConfig
               api.listIndexes(tab.connectionId, tab.database, schema, table.name).catch(() => [] as IndexInfo[]),
               api.listForeignKeys(tab.connectionId, tab.database, schema, table.name).catch(() => [] as ForeignKeyInfo[]),
             ]).then(([columns, indexes, foreignKeys]) => ({
-              schema: schema === tab.database && !isSchemaAware(connection.db_type) ? undefined : schema,
+              schema: schema === tab.database && !isSchemaAware(databaseType) ? undefined : schema,
               name: table.name,
               tableType: table.table_type,
               comment: table.comment,
@@ -340,7 +353,7 @@ export async function buildAiContext(tab: QueryTab, connection: ConnectionConfig
   return {
     connectionId: tab.connectionId,
     connectionName: connection.name,
-    databaseType: connection.db_type,
+    databaseType,
     database: tab.database,
     currentSql: tab.sql,
     lastError: extractLastError(tab.result),
@@ -352,6 +365,7 @@ export async function buildAiContext(tab: QueryTab, connection: ConnectionConfig
 }
 
 async function loadMentionedTableContext(tab: QueryTab, connection: ConnectionConfig, mention: AiTableMention, maxColumnsPerTable: number): Promise<AiSchemaTable | undefined> {
+  const databaseType = aiDatabaseTypeForConnection(connection);
   const schema = await resolveMentionedTableSchema(tab, connection, mention);
   const [columns, indexes, foreignKeys, tableComment] = await Promise.all([
     api.getColumns(tab.connectionId, tab.database, schema, mention.table),
@@ -360,7 +374,7 @@ async function loadMentionedTableContext(tab: QueryTab, connection: ConnectionCo
     loadTableComment(tab.connectionId, tab.database, schema, mention.table).catch(() => undefined),
   ]);
   return {
-    schema: schema === tab.database && !isSchemaAware(connection.db_type) ? undefined : schema,
+    schema: schema === tab.database && !isSchemaAware(databaseType) ? undefined : schema,
     name: mention.table,
     tableType: "TABLE",
     comment: tableComment,
@@ -380,7 +394,7 @@ async function resolveMentionedTableSchema(tab: QueryTab, connection: Connection
   if (tab.tableMeta?.tableName.toLowerCase() === mention.table.toLowerCase() && tab.tableMeta.schema) {
     return tab.tableMeta.schema;
   }
-  if (isSchemaAware(connection.db_type)) {
+  if (isSchemaAware(aiDatabaseTypeForConnection(connection))) {
     const schemas = await loadCandidateSchemas(tab, connection);
     for (const schema of schemas) {
       const tables = await api.listTables(tab.connectionId, tab.database, schema, mention.table, 10).catch(() => []);
@@ -391,11 +405,15 @@ async function resolveMentionedTableSchema(tab: QueryTab, connection: Connection
 }
 
 async function loadCandidateSchemas(tab: QueryTab, connection: ConnectionConfig): Promise<string[]> {
-  if (isSchemaAware(connection.db_type)) {
+  if (isSchemaAware(aiDatabaseTypeForConnection(connection))) {
     const schemas = await api.listSchemas(tab.connectionId, tab.database);
     return prioritizeSchemas(schemas);
   }
   return [tab.database || connection.database || "main"];
+}
+
+function aiDatabaseTypeForConnection(connection: ConnectionConfig): DatabaseType {
+  return effectiveDatabaseTypeForConnection(connection) ?? connection.db_type;
 }
 
 function prioritizeSchemas(schemas: string[]): string[] {

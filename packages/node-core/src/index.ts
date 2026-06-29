@@ -6,5 +6,6 @@ export * from "./diagnostics.js";
 export * from "./entrypoint.js";
 export * from "./format.js";
 export * from "./paths.js";
+export * from "./redis-command.js";
 export * from "./schema-context.js";
 export * from "./sql-safety.js";

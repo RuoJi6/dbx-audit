@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use crate::connection::{AppState, PoolKind};
 use crate::database_capabilities;
 use crate::db;
-use crate::models::connection::DatabaseType;
+use crate::models::connection::{ConnectionConfig, DatabaseType};
 #[cfg(feature = "duckdb-bundled")]
 use crate::sql::starts_with_duckdb_result_sql_keyword;
 use crate::sql::{split_sql_batches, split_sql_statements};
@@ -36,6 +36,54 @@ pub enum PoolErrorAction {
     Keep,
     Discard,
     ReconnectAndRetry,
+}
+
+/// Unified database operation execution budget.
+/// query_timeout = None only means SQL execution has no upper limit;
+/// checkout/connect/recycle/cancel/cleanup always have hard upper limits and cannot be disabled.
+#[derive(Debug, Clone)]
+pub struct DbOperationBudget {
+    pub checkout_timeout: Duration,
+    pub connect_timeout: Duration,
+    pub recycle_timeout: Duration,
+    pub query_timeout: Option<Duration>,
+    pub cancel_timeout: Duration,
+    pub cleanup_timeout: Duration,
+}
+
+impl DbOperationBudget {
+    /// Build an execution budget from connection config.
+    /// checkout/connect/recycle use connect_timeout_secs (clamped to 1s minimum, 300s maximum).
+    /// query_timeout follows resolve_query_timeout semantics (Some(0) -> None).
+    /// cancel/cleanup are fixed values and cannot be disabled.
+    pub fn from_config(connect_timeout_secs: u64, query_timeout_secs: Option<u64>) -> Self {
+        let infra_timeout = Duration::from_secs(connect_timeout_secs.clamp(1, 300));
+        Self {
+            checkout_timeout: infra_timeout,
+            connect_timeout: infra_timeout,
+            recycle_timeout: infra_timeout,
+            query_timeout: resolve_query_timeout(query_timeout_secs),
+            cancel_timeout: Duration::from_secs(5),
+            cleanup_timeout: Duration::from_secs(3),
+        }
+    }
+
+    pub fn from_connection_config(config: &ConnectionConfig) -> Self {
+        Self::from_config(config.effective_connect_timeout_secs(), Some(config.query_timeout_secs))
+    }
+
+    /// Use global default values (when no connection config is available).
+    pub fn with_defaults() -> Self {
+        let default_infra = db::connection_timeout();
+        Self {
+            checkout_timeout: default_infra,
+            connect_timeout: default_infra,
+            recycle_timeout: default_infra,
+            query_timeout: Some(QUERY_TIMEOUT),
+            cancel_timeout: Duration::from_secs(5),
+            cleanup_timeout: Duration::from_secs(3),
+        }
+    }
 }
 
 /// Check read-only protection for a connection, blocking write SQL statements.
@@ -656,6 +704,7 @@ pub fn is_connection_error(err: &str) -> bool {
         || lower.contains("broken pipe")
         || lower.contains("reset by peer")
         || lower.contains("timed out")
+        || (lower.contains("pool") && lower.contains("timeout"))
         || lower.contains("closed")
         || lower.contains("关闭的连接")
         || lower.contains("连接已关闭")
@@ -680,6 +729,10 @@ fn is_agent_rpc_timeout_error(lower: &str) -> bool {
     lower.starts_with("agent rpc call timed out ")
 }
 
+fn is_schema_reset_cleanup_error(lower: &str) -> bool {
+    lower.contains("schema.reset cleanup failed")
+}
+
 fn should_discard_agent_pool_after_error(err: &str) -> bool {
     let lower = err.to_lowercase();
     is_dbx_query_timeout_error(&lower)
@@ -695,6 +748,7 @@ pub fn pool_error_action(db_type: Option<DatabaseType>, err: &str) -> PoolErrorA
     let lower = err.to_lowercase();
     if db::sqlserver::is_driver_panic_error(err)
         || (is_dbx_query_timeout_error(&lower) && should_discard_pool_after_query_timeout(db_type))
+        || is_schema_reset_cleanup_error(&lower)
         || (db_type.is_some_and(|db_type| database_capabilities::is_agent_type(&db_type))
             && should_discard_agent_pool_after_error(err)
             && !is_connection_error(err))
@@ -824,6 +878,23 @@ fn resolve_query_timeout(timeout_secs: Option<u64>) -> Option<Duration> {
     }
 }
 
+async fn operation_budget_for_pool_key(
+    state: &AppState,
+    pool_key: &str,
+    query_timeout: Option<Duration>,
+) -> DbOperationBudget {
+    let mut budget = configured_operation_budget_for_pool_key(state, pool_key).await;
+    budget.query_timeout = query_timeout;
+    budget
+}
+
+async fn configured_operation_budget_for_pool_key(state: &AppState, pool_key: &str) -> DbOperationBudget {
+    let configs = state.configs.read().await;
+    crate::connection::config_for_pool_key(pool_key, &configs)
+        .map(DbOperationBudget::from_connection_config)
+        .unwrap_or_else(DbOperationBudget::with_defaults)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn do_execute(
     state: &AppState,
@@ -851,6 +922,7 @@ pub async fn do_execute(
         let conn_name = config.filter(|c| c.read_only).map(|c| c.name.clone());
         (attached, conn_name)
     };
+    let operation_budget = operation_budget_for_pool_key(state, pool_key, query_timeout).await;
     if let Some(name) = conn_name_if_readonly {
         crate::query_execution_sql::check_read_only(sql, &name)?;
     }
@@ -889,7 +961,21 @@ pub async fn do_execute(
             let bare = *mode == crate::connection::MysqlMode::Bare;
             let max_rows = options.max_rows;
             drop(connections);
-            let mut conn = db::mysql::get_conn_with_health_check(&p).await?;
+            let mut conn = match db::mysql::get_conn_with_health_check_with_cancel(
+                &p,
+                operation_budget.checkout_timeout,
+                operation_budget.cleanup_timeout,
+                cancel_token.as_ref(),
+            )
+            .await
+            {
+                Ok(conn) => conn,
+                Err(err) if err == QUERY_CANCELED => {
+                    state.remove_pool_by_key(pool_key).await;
+                    return Err(err);
+                }
+                Err(err) => return Err(err),
+            };
             let connection_id = conn.id();
             if let Some(ref execution_id) = options.execution_id {
                 let kill_opts = conn.opts().clone();
@@ -913,7 +999,7 @@ pub async fn do_execute(
             let p = p.clone();
             let schema = schema.map(|s| s.to_string());
             let max_rows = options.max_rows;
-            let query_timeout = query_timeout;
+            let cancel_context = state.get_postgres_cancel_context(pool_key).await;
             drop(connections);
             if let Some(schema) = schema {
                 db::postgres::execute_query_with_schema_and_max_rows_and_cancel(
@@ -922,12 +1008,20 @@ pub async fn do_execute(
                     sql,
                     max_rows,
                     cancel_token,
-                    query_timeout,
+                    operation_budget.clone(),
+                    cancel_context,
                 )
                 .await
             } else {
-                db::postgres::execute_query_with_max_rows_and_cancel(&p, sql, max_rows, cancel_token, query_timeout)
-                    .await
+                db::postgres::execute_query_with_max_rows_and_cancel(
+                    &p,
+                    sql,
+                    max_rows,
+                    cancel_token,
+                    operation_budget.clone(),
+                    cancel_context,
+                )
+                .await
             }
         }
         PoolKind::Sqlite(p) => {
@@ -1553,12 +1647,21 @@ async fn execute_multi_mysql(
     options: QueryExecutionOptions,
 ) -> Result<Vec<db::QueryResult>, String> {
     let query_timeout = resolve_query_timeout(options.timeout_secs);
+    let operation_budget = operation_budget_for_pool_key(state, pool_key, query_timeout).await;
     let bare = mode == crate::connection::MysqlMode::Bare;
     let max_rows = options.max_rows;
-    let mut conn = match db::mysql::get_conn_with_health_check(pool).await {
+    let mut conn = match db::mysql::get_conn_with_health_check_with_cancel(
+        pool,
+        operation_budget.checkout_timeout,
+        operation_budget.cleanup_timeout,
+        cancel_token.as_ref(),
+    )
+    .await
+    {
         Ok(conn) => conn,
         Err(err) => {
             if matches!(pool_error_action(db_type, &err), PoolErrorAction::Discard | PoolErrorAction::ReconnectAndRetry)
+                || err == QUERY_CANCELED
             {
                 state.remove_pool_by_key(pool_key).await;
             }
@@ -1731,6 +1834,50 @@ pub async fn execute_statements(
     let start = std::time::Instant::now();
     let mysql_dialect = connection_mysql_query_dialect(state, connection_id).await;
 
+    let agent_client = {
+        let conns = state.connections.read().await;
+        match conns.get(&pool_key) {
+            Some(PoolKind::Agent(client)) => Some(client.clone()),
+            _ => None,
+        }
+    };
+    if let Some(client) = agent_client {
+        check_read_only_for_connection_multi(state, &pool_key, statements).await?;
+        let db_type = connection_database_type_for_pool_key(state, &pool_key).await;
+        let execution_schema = schema_for_execution_context(db_type, schema);
+        let rewritten_statements;
+        let statements = if matches!(db_type, Some(DatabaseType::Iris)) {
+            rewritten_statements =
+                statements.iter().map(|sql| sql_for_execution_context(db_type, sql, schema)).collect::<Vec<_>>();
+            rewritten_statements.as_slice()
+        } else {
+            statements
+        };
+        let mut client = client.lock().await;
+        let database = if database.trim().is_empty() { None } else { Some(database) };
+        let timeout_duration = timeout_secs.map(Duration::from_secs);
+        let result: Result<db::QueryResult, String> =
+            client.execute_batch(database, statements, execution_schema, timeout_duration).await;
+        match result {
+            Ok(result) => return Ok(db::QueryResult { execution_time_ms: start.elapsed().as_millis(), ..result }),
+            Err(err) => {
+                if err.contains("Unknown method: execute_batch") {
+                    log::warn!(
+                        "Agent does not support execute_batch; falling back to statement-by-statement execution"
+                    );
+                } else {
+                    match pool_error_action(connection_database_type(state, connection_id).await, &err) {
+                        PoolErrorAction::ReconnectAndRetry | PoolErrorAction::Discard => {
+                            let _ = state.remove_pool_by_key(&pool_key).await;
+                        }
+                        PoolErrorAction::Keep => {}
+                    }
+                    return Err(err);
+                }
+            }
+        }
+    }
+
     for (i, sql) in statements.iter().enumerate() {
         match do_execute(
             state,
@@ -1806,6 +1953,7 @@ pub async fn execute_statements_in_transaction(
 
     let start = std::time::Instant::now();
     let db_type = connection_database_type(state, connection_id).await;
+    let operation_budget = configured_operation_budget_for_pool_key(state, &pool_key).await;
 
     // Clone the pool handle within the lock, then drop it before any async work.
     let path = {
@@ -1842,8 +1990,13 @@ pub async fn execute_statements_in_transaction(
     };
 
     let result = match path {
-        Some(TxPath::Pg(pool)) => exec_tx_pg_inner(pool, statements, schema, start).await,
-        Some(TxPath::Mysql(pool, _bare)) => exec_tx_mysql_inner(pool, statements, start).await,
+        Some(TxPath::Pg(pool)) => {
+            let cancel_context = state.get_postgres_cancel_context(&pool_key).await;
+            exec_tx_pg_inner(pool, statements, schema, start, operation_budget.clone(), cancel_context).await
+        }
+        Some(TxPath::Mysql(pool, _bare)) => {
+            exec_tx_mysql_inner(pool, statements, start, operation_budget.clone()).await
+        }
         Some(TxPath::Sqlite(pool)) => exec_tx_sqlite_inner(pool, statements, start).await,
         Some(TxPath::Explicit) => {
             let mysql_dialect = connection_mysql_query_dialect(state, connection_id).await;
@@ -1882,24 +2035,41 @@ async fn exec_tx_pg_inner(
     statements: &[String],
     schema: Option<&str>,
     start: std::time::Instant,
+    budget: DbOperationBudget,
+    cancel_context: Option<db::postgres::PostgresCancelContext>,
 ) -> Result<db::QueryResult, String> {
-    let mut client = pool.get().await.map_err(|e| format!("Failed to acquire connection: {}", e))?;
+    let mut client = db::postgres::checkout_postgres_client(&pool, None, budget.checkout_timeout)
+        .await
+        .map_err(|e| format!("Failed to acquire connection: {}", e))?;
     let had_schema = schema.is_some();
     if let Some(s) = schema {
-        client
-            .execute(&format!("SET search_path TO {}", db::postgres::pg_quote_ident(s)), &[])
-            .await
-            .map_err(|e| format!("SET search_path failed: {}", e))?;
+        db::postgres::execute_postgres_infra_statement(
+            &client,
+            &format!("SET search_path TO {}", db::postgres::pg_quote_ident(s)),
+            budget.recycle_timeout,
+            "schema.set",
+        )
+        .await
+        .map_err(|e| format!("SET search_path failed: {}", e))?;
     }
-    let tx_result = exec_tx_pg_statements(&mut client, statements).await;
+    let tx_result = exec_tx_pg_statements(&mut client, statements, &budget, cancel_context).await;
 
     // Always reset search_path so the connection is clean when returned to the pool
-    if had_schema {
-        let _ = client.execute("RESET search_path", &[]).await;
-    }
+    let reset_result = if had_schema {
+        db::postgres::execute_postgres_infra_statement(
+            &client,
+            "RESET search_path",
+            budget.cleanup_timeout,
+            "schema.reset",
+        )
+        .await
+        .map_err(|err| format!("PostgreSQL schema.reset cleanup failed: {err}"))
+    } else {
+        Ok(0)
+    };
 
-    match tx_result {
-        Ok(total_affected) => Ok(db::QueryResult {
+    match (tx_result, reset_result) {
+        (Ok(total_affected), Ok(_)) => Ok(db::QueryResult {
             columns: vec![],
             column_types: Vec::new(),
             column_sortables: vec![],
@@ -1910,23 +2080,42 @@ async fn exec_tx_pg_inner(
             session_id: None,
             has_more: false,
         }),
-        Err(e) => Err(e),
+        (Err(e), Ok(_)) => Err(e),
+        (Ok(_), Err(reset_err)) => Err(reset_err),
+        (Err(e), Err(reset_err)) => Err(format!("{e}; {reset_err}")),
     }
 }
 
-async fn exec_tx_pg_statements(client: &mut deadpool_postgres::Client, statements: &[String]) -> Result<u64, String> {
-    let tx = client.transaction().await.map_err(|e| format!("Failed to begin transaction: {}", e))?;
+async fn exec_tx_pg_statements(
+    client: &mut deadpool_postgres::Client,
+    statements: &[String],
+    budget: &DbOperationBudget,
+    cancel_context: Option<db::postgres::PostgresCancelContext>,
+) -> Result<u64, String> {
+    let tx = tokio::time::timeout(budget.recycle_timeout, client.transaction())
+        .await
+        .map_err(|_| {
+            format!("Failed to begin transaction: timed out after {} seconds", budget.recycle_timeout.as_secs())
+        })?
+        .map_err(|e| format!("Failed to begin transaction: {}", e))?;
     let mut total_affected: u64 = 0;
     for (i, sql) in statements.iter().enumerate() {
-        match tx.execute(sql, &[]).await {
-            Ok(affected) => total_affected += affected,
-            Err(e) => {
-                // Transaction auto-rollbacks on drop
-                return Err(format!("Statement {} failed: {}", i + 1, e));
-            }
-        }
+        let pg_cancel_token = tx.client().cancel_token();
+        let affected = db::postgres::wait_postgres_operation(
+            pg_cancel_token,
+            cancel_context.clone(),
+            budget.query_timeout,
+            budget.cancel_timeout,
+            async { tx.execute(sql, &[]).await.map_err(|e| e.to_string()) },
+        )
+        .await
+        .map_err(|e| format!("Statement {} failed: {}", i + 1, e))?;
+        total_affected += affected;
     }
-    tx.commit().await.map_err(|e| format!("COMMIT failed: {}", e))?;
+    tokio::time::timeout(budget.cleanup_timeout, tx.commit())
+        .await
+        .map_err(|_| format!("COMMIT timed out after {} seconds", budget.cleanup_timeout.as_secs()))?
+        .map_err(|e| format!("COMMIT failed: {}", e))?;
     Ok(total_affected)
 }
 
@@ -1934,20 +2123,28 @@ async fn exec_tx_mysql_inner(
     pool: mysql_async::Pool,
     statements: &[String],
     start: std::time::Instant,
+    budget: DbOperationBudget,
 ) -> Result<db::QueryResult, String> {
-    let mut conn = db::mysql::get_conn_with_health_check(&pool).await?;
-    conn.query_drop("START TRANSACTION").await.map_err(|e| format!("Failed to begin transaction: {}", e))?;
+    let mut conn = db::mysql::get_conn_with_health_check_with_timeout(&pool, budget.checkout_timeout).await?;
+    mysql_query_drop_with_timeout(
+        &mut conn,
+        "START TRANSACTION",
+        budget.recycle_timeout,
+        "Failed to begin transaction",
+    )
+    .await?;
     let mut total_affected: u64 = 0;
     for (i, sql) in statements.iter().enumerate() {
-        match conn.query_iter(sql).await {
-            Ok(result) => total_affected += result.affected_rows(),
+        match mysql_query_iter_with_timeout(&mut conn, sql, budget.query_timeout).await {
+            Ok(affected) => total_affected += affected,
             Err(e) => {
-                let _ = conn.query_drop("ROLLBACK").await;
+                let _ = mysql_query_drop_with_timeout(&mut conn, "ROLLBACK", budget.cleanup_timeout, "ROLLBACK failed")
+                    .await;
                 return Err(format!("Statement {} failed: {}", i + 1, e));
             }
         }
     }
-    conn.query_drop("COMMIT").await.map_err(|e| format!("COMMIT failed: {}", e))?;
+    mysql_query_drop_with_timeout(&mut conn, "COMMIT", budget.cleanup_timeout, "COMMIT failed").await?;
     Ok(db::QueryResult {
         columns: vec![],
         column_types: Vec::new(),
@@ -1959,6 +2156,33 @@ async fn exec_tx_mysql_inner(
         session_id: None,
         has_more: false,
     })
+}
+
+async fn mysql_query_drop_with_timeout(
+    conn: &mut mysql_async::Conn,
+    sql: &str,
+    timeout_duration: Duration,
+    context: &str,
+) -> Result<(), String> {
+    tokio::time::timeout(timeout_duration, conn.query_drop(sql))
+        .await
+        .map_err(|_| format!("{context}: timed out after {} seconds", timeout_duration.as_secs()))?
+        .map_err(|e| format!("{context}: {e}"))
+}
+
+async fn mysql_query_iter_with_timeout(
+    conn: &mut mysql_async::Conn,
+    sql: &str,
+    timeout_duration: Option<Duration>,
+) -> Result<u64, String> {
+    match timeout_duration {
+        Some(timeout_duration) => tokio::time::timeout(timeout_duration, conn.query_iter(sql))
+            .await
+            .map_err(|_| format!("Query timed out after {} seconds", timeout_duration.as_secs()))?
+            .map(|result| result.affected_rows())
+            .map_err(|e| e.to_string()),
+        None => conn.query_iter(sql).await.map(|result| result.affected_rows()).map_err(|e| e.to_string()),
+    }
 }
 
 async fn exec_tx_sqlite_inner(
@@ -2131,6 +2355,55 @@ mod tests {
     use super::*;
     use crate::models::connection::{default_redis_key_separator, ConnectionConfig, DatabaseType};
 
+    fn test_connection_config(db_type: DatabaseType) -> ConnectionConfig {
+        ConnectionConfig {
+            id: "conn-1".to_string(),
+            name: "Connection".to_string(),
+            db_type,
+            driver_profile: None,
+            driver_label: None,
+            url_params: None,
+            host: "localhost".to_string(),
+            port: 0,
+            username: String::new(),
+            password: String::new(),
+            database: None,
+            visible_databases: None,
+            visible_schemas: None,
+            attached_databases: Vec::new(),
+            color: None,
+            transport_layers: Vec::new(),
+            connect_timeout_secs: 10,
+            query_timeout_secs: 30,
+            idle_timeout_secs: 60,
+            keepalive_interval_secs: 30,
+            ssl: false,
+            ca_cert_path: String::new(),
+            client_cert_path: String::new(),
+            client_key_path: String::new(),
+            sysdba: false,
+            oracle_connection_type: None,
+            connection_string: None,
+            redis_connection_mode: None,
+            redis_sentinel_master: String::new(),
+            redis_sentinel_nodes: String::new(),
+            redis_sentinel_username: String::new(),
+            redis_sentinel_password: String::new(),
+            redis_sentinel_tls: false,
+            redis_cluster_nodes: String::new(),
+            redis_key_separator: default_redis_key_separator(),
+            redis_scan_page_size: None,
+            etcd_endpoints: String::new(),
+            gbase_server: String::new(),
+            informix_server: String::new(),
+            external_config: None,
+            jdbc_driver_class: None,
+            jdbc_driver_paths: Vec::new(),
+            one_time: false,
+            read_only: false,
+        }
+    }
+
     #[tokio::test]
     async fn wait_for_query_returns_cancelled_when_token_is_cancelled() {
         let token = CancellationToken::new();
@@ -2209,6 +2482,71 @@ mod tests {
     }
 
     #[test]
+    fn db_operation_budget_from_config() {
+        let budget = DbOperationBudget::from_config(10, Some(30));
+        assert_eq!(budget.checkout_timeout, Duration::from_secs(10));
+        assert_eq!(budget.connect_timeout, Duration::from_secs(10));
+        assert_eq!(budget.recycle_timeout, Duration::from_secs(10));
+        assert_eq!(budget.query_timeout, Some(Duration::from_secs(30)));
+        assert_eq!(budget.cancel_timeout, Duration::from_secs(5));
+        assert_eq!(budget.cleanup_timeout, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn db_operation_budget_from_connection_config_uses_connection_settings() {
+        let mut config = test_connection_config(DatabaseType::Postgres);
+        config.connect_timeout_secs = 12;
+        config.query_timeout_secs = 0;
+
+        let budget = DbOperationBudget::from_connection_config(&config);
+
+        assert_eq!(budget.checkout_timeout, Duration::from_secs(12));
+        assert_eq!(budget.connect_timeout, Duration::from_secs(12));
+        assert_eq!(budget.recycle_timeout, Duration::from_secs(12));
+        assert_eq!(budget.query_timeout, None);
+        assert_eq!(budget.cancel_timeout, Duration::from_secs(5));
+        assert_eq!(budget.cleanup_timeout, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn db_operation_budget_query_timeout_zero_means_no_limit() {
+        let budget = DbOperationBudget::from_config(10, Some(0));
+        assert_eq!(budget.query_timeout, None);
+        // Infrastructure timeouts still have hard limits
+        assert_eq!(budget.checkout_timeout, Duration::from_secs(10));
+        assert_eq!(budget.cancel_timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn db_operation_budget_query_timeout_zero_keeps_transaction_infra_limits() {
+        let mut config = test_connection_config(DatabaseType::Mysql);
+        config.connect_timeout_secs = 7;
+        config.query_timeout_secs = 0;
+
+        let budget = DbOperationBudget::from_connection_config(&config);
+
+        assert_eq!(budget.query_timeout, None);
+        assert_eq!(budget.checkout_timeout, Duration::from_secs(7));
+        assert_eq!(budget.recycle_timeout, Duration::from_secs(7));
+        assert_eq!(budget.cleanup_timeout, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn db_operation_budget_clamps_infra_timeout() {
+        let budget = DbOperationBudget::from_config(0, Some(30));
+        assert_eq!(budget.checkout_timeout, Duration::from_secs(1)); // clamped to min 1s
+        let budget = DbOperationBudget::from_config(600, Some(30));
+        assert_eq!(budget.checkout_timeout, Duration::from_secs(300)); // clamped to max 300s
+    }
+
+    #[test]
+    fn db_operation_budget_with_defaults() {
+        let budget = DbOperationBudget::with_defaults();
+        assert_eq!(budget.checkout_timeout, db::connection_timeout());
+        assert_eq!(budget.query_timeout, Some(QUERY_TIMEOUT));
+    }
+
+    #[test]
     fn is_connection_error_detects_english_messages() {
         assert!(is_connection_error("connection reset"));
         assert!(is_connection_error("broken pipe"));
@@ -2257,6 +2595,20 @@ mod tests {
     }
 
     #[test]
+    fn is_connection_error_detects_deadpool_pool_timeouts() {
+        // deadpool-postgres PoolError::Timeout messages (contain "pool" + "timeout" but not "timed out")
+        assert!(is_connection_error("pool wait timeout"));
+        assert!(is_connection_error("pool create timeout"));
+        assert!(is_connection_error("pool recycle timeout"));
+        // checkout helper timeout messages
+        assert!(is_connection_error("PostgreSQL connection pool checkout timed out (5s)"));
+        assert!(is_connection_error("MySQL get connection timed out"));
+        assert!(is_connection_error("MySQL ping timed out"));
+        assert!(is_connection_error("MySQL kill connection checkout timed out"));
+        assert!(is_connection_error("MySQL KILL QUERY timed out"));
+    }
+
+    #[test]
     fn pool_error_action_discards_sqlserver_driver_panic_without_retry() {
         let err = format!("{} the current client will be rebuilt.", db::sqlserver::SQLSERVER_DRIVER_PANIC_ERROR_PREFIX);
 
@@ -2276,6 +2628,15 @@ mod tests {
         assert_eq!(pool_error_action(Some(DatabaseType::Oracle), err), PoolErrorAction::Discard);
         assert_eq!(pool_error_action(Some(DatabaseType::Sqlite), err), PoolErrorAction::Keep);
         assert_eq!(pool_error_action(Some(DatabaseType::DuckDb), err), PoolErrorAction::Keep);
+    }
+
+    #[test]
+    fn pool_error_action_discards_schema_reset_cleanup_without_retry() {
+        let err = "PostgreSQL schema.reset cleanup failed: PostgreSQL schema.reset timed out after 3 seconds";
+
+        assert_eq!(pool_error_action(Some(DatabaseType::Postgres), err), PoolErrorAction::Discard);
+        assert_eq!(pool_error_action(Some(DatabaseType::OpenGauss), err), PoolErrorAction::Discard);
+        assert!(should_discard_pool_after_error(Some(DatabaseType::Postgres), err));
     }
 
     #[test]
@@ -2468,6 +2829,7 @@ mod tests {
             redis_sentinel_tls: false,
             redis_cluster_nodes: String::new(),
             redis_key_separator: default_redis_key_separator(),
+            redis_scan_page_size: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),

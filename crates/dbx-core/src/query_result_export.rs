@@ -770,6 +770,19 @@ mod tests {
     }
 
     #[test]
+    fn clickhouse_scalar_with_query_supports_streaming_pagination() {
+        let sql = "WITH 1 AS min_id SELECT dept, COUNT(*) FROM employees WHERE id >= min_id GROUP BY dept";
+        let req = QueryResultExportRequest {
+            sql: sql.to_string(),
+            query_base_sql: sql.to_string(),
+            database_type: DatabaseType::ClickHouse,
+            ..request("csv", Some(1000), None)
+        };
+
+        assert!(supports_streaming_offset_pagination(&req, 100));
+    }
+
+    #[test]
     fn keyset_candidate_accepts_simple_single_table_wildcard_query() {
         let candidate = safe_keyset_candidate("SELECT * FROM public.users").expect("safe keyset candidate");
         assert_eq!(candidate.schema.as_deref(), Some("public"));

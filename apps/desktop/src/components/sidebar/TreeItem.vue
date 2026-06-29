@@ -10,6 +10,7 @@ import {
   Eye,
   ChevronRight,
   ChevronDown,
+  ChevronsDown,
   Loader2,
   FolderOpen,
   FolderClosed,
@@ -62,7 +63,7 @@ import { useSettingsStore } from "@/stores/settingsStore";
 import { useSavedSqlStore } from "@/stores/savedSqlStore";
 import { useToast } from "@/composables/useToast";
 import { useDatabaseOptions } from "@/composables/useDatabaseOptions";
-import type { ColumnInfo, ConnectionConfig, DatabaseType, TreeNode, TreeNodeType } from "@/types/database";
+import type { ColumnInfo, ConnectionConfig, DatabaseType, ObjectSourceKind, TreeNode, TreeNodeType } from "@/types/database";
 import * as api from "@/lib/api";
 import { uuid } from "@/lib/utils";
 import { resolveDefaultDatabase } from "@/lib/defaultDatabase";
@@ -99,6 +100,7 @@ import {
 import { buildRenameObjectSql, supportsObjectRename, type RenameableObjectType } from "@/lib/objectRenameSql";
 import { buildRoutineRenameObjectSourceStatements, supportsSourceBackedRoutineRename } from "@/lib/objectSourceEditor";
 import { buildViewDdl } from "@/lib/viewDdl";
+import { formatSqlForDisplay, sqlFormatDialectForDbType } from "@/lib/sqlFormatter";
 import DdlViewDialog from "@/components/objects/DdlViewDialog.vue";
 import { getTableStructureCapabilities } from "@/lib/tableStructureCapabilities";
 import { codeMirrorSqlDialect, connectionObjectTreeNodeSchema, connectionObjectTreeQuerySchema, connectionUsesDatabaseObjectTreeMode, effectiveDatabaseTypeForConnection, tableStructureDatabaseTypeForConnection } from "@/lib/jdbcDialect";
@@ -599,6 +601,14 @@ async function loadMoreObjectGroupChildren() {
   }
 }
 
+async function loadAllObjectGroupChildren() {
+  try {
+    await connectionStore.loadAllObjectGroupChildren(props.node);
+  } catch (e: any) {
+    toast(t("connection.connectFailed", { message: translateBackendError(t, e?.message || String(e)) }), 5000);
+  }
+}
+
 function visibleTreeNodes(): TreeNode[] {
   if (sidebarTreeContext) return sidebarTreeContext.getVisibleNodes();
   return flattenTree(connectionStore.treeNodes).map((item) => item.node);
@@ -826,10 +836,10 @@ function openMongoCollectionData(node: TreeNode) {
   queryStore.updateSql(tab, node.label);
 }
 
-function openSavedSqlFile() {
+async function openSavedSqlFile() {
   const node = props.node;
   if (node.type !== "saved-sql-file" || !node.savedSqlId) return;
-  const file = savedSqlStore.getFile(node.savedSqlId);
+  const file = await savedSqlStore.ensureFileContent(node.savedSqlId);
   if (!file) return;
   queryStore.openSavedSql(file);
   connectionStore.activeConnectionId = file.connectionId;
@@ -1047,6 +1057,7 @@ async function openData() {
         console.warn("[DBX][openData:metadata:error]", { traceId, tabId, elapsed: elapsed(), error });
       }
     };
+    const shouldRefreshTableMeta = !cachedTableMeta;
     if (cachedTableMeta) {
       console.info("[DBX][openData:metadata:cache-hit]", {
         traceId,
@@ -1057,8 +1068,7 @@ async function openData() {
         elapsed: elapsed(),
       });
     } else {
-      void refreshTableMetaInBackground();
-      logPhase("metadata-started", { tabId });
+      logPhase("metadata-deferred", { tabId });
     }
 
     // Check if superseded by a newer openData call
@@ -1095,6 +1105,10 @@ async function openData() {
     await queryStore.executeTabSql(tabId, sql, { sourceTraceId: traceId, skipEnsureConnected: true });
     console.info("[DBX][openData:execute:done]", { traceId, tabId, elapsed: elapsed() });
     logPhase("execute-tab-sql", { tabId });
+    if (shouldRefreshTableMeta && isCurrentDataTab()) {
+      void refreshTableMetaInBackground();
+      logPhase("metadata-started", { tabId });
+    }
   } catch (e: any) {
     if (!isActive()) {
       logPhase("superseded-after-error", { tabId });
@@ -1259,9 +1273,10 @@ async function generateDdlTemplate() {
     let ddl: string;
     if (node.type === "table") {
       ddl = await api.getTableDdl(node.connectionId, node.database, schema, node.label);
+    } else if (node.type === "materialized_view") {
+      ddl = await api.getTableDdl(node.connectionId, node.database, schema, node.label, "MATERIALIZED_VIEW");
     } else {
-      const objectType = node.type === "materialized_view" ? "MATERIALIZED_VIEW" : "VIEW";
-      const result = await api.getObjectSource(node.connectionId, node.database, schema, node.label, objectType);
+      const result = await api.getObjectSource(node.connectionId, node.database, schema, node.label, "VIEW");
       ddl = await buildViewDdl({
         databaseType: currentDatabaseType(),
         schema,
@@ -1269,7 +1284,8 @@ async function generateDdlTemplate() {
         source: result.source,
       });
     }
-    openSqlTemplateTab(node.connectionId, node.database, node.schema, ddl, `DDL - ${node.label}`);
+    const formatted = await formatSqlForDisplay(ddl, sqlFormatDialectForDbType(currentDatabaseType()), settingsStore.editorSettings.sqlFormatter);
+    openSqlTemplateTab(node.connectionId, node.database, node.schema, formatted, `DDL - ${node.label}`);
   } catch (e: any) {
     toast(e?.message || String(e), 5000);
   }
@@ -1443,6 +1459,10 @@ const ddlDialect = computed(() => {
   if (!ddlTarget.value?.connectionId) return "mysql";
   return codeMirrorSqlDialect(effectiveDatabaseTypeForConnection(connectionStore.getConfig(ddlTarget.value.connectionId)));
 });
+const ddlFormatDialect = computed(() => {
+  if (!ddlTarget.value?.connectionId) return "generic";
+  return sqlFormatDialectForDbType(effectiveDatabaseTypeForConnection(connectionStore.getConfig(ddlTarget.value.connectionId)));
+});
 const showCreateDatabaseDialog = ref(false);
 const createDatabaseName = ref("");
 const createDatabaseCharset = ref("utf8mb4");
@@ -1610,7 +1630,8 @@ function viewObjectSource() {
     })
     .then(async (result) => {
       const tabId = queryStore.createTab(node.connectionId!, node.database!, `Source - ${node.label}`);
-      queryStore.updateSql(tabId, result.source);
+      const formatted = await formatSqlForDisplay(result.source, sqlFormatDialectForDbType(currentDatabaseType()), settingsStore.editorSettings.sqlFormatter);
+      queryStore.updateSql(tabId, formatted);
       if (objectType !== "SEQUENCE") {
         queryStore.setObjectSource(tabId, {
           schema,
@@ -1644,8 +1665,9 @@ function viewObjectDdl() {
         name: node.label,
         source: result.source,
       });
+      const formatted = await formatSqlForDisplay(ddl, sqlFormatDialectForDbType(effectiveDatabaseTypeForConnection(connection)), settingsStore.editorSettings.sqlFormatter);
       const tabId = queryStore.createTab(node.connectionId!, node.database!, `DDL - ${node.label}`);
-      queryStore.updateSql(tabId, ddl);
+      queryStore.updateSql(tabId, formatted);
     })
     .catch((e: any) => {
       toast(e?.message || String(e), 5000);
@@ -2559,7 +2581,7 @@ async function exportStructure() {
     const parts: string[] = [];
     for (const target of targets) {
       await connectionStore.ensureConnected(target.connectionId);
-      const ddl = await api.getTableDdl(target.connectionId, target.database, target.schema || target.database, target.label, target.type === "view" ? "VIEW" : undefined);
+      const ddl = await api.getTableDdl(target.connectionId, target.database, target.schema || target.database, target.label, tableDdlObjectTypeForNode(target.type));
       parts.push(ddl.trim());
     }
     structurePreviewSql.value = `${parts.filter(Boolean).join("\n\n")}\n`;
@@ -2572,7 +2594,13 @@ async function exportStructure() {
 }
 
 function canExportStructureNode(node: TreeNode): node is TreeNode & { connectionId: string; database: string } {
-  return (node.type === "table" || node.type === "view") && !!node.connectionId && !!node.database;
+  return (node.type === "table" || node.type === "view" || node.type === "materialized_view") && !!node.connectionId && !!node.database;
+}
+
+function tableDdlObjectTypeForNode(type: TreeNodeType): ObjectSourceKind | undefined {
+  if (type === "view") return "VIEW";
+  if (type === "materialized_view") return "MATERIALIZED_VIEW";
+  return undefined;
 }
 
 function selectedStructureNodes(): TreeNode[] {
@@ -3455,8 +3483,8 @@ function savedSqlHistoryScopeForNode(node: TreeNode): SavedSqlHistoryScope | nul
   return null;
 }
 
-function openSavedSqlHistoryFile(fileId: string) {
-  const file = savedSqlStore.getFile(fileId);
+async function openSavedSqlHistoryFile(fileId: string) {
+  const file = await savedSqlStore.ensureFileContent(fileId);
   if (!file) return;
   queryStore.openSavedSql(file);
   connectionStore.activeConnectionId = file.connectionId;
@@ -3958,6 +3986,7 @@ function treeItemMenuItems(): ContextMenuItem[] {
   // 9. Group Labels (group-columns, group-tables, etc.)
   if (isGroupLabel(node)) {
     const hasGroupCreateAction = (node.type === "group-tables" && canCreateTable.value) || (node.type === "group-views" && !!node.connectionId && !!node.database);
+    const canLoadAllObjectGroup = node.type === "group-tables" || node.type === "group-views" || node.type === "group-materialized-views";
     if (node.type === "group-tables" && canCreateTable.value) {
       items.push({ label: t("contextMenu.createTable"), action: createTable, icon: Plus });
     }
@@ -3966,6 +3995,14 @@ function treeItemMenuItems(): ContextMenuItem[] {
     }
     if (hasGroupCreateAction) {
       items.push({ label: "", separator: true });
+    }
+    if (canLoadAllObjectGroup) {
+      items.push({
+        label: t("contextMenu.expandAll"),
+        action: loadAllObjectGroupChildren,
+        icon: ChevronsDown,
+        disabled: node.isLoading,
+      });
     }
     if (node.type !== "group-partitions") {
       items.push({
@@ -4052,8 +4089,8 @@ function treeItemMenuItems(): ContextMenuItem[] {
           <Badge v-if="isNodeDefaultDatabase" variant="secondary" class="h-4 px-1.5 text-[10px]">
             {{ t("editor.defaultDatabase") }}
           </Badge>
-          <span v-if="columnComment" class="ml-auto truncate text-muted-foreground/60 text-[10px] max-w-[20%] shrink-0 text-right">{{ columnComment }}</span>
-          <span v-if="tableComment" class="ml-auto truncate text-muted-foreground/60 text-[10px] max-w-[20%] shrink-0 text-right">{{ tableComment }}</span>
+          <span v-if="columnComment" class="sidebar-object-comment ml-auto max-w-[20%] shrink-0 truncate text-right">{{ columnComment }}</span>
+          <span v-if="tableComment" class="sidebar-object-comment ml-auto max-w-[20%] shrink-0 truncate text-right">{{ tableComment }}</span>
           <span v-if="node.type === 'connection' && node.connectionId && connectionStore.connectedIds.has(node.connectionId)" class="w-1.5 h-1.5 rounded-full bg-green-500 shrink-0" />
           <Badge v-if="isConnectionReadonly" variant="secondary" class="h-4 px-1.5 text-[10px] gap-0.5"><Lock class="w-2.5 h-2.5" />{{ t("connection.readOnlyBadge") }}</Badge>
           <ConnectionErrorIndicator v-if="node.type === 'connection'" :connection-id="node.connectionId" trigger-class="h-4 w-4" />
@@ -4414,10 +4451,20 @@ function treeItemMenuItems(): ContextMenuItem[] {
 
   <DangerConfirmDialog v-model:open="showDropSchemaConfirm" :title="t('contextMenu.confirmDropSchemaTitle')" :message="t('contextMenu.confirmDropSchemaMessage', { name: node.label })" :sql="dropSchemaPreviewSql" :confirm-label="t('contextMenu.dropSchema')" @confirm="confirmDropSchema" />
 
-  <DdlViewDialog v-if="ddlTarget" :connection-id="ddlTarget.connectionId!" :database="ddlTarget.database!" :schema="ddlTarget.schema" :table-name="ddlTarget.label" :dialect="ddlDialect" v-model:open="showDdlDialog" />
+  <DdlViewDialog v-if="ddlTarget" :connection-id="ddlTarget.connectionId!" :database="ddlTarget.database!" :schema="ddlTarget.schema" :table-name="ddlTarget.label" :dialect="ddlDialect" :format-dialect="ddlFormatDialect" v-model:open="showDdlDialog" />
 </template>
 
 <style>
+.sidebar-object-comment {
+  color: var(--muted-foreground);
+  font-family: "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", system-ui, sans-serif;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 16px;
+  opacity: 1;
+  text-rendering: optimizeLegibility;
+}
+
 .tree-item-connection-tint {
   isolation: isolate;
   background-color: transparent !important;

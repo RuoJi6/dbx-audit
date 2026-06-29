@@ -627,6 +627,56 @@ async fn list_schema_infos_once(
     Ok(schemas.into_iter().map(|name| db::SchemaInfo { name, comment: None }).collect())
 }
 
+pub async fn list_data_types_core(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+) -> Result<Vec<String>, String> {
+    retry_metadata_connection(state, connection_id, Some(database), || async {
+        let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
+        let db_config = connection_config(state, connection_id).await;
+        let connections = state.connections.read().await;
+        if let Some(PoolKind::ExternalDriver { config, session, .. }) = connections.get(&pool_key) {
+            let config = config.clone();
+            let session = session.clone();
+            drop(connections);
+            return session
+                .invoke::<Vec<String>>(
+                    "listDataTypes",
+                    serde_json::json!({ "connection": config.as_ref(), "database": database }),
+                )
+                .await
+                .map(deduplicate_data_type_names);
+        }
+        if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
+            drop(connections);
+            let mut client = client.lock().await;
+            return client
+                .list_data_types::<Vec<String>>(database, agent_metadata_timeout(db_config.as_ref()))
+                .await
+                .map(deduplicate_data_type_names);
+        }
+        Ok(Vec::new())
+    })
+    .await
+}
+
+fn deduplicate_data_type_names(names: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut result = Vec::new();
+    for name in names {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let key = trimmed.to_ascii_lowercase();
+        if seen.insert(key) {
+            result.push(trimmed.to_string());
+        }
+    }
+    result
+}
+
 async fn list_schemas_once(
     state: &AppState,
     connection_id: &str,
@@ -949,7 +999,12 @@ async fn list_tables_once(
             drop(connections);
             let mut client = client.lock().await;
             match client
-                .list_tables::<Vec<db::TableInfo>>(database, schema, agent_metadata_timeout(db_config.as_ref()))
+                .list_tables_filtered::<Vec<db::TableInfo>>(
+                    database,
+                    schema,
+                    object_types,
+                    agent_metadata_timeout(db_config.as_ref()),
+                )
                 .await
             {
                 Ok(tables) if !tables.is_empty() => {
@@ -1086,12 +1141,12 @@ fn filter_table_infos(
     offset: Option<usize>,
     object_types: Option<&[String]>,
 ) -> Vec<db::TableInfo> {
-    let filter = filter.unwrap_or("").to_lowercase();
+    let filter = filter.unwrap_or("");
     let limit = limit.unwrap_or(usize::MAX);
     let offset = offset.unwrap_or(0);
     tables
         .into_iter()
-        .filter(|table| filter.is_empty() || table.name.to_lowercase().contains(&filter))
+        .filter(|table| crate::sql::contains_or_fuzzy_match(&table.name, filter))
         .filter(|table| table_info_matches_object_types(table, object_types))
         .skip(offset)
         .take(limit)
@@ -1311,6 +1366,7 @@ mod tests {
             redis_sentinel_tls: false,
             redis_cluster_nodes: String::new(),
             redis_key_separator: crate::models::connection::default_redis_key_separator(),
+            redis_scan_page_size: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
@@ -1428,6 +1484,35 @@ mod tests {
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].name, "audit_record");
+    }
+
+    #[test]
+    fn filter_table_infos_matches_fuzzy_subsequences() {
+        let tables = vec![test_table_info("system_user"), test_table_info("user_order"), test_table_info("alpha")];
+
+        let system_user = filter_table_infos(tables.clone(), Some("sysu"), None, None, None);
+        assert_eq!(system_user.into_iter().map(|table| table.name).collect::<Vec<_>>(), vec!["system_user"]);
+
+        let user_order = filter_table_infos(tables, Some("uo"), None, None, None);
+        assert_eq!(user_order.into_iter().map(|table| table.name).collect::<Vec<_>>(), vec!["user_order"]);
+    }
+
+    #[test]
+    fn filter_table_infos_skips_fuzzy_for_single_character_filters() {
+        let tables = vec![test_table_info("orders"), test_table_info("user_order")];
+
+        let filtered = filter_table_infos(tables, Some("u"), None, None, None);
+
+        assert_eq!(filtered.into_iter().map(|table| table.name).collect::<Vec<_>>(), vec!["user_order"]);
+    }
+
+    #[test]
+    fn filter_table_infos_keeps_special_filter_characters_literal() {
+        let tables = vec![test_table_info("user_%"), test_table_info("user_account"), test_table_info("userXpercent")];
+
+        let filtered = filter_table_infos(tables, Some("user_%"), None, None, None);
+
+        assert_eq!(filtered.into_iter().map(|table| table.name).collect::<Vec<_>>(), vec!["user_%"]);
     }
 
     #[test]
@@ -2441,7 +2526,15 @@ pub async fn get_columns_core(
             }
             PoolKind::Mysql(p, _) if db_config.as_ref().is_some_and(is_doris_family_config) => {
                 let metadata_database = mysql_show_metadata_database_for_config(db_config.as_ref(), database);
-                db::mysql::get_columns_show(p, metadata_database, table).await.map(deduplicate_column_infos)
+                // Doris/StarRocks previously went straight to `SHOW COLUMNS` for
+                // speed (see perf(doris) commit), but `SHOW COLUMNS` reports the
+                // `Key` column as `YES`/`NO` rather than MySQL's `PRI`, so primary
+                // keys were never detected. `get_columns` queries
+                // information_schema.COLUMNS first — where `COLUMN_KEY = 'PRI'`
+                // correctly identifies primary keys (and only real primary keys,
+                // not duplicate-key sort columns) — and falls back to `SHOW COLUMNS`
+                // automatically when information_schema is unavailable.
+                db::mysql::get_columns(p, metadata_database, table).await.map(deduplicate_column_infos)
             }
             PoolKind::Mysql(p, mode) => {
                 dispatch_mysql!(p, mode, db::mysql::get_columns, db::ob_oracle::get_columns, database, table)
@@ -2538,6 +2631,8 @@ pub async fn list_indexes_core(
                 }
                 if *mode == MysqlMode::OceanBaseOracle {
                     db::ob_oracle::list_indexes(p, schema, table).await
+                } else if db_config.as_ref().is_some_and(is_doris_family_config) {
+                    db::mysql::list_doris_family_indexes(p, mysql_table_metadata_catalog(database, schema), table).await
                 } else {
                     db::mysql::list_indexes(p, mysql_table_metadata_catalog(database, schema), table).await
                 }
@@ -2744,6 +2839,18 @@ pub async fn get_table_ddl_core(
             source: source.source,
         }));
     }
+    if matches!(object_type, Some(db::ObjectSourceKind::MaterializedView)) {
+        let source = get_object_source_core(
+            state,
+            connection_id,
+            database,
+            schema,
+            table,
+            db::ObjectSourceKind::MaterializedView,
+        )
+        .await?;
+        return Ok(source.source);
+    }
 
     let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
     let db_config = connection_config(state, connection_id).await;
@@ -2948,16 +3055,42 @@ pub fn sqlserver_object_source_sql(schema: &str, name: &str, kind: &db::ObjectSo
 }
 
 pub fn postgres_object_source_sql(schema: &str, name: &str, kind: &db::ObjectSourceKind) -> String {
+    postgres_object_source_sql_inner(schema, name, kind, true)
+}
+
+fn postgres_object_source_sql_without_relispopulated(schema: &str, name: &str, kind: &db::ObjectSourceKind) -> String {
+    postgres_object_source_sql_inner(schema, name, kind, false)
+}
+
+fn postgres_object_source_sql_inner(
+    schema: &str,
+    name: &str,
+    kind: &db::ObjectSourceKind,
+    include_relispopulated: bool,
+) -> String {
     match kind {
         db::ObjectSourceKind::View | db::ObjectSourceKind::MaterializedView => {
+            let materialized_populated_clause = if include_relispopulated {
+                " || CASE WHEN c.relispopulated THEN ' WITH DATA' ELSE ' WITH NO DATA' END"
+            } else {
+                ""
+            };
+            let materialized_viewdef = "regexp_replace(pg_get_viewdef(c.oid, 0), ';[[:space:]]*$', '')";
+            let materialized_source_expr = format!(
+                "CASE WHEN {materialized_viewdef} ~* '^[[:space:]]*CREATE[[:space:]]+(OR[[:space:]]+REPLACE[[:space:]]+)?MATERIALIZED[[:space:]]+VIEW[[:space:]]+' \
+                 THEN {materialized_viewdef} \
+                 ELSE format('CREATE MATERIALIZED VIEW %I.%I AS ', n.nspname, c.relname) || {materialized_viewdef}{materialized_populated_clause} \
+                 END"
+            );
             format!(
-                "SELECT CASE WHEN c.relkind = 'm' THEN format('CREATE MATERIALIZED VIEW %I.%I AS ', n.nspname, c.relname) || regexp_replace(pg_get_viewdef(c.oid, 0), ';[[:space:]]*$', '') || CASE WHEN c.relispopulated THEN ' WITH DATA' ELSE ' WITH NO DATA' END \
+                "SELECT CASE WHEN c.relkind = 'm' THEN {} \
                  ELSE format('CREATE OR REPLACE VIEW %I.%I AS ', n.nspname, c.relname) || pg_get_viewdef(c.oid, 0) \
                  END \
                  FROM pg_catalog.pg_class c \
                  JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
                  WHERE n.nspname = {} AND c.relname = {} AND c.relkind IN ('v','m') \
                  ORDER BY c.oid LIMIT 1",
+                materialized_source_expr,
                 sql_string(schema),
                 sql_string(name)
             )
@@ -3072,7 +3205,7 @@ async fn mysql_object_source(
 ) -> Result<String, String> {
     use mysql_async::prelude::*;
     let sql = mysql_object_source_sql(name, kind);
-    let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
+    let mut conn = db::mysql::get_conn_with_timeout(pool, db::connection_timeout()).await?;
     let result = conn.query_iter(&sql).await.map_err(|e| e.to_string())?;
     let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
     let row = rows.first().ok_or("Object source not found")?;
@@ -3284,6 +3417,16 @@ async fn postgres_object_source(
     let sql = postgres_object_source_sql(schema, name, object_type);
     match db::postgres::execute_query(pool, &sql).await.and_then(first_string_cell) {
         Ok(source) => Ok(source),
+        Err(primary_err)
+            if postgres_missing_relispopulated_error(&primary_err)
+                && matches!(object_type, db::ObjectSourceKind::View | db::ObjectSourceKind::MaterializedView) =>
+        {
+            let fallback_sql = postgres_object_source_sql_without_relispopulated(schema, name, object_type);
+            db::postgres::execute_query(pool, &fallback_sql)
+                .await
+                .and_then(first_string_cell)
+                .map_err(|fallback_err| format!("{primary_err}; relispopulated fallback failed: {fallback_err}"))
+        }
         Err(primary_err) if matches!(object_type, db::ObjectSourceKind::View) => {
             let fallback_sql = postgres_view_source_fallback_sql(schema, name);
             db::postgres::execute_query(pool, &fallback_sql)
@@ -3293,6 +3436,14 @@ async fn postgres_object_source(
         }
         Err(err) => Err(err),
     }
+}
+
+fn postgres_missing_relispopulated_error(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("does not exist")
+        && (lower.contains("column c.relispopulated")
+            || lower.contains("column \"c\".\"relispopulated\"")
+            || lower.contains("column \"relispopulated\""))
 }
 
 #[cfg(test)]
@@ -3310,14 +3461,51 @@ mod object_source_tests {
 
     #[test]
     fn builds_postgres_object_source_sql_for_views_and_functions() {
-        assert_eq!(
-            postgres_object_source_sql("public", "active_users", &ObjectSourceKind::View),
-            "SELECT CASE WHEN c.relkind = 'm' THEN format('CREATE MATERIALIZED VIEW %I.%I AS ', n.nspname, c.relname) || regexp_replace(pg_get_viewdef(c.oid, 0), ';[[:space:]]*$', '') || CASE WHEN c.relispopulated THEN ' WITH DATA' ELSE ' WITH NO DATA' END ELSE format('CREATE OR REPLACE VIEW %I.%I AS ', n.nspname, c.relname) || pg_get_viewdef(c.oid, 0) END FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relname = 'active_users' AND c.relkind IN ('v','m') ORDER BY c.oid LIMIT 1"
-        );
+        let view_sql = postgres_object_source_sql("public", "active_users", &ObjectSourceKind::View);
+
+        assert!(view_sql.contains("CREATE MATERIALIZED VIEW"));
+        assert!(view_sql.contains("CREATE OR REPLACE VIEW"));
+        assert!(view_sql.contains("CASE WHEN c.relispopulated THEN ' WITH DATA' ELSE ' WITH NO DATA' END"));
+        assert!(view_sql.contains("n.nspname = 'public'"));
+        assert!(view_sql.contains("c.relname = 'active_users'"));
+
         assert_eq!(
             postgres_object_source_sql("public", "recalc_score", &ObjectSourceKind::Function),
             "SELECT pg_get_functiondef(p.oid) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public' AND p.proname = 'recalc_score' AND p.prokind = 'f' ORDER BY p.oid LIMIT 1"
         );
+    }
+
+    #[test]
+    fn builds_postgres_object_source_sql_without_relispopulated_for_legacy_catalogs() {
+        let sql = postgres_object_source_sql_without_relispopulated(
+            "public",
+            "active_users",
+            &ObjectSourceKind::MaterializedView,
+        );
+
+        assert!(sql.contains("CREATE MATERIALIZED VIEW"));
+        assert!(sql.contains("pg_get_viewdef(c.oid, 0)"));
+        assert!(!sql.contains("relispopulated"));
+    }
+
+    #[test]
+    fn keeps_legacy_materialized_viewdef_when_it_already_contains_create_statement() {
+        let sql = postgres_object_source_sql("public", "active_users", &ObjectSourceKind::MaterializedView);
+
+        assert!(
+            sql.contains(
+                "~* '^[[:space:]]*CREATE[[:space:]]+(OR[[:space:]]+REPLACE[[:space:]]+)?MATERIALIZED[[:space:]]+VIEW[[:space:]]+'"
+            )
+        );
+        assert!(sql.contains(
+            "THEN regexp_replace(pg_get_viewdef(c.oid, 0), ';[[:space:]]*$', '') ELSE format('CREATE MATERIALIZED VIEW"
+        ));
+    }
+
+    #[test]
+    fn detects_legacy_postgres_relispopulated_errors() {
+        assert!(postgres_missing_relispopulated_error("ERROR: column c.relispopulated does not exist"));
+        assert!(!postgres_missing_relispopulated_error("ERROR: relation public.relispopulated does not exist"));
     }
 
     #[test]
@@ -3435,7 +3623,12 @@ mod ddl_tests {
 pub async fn mysql_ddl(pool: &db::mysql::MySqlPool, table: &str) -> Result<String, String> {
     use mysql_async::prelude::*;
     let sql = format!("SHOW CREATE TABLE `{}`", table.replace('`', "``"));
-    let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
+    // Use the health-checked getter so a stale pooled connection (server closed
+    // it after an idle timeout, NAT/firewall dropped the TCP state, etc.) is
+    // detected and replaced before issuing the query. Without this, the first
+    // DDL request after a period of inactivity could surface a low-level
+    // connection error that a manual refresh would have masked.
+    let mut conn = db::mysql::get_conn_with_health_check(pool).await?;
     let result = conn.query_iter(&sql).await.map_err(|e| e.to_string())?;
     let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
     let row = rows.first().ok_or("DDL not found")?;

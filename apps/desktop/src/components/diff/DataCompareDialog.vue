@@ -64,6 +64,7 @@ interface DataCompareTableResult {
 }
 
 const PREVIEW_LIMIT_OPTIONS = [50, 100, 200, 500];
+const SYNC_EXECUTE_BATCH_SIZE = 500;
 
 const { t } = useI18n();
 const { toast } = useToast();
@@ -717,13 +718,22 @@ async function executeSql() {
   executedCount.value = 0;
   try {
     await store.ensureConnected(targetConnectionId.value);
-    for (const stmt of syncPlan.value.syncStatements) {
+    const statements = syncPlan.value.syncStatements;
+    for (let index = 0; index < statements.length; index += SYNC_EXECUTE_BATCH_SIZE) {
+      const batch = statements.slice(index, index + SYNC_EXECUTE_BATCH_SIZE);
       try {
-        await api.executeQuery(targetConnectionId.value, targetDatabase.value, stmt, targetSchema.value);
+        await api.executeBatch(targetConnectionId.value, targetDatabase.value, batch, targetSchema.value);
+        executedCount.value += batch.length;
       } catch (e: any) {
-        syncErrors.value.push({ sql: stmt, error: e?.message || String(e) });
+        for (const stmt of batch) {
+          try {
+            await api.executeBatch(targetConnectionId.value, targetDatabase.value, [stmt], targetSchema.value);
+          } catch (singleError: any) {
+            syncErrors.value.push({ sql: stmt, error: singleError?.message || String(singleError) });
+          }
+          executedCount.value++;
+        }
       }
-      executedCount.value++;
     }
     const failed = syncErrors.value.length;
     if (failed === 0) {
@@ -1168,7 +1178,7 @@ watch(
           </div>
           <div v-else-if="syncPlan.syncSql.trim()" class="space-y-1">
             <Label class="text-xs font-medium">{{ t("diff.generatedSql") }}</Label>
-            <textarea :value="syncPlan.syncSql" readonly class="w-full h-48 rounded-lg border bg-muted/20 p-3 font-mono text-xs resize-none focus:outline-none focus:ring-1 focus:ring-ring" />
+            <textarea :value="syncPlan.syncSql" readonly class="w-full h-48 rounded-[6px] border bg-muted/20 p-3 font-mono text-xs resize-none focus:outline-none focus:ring-1 focus:ring-ring" />
           </div>
           <div v-else-if="differentTableCount === 0 && failedTableCount === 0" class="text-sm text-muted-foreground">
             {{ t("dataCompare.noDifferences") }}

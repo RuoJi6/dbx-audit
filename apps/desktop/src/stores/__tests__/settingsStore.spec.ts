@@ -9,4 +9,13 @@ describe("normalizeEditorSettings", () => {
   it("preserves disabled automatic table aliases", () => {
     expect(normalizeEditorSettings({ autoAliasTables: false }).autoAliasTables).toBe(false);
   });
+
+  it("defaults update downloads to the official source", () => {
+    expect(normalizeEditorSettings({}).updateDownloadSource).toBe("official");
+  });
+
+  it("preserves CNB update download source and rejects invalid values", () => {
+    expect(normalizeEditorSettings({ updateDownloadSource: "cnb" }).updateDownloadSource).toBe("cnb");
+    expect(normalizeEditorSettings({ updateDownloadSource: "mirror" as any }).updateDownloadSource).toBe("official");
+  });
 });

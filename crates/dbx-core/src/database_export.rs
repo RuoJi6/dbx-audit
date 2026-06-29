@@ -6,7 +6,11 @@ use tokio::sync::RwLock;
 
 use crate::models::connection::DatabaseType;
 use crate::sql_dialect::{qualified_table_name, quote_table_identifier};
-use crate::transfer::{format_ch_array_sql_literal, format_pg_array_sql_literal, quote_identifier};
+use crate::transfer::{
+    format_ch_array_sql_literal, format_pg_array_sql_literal, is_identity_column_extra, quote_identifier,
+    selected_columns_include_identity_extras, wrap_dameng_identity_insert_sql,
+    wrap_dameng_identity_insert_sql_for_table,
+};
 
 static EXPORT_CANCELLED: std::sync::LazyLock<RwLock<HashSet<String>>> =
     std::sync::LazyLock::new(|| RwLock::new(HashSet::new()));
@@ -89,6 +93,8 @@ pub struct ExportedTableSql {
     #[serde(default)]
     pub column_types: Vec<Option<String>>,
     #[serde(default)]
+    pub column_extras: Vec<Option<String>>,
+    #[serde(default)]
     pub rows: Vec<Vec<Value>>,
     #[serde(default)]
     pub truncated: bool,
@@ -109,6 +115,8 @@ pub struct BuildExportInsertStatementsOptions {
     pub columns: Vec<String>,
     #[serde(default)]
     pub column_types: Vec<Option<String>>,
+    #[serde(default)]
+    pub column_extras: Vec<Option<String>>,
     #[serde(default)]
     pub rows: Vec<Vec<Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -254,6 +262,10 @@ pub fn build_export_insert_statements(options: BuildExportInsertStatementsOption
         .collect::<Vec<_>>()
         .join(", ");
     let mut statements = Vec::new();
+    let needs_dameng_identity_insert = options.database_type == Some(DatabaseType::Dameng)
+        && insert_columns.iter().any(|(index, _)| {
+            is_identity_column_extra(options.column_extras.get(*index).and_then(|value| value.as_deref()))
+        });
 
     for rows in options.rows.chunks(batch_size) {
         let values = rows
@@ -275,7 +287,12 @@ pub fn build_export_insert_statements(options: BuildExportInsertStatementsOption
             })
             .collect::<Vec<_>>()
             .join(", ");
-        statements.push(format!("INSERT INTO {table} ({columns}) VALUES {values};"));
+        let insert_sql = format!("INSERT INTO {table} ({columns}) VALUES {values};");
+        if needs_dameng_identity_insert {
+            statements.push(wrap_dameng_identity_insert_sql_for_table(&insert_sql, &table));
+        } else {
+            statements.push(insert_sql);
+        }
     }
 
     Ok(statements)
@@ -329,6 +346,7 @@ pub fn build_database_sql_export(options: BuildDatabaseSqlExportOptions) -> Resu
             qualified_table_name: table.qualified_table_name,
             columns: table.columns,
             column_types: table.column_types,
+            column_extras: table.column_extras,
             rows: table.rows,
             batch_size: Some(insert_batch_size),
         })?;
@@ -766,6 +784,7 @@ pub async fn export_database_sql_core(
             };
             let col_names = columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>();
             let col_types = columns.iter().map(|c| Some(c.data_type.clone())).collect::<Vec<_>>();
+            let col_extras = columns.iter().map(|c| c.extra.clone()).collect::<Vec<_>>();
 
             if !col_names.is_empty() {
                 // Get row count
@@ -822,7 +841,7 @@ pub async fn export_database_sql_core(
                         break;
                     }
 
-                    let insert_sql = crate::transfer::generate_insert_typed(
+                    let mut insert_sql = crate::transfer::generate_insert_typed(
                         &col_names,
                         &col_types,
                         &result.rows,
@@ -830,9 +849,18 @@ pub async fn export_database_sql_core(
                         &request.schema,
                         &db_type,
                     );
+                    if db_type == DatabaseType::Dameng
+                        && selected_columns_include_identity_extras(&col_names, &col_extras)
+                    {
+                        insert_sql = wrap_dameng_identity_insert_sql(&insert_sql, table_name, &request.schema);
+                    }
 
                     if !insert_sql.is_empty() {
-                        writeln!(file, "{};\n", insert_sql).map_err(|e| format!("Failed to write file: {e}"))?;
+                        if insert_sql.trim_end().ends_with(';') {
+                            writeln!(file, "{}\n", insert_sql).map_err(|e| format!("Failed to write file: {e}"))?;
+                        } else {
+                            writeln!(file, "{};\n", insert_sql).map_err(|e| format!("Failed to write file: {e}"))?;
+                        }
                     }
 
                     rows_exported += row_count as u64;
@@ -1106,6 +1134,7 @@ mod tests {
             qualified_table_name: None,
             columns: vec!["id".to_string(), "name".to_string()],
             column_types: Vec::new(),
+            column_extras: Vec::new(),
             rows: vec![vec![json!(1), json!("Ada")], vec![json!(2), json!("O'Hara")], vec![json!(3), json!("Linus")]],
             batch_size: Some(2),
         })
@@ -1129,6 +1158,7 @@ mod tests {
             qualified_table_name: None,
             columns: vec!["enabled".to_string(), "mask".to_string(), "label".to_string()],
             column_types: vec![Some("bit(1)".to_string()), Some("BIT(4)".to_string()), Some("varchar(20)".to_string())],
+            column_extras: Vec::new(),
             rows: vec![vec![json!("1"), json!("1010"), json!("1010")], vec![json!(false), json!(3), json!("off")]],
             batch_size: Some(10),
         })
@@ -1149,12 +1179,36 @@ mod tests {
             qualified_table_name: None,
             columns: vec!["id".to_string(), "title".to_string(), "search_vector".to_string()],
             column_types: vec![Some("integer".to_string()), Some("text".to_string()), Some("tsvector".to_string())],
+            column_extras: Vec::new(),
             rows: vec![vec![json!(1), json!("Hello"), json!("'hello':1A")]],
             batch_size: Some(10),
         })
         .unwrap();
 
         assert_eq!(statements, vec!["INSERT INTO \"public\".\"articles\" (\"id\", \"title\") VALUES (1, 'Hello');"]);
+    }
+
+    #[test]
+    fn dameng_identity_export_inserts_enable_identity_insert() {
+        let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
+            database_type: Some(DatabaseType::Dameng),
+            schema: Some("SYSDBA".to_string()),
+            table_name: Some("USERS".to_string()),
+            qualified_table_name: None,
+            columns: vec!["ID".to_string(), "NAME".to_string()],
+            column_types: vec![Some("INT".to_string()), Some("VARCHAR(20)".to_string())],
+            column_extras: vec![Some("identity".to_string()), None],
+            rows: vec![vec![json!(1), json!("Ada")]],
+            batch_size: Some(10),
+        })
+        .unwrap();
+
+        assert_eq!(
+            statements,
+            vec![
+                "SET IDENTITY_INSERT \"SYSDBA\".\"USERS\" ON;\nINSERT INTO \"SYSDBA\".\"USERS\" (\"ID\", \"NAME\") VALUES (1, 'Ada');\nSET IDENTITY_INSERT \"SYSDBA\".\"USERS\" OFF;"
+            ]
+        );
     }
 
     #[test]
@@ -1171,6 +1225,7 @@ mod tests {
                 ddl: Some("CREATE TABLE `users` (`id` int);".to_string()),
                 columns: vec!["id".to_string()],
                 column_types: Vec::new(),
+                column_extras: Vec::new(),
                 rows: vec![vec![json!(1)]],
                 truncated: true,
             }],

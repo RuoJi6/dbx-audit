@@ -198,10 +198,11 @@ impl NacosOpenApiAdmin {
         namespace: &str,
         search: &str,
         group: &str,
+        app_name: &str,
         page_no: u32,
         page_size: u32,
     ) -> Result<Value, String> {
-        let v3_params = vec![
+        let mut v3_params = vec![
             ("search".to_string(), "blur".to_string()),
             ("dataId".to_string(), search.to_string()),
             ("groupName".to_string(), group.to_string()),
@@ -209,10 +210,11 @@ impl NacosOpenApiAdmin {
             ("pageNo".to_string(), page_no.to_string()),
             ("pageSize".to_string(), page_size.to_string()),
         ];
+        push_optional(&mut v3_params, "appName", Some(app_name.to_string()));
         match self.get_json("/v3/console/cs/config/list", v3_params).await {
             Ok(value) => Ok(value),
             Err(v3_err) => {
-                let v1_params = vec![
+                let mut v1_params = vec![
                     ("search".to_string(), "blur".to_string()),
                     ("dataId".to_string(), search.to_string()),
                     ("group".to_string(), group.to_string()),
@@ -220,6 +222,7 @@ impl NacosOpenApiAdmin {
                     ("pageNo".to_string(), page_no.to_string()),
                     ("pageSize".to_string(), page_size.to_string()),
                 ];
+                push_optional(&mut v1_params, "appName", Some(app_name.to_string()));
                 self.get_json("/v1/cs/configs", v1_params).await.map_err(|v1_err| {
                     format!("Failed to list Nacos configs with v3 and v1 APIs. v3: {v3_err}; v1: {v1_err}")
                 })
@@ -285,6 +288,7 @@ impl NacosOpenApiAdmin {
         namespace: String,
         group: Option<String>,
         data_id_filter: Option<String>,
+        app_name_filter: Option<String>,
         page_no: u32,
         page_size: u32,
     ) -> Result<NacosConfigList, String> {
@@ -292,13 +296,15 @@ impl NacosOpenApiAdmin {
             return Ok(NacosConfigList { page_no, page_size, total_count: 0, items: Vec::new() });
         };
         let group = group.unwrap_or_default();
+        let app_name = app_name_filter.unwrap_or_default();
         let scan_page_size = page_size.max(self.cfg.page_size).clamp(100, 500);
         let max_scan_pages = 10;
         let mut matched = Vec::new();
         let mut current_page = 1;
 
         while current_page <= max_scan_pages {
-            let value = self.get_config_list_value(&namespace, "", &group, current_page, scan_page_size).await?;
+            let value =
+                self.get_config_list_value(&namespace, "", &group, &app_name, current_page, scan_page_size).await?;
             let list = parse_config_list(value, namespace.clone(), current_page, scan_page_size);
             matched.extend(list.items.into_iter().filter(|item| item.data_id.to_lowercase().contains(&filter)));
 
@@ -341,6 +347,7 @@ impl NacosAdmin for NacosOpenApiAdmin {
     async fn test_connection(&self) -> Result<NacosConnectionInfo, String> {
         let raw = self.get_server_state().await?;
         let _ = self.access_token().await?;
+        let _ = self.list_namespaces().await?;
         Ok(NacosConnectionInfo {
             server_addr: self.cfg.server_addr.clone(),
             display_server_addr: self.cfg.display_server_addr.clone(),
@@ -358,7 +365,10 @@ impl NacosAdmin for NacosOpenApiAdmin {
     async fn list_namespaces(&self) -> Result<Vec<NacosNamespaceInfo>, String> {
         let value = match self.get_json("/v3/console/core/namespace/list", Vec::new()).await {
             Ok(value) => value,
-            Err(_) => self.get_json("/v1/console/namespaces", Vec::new()).await?,
+            Err(v3_err) => self
+                .get_json("/v1/console/namespaces", Vec::new())
+                .await
+                .map_err(|v1_err| namespace_list_error(&v3_err, &v1_err))?,
         };
         Ok(parse_namespaces(value))
     }
@@ -455,12 +465,22 @@ impl NacosAdmin for NacosOpenApiAdmin {
         let search = data_id_filter.clone().unwrap_or_default();
         let group_filter = query.group.clone();
         let group = group_filter.clone().unwrap_or_default();
-        let value = self.get_config_list_value(&namespace, &search, &group, page_no, page_size).await?;
+        let app_name_filter = query.app_name.map(|value| value.trim().to_string()).filter(|value| !value.is_empty());
+        let app_name = app_name_filter.clone().unwrap_or_default();
+        let value = self.get_config_list_value(&namespace, &search, &group, &app_name, page_no, page_size).await?;
         let parsed =
             self.enrich_missing_config_formats(parse_config_list(value, namespace.clone(), page_no, page_size)).await;
         if data_id_filter.is_some() && parsed.items.is_empty() {
-            let fallback =
-                self.list_configs_by_client_filter(namespace, group_filter, data_id_filter, page_no, page_size).await?;
+            let fallback = self
+                .list_configs_by_client_filter(
+                    namespace,
+                    group_filter,
+                    data_id_filter,
+                    app_name_filter,
+                    page_no,
+                    page_size,
+                )
+                .await?;
             if !fallback.items.is_empty() {
                 return Ok(fallback);
             }
@@ -524,35 +544,15 @@ impl NacosAdmin for NacosOpenApiAdmin {
 
     async fn publish_config(&self, req: NacosConfigUpsert) -> Result<(), String> {
         let namespace = self.namespace(req.namespace.as_deref());
-        let mut v3_query = vec![
-            ("dataId".to_string(), req.data_id.clone()),
-            ("groupName".to_string(), req.group.clone()),
-            ("content".to_string(), req.content.clone()),
-            ("namespaceId".to_string(), namespace.clone()),
-        ];
-        push_optional(&mut v3_query, "type", req.config_type.clone());
-        push_optional(&mut v3_query, "appName", req.app_name.clone());
-        push_optional(&mut v3_query, "desc", req.desc.clone());
-        push_optional(&mut v3_query, "tags", req.tags.clone());
-
-        let mut v1_form = vec![
-            ("dataId".to_string(), req.data_id),
-            ("group".to_string(), req.group),
-            ("content".to_string(), req.content),
-            ("tenant".to_string(), namespace),
-        ];
-        push_optional(&mut v1_form, "type", req.config_type);
-        push_optional(&mut v1_form, "appName", req.app_name);
-        push_optional(&mut v1_form, "desc", req.desc);
-        push_optional(&mut v1_form, "config_tags", req.tags);
+        let (v3_form, v1_form) = build_publish_forms(req, namespace);
 
         let mut errors = Vec::new();
-        for (path, query) in [
-            ("/v3/console/cs/config", v3_query.clone()),
-            ("/v3/console/cs/config/publish", v3_query.clone()),
-            ("/v3/console/cs/config/update", v3_query),
+        for (path, form) in [
+            ("/v3/console/cs/config", v3_form.clone()),
+            ("/v3/console/cs/config/publish", v3_form.clone()),
+            ("/v3/console/cs/config/update", v3_form),
         ] {
-            match self.request(reqwest::Method::POST, path, query, None, None).await {
+            match self.request(reqwest::Method::POST, path, Vec::new(), Some(form), None).await {
                 Ok(resp) => match error_for_status(resp, path).await {
                     Ok(_) => return Ok(()),
                     Err(err) => errors.push(err),
@@ -988,6 +988,38 @@ fn push_optional(params: &mut Vec<(String, String)>, key: &str, value: Option<St
     }
 }
 
+fn build_publish_forms(req: NacosConfigUpsert, namespace: String) -> (Vec<(String, String)>, Vec<(String, String)>) {
+    let mut v3_form = vec![
+        ("dataId".to_string(), req.data_id.clone()),
+        ("groupName".to_string(), req.group.clone()),
+        ("content".to_string(), req.content.clone()),
+        ("namespaceId".to_string(), namespace.clone()),
+    ];
+    push_optional(&mut v3_form, "type", req.config_type.clone());
+    push_optional(&mut v3_form, "appName", req.app_name.clone());
+    push_optional(&mut v3_form, "desc", req.desc.clone());
+    push_optional(&mut v3_form, "configTags", req.tags.clone());
+    push_optional(&mut v3_form, "config_tags", req.tags.clone());
+
+    let mut v1_form = vec![
+        ("dataId".to_string(), req.data_id),
+        ("group".to_string(), req.group),
+        ("content".to_string(), req.content),
+        ("tenant".to_string(), namespace),
+    ];
+    push_optional(&mut v1_form, "type", req.config_type);
+    push_optional(&mut v1_form, "appName", req.app_name);
+    push_optional(&mut v1_form, "desc", req.desc);
+    push_optional(&mut v1_form, "config_tags", req.tags);
+
+    (v3_form, v1_form)
+}
+
+fn namespace_list_error(v3_err: &str, v1_err: &str) -> String {
+    let message = format!("Failed to list Nacos namespaces with v3 and v1 APIs. v3: {v3_err}; v1: {v1_err}");
+    classified_error(classify_nacos_error(&message), &message)
+}
+
 async fn response_json_or_text(resp: reqwest::Response) -> Result<Value, String> {
     let bytes = resp.bytes().await.map_err(|e| format!("Failed to read Nacos response: {e}"))?;
     if bytes.is_empty() {
@@ -1023,11 +1055,7 @@ fn classify_nacos_error(message: &str) -> &'static str {
     {
         return "authFailed";
     }
-    if lower.contains("no static resource")
-        || lower.contains("context path")
-        || lower.contains("path\":\"/")
-        || lower.contains("path=/")
-    {
+    if lower.contains("no static resource") || lower.contains("context path") {
         return "contextPathMismatch";
     }
     if lower.contains("history")
@@ -1383,7 +1411,7 @@ mod tests {
         let parsed = parse_config_list(
             serde_json::json!({
                 "totalCount": 1,
-                "pageItems": [{ "dataId": "app.yaml", "group": "DEFAULT_GROUP", "type": "yaml" }]
+                "pageItems": [{ "dataId": "app.yaml", "group": "DEFAULT_GROUP", "type": "yaml", "appName": "portal" }]
             }),
             "public".to_string(),
             1,
@@ -1392,6 +1420,7 @@ mod tests {
         assert_eq!(parsed.total_count, 1);
         assert_eq!(parsed.items[0].data_id, "app.yaml");
         assert_eq!(parsed.items[0].namespace, "public");
+        assert_eq!(parsed.items[0].app_name.as_deref(), Some("portal"));
         assert_eq!(parsed.items[0].config_type.as_deref(), Some("yaml"));
     }
 
@@ -1439,7 +1468,7 @@ mod tests {
                 "data": {
                     "totalCount": 1,
                     "pageItems": [
-                        { "dataId": "app.json", "groupName": "DEFAULT_GROUP", "namespaceId": "public" }
+                        { "dataId": "app.json", "groupName": "DEFAULT_GROUP", "namespaceId": "public", "appName": "console" }
                     ]
                 }
             }),
@@ -1449,6 +1478,7 @@ mod tests {
         );
         assert_eq!(parsed.total_count, 1);
         assert_eq!(parsed.items[0].group, "DEFAULT_GROUP");
+        assert_eq!(parsed.items[0].app_name.as_deref(), Some("console"));
         assert_eq!(parsed.items[0].config_type.as_deref(), Some("json"));
     }
 
@@ -1474,6 +1504,44 @@ mod tests {
         assert_eq!(parsed.namespace, "ops");
         assert_eq!(parsed.config_type.as_deref(), Some("text"));
         assert_eq!(parsed.content.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn builds_v3_publish_form_fields() {
+        let (v3_form, v1_form) = build_publish_forms(
+            NacosConfigUpsert {
+                namespace: Some("ops".to_string()),
+                data_id: "app.yaml".to_string(),
+                group: "DEFAULT_GROUP".to_string(),
+                content: "server:\n  port: 8080".to_string(),
+                config_type: Some("yaml".to_string()),
+                app_name: Some("portal".to_string()),
+                desc: Some("main config".to_string()),
+                tags: Some("prod,gray".to_string()),
+            },
+            "ops".to_string(),
+        );
+
+        assert!(v3_form.contains(&("dataId".to_string(), "app.yaml".to_string())));
+        assert!(v3_form.contains(&("groupName".to_string(), "DEFAULT_GROUP".to_string())));
+        assert!(v3_form.contains(&("namespaceId".to_string(), "ops".to_string())));
+        assert!(v3_form.contains(&("content".to_string(), "server:\n  port: 8080".to_string())));
+        assert!(v3_form.contains(&("type".to_string(), "yaml".to_string())));
+        assert!(v3_form.contains(&("configTags".to_string(), "prod,gray".to_string())));
+        assert!(v3_form.contains(&("config_tags".to_string(), "prod,gray".to_string())));
+        assert!(v1_form.contains(&("group".to_string(), "DEFAULT_GROUP".to_string())));
+        assert!(v1_form.contains(&("tenant".to_string(), "ops".to_string())));
+    }
+
+    #[test]
+    fn namespace_list_error_keeps_v3_and_v1_details() {
+        let err = namespace_list_error(
+            "NACOS_ERROR[authFailed]: Nacos admin /v3/console/core/namespace/list returned 403 Forbidden",
+            "NACOS_ERROR[apiVersionMismatch]: Nacos admin /v1/console/namespaces returned 410 Gone",
+        );
+        assert!(err.starts_with("NACOS_ERROR[authFailed]:"));
+        assert!(err.contains("/v3/console/core/namespace/list returned 403 Forbidden"));
+        assert!(err.contains("/v1/console/namespaces returned 410 Gone"));
     }
 
     #[test]
@@ -1696,6 +1764,12 @@ mod tests {
     fn classifies_common_nacos_errors() {
         assert_eq!(classify_nacos_error("401 Unauthorized invalid access token"), "authFailed");
         assert_eq!(classify_nacos_error("No static resource nacos/v3/console/server/state"), "contextPathMismatch");
+        assert_eq!(
+            classify_nacos_error(
+                r#"410 Gone {"message":"Current API will be deprecated","path":"/v1/console/namespaces"}"#
+            ),
+            "apiVersionMismatch"
+        );
         assert_eq!(classify_nacos_error("404 Not Found"), "apiVersionMismatch");
         assert_eq!(classify_nacos_error("connection refused"), "connectionFailed");
     }

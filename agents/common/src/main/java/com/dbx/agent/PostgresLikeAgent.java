@@ -323,7 +323,7 @@ public abstract class PostgresLikeAgent extends AbstractJdbcAgent {
                         result.add(new ColumnInfo(
                             colName,
                             rs.getString("data_type"),
-                            "YES".equals(rs.getString("is_nullable")),
+                            rs.getBoolean("is_nullable"),
                             rs.getString("column_default"),
                             primaryKeys.contains(colName),
                             null,

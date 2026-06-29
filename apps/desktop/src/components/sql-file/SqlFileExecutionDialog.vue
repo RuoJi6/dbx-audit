@@ -14,11 +14,13 @@ import { useToast } from "@/composables/useToast";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { databaseOptionsForConnection } from "@/composables/useDatabaseOptions";
 import { cancelSqlFileExecution, executeSqlFile, listenSqlFileProgress, listDatabases, previewSqlFile, type SqlFilePreview, type SqlFileProgress, type SqlFileStatus } from "@/lib/api";
+import { useExportTracker } from "@/composables/useExportTracker";
 import { Check, CheckSquare, FileCode, FolderOpen, Loader2, Play, Square, X } from "@lucide/vue";
 
 const { t } = useI18n();
 const { toast } = useToast();
 const { highlight } = useSqlHighlighter();
+const { addSqlFileTask, updateSqlFileTask } = useExportTracker();
 const open = defineModel<boolean>("open", { default: false });
 
 const props = defineProps<{
@@ -282,6 +284,7 @@ async function startExecution() {
   terminalStatus.value = "running";
   terminalError.value = "";
   progress.value = null;
+  addSqlFileTask(id, preview.value.fileName, preview.value.filePath);
 
   let unlisten: (() => void) | undefined;
   try {
@@ -296,6 +299,7 @@ async function startExecution() {
       progress.value = next;
       terminalStatus.value = next.status;
       terminalError.value = next.error ?? terminalError.value;
+      updateSqlFileTask(id, next);
       if (isTerminalStatus(next.status)) {
         running.value = false;
         cancelling.value = false;
@@ -320,6 +324,18 @@ async function startExecution() {
     });
     if (!isTerminalStatus(terminalStatus.value)) {
       terminalStatus.value = cancelRequested.value ? "cancelled" : "done";
+      const lastProgress = progress.value as SqlFileProgress | null;
+      updateSqlFileTask(id, {
+        executionId: id,
+        status: terminalStatus.value,
+        statementIndex: lastProgress?.statementIndex ?? 0,
+        successCount: lastProgress?.successCount ?? 0,
+        failureCount: lastProgress?.failureCount ?? 0,
+        affectedRows: lastProgress?.affectedRows ?? 0,
+        elapsedMs: lastProgress?.elapsedMs ?? 0,
+        statementSummary: lastProgress?.statementSummary ?? "",
+        error: lastProgress?.error ?? null,
+      });
       if (terminalStatus.value === "done") {
         await refreshTargetAfterImport();
       }
@@ -327,6 +343,18 @@ async function startExecution() {
   } catch (e: any) {
     terminalStatus.value = cancelRequested.value ? "cancelled" : "error";
     terminalError.value = e?.message || String(e);
+    const lastProgress = progress.value as SqlFileProgress | null;
+    updateSqlFileTask(id, {
+      executionId: id,
+      status: terminalStatus.value,
+      statementIndex: lastProgress?.statementIndex ?? 0,
+      successCount: lastProgress?.successCount ?? 0,
+      failureCount: lastProgress?.failureCount ?? 0,
+      affectedRows: lastProgress?.affectedRows ?? 0,
+      elapsedMs: lastProgress?.elapsedMs ?? 0,
+      statementSummary: lastProgress?.statementSummary ?? "",
+      error: terminalError.value,
+    });
     if (!cancelRequested.value) {
       toast(terminalError.value, 5000);
     }
@@ -356,7 +384,6 @@ async function cancelExecution() {
 }
 
 function handleOpenChange(nextOpen: boolean) {
-  if (!nextOpen && running.value) return;
   open.value = nextOpen;
 }
 
@@ -373,6 +400,7 @@ watch(
   open,
   (value) => {
     if (!value) return;
+    if (running.value) return;
     resetState();
     if (connectionId.value) {
       loadDatabasesForConnection(connectionId.value);
@@ -543,6 +571,9 @@ watch(
 
       <DialogFooter>
         <template v-if="running">
+          <Button variant="outline" size="sm" @click="open = false">
+            {{ t("sqlFile.runInBackground") }}
+          </Button>
           <Button variant="destructive" size="sm" :disabled="cancelling" @click="cancelExecution">
             <Loader2 v-if="cancelling" class="w-3.5 h-3.5 mr-1.5 animate-spin" />
             <X v-else class="w-3.5 h-3.5 mr-1.5" />

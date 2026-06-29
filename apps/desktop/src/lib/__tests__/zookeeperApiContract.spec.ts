@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { zookeeperDelete, zookeeperGet, zookeeperListPrefix, zookeeperPut, type KvPutOptions, type KvPutResponse } from "../api";
+import { zookeeperDelete, zookeeperGet, zookeeperListPrefix, zookeeperPut, type KvListPrefixOptions, type KvPutOptions, type KvPutResponse } from "../api";
 import type { DatabaseType } from "@/types/database";
 
 describe("zookeeper frontend API contract", () => {
@@ -13,9 +13,13 @@ describe("zookeeper frontend API contract", () => {
       key: "/sessions/member-0000000001",
       createdKey: "/sessions/member-0000000001",
     };
+    const listOptions: KvListPrefixOptions = {
+      recursive: false,
+    };
 
     expect(dbType).toBe("zookeeper");
     expect(options.createMode).toBe("ephemeral_sequential");
+    expect(listOptions.recursive).toBe(false);
     expect(response.createdKey).toBe(response.key);
     expect(typeof zookeeperListPrefix).toBe("function");
     expect(typeof zookeeperGet).toBe("function");

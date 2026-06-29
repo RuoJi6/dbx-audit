@@ -195,6 +195,30 @@ test("buildGroupedObjectTreeNodes groups Oracle packages and package bodies", ()
   );
 });
 
+test("buildGroupedObjectTreeNodes groups materialized views separately from views", () => {
+  const groups = buildGroupedObjectTreeNodes({
+    nodeId: "conn:app:APP",
+    connectionId: "conn",
+    database: "app",
+    schema: "APP",
+    objects: [
+      { name: "ACTIVE_USERS", object_type: "VIEW", schema: "APP" },
+      { name: "USER_SUMMARY_MV", object_type: "MATERIALIZED_VIEW", schema: "APP" },
+    ],
+  });
+
+  const viewGroup = groups.find((node) => node.type === "group-views");
+  const materializedViewGroup = groups.find((node) => node.type === "group-materialized-views");
+  assert.deepEqual(
+    viewGroup?.children?.map((node) => ({ label: node.label, type: node.type })),
+    [{ label: "ACTIVE_USERS", type: "view" }],
+  );
+  assert.deepEqual(
+    materializedViewGroup?.children?.map((node) => ({ label: node.label, type: node.type })),
+    [{ label: "USER_SUMMARY_MV", type: "materialized_view" }],
+  );
+});
+
 test("buildObjectGroupPlaceholderNodes creates capability-driven lazy sidebar groups", () => {
   const groups = buildObjectGroupPlaceholderNodes({
     nodeId: "conn:app:HR",

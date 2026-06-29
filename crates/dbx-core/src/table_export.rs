@@ -435,6 +435,7 @@ async fn try_export_native_table_stream(
     db_type: &DatabaseType,
     col_names: &[String],
     column_types: &[Option<String>],
+    column_extras: &[Option<String>],
     primary_keys: &[String],
     total_rows: Option<u64>,
     row_limit: Option<usize>,
@@ -640,6 +641,7 @@ async fn try_export_native_table_stream(
                         qualified_table_name: None,
                         columns: col_names.to_vec(),
                         column_types: column_types.to_vec(),
+                        column_extras: column_extras.to_vec(),
                         rows: std::mem::take(pending_rows),
                         batch_size: Some(SQL_INSERT_BATCH_SIZE),
                     })?;
@@ -761,10 +763,10 @@ pub async fn export_table_data_core(
     // 3. Resolve columns. Data grid exports can provide columns/primary keys
     // directly, which avoids expensive metadata round-trips on JDBC drivers.
     let requested_columns = request.columns.as_ref().filter(|columns| !columns.is_empty());
-    let (col_names, column_types, primary_keys) = if let Some(requested_columns) = requested_columns {
+    let (col_names, column_types, column_extras, primary_keys) = if let Some(requested_columns) = requested_columns {
         let primary_keys = request.primary_keys.clone().unwrap_or_default();
         let column_types = request.column_types.clone().unwrap_or_default();
-        (requested_columns.clone(), column_types, primary_keys)
+        (requested_columns.clone(), column_types, Vec::new(), primary_keys)
     } else {
         let columns = crate::schema::get_columns_core(
             state,
@@ -776,8 +778,9 @@ pub async fn export_table_data_core(
         .await?;
         let col_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
         let column_types: Vec<Option<String>> = columns.iter().map(|c| Some(c.data_type.clone())).collect();
+        let column_extras: Vec<Option<String>> = columns.iter().map(|c| c.extra.clone()).collect();
         let primary_keys: Vec<String> = columns.iter().filter(|c| c.is_primary_key).map(|c| c.name.clone()).collect();
-        (col_names, column_types, primary_keys)
+        (col_names, column_types, column_extras, primary_keys)
     };
 
     if col_names.is_empty() {
@@ -844,6 +847,7 @@ pub async fn export_table_data_core(
         &db_type,
         &col_names,
         &column_types,
+        &column_extras,
         &primary_keys,
         total_rows,
         row_limit,
@@ -1246,6 +1250,7 @@ pub async fn export_table_data_core(
                     qualified_table_name: None,
                     columns: col_names.clone(),
                     column_types: column_types.clone(),
+                    column_extras: column_extras.clone(),
                     rows: result.rows.clone(),
                     batch_size: Some(100),
                 })?;
