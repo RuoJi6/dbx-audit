@@ -56,6 +56,7 @@ export interface NacosConfigQuery {
   namespace?: string;
   group?: string;
   dataId?: string;
+  appName?: string;
   search?: string;
   pageNo?: number;
   pageSize?: number;

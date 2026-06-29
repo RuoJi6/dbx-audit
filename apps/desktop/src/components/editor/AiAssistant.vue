@@ -24,7 +24,7 @@ import { buildAiAgentPlan } from "@/lib/aiAgentPlan";
 import { buildAiAgentStepItems, type AiAgentStepItem, type AiAgentStepTone } from "@/lib/aiAgentStepPresentation";
 import { createAiShikiCodeHighlighter, type AiCodeHighlighter } from "@/lib/aiCodeHighlighter";
 import { createAiMessageRenderer } from "@/lib/aiMessageRender";
-import { Marked } from "marked";
+import { formatAiInlineMarkdown, handleAiMarkdownLinkClick } from "@/lib/aiMarkdown";
 import { aiCancelStream, aiListModels, saveAiConversation, loadAiConversations, deleteAiConversation, listSchemas, listTables, type AiConversation, type AiModelInfo } from "@/lib/api";
 import type { AiMessage } from "@/lib/api";
 import type { ConnectionConfig, QueryTab, TableInfo } from "@/types/database";
@@ -1021,32 +1021,27 @@ function triggerAction(action: AiAction, instruction?: string) {
 
 defineExpose({ triggerAction });
 
-const markedInstance = new Marked({
-  breaks: true,
-  gfm: true,
-  renderer: {
-    code({ text }: { text: string }) {
-      return `<code class="rounded bg-muted px-1.5 py-0.5 text-[11px] font-mono">${text}</code>`;
-    },
-  },
-});
-
-function formatInlineText(text: string): string {
-  try {
-    return markedInstance.parse(text) as string;
-  } catch {
-    return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  }
-}
-
 const messageRenderer = computed(() => {
   const appearance = aiCodeAppearance.value;
   const highlightCode = shikiCodeHighlighter.value;
   return createAiMessageRenderer({
-    markdown: formatInlineText,
+    markdown: formatAiInlineMarkdown,
     highlightCode: highlightCode ? (content, lang) => highlightCode(content, lang, appearance) : undefined,
   });
 });
+
+function onMarkdownClick(event: MouseEvent) {
+  handleAiMarkdownLinkClick(event, openExternalUrl);
+}
+
+async function openExternalUrl(url: string) {
+  try {
+    const { open } = await import("@tauri-apps/plugin-shell");
+    await open(url);
+  } catch {
+    window.open(url, "_blank", "noopener,noreferrer");
+  }
+}
 </script>
 
 <template>
@@ -1148,7 +1143,7 @@ const messageRenderer = computed(() => {
                 </div>
               </div>
               <template v-for="(seg, j) in messageRenderer.render(msg.content)" :key="j">
-                <div v-if="seg.type === 'text'" class="ai-markdown whitespace-normal">
+                <div v-if="seg.type === 'text'" class="ai-markdown whitespace-normal" @click.capture="onMarkdownClick">
                   <div v-html="seg.html" />
                 </div>
                 <div v-else class="my-2 overflow-hidden rounded-md border border-zinc-200 bg-zinc-50 dark:border-zinc-700/50 dark:bg-zinc-900">
@@ -1201,7 +1196,7 @@ const messageRenderer = computed(() => {
     </ScrollArea>
 
     <div class="p-2">
-      <div ref="promptPanelRef" class="relative rounded-lg border bg-background">
+      <div ref="promptPanelRef" class="relative rounded-[6px] border bg-background">
         <div class="resize-handle" @mousedown="startResize"></div>
         <div class="px-2 pb-2 pt-1">
           <div v-if="connectionStore.connections.length" class="flex items-center gap-1 mb-1 text-xs text-foreground/80">
@@ -1313,14 +1308,14 @@ const messageRenderer = computed(() => {
               v-model="assistantMode"
               :items="assistantModeItems"
               :aria-label="activeModeHint"
-              trigger-class="flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full border px-2 py-0.5 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground"
+              trigger-class="flex shrink-0 items-center gap-1 whitespace-nowrap rounded-[6px] border px-2 py-0.5 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground"
               item-class="text-xs px-2"
             />
             <LightDropdown
               :model-value="activeAction"
               :items="actionMenuItems"
               content-class="w-max min-w-0"
-              trigger-class="flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full border px-2 py-0.5 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground"
+              trigger-class="flex shrink-0 items-center gap-1 whitespace-nowrap rounded-[6px] border px-2 py-0.5 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground"
               item-class="text-xs px-2"
               @update:model-value="(value) => selectAction(value as AiAction)"
             />
@@ -1335,7 +1330,7 @@ const messageRenderer = computed(() => {
               :loading-text="t('ai.loadingModels')"
               :loading="modelLoading"
               :display-name="displayModelName"
-              trigger-class="min-w-0 w-auto max-w-[220px] shrink justify-end rounded-full border px-2 py-0.5 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground"
+              trigger-class="min-w-0 w-auto max-w-[220px] shrink justify-end rounded-[6px] border px-2 py-0.5 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground"
               content-class="w-72"
               item-class="h-auto min-h-8 px-2 py-1.5 text-xs"
               @update:model-value="handleModelSelect"

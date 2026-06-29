@@ -52,6 +52,8 @@ pub struct KvListPrefixRequest {
     pub limit: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub continuation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recursive: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -140,10 +142,20 @@ pub struct KvDeleteResponse {
 }
 
 pub fn kv_list_prefix_params(prefix: &str, limit: usize, continuation: Option<&str>) -> serde_json::Value {
+    kv_list_prefix_params_with_options(prefix, limit, continuation, None)
+}
+
+pub fn kv_list_prefix_params_with_options(
+    prefix: &str,
+    limit: usize,
+    continuation: Option<&str>,
+    recursive: Option<bool>,
+) -> serde_json::Value {
     serde_json::to_value(KvListPrefixRequest {
         prefix: prefix.to_string(),
         limit,
         continuation: continuation.map(str::to_string),
+        recursive,
     })
     .expect("KV list prefix request should serialize")
 }
@@ -178,8 +190,24 @@ pub async fn kv_list_prefix_core(
     limit: usize,
     continuation: Option<&str>,
 ) -> Result<KvListPrefixResponse, String> {
-    call_agent_kv(state, connection_id, AgentKvMethod::ListPrefix, kv_list_prefix_params(prefix, limit, continuation))
-        .await
+    kv_list_prefix_core_with_options(state, connection_id, prefix, limit, continuation, None).await
+}
+
+pub async fn kv_list_prefix_core_with_options(
+    state: &AppState,
+    connection_id: &str,
+    prefix: &str,
+    limit: usize,
+    continuation: Option<&str>,
+    recursive: Option<bool>,
+) -> Result<KvListPrefixResponse, String> {
+    call_agent_kv(
+        state,
+        connection_id,
+        AgentKvMethod::ListPrefix,
+        kv_list_prefix_params_with_options(prefix, limit, continuation, recursive),
+    )
+    .await
 }
 
 pub async fn kv_get_core(state: &AppState, connection_id: &str, key: &str) -> Result<KvGetResponse, String> {
@@ -255,6 +283,18 @@ mod tests {
             serde_json::json!({
                 "prefix": "",
                 "limit": 50
+            })
+        );
+    }
+
+    #[test]
+    fn serializes_kv_list_prefix_params_with_recursive_false() {
+        assert_eq!(
+            kv_list_prefix_params_with_options("/app", 200, None, Some(false)),
+            serde_json::json!({
+                "prefix": "/app",
+                "limit": 200,
+                "recursive": false
             })
         );
     }

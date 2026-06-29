@@ -109,11 +109,15 @@ public final class JsonRpcServer {
         }
         if (AgentProtocol.METHOD_LIST_TABLES.equals(method)) {
             switchCatalog(params);
-            return agent.listTables(params.get("schema").getAsString());
+            return agent.listTables(params.get("schema").getAsString(), stringListOrNull(params, "object_types"));
         }
         if (AgentProtocol.METHOD_LIST_OBJECTS.equals(method)) {
             switchCatalog(params);
             return agent.listObjects(params.get("schema").getAsString());
+        }
+        if (AgentProtocol.METHOD_LIST_DATA_TYPES.equals(method)) {
+            switchCatalog(params);
+            return agent.listDataTypes();
         }
         if (AgentProtocol.METHOD_COMPLETION_ASSISTANT_SEARCH_V1.equals(method)) {
             switchCatalog(params);
@@ -217,6 +221,11 @@ public final class JsonRpcServer {
             Type statementsType = new TypeToken<List<String>>() {}.getType();
             List<String> statements = gson.fromJson(params.get("statements"), statementsType);
             return agent.executeTransaction(statements, stringOrNull(params, "schema"));
+        }
+        if (AgentProtocol.METHOD_EXECUTE_BATCH.equals(method)) {
+            Type statementsType = new TypeToken<List<String>>() {}.getType();
+            List<String> statements = gson.fromJson(params.get("statements"), statementsType);
+            return agent.executeBatch(statements, stringOrNull(params, "schema"));
         }
         if (AgentProtocol.METHOD_DISCONNECT.equals(method)) {
             JdbcExecutor.INSTANCE.closeAllQuerySessions();

@@ -84,6 +84,11 @@ describe("splitSqlStatementRanges", () => {
     const sql = "SELECT $$ a; b $$;\nSELECT 2";
     expect(rangeSqlTexts(splitSqlStatementRanges(sql))).toEqual(["SELECT $$ a; b $$", "SELECT 2"]);
   });
+
+  it("skips MySQL delimiter commands and empty custom delimiter statements", () => {
+    const sql = "select COUNT(1) FROM your_table;\ndelimiter ;;\nselect COUNT(1) FROM your_table;\n\n;;\ndelimiter ;";
+    expect(rangeSqlTexts(splitSqlStatementRanges(sql, "mysql"))).toEqual(["select COUNT(1) FROM your_table", "select COUNT(1) FROM your_table;"]);
+  });
 });
 
 describe("statementRangeAtCursor", () => {
@@ -219,6 +224,12 @@ describe("statementRangeAtCursor", () => {
     expect(range?.from).toBe(2);
     expect(range?.sql).toBe("SELECT 1");
   });
+
+  it("skips MySQL delimiter commands when resolving the cursor statement", () => {
+    const sql = "select COUNT(1) FROM your_table;\ndelimiter ;;\nselect COUNT(1) FROM your_table;\n\n;;\ndelimiter ;";
+    expect(statementRangeAtCursor(sql, indexOf(sql, "COUNT", 2), "mysql")?.sql.trim()).toBe("select COUNT(1) FROM your_table;");
+    expect(statementRangeAtCursor(sql, indexOf(sql, "delimiter"), "mysql")).toBeNull();
+  });
 });
 
 describe("fullSqlRange", () => {
@@ -297,6 +308,12 @@ describe("buildExecutionCandidates", () => {
     const candidates = buildExecutionCandidates(sql, sql.length);
     expect(candidateKinds(candidates)).toEqual(["all"]);
   });
+
+  it("uses the MySQL statement body for delimiter scripts", () => {
+    const sql = "select COUNT(1) FROM your_table;\ndelimiter ;;\nselect COUNT(1) FROM your_table;\n\n;;\ndelimiter ;";
+    const candidates = buildExecutionCandidates(sql, indexOf(sql, "COUNT", 2), "mysql");
+    expect(candidateSummaries(candidates)).toEqual(["cursor:select COUNT(1) FROM your_table;", "all:select COUNT(1) FROM your_table;\ndelimiter ;;\nselect COUNT(1) FROM your_table;\n\n;;\ndelimiter ;"]);
+  });
 });
 
 describe("hasMultipleExecutionTargets", () => {
@@ -315,6 +332,11 @@ describe("hasMultipleExecutionTargets", () => {
   it("counts executable Redis command lines", () => {
     expect(hasMultipleExecutionTargets("GET user:1", "redis")).toBe(false);
     expect(hasMultipleExecutionTargets("GET user:1\n# comment\nDEL user:2", "redis")).toBe(true);
+  });
+
+  it("counts MySQL delimiter scripts by executable statements", () => {
+    const sql = "select COUNT(1) FROM your_table;\ndelimiter ;;\nselect COUNT(1) FROM your_table;\n\n;;\ndelimiter ;";
+    expect(hasMultipleExecutionTargets(sql, "mysql")).toBe(true);
   });
 });
 

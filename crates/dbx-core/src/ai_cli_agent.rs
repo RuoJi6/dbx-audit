@@ -52,6 +52,7 @@ pub fn dbx_mcp_enabled_tools(agent_mode: bool) -> Vec<&'static str> {
     let mut tools = vec!["dbx_list_connections", "dbx_list_tables", "dbx_describe_table", "dbx_get_schema_context"];
     if agent_mode {
         tools.push("dbx_execute_query");
+        tools.push("dbx_execute_redis_command");
     }
     tools
 }

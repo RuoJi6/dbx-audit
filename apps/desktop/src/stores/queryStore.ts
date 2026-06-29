@@ -49,6 +49,7 @@ const STORAGE_KEY = "dbx-open-tabs";
 const ACTIVE_TAB_KEY = "dbx-active-tab";
 const ORACLE_LIKE_METADATA_TYPES = new Set<string>(["oracle", "dameng", "oceanbase-oracle"]);
 const BACKGROUND_CLIENT_SESSION_SUFFIXES = ["count", "explain", "export"] as const;
+const CANCEL_QUERY_TIMEOUT_MS = 10_000;
 
 interface BuildQueryResultExportRequestOptions {
   exportId: string;
@@ -91,6 +92,20 @@ async function withFrontendQueryTimeout<T>(promise: Promise<T>, timeoutSecs: num
       promise,
       new Promise<never>((_, reject) => {
         timer = setTimeout(() => reject(new Error(message)), timeoutSecs * 1000);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function withCancelQueryTimeout<T>(promise: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("Cancel request timed out after 10s.")), CANCEL_QUERY_TIMEOUT_MS);
       }),
     ]);
   } finally {
@@ -1009,6 +1024,10 @@ export const useQueryStore = defineStore("query", () => {
   function openSavedSql(file: SavedSqlFile) {
     const existing = tabs.value.find((tab) => tab.savedSqlId === file.id);
     if (existing) {
+      if (!existing.sql && file.sql) {
+        existing.sql = file.sql;
+        existing.originalSql = file.sql;
+      }
       activeTabId.value = existing.id;
       return existing.id;
     }
@@ -1032,6 +1051,21 @@ export const useQueryStore = defineStore("query", () => {
     tabs.value.push(tab);
     activeTabId.value = id;
     return id;
+  }
+
+  async function hydrateSavedSqlTabs() {
+    const savedSqlStore = useSavedSqlStore();
+    const linkedTabs = tabs.value.filter((tab) => tab.savedSqlId && tab.sql === "");
+    for (const tab of linkedTabs) {
+      const file = await savedSqlStore.ensureFileContent(tab.savedSqlId!);
+      if (!file) continue;
+      tab.title = tab.customTitle ? tab.title : file.name;
+      tab.connectionId = file.connectionId;
+      tab.database = file.database;
+      tab.schema = file.schema;
+      tab.sql = file.sql;
+      tab.originalSql = file.sql;
+    }
   }
 
   function togglePinnedTab(id: string) {
@@ -1092,9 +1126,9 @@ export const useQueryStore = defineStore("query", () => {
     // Sync connection change back to the saved SQL file if this tab is linked
     if (tab.savedSqlId) {
       const savedSqlStore = useSavedSqlStore();
-      const existing = savedSqlStore.getFile(tab.savedSqlId);
-      if (existing) {
-        void savedSqlStore.saveFile({
+      void savedSqlStore.ensureFileContent(tab.savedSqlId).then((existing) => {
+        if (!existing) return;
+        return savedSqlStore.saveFile({
           id: existing.id,
           connectionId,
           name: existing.name,
@@ -1102,7 +1136,7 @@ export const useQueryStore = defineStore("query", () => {
           schema: existing.schema,
           sql: existing.sql,
         });
-      }
+      });
     }
   }
 
@@ -1969,7 +2003,7 @@ export const useQueryStore = defineStore("query", () => {
     if (!executionId) return false;
     tab.isCancelling = true;
     try {
-      const canceled = await api.cancelQuery(executionId);
+      const canceled = await withCancelQueryTimeout(api.cancelQuery(executionId));
       if (!canceled) {
         const current = tabs.value.find((t) => t.id === id);
         if (current && current.executionId === executionId) {
@@ -1985,7 +2019,10 @@ export const useQueryStore = defineStore("query", () => {
       if (tab) useConnectionStore().recordConnectionLostError(tab.connectionId, e);
       const current = tabs.value.find((t) => t.id === id);
       if (current && current.executionId === executionId) {
+        current.isExecuting = false;
         current.isCancelling = false;
+        current.executionId = undefined;
+        current.queryExecutionStartedAt = undefined;
         current.result = toErrorResult(e);
       }
       return false;
@@ -2382,6 +2419,7 @@ export const useQueryStore = defineStore("query", () => {
     linkSavedSql,
     linkExternalSqlPath,
     openSavedSql,
+    hydrateSavedSqlTabs,
     togglePinnedTab,
     reorderTab,
     updateDatabase,

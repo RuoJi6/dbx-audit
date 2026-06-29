@@ -1,6 +1,7 @@
 import type { ConnectionConfig } from "./connections.js";
 import type { TableInfo, ColumnInfo, QueryOptions, QueryResult } from "./database.js";
 import { collectionListToTableInfos, evaluateMongoAggregateSafety, evaluateMongoWriteSafety, inferMongoColumns, mongoDocumentsToQueryResult, parseMongoAggregateCommand, parseMongoCountDocumentsCommand, parseMongoFindCommand, parseMongoGetIndexesCommand, parseMongoWriteCommand, type CollectionInfo, type MongoWriteCommand } from "./database.js";
+import type { RedisCommandOptions, RedisCommandResult } from "./redis-command.js";
 import { sqlSafetyFromEnv } from "./sql-safety.js";
 
 const baseUrl = process.env.DBX_WEB_URL!.replace(/\/+$/, "");
@@ -220,6 +221,23 @@ export async function executeQuery(config: ConnectionConfig, sql: string, option
   });
   const limitedRows = rows.slice(0, options?.maxRows ?? rows.length);
   return { columns: data.columns, rows: limitedRows, row_count: limitedRows.length };
+}
+
+export async function executeRedisCommand(config: ConnectionConfig, db: number, command: string, options?: RedisCommandOptions): Promise<RedisCommandResult> {
+  if (config.db_type !== "redis") {
+    throw new Error("Connection is not Redis.");
+  }
+  await ensureConnected(config);
+  const res = await apiFetch("/api/redis/execute-command", {
+    method: "POST",
+    body: JSON.stringify({
+      connectionId: config.id,
+      db,
+      command,
+      skipSafetyCheck: options?.skipSafetyCheck ?? false,
+    }),
+  });
+  return (await res.json()) as RedisCommandResult;
 }
 
 async function executeMongoWrite(config: ConnectionConfig, command: MongoWriteCommand): Promise<number> {

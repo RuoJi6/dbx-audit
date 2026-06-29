@@ -79,6 +79,8 @@ pub struct NacosConfigQuery {
     #[serde(default)]
     pub data_id: Option<String>,
     #[serde(default)]
+    pub app_name: Option<String>,
+    #[serde(default)]
     pub search: Option<String>,
     #[serde(default)]
     pub page_no: Option<u32>,

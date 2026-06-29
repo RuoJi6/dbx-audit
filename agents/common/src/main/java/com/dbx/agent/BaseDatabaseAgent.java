@@ -94,6 +94,11 @@ public abstract class BaseDatabaseAgent implements DatabaseAgent {
         return TransactionExecutor.executeUpdateStatements(requireConnected(), statements, schema, this::setSchemaSQL);
     }
 
+    @Override
+    public QueryResult executeBatch(List<String> statements, String schema) {
+        return BatchExecutor.executeBatchStatements(requireConnected(), statements, schema, this::setSchemaSQL);
+    }
+
     protected Connection requireConnected() {
         Connection conn = getConnection();
         if (conn == null) {

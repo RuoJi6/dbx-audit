@@ -1495,7 +1495,37 @@ where
     let iterations = max_iterations.max(1);
     let total_keys: u64 = if cursor == 0 { redis::cmd("DBSIZE").query_async(con).await.unwrap_or(0) } else { 0 };
 
+    let is_exact_match = !pattern.contains('*') && !pattern.contains('?') && !pattern.contains('[');
+    if cursor == 0 && is_exact_match && !pattern.is_empty() {
+        match redis::cmd("EXISTS").arg(pattern).query_async::<bool>(con).await {
+            Ok(true) => {
+                let key_type: String = if include_types {
+                    redis::cmd("TYPE").arg(pattern).query_async(con).await.unwrap_or_else(|_| "unknown".to_string())
+                } else {
+                    String::new()
+                };
+
+                let value_preview = if include_types { redis_key_value_preview(&key_type) } else { String::new() };
+
+                let key_info = RedisKeyInfo {
+                    key_display: redis_key_bytes_to_display(pattern.as_bytes()),
+                    key_raw: redis_key_bytes_to_raw(pattern.as_bytes()),
+                    key_type,
+                    ttl: -2,
+                    size: 0,
+                    value_preview,
+                };
+                return Ok(RedisScanResult { cursor: 0, keys: vec![key_info], total_keys });
+            }
+            Ok(false) => {
+                return Ok(RedisScanResult { cursor: 0, keys: vec![], total_keys });
+            }
+            Err(_) => {}
+        }
+    }
+
     let mut all_keys: Vec<RedisKeyInfo> = Vec::new();
+
     let mut current_cursor = cursor;
 
     for _ in 0..iterations {
@@ -2615,6 +2645,7 @@ mod tests {
             redis_sentinel_tls: false,
             redis_cluster_nodes: String::new(),
             redis_key_separator: crate::models::connection::default_redis_key_separator(),
+            redis_scan_page_size: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),

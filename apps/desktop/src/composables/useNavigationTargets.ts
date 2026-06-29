@@ -91,11 +91,9 @@ async function openTableTarget(target: NavigationTarget, options: { tableInfoTab
       columns: [],
       primaryKeys: [],
     });
-    const columnsPromise = api.getColumns(target.connectionId, target.database, querySchema, target.tableName);
-    const dataPromise = queryStore.executeTabSql(tabId, sql);
-    const [columnsResult, dataResult] = await Promise.allSettled([columnsPromise, dataPromise]);
-    if (columnsResult.status === "fulfilled") {
-      const columns = columnsResult.value;
+    await queryStore.executeTabSql(tabId, sql);
+    try {
+      const columns = await api.getColumns(target.connectionId, target.database, querySchema, target.tableName);
       const indexes = await api.listIndexes(target.connectionId, target.database, querySchema, target.tableName).catch(() => []);
       const primaryKeys = editableRowIdentifierColumns(effectiveDbType, columns, indexes);
       const useRowId = usesSyntheticRowIdKey(effectiveDbType, primaryKeys);
@@ -120,9 +118,9 @@ async function openTableTarget(target: NavigationTarget, options: { tableInfoTab
         queryStore.updateSql(tabId, newSql);
         await queryStore.executeTabSql(tabId, newSql);
       }
+    } catch (reason) {
+      console.error("[DBX] ERROR fetching table metadata:", reason);
     }
-    if (dataResult.status === "rejected") throw dataResult.reason;
-    if (columnsResult.status === "rejected") console.error("[DBX] ERROR fetching table metadata:", columnsResult.reason);
   } catch (e: any) {
     queryStore.setErrorResult(tabId, e);
   }

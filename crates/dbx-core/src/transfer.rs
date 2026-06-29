@@ -154,6 +154,81 @@ fn is_postgres_identity_extra(extra: Option<&str>) -> bool {
     })
 }
 
+pub(crate) fn is_identity_column_extra(extra: Option<&str>) -> bool {
+    extra.is_some_and(|value| {
+        let normalized = value.trim().to_ascii_lowercase();
+        normalized.contains("identity") || normalized.contains("auto_increment") || normalized.contains("autoincrement")
+    })
+}
+
+pub(crate) fn selected_columns_include_identity_extras(columns: &[String], column_extras: &[Option<String>]) -> bool {
+    columns
+        .iter()
+        .enumerate()
+        .any(|(index, _)| is_identity_column_extra(column_extras.get(index).and_then(|extra| extra.as_deref())))
+}
+
+fn selected_columns_include_identity_columns(columns: &[String], all_columns: &[db::ColumnInfo]) -> bool {
+    all_columns.iter().any(|column| {
+        is_identity_column_extra(column.extra.as_deref())
+            && columns.iter().any(|name| name.eq_ignore_ascii_case(&column.name))
+    })
+}
+
+fn dameng_identity_insert_statement(table: &str, schema: &str, enabled: bool) -> String {
+    let full_table = qualified_table(table, schema, &DatabaseType::Dameng);
+    format!("SET IDENTITY_INSERT {full_table} {}", if enabled { "ON" } else { "OFF" })
+}
+
+pub(crate) fn wrap_dameng_identity_insert_sql(insert_sql: &str, table: &str, schema: &str) -> String {
+    let full_table = qualified_table(table, schema, &DatabaseType::Dameng);
+    wrap_dameng_identity_insert_sql_for_table(insert_sql, &full_table)
+}
+
+pub(crate) fn wrap_dameng_identity_insert_sql_for_table(insert_sql: &str, full_table: &str) -> String {
+    let trimmed = insert_sql.trim().trim_end_matches(';').trim();
+    format!(
+        "{};\n{};\n{};",
+        format!("SET IDENTITY_INSERT {full_table} ON"),
+        trimmed,
+        format!("SET IDENTITY_INSERT {full_table} OFF")
+    )
+}
+
+async fn execute_transfer_write_statement(
+    state: &AppState,
+    target_pool_key: &str,
+    sql: &str,
+    target_db_type: &DatabaseType,
+    table: &str,
+    schema: &str,
+    needs_identity_insert: bool,
+) -> Result<(), String> {
+    if !needs_identity_insert || !matches!(target_db_type, DatabaseType::Dameng) {
+        execute_on_pool(state, target_pool_key, sql).await?;
+        return Ok(());
+    }
+
+    let enable_sql = dameng_identity_insert_statement(table, schema, true);
+    let disable_sql = dameng_identity_insert_statement(table, schema, false);
+    execute_on_pool(state, target_pool_key, &enable_sql)
+        .await
+        .map_err(|e| format!("Failed to enable Dameng IDENTITY_INSERT for {table}: {e}"))?;
+    let write_result = execute_on_pool(state, target_pool_key, sql).await;
+    let disable_result = execute_on_pool(state, target_pool_key, &disable_sql).await;
+
+    match (write_result, disable_result) {
+        (Ok(_), Ok(_)) => Ok(()),
+        (Err(write_error), Ok(_)) => Err(write_error),
+        (Ok(_), Err(disable_error)) => {
+            Err(format!("Failed to disable Dameng IDENTITY_INSERT for {table}: {disable_error}"))
+        }
+        (Err(write_error), Err(disable_error)) => {
+            Err(format!("{write_error}; also failed to disable Dameng IDENTITY_INSERT for {table}: {disable_error}"))
+        }
+    }
+}
+
 fn rewrite_postgres_schema_qualified_references(input: &str, source_schema: &str, target_schema: &str) -> String {
     if source_schema.trim().is_empty() || source_schema == target_schema {
         return input.to_string();
@@ -3260,6 +3335,22 @@ where
         (request.mode.clone(), vec![])
     };
 
+    let writes_dameng_identity_columns = if matches!(target_db_type, DatabaseType::Dameng) {
+        let target_columns = get_columns_for_transfer(
+            state,
+            target_pool_key,
+            &request.target_connection_id,
+            &request.target_database,
+            &request.target_schema,
+            &target_table,
+        )
+        .await
+        .unwrap_or_default();
+        selected_columns_include_identity_columns(&col_names, &target_columns)
+    } else {
+        false
+    };
+
     // Transfer data in batches
     let batch_size = if request.batch_size == 0 { 1000 } else { request.batch_size };
     let mut offset: u64 = 0;
@@ -3297,7 +3388,17 @@ where
             &pk_columns,
         );
         for (statement_index, batch_sql) in write_statements.iter().enumerate() {
-            execute_on_pool(state, target_pool_key, batch_sql).await.map_err(|e| {
+            execute_transfer_write_statement(
+                state,
+                target_pool_key,
+                batch_sql,
+                target_db_type,
+                &target_table,
+                &request.target_schema,
+                writes_dameng_identity_columns,
+            )
+            .await
+            .map_err(|e| {
                 let absolute_row = parse_mysql_row_error(&e).map(|row| offset + row);
                 match absolute_row {
                     Some(row) => format!(
@@ -3742,6 +3843,7 @@ mod tests {
             redis_sentinel_tls: false,
             redis_cluster_nodes: String::new(),
             redis_key_separator: default_redis_key_separator(),
+            redis_scan_page_size: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
@@ -3823,6 +3925,47 @@ mod tests {
 
         let error = validate_transfer_target_table_names(&request).unwrap_err();
         assert!(error.contains("both map to 'orders'"));
+    }
+
+    #[test]
+    fn detects_identity_extras_for_selected_columns() {
+        assert!(selected_columns_include_identity_extras(
+            &[String::from("id"), String::from("name")],
+            &[Some(String::from("identity")), None],
+        ));
+        assert!(selected_columns_include_identity_extras(
+            &[String::from("id")],
+            &[Some(String::from("auto_increment"))],
+        ));
+        assert!(!selected_columns_include_identity_extras(
+            &[String::from("name")],
+            &[None, Some(String::from("identity"))],
+        ));
+    }
+
+    #[test]
+    fn detects_selected_identity_columns_from_target_metadata() {
+        let target_columns = vec![
+            db::ColumnInfo { extra: Some("identity".to_string()), ..test_column("ID", "INT") },
+            test_column("NAME", "VARCHAR(20)"),
+        ];
+
+        assert!(selected_columns_include_identity_columns(&[String::from("id")], &target_columns));
+        assert!(!selected_columns_include_identity_columns(&[String::from("name")], &target_columns));
+    }
+
+    #[test]
+    fn dameng_identity_insert_wrapper_quotes_schema_and_table() {
+        let sql = wrap_dameng_identity_insert_sql(
+            "INSERT INTO \"SYSDBA\".\"USERS\" (\"ID\") VALUES\n(1);",
+            "USERS",
+            "SYSDBA",
+        );
+
+        assert_eq!(
+            sql,
+            "SET IDENTITY_INSERT \"SYSDBA\".\"USERS\" ON;\nINSERT INTO \"SYSDBA\".\"USERS\" (\"ID\") VALUES\n(1);\nSET IDENTITY_INSERT \"SYSDBA\".\"USERS\" OFF;"
+        );
     }
 
     #[test]

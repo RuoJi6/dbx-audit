@@ -5,10 +5,12 @@ import { useHistoryStore } from "@/stores/historyStore";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useToast } from "@/composables/useToast";
+import { isSingleDatabase } from "@/lib/databaseCapabilities";
 import { classifySqlActivityKind } from "@/lib/historyActivityKind";
 import { sqlMetadataRefreshTarget } from "@/lib/sqlMetadataRefresh";
 import { classifyRedisCommandSafety, firstRedisCommandToken } from "@/lib/redisCommandSafety";
 import { isSqlExecutionSnapshot, resolveExecutableSql, type SqlExecutionOverride, type SqlExecutionSnapshot } from "@/lib/sqlExecutionTarget";
+import { extractSqlParameters } from "@/lib/sqlParameters";
 import type { ConnectionConfig, QueryTab } from "@/types/database";
 
 const DANGER_RE = /^\s*(DROP|DELETE|TRUNCATE|ALTER|UPDATE|MERGE|REPLACE)\b/i;
@@ -41,6 +43,7 @@ export function useSqlExecution(deps: {
   resolveExecutableSql?: (snapshot?: SqlExecutionSnapshot) => Promise<string>;
   activeOutputView: Ref<"result" | "summary" | "explain" | "chart">;
   blockDangerousRedisCommands?: Ref<boolean>;
+  onMissingDatabase?: () => void;
 }) {
   const { t } = useI18n();
   const queryStore = useQueryStore();
@@ -54,6 +57,9 @@ export function useSqlExecution(deps: {
   const showDangerDialog = ref(false);
   const suppressDangerConfirm = ref(false);
   const explainMode = ref<"explain" | "autotrace">("explain");
+  const showSqlParameterDialog = ref(false);
+  const sqlParameterSourceSql = ref("");
+  const sqlParameterNames = ref<string[]>([]);
 
   async function resolvedExecutableSql(source?: SqlExecutionOverride): Promise<string> {
     if (typeof source === "string") return source;
@@ -66,6 +72,15 @@ export function useSqlExecution(deps: {
     const tab = deps.activeTab.value;
     const sql = await resolvedExecutableSql(sqlOverride);
     if (!tab || !sql.trim()) return;
+    if (requiresDatabaseSelection(tab, deps.activeConnection.value)) {
+      deps.onMissingDatabase?.();
+      return;
+    }
+    if (supportsSqlTemplateParameters(deps.activeConnection.value) && prepareSqlParameterDialog(sql)) return;
+    await continueExecute(sql);
+  }
+
+  async function continueExecute(sql: string) {
     // Redis: block dangerous commands when toggle is on (check each line for multi-line input)
     if (deps.activeConnection.value?.db_type === "redis" && deps.blockDangerousRedisCommands?.value !== false) {
       const commands = sql
@@ -86,14 +101,27 @@ export function useSqlExecution(deps: {
       suppressDangerConfirm.value = false;
       showDangerDialog.value = true;
     } else {
-      doExecute(sql);
+      await doExecute(sql);
     }
+  }
+
+  function prepareSqlParameterDialog(sql: string): boolean {
+    const parameters = extractSqlParameters(sql);
+    if (!parameters.length) return false;
+    sqlParameterSourceSql.value = sql;
+    sqlParameterNames.value = parameters;
+    showSqlParameterDialog.value = true;
+    return true;
   }
 
   async function doExecute(sql?: string) {
     sql ??= await resolvedExecutableSql();
     const tab = deps.activeTab.value;
     if (!tab || !sql.trim()) return;
+    if (requiresDatabaseSelection(tab, deps.activeConnection.value)) {
+      deps.onMissingDatabase?.();
+      return;
+    }
     deps.activeOutputView.value = "result";
     const connName = connectionStore.getConfig(tab.connectionId)?.name || "";
     const start = Date.now();
@@ -168,6 +196,13 @@ export function useSqlExecution(deps: {
     await doExecute(sql);
   }
 
+  async function onSqlParametersConfirm(sql: string) {
+    showSqlParameterDialog.value = false;
+    sqlParameterSourceSql.value = "";
+    sqlParameterNames.value = [];
+    await continueExecute(sql);
+  }
+
   return {
     dangerSql,
     pendingDangerSql,
@@ -178,6 +213,22 @@ export function useSqlExecution(deps: {
     cancelActiveExecution,
     tryExplain,
     onDangerConfirm,
+    showSqlParameterDialog,
+    sqlParameterSourceSql,
+    sqlParameterNames,
+    onSqlParametersConfirm,
     explainMode,
   };
+}
+
+function supportsSqlTemplateParameters(connection: ConnectionConfig | undefined): boolean {
+  if (!connection) return false;
+  return connection.db_type !== "redis" && connection.db_type !== "mongodb";
+}
+
+function requiresDatabaseSelection(tab: QueryTab, connection: ConnectionConfig | undefined): boolean {
+  if (tab.mode !== "query") return false;
+  if (!connection || tab.database) return false;
+  if (isSingleDatabase(connection.db_type)) return false;
+  return !["elasticsearch", "qdrant", "milvus", "weaviate", "chromadb", "zookeeper"].includes(connection.db_type);
 }

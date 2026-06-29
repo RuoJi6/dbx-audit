@@ -12,8 +12,17 @@ pub async fn zookeeper_list_prefix(
     prefix: String,
     limit: usize,
     continuation: Option<String>,
+    recursive: Option<bool>,
 ) -> Result<KvListPrefixResponse, String> {
-    dbx_core::agent_kv::kv_list_prefix_core(&state, &connection_id, &prefix, limit, continuation.as_deref()).await
+    dbx_core::agent_kv::kv_list_prefix_core_with_options(
+        &state,
+        &connection_id,
+        &prefix,
+        limit,
+        continuation.as_deref(),
+        recursive,
+    )
+    .await
 }
 
 #[tauri::command]

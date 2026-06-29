@@ -126,7 +126,7 @@ pub(in crate::schema) async fn get_columns(
         }
         PoolKind::Mysql(p, _) if config.is_some_and(is_doris_family_config) => {
             let metadata_database = mysql_show_metadata_database_for_config(config, database);
-            db::mysql::get_columns_show(p, metadata_database, table).await
+            db::mysql::get_columns(p, metadata_database, table).await
         }
         PoolKind::Mysql(p, mode) if *mode == MysqlMode::OceanBaseOracle => {
             db::ob_oracle::get_columns(p, database, table).await
@@ -155,6 +155,9 @@ pub(in crate::schema) async fn list_indexes(
     match pool {
         PoolKind::Mysql(p, mode) if *mode == MysqlMode::OceanBaseOracle => {
             db::ob_oracle::list_indexes(p, schema, table).await
+        }
+        PoolKind::Mysql(p, _) if config.is_some_and(is_doris_family_config) => {
+            db::mysql::list_doris_family_indexes(p, database, table).await
         }
         PoolKind::Mysql(p, _) => db::mysql::list_indexes(p, schema, table).await,
         PoolKind::Postgres(p) if config.is_some_and(is_questdb_config) => {

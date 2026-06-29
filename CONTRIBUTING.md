@@ -19,25 +19,33 @@ Required tools:
 
 - Node.js `>=22.13.0`
 - pnpm `10.27.0`
+- Make
 - Rust stable
 - Java 17, when working on JDBC plugin packaging
 
 Install dependencies:
 
 ```bash
-pnpm install
+make install
 ```
 
 Run the desktop app during development:
 
 ```bash
-pnpm dev:tauri
+make
 ```
 
-Run the web backend:
+Run the web app during development:
 
 ```bash
-pnpm dev:backend
+make dev-web       # frontend
+make dev-backend   # backend
+```
+
+Preview the documentation site:
+
+```bash
+make docs
 ```
 
 ## Checks
@@ -45,7 +53,7 @@ pnpm dev:backend
 Before opening a pull request, run:
 
 ```bash
-pnpm check
+make check
 cargo fmt --check
 cargo check --workspace --locked
 ```
@@ -55,9 +63,9 @@ cargo check --workspace --locked
 > development when you're not touching DuckDB features:
 >
 > ```bash
-> cargo check --workspace --no-default-features
-> cargo test  --workspace --no-default-features
-> pnpm tauri dev -- --no-default-features
+> make cargo-check-fast
+> make cargo-test-fast
+> make dev-fast
 > ```
 >
 > Release builds and CI should always include DuckDB (omit the flag).

@@ -66,5 +66,5 @@ defineExpose({ focusSearch, refresh });
 </script>
 
 <template>
-  <KvKeyBrowser ref="browserRef" :connection-id="props.connectionId" :api="zookeeperApi" :labels="labels" supports-create-modes enable-node-actions metadata-style="zookeeper" :create-mode-options="createModeOptions" />
+  <KvKeyBrowser ref="browserRef" :connection-id="props.connectionId" :api="zookeeperApi" :labels="labels" supports-create-modes enable-node-actions metadata-style="zookeeper" lazy-hierarchy :create-mode-options="createModeOptions" />
 </template>

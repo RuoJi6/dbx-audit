@@ -1000,6 +1000,159 @@ fn builds_sql_server_quoted_column_and_index_statements() {
     );
 }
 
+#[test]
+fn sqlserver_unchanged_foreign_key_does_not_warn_when_saving_other_changes() {
+    let mut email = column("email");
+    email.data_type = "nvarchar(255)".to_string();
+    email.is_nullable = false;
+
+    let mut user_fk = foreign_key("fk_orders_user_id", "user_id", "users", "id");
+    user_fk.ref_schema = "dbo".to_string();
+    user_fk.original = Some(ForeignKeyInfo {
+        name: "fk_orders_user_id".to_string(),
+        column: "user_id".to_string(),
+        ref_schema: Some("dbo".to_string()),
+        ref_table: "users".to_string(),
+        ref_column: "id".to_string(),
+        on_update: None,
+        on_delete: None,
+    });
+
+    let result = build_table_structure_change_sql(TableStructureSqlOptions {
+        database_type: Some(DatabaseType::SqlServer),
+        schema: Some("dbo".to_string()),
+        table_name: "orders".to_string(),
+        columns: vec![email],
+        indexes: Vec::new(),
+        foreign_keys: vec![user_fk],
+        triggers: Vec::new(),
+        table_comment: None,
+        original_table_comment: None,
+    });
+
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert_eq!(result.statements, vec!["ALTER TABLE [dbo].[orders] ADD [email] nvarchar(255) NOT NULL;"]);
+}
+
+#[test]
+fn sqlserver_changed_foreign_key_still_warns_as_unsupported() {
+    let mut user_fk = foreign_key("fk_orders_user_id", "user_id", "accounts", "id");
+    user_fk.ref_schema = "dbo".to_string();
+    user_fk.original = Some(ForeignKeyInfo {
+        name: "fk_orders_user_id".to_string(),
+        column: "user_id".to_string(),
+        ref_schema: Some("dbo".to_string()),
+        ref_table: "users".to_string(),
+        ref_column: "id".to_string(),
+        on_update: None,
+        on_delete: None,
+    });
+
+    let result = build_table_structure_change_sql(TableStructureSqlOptions {
+        database_type: Some(DatabaseType::SqlServer),
+        schema: Some("dbo".to_string()),
+        table_name: "orders".to_string(),
+        columns: Vec::new(),
+        indexes: Vec::new(),
+        foreign_keys: vec![user_fk],
+        triggers: Vec::new(),
+        table_comment: None,
+        original_table_comment: None,
+    });
+
+    assert_eq!(result.statements, Vec::<String>::new());
+    assert_eq!(result.warnings, vec!["Editing foreign keys is not supported for sqlserver from this editor."]);
+}
+
+#[test]
+fn sqlserver_unchanged_identity_extra_does_not_mark_existing_column_changed() {
+    let mut id = column("id");
+    id.data_type = "int".to_string();
+    id.is_nullable = false;
+    id.is_primary_key = true;
+    id.extra = Some(ColumnExtra {
+        auto_increment: Some(true),
+        identity: Some(ColumnIdentity { generation: None, seed: Some(1), increment: Some(1) }),
+        ..Default::default()
+    });
+    id.original = Some(ColumnInfo {
+        name: "id".to_string(),
+        data_type: "int".to_string(),
+        is_nullable: false,
+        column_default: None,
+        is_primary_key: true,
+        extra: Some("IDENTITY(1,1)".to_string()),
+        comment: None,
+    });
+
+    let result = build_table_structure_change_sql(TableStructureSqlOptions {
+        database_type: Some(DatabaseType::SqlServer),
+        schema: Some("dbo".to_string()),
+        table_name: "orders".to_string(),
+        columns: vec![id],
+        indexes: Vec::new(),
+        foreign_keys: Vec::new(),
+        triggers: Vec::new(),
+        table_comment: None,
+        original_table_comment: None,
+    });
+
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert_eq!(result.statements, Vec::<String>::new());
+}
+
+#[test]
+fn sqlserver_existing_column_identity_change_warns_without_unchanged_foreign_key_warning() {
+    let mut id = column("id");
+    id.data_type = "int".to_string();
+    id.is_nullable = false;
+    id.is_primary_key = true;
+    id.extra = Some(ColumnExtra {
+        auto_increment: Some(true),
+        identity: Some(ColumnIdentity { generation: None, seed: Some(1), increment: Some(1) }),
+        ..Default::default()
+    });
+    id.original = Some(ColumnInfo {
+        name: "id".to_string(),
+        data_type: "int".to_string(),
+        is_nullable: false,
+        column_default: None,
+        is_primary_key: true,
+        extra: None,
+        comment: None,
+    });
+
+    let mut user_fk = foreign_key("fk_orders_user_id", "user_id", "users", "id");
+    user_fk.ref_schema = "dbo".to_string();
+    user_fk.original = Some(ForeignKeyInfo {
+        name: "fk_orders_user_id".to_string(),
+        column: "user_id".to_string(),
+        ref_schema: Some("dbo".to_string()),
+        ref_table: "users".to_string(),
+        ref_column: "id".to_string(),
+        on_update: None,
+        on_delete: None,
+    });
+
+    let result = build_table_structure_change_sql(TableStructureSqlOptions {
+        database_type: Some(DatabaseType::SqlServer),
+        schema: Some("dbo".to_string()),
+        table_name: "orders".to_string(),
+        columns: vec![id],
+        indexes: Vec::new(),
+        foreign_keys: vec![user_fk],
+        triggers: Vec::new(),
+        table_comment: None,
+        original_table_comment: None,
+    });
+
+    assert_eq!(result.statements, Vec::<String>::new());
+    assert_eq!(
+        result.warnings,
+        vec!["Changing SQL Server IDENTITY for existing column \"id\" is not supported from this editor."]
+    );
+}
+
 #[cfg(feature = "duckdb-bundled")]
 #[test]
 fn builds_duckdb_create_table_statements() {
@@ -1828,4 +1981,79 @@ fn postgres_varchar_default_is_quoted() {
     });
 
     assert!(result.statements.iter().any(|s| s.contains("SET DEFAULT 'test label'")));
+}
+
+#[test]
+fn postgres_empty_string_default_is_not_quoted_again() {
+    let mut col = column("sku");
+    col.data_type = "character varying".to_string();
+    col.default_value = "''".to_string();
+    col.original = Some(ColumnInfo {
+        name: "sku".to_string(),
+        data_type: "character varying".to_string(),
+        is_nullable: true,
+        column_default: None,
+        is_primary_key: false,
+        extra: None,
+        comment: Some(String::new()),
+    });
+
+    let result = build_single_column_alter_sql(SingleColumnAlterSqlOptions {
+        database_type: Some(DatabaseType::Postgres),
+        schema: Some("core".to_string()),
+        table_name: "products".to_string(),
+        column: col,
+    });
+
+    assert_eq!(result.statements, vec!["ALTER TABLE \"core\".\"products\" ALTER COLUMN \"sku\" SET DEFAULT '';"]);
+}
+
+#[test]
+fn postgres_string_default_cast_matches_plain_literal() {
+    let mut col = column("category");
+    col.data_type = "character varying".to_string();
+    col.default_value = "''".to_string();
+    col.original = Some(ColumnInfo {
+        name: "category".to_string(),
+        data_type: "character varying".to_string(),
+        is_nullable: true,
+        column_default: Some("''::character varying".to_string()),
+        is_primary_key: false,
+        extra: None,
+        comment: Some(String::new()),
+    });
+
+    let result = build_single_column_alter_sql(SingleColumnAlterSqlOptions {
+        database_type: Some(DatabaseType::Postgres),
+        schema: Some("core".to_string()),
+        table_name: "products".to_string(),
+        column: col,
+    });
+
+    assert_eq!(result.statements, Vec::<String>::new());
+}
+
+#[test]
+fn postgres_integer_default_is_not_quoted() {
+    let mut col = column("stock");
+    col.data_type = "integer".to_string();
+    col.default_value = "0".to_string();
+    col.original = Some(ColumnInfo {
+        name: "stock".to_string(),
+        data_type: "integer".to_string(),
+        is_nullable: true,
+        column_default: None,
+        is_primary_key: false,
+        extra: None,
+        comment: Some(String::new()),
+    });
+
+    let result = build_single_column_alter_sql(SingleColumnAlterSqlOptions {
+        database_type: Some(DatabaseType::Postgres),
+        schema: Some("core".to_string()),
+        table_name: "products".to_string(),
+        column: col,
+    });
+
+    assert_eq!(result.statements, vec!["ALTER TABLE \"core\".\"products\" ALTER COLUMN \"stock\" SET DEFAULT 0;"]);
 }

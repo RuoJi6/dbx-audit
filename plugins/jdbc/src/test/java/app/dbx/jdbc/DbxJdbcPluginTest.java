@@ -316,6 +316,21 @@ final class DbxJdbcPluginTest {
     }
 
     @Test
+    void jdbcUrlAppendsDremioConnectionUrlParamsWithSemicolon() throws Exception {
+        JsonNode connection = MAPPER.readTree("""
+            {
+              "connection_string": "jdbc:dremio:direct=dremio.example.com:31010",
+              "url_params": "schema=Samples;ssl=true"
+            }
+            """);
+
+        assertEquals(
+            "jdbc:dremio:direct=dremio.example.com:31010;schema=Samples;ssl=true",
+            DbxJdbcPlugin.jdbcUrl(connection)
+        );
+    }
+
+    @Test
     void jdbcUrlAppendsDb2ConnectionUrlParamsWithColonProperties() throws Exception {
         JsonNode connection = MAPPER.readTree("""
             {
@@ -605,6 +620,28 @@ final class DbxJdbcPluginTest {
     }
 
     @Test
+    void listDataTypesUsesJdbcTypeInfo() throws Exception {
+        JsonNode response = request("listDataTypes", """
+            { "connection": %s }
+            """.formatted(CONNECTION));
+
+        assertFalse(response.has("error"), response.toString());
+        boolean foundInteger = false;
+        boolean foundVarchar = false;
+        for (JsonNode type : response.path("result")) {
+            String name = type.asText();
+            if ("INTEGER".equalsIgnoreCase(name)) {
+                foundInteger = true;
+            }
+            if ("VARCHAR".equalsIgnoreCase(name) || "CHARACTER VARYING".equalsIgnoreCase(name)) {
+                foundVarchar = true;
+            }
+        }
+        assertEquals(true, foundInteger);
+        assertEquals(true, foundVarchar);
+    }
+
+    @Test
     void listObjectsAcceptsCamelCaseMethodAndFallsBackWhenCatalogFiltersEverything() throws Exception {
         createPeopleTable();
 
@@ -636,6 +673,26 @@ final class DbxJdbcPluginTest {
         assertFalse(response.has("error"), response.toString());
         assertEquals("ID", response.path("result").path(0).path("name").asText());
         assertEquals(true, response.path("result").path(0).path("is_primary_key").asBoolean());
+    }
+
+    @Test
+    void kingbaseGetColumnsUsesFormattedCatalogTypes() throws Exception {
+        Method method = DbxJdbcPlugin.class.getDeclaredMethod("kingbaseGetColumns", Connection.class, String.class, String.class);
+        method.setAccessible(true);
+        List<String> sql = new ArrayList<>();
+
+        JsonNode result = (JsonNode) method.invoke(null, kingbaseColumnsConnection(sql), "dbx_issue_1942", "t_timestamp_type");
+
+        assertEquals("id", result.path(0).path("name").asText());
+        assertEquals("INTEGER", result.path(0).path("data_type").asText());
+        assertEquals(true, result.path(0).path("is_primary_key").asBoolean());
+        assertEquals("create_time", result.path(1).path("name").asText());
+        assertEquals("TIMESTAMP WITH TIME ZONE", result.path(1).path("data_type").asText());
+        assertEquals("create_by", result.path(2).path("name").asText());
+        assertEquals("CHARACTER VARYING(64 byte)", result.path(2).path("data_type").asText());
+        assertEquals(64, result.path(2).path("character_maximum_length").asInt());
+        assertEquals(true, sql.get(1).contains("format_type(a.atttypid, a.atttypmod) AS data_type"));
+        assertEquals(true, sql.get(1).contains("FROM sys_catalog.sys_attribute"));
     }
 
     @Test
@@ -915,6 +972,116 @@ final class DbxJdbcPluginTest {
                 default -> defaultValue(method.getReturnType());
             }
         );
+    }
+
+    private static Connection kingbaseColumnsConnection(List<String> sql) {
+        ResultSet primaryKeys = rowsResultSet(
+            new String[] { "column_name" },
+            new Object[][] { { "id" } }
+        );
+        ResultSet columns = rowsResultSet(
+            new String[] {
+                "column_name",
+                "data_type",
+                "is_nullable",
+                "column_default",
+                "column_comment",
+                "numeric_precision",
+                "numeric_scale",
+                "character_maximum_length"
+            },
+            new Object[][] {
+                { "id", "INTEGER", false, null, null, 32, 0, null },
+                { "create_time", "TIMESTAMP WITH TIME ZONE", true, null, null, null, null, null },
+                { "create_by", "CHARACTER VARYING(64 byte)", true, null, null, null, null, 64 }
+            }
+        );
+        int[] index = { 0 };
+        return (Connection) Proxy.newProxyInstance(
+            DbxJdbcPluginTest.class.getClassLoader(),
+            new Class<?>[] { Connection.class },
+            (proxy, method, args) -> switch (method.getName()) {
+                case "createStatement" -> {
+                    yield statement(sql, index[0]++ == 0 ? primaryKeys : columns);
+                }
+                case "isClosed" -> false;
+                case "close" -> null;
+                default -> defaultValue(method.getReturnType());
+            }
+        );
+    }
+
+    private static Statement statement(List<String> sql, ResultSet rs) {
+        return (Statement) Proxy.newProxyInstance(
+            DbxJdbcPluginTest.class.getClassLoader(),
+            new Class<?>[] { Statement.class },
+            (proxy, method, args) -> switch (method.getName()) {
+                case "executeQuery" -> {
+                    sql.add(String.valueOf(args[0]));
+                    yield rs;
+                }
+                case "close" -> null;
+                default -> defaultValue(method.getReturnType());
+            }
+        );
+    }
+
+    private static PreparedStatement preparedStatement(ResultSet rs) {
+        return (PreparedStatement) Proxy.newProxyInstance(
+            DbxJdbcPluginTest.class.getClassLoader(),
+            new Class<?>[] { PreparedStatement.class },
+            (proxy, method, args) -> switch (method.getName()) {
+                case "executeQuery" -> rs;
+                case "setString", "close" -> null;
+                default -> defaultValue(method.getReturnType());
+            }
+        );
+    }
+
+    private static ResultSet rowsResultSet(String[] columns, Object[][] rows) {
+        return (ResultSet) Proxy.newProxyInstance(
+            DbxJdbcPluginTest.class.getClassLoader(),
+            new Class<?>[] { ResultSet.class },
+            new java.lang.reflect.InvocationHandler() {
+                private int index = -1;
+
+                @Override
+                public Object invoke(Object proxy, Method method, Object[] args) {
+                    return switch (method.getName()) {
+                        case "next" -> ++index < rows.length;
+                        case "getString" -> stringValue(columns, rows[index], args[0]);
+                        case "getBoolean" -> booleanValue(columns, rows[index], args[0]);
+                        case "getObject" -> columnValue(columns, rows[index], args[0]);
+                        case "close" -> null;
+                        default -> defaultValue(method.getReturnType());
+                    };
+                }
+            }
+        );
+    }
+
+    private static String stringValue(String[] columns, Object[] row, Object key) {
+        Object value = columnValue(columns, row, key);
+        return value == null ? null : String.valueOf(value);
+    }
+
+    private static boolean booleanValue(String[] columns, Object[] row, Object key) {
+        Object value = columnValue(columns, row, key);
+        if (value instanceof Boolean bool) return bool;
+        if (value instanceof Number number) return number.intValue() != 0;
+        return Boolean.parseBoolean(String.valueOf(value));
+    }
+
+    private static Object columnValue(String[] columns, Object[] row, Object key) {
+        if (key instanceof Number number) {
+            return row[number.intValue() - 1];
+        }
+        for (int i = 0; i < columns.length; i++) {
+            if (columns[i].equalsIgnoreCase(String.valueOf(key))) {
+                return row[i];
+            }
+        }
+        return null;
     }
 
     private static ResultSet columnNullableResultSet(String isNullable, int nullableCode) {

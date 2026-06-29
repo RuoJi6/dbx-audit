@@ -1,7 +1,11 @@
 package com.dbx.agent.kingbase;
 
+import com.dbx.agent.ColumnInfo;
 import com.dbx.agent.DatabaseAgent;
 import com.dbx.agent.DatabaseInfo;
+import com.dbx.agent.ObjectInfo;
+import com.dbx.agent.ObjectSource;
+import com.dbx.agent.TableInfo;
 import com.dbx.agent.test.JdbcFakeExecutionBehaviorTest;
 import com.dbx.agent.test.TestSupport;
 import org.junit.jupiter.api.Assertions;
@@ -99,6 +103,144 @@ class KingbaseAgentTest extends JdbcFakeExecutionBehaviorTest {
     }
 
     @Test
+    void regularListTablesUsesKingbaseCatalogAndIncludesViews() {
+        List<String> sql = new ArrayList<>();
+        KingbaseAgent agent = new KingbaseAgent();
+        TestSupport.setPrivateConnection(agent, preparedConnection(sql, resultSet(
+            new String[]{"table_name", "table_type", "table_comment"},
+            new Object[][]{{"app_table", "TABLE", "table comment"}, {"app_view", "VIEW", "view comment"}}
+        )));
+
+        List<TableInfo> tables = agent.listTables("public");
+
+        Assertions.assertEquals(2, tables.size());
+        Assertions.assertEquals("app_table", tables.get(0).getName());
+        Assertions.assertEquals("TABLE", tables.get(0).getTable_type());
+        Assertions.assertEquals("app_view", tables.get(1).getName());
+        Assertions.assertEquals("VIEW", tables.get(1).getTable_type());
+        Assertions.assertTrue(sql.get(0).contains("FROM sys_catalog.sys_class"), sql.get(0));
+        Assertions.assertTrue(sql.get(0).contains("c.relkind IN ('r','p','v','m','f')"), sql.get(0));
+    }
+
+    @Test
+    void regularListObjectsIncludesKingbaseViewsProceduresAndFunctions() {
+        List<String> sql = new ArrayList<>();
+        KingbaseAgent agent = new KingbaseAgent();
+        TestSupport.setPrivateConnection(agent, preparedConnection(sql,
+            resultSet(
+                new String[]{"table_name", "table_type", "table_comment"},
+                new Object[][]{{"app_table", "TABLE", null}, {"app_view", "VIEW", "view comment"}}
+            ),
+            resultSet(
+                new String[]{"routine_name", "routine_type", "routine_comment"},
+                new Object[][]{{"refresh_stats", "PROCEDURE", "proc comment"}, {"format_name", "FUNCTION", "fn comment"}}
+            )
+        ));
+
+        List<ObjectInfo> objects = agent.listObjects("public");
+
+        Assertions.assertEquals(4, objects.size());
+        Assertions.assertEquals("app_table", objects.get(0).getName());
+        Assertions.assertEquals("TABLE", objects.get(0).getObject_type());
+        Assertions.assertEquals("app_view", objects.get(1).getName());
+        Assertions.assertEquals("VIEW", objects.get(1).getObject_type());
+        Assertions.assertEquals("refresh_stats", objects.get(2).getName());
+        Assertions.assertEquals("PROCEDURE", objects.get(2).getObject_type());
+        Assertions.assertEquals("format_name", objects.get(3).getName());
+        Assertions.assertEquals("FUNCTION", objects.get(3).getObject_type());
+        Assertions.assertTrue(sql.get(1).contains("FROM sys_catalog.sys_proc"), sql.get(1));
+        Assertions.assertTrue(sql.get(1).contains("p.prokind IN ('p','f')"), sql.get(1));
+    }
+
+    @Test
+    void regularRoutineSourceUsesKingbaseFunctionDefinition() {
+        List<String> sql = new ArrayList<>();
+        KingbaseAgent agent = new KingbaseAgent();
+        TestSupport.setPrivateConnection(agent, preparedConnection(sql, resultSet(
+            new String[]{"source"},
+            new Object[][]{{"CREATE FUNCTION public.format_name() RETURNS text AS $$ SELECT 'x'; $$"}}
+        )));
+
+        ObjectSource source = agent.getObjectSource("public", "format_name", "FUNCTION");
+
+        Assertions.assertTrue(source.getSource().startsWith("CREATE FUNCTION public.format_name()"), source.getSource());
+        Assertions.assertTrue(sql.get(0).contains("SELECT sys_get_functiondef(p.oid) AS source"), sql.get(0));
+        Assertions.assertTrue(sql.get(0).contains("FROM sys_catalog.sys_proc"), sql.get(0));
+    }
+
+    @Test
+    void regularGetColumnsUsesFormattedCatalogTypes() {
+        List<String> sql = new ArrayList<>();
+        KingbaseAgent agent = new KingbaseAgent();
+        TestSupport.setPrivateConnection(agent, preparedConnection(sql,
+            resultSet(
+                new String[]{"column_name"},
+                new Object[][]{{"id"}}
+            ),
+            resultSet(
+                new String[]{
+                    "column_name",
+                    "data_type",
+                    "is_nullable",
+                    "column_default",
+                    "column_comment",
+                    "numeric_precision",
+                    "numeric_scale",
+                    "character_maximum_length"
+                },
+                new Object[][]{
+                    {"id", "integer", false, "nextval('orders_id_seq'::regclass)", "identifier", 32, 0, null},
+                    {"create_time", "timestamp with time zone", true, null, null, null, null, null},
+                    {"name", "character varying(64)", true, null, "display name", null, null, 64}
+                }
+            )
+        ));
+
+        List<ColumnInfo> columns = agent.getColumns("public", "orders");
+
+        Assertions.assertEquals(3, columns.size());
+        Assertions.assertEquals("integer", columns.get(0).getData_type());
+        Assertions.assertTrue(columns.get(0).getIs_primary_key());
+        Assertions.assertFalse(columns.get(0).getIs_nullable());
+        Assertions.assertEquals("timestamp with time zone", columns.get(1).getData_type());
+        Assertions.assertNotEquals("USER-DEFINED", columns.get(1).getData_type());
+        Assertions.assertEquals(Integer.valueOf(64), columns.get(2).getCharacter_maximum_length());
+        Assertions.assertTrue(sql.get(1).contains("format_type(a.atttypid, a.atttypmod) AS data_type"), sql.get(1));
+        Assertions.assertTrue(sql.get(1).contains("FROM sys_catalog.sys_attribute"), sql.get(1));
+        Assertions.assertFalse(sql.get(1).contains("information_schema.columns"), sql.get(1));
+    }
+
+    @Test
+    void mysqlCompatGetColumnsKeepsInformationSchemaPath() {
+        List<String> sql = new ArrayList<>();
+        KingbaseAgent agent = new KingbaseAgent();
+        agent.setMysqlCompatMode(true);
+        TestSupport.setPrivateConnection(agent, preparedConnection(sql,
+            resultSet(
+                new String[]{"column_name"},
+                new Object[][]{{"id"}}
+            ),
+            resultSet(
+                new String[]{
+                    "column_name",
+                    "data_type",
+                    "is_nullable",
+                    "column_default",
+                    "numeric_precision",
+                    "numeric_scale",
+                    "character_maximum_length"
+                },
+                new Object[][]{{"id", "int", "NO", null, 32, 0, null}}
+            )
+        ));
+
+        List<ColumnInfo> columns = agent.getColumns("PUBLIC", "orders");
+
+        Assertions.assertEquals("int", columns.get(0).getData_type());
+        Assertions.assertTrue(sql.get(1).contains("FROM information_schema.columns"), sql.get(1));
+    }
+
+    @Test
     void mysqlCompatTimestampTypeNameIsReadAsTimestampText() throws Exception {
         Timestamp timestamp = Timestamp.valueOf("2026-06-22 11:29:00");
         KingbaseAgent agent = new KingbaseAgent();
@@ -110,9 +252,19 @@ class KingbaseAgentTest extends JdbcFakeExecutionBehaviorTest {
     }
 
     private static Connection preparedConnection(List<String> sql, ResultSet rs) {
+        return preparedConnection(sql, new ResultSet[]{rs});
+    }
+
+    private static Connection preparedConnection(List<String> sql, ResultSet... resultSets) {
+        int[] resultSetIndex = {0};
         PreparedStatement statement = proxy(PreparedStatement.class, (method, args) -> {
             if ("executeQuery".equals(method.getName())) {
-                return rs;
+                int current = Math.min(resultSetIndex[0], resultSets.length - 1);
+                resultSetIndex[0] += 1;
+                return resultSets[current];
+            }
+            if ("setString".equals(method.getName())) {
+                return null;
             }
             if ("close".equals(method.getName())) {
                 return null;
@@ -122,7 +274,9 @@ class KingbaseAgentTest extends JdbcFakeExecutionBehaviorTest {
         Statement plainStatement = proxy(Statement.class, (method, args) -> {
             if ("executeQuery".equals(method.getName())) {
                 sql.add(String.valueOf(args[0]));
-                return rs;
+                int current = Math.min(resultSetIndex[0], resultSets.length - 1);
+                resultSetIndex[0] += 1;
+                return resultSets[current];
             }
             if ("close".equals(method.getName())) {
                 return null;
@@ -162,6 +316,13 @@ class KingbaseAgentTest extends JdbcFakeExecutionBehaviorTest {
                         }
                     }
                     return null;
+                case "getBoolean":
+                    Object booleanValue = columnValue(columns, rows[index[0]], args[0]);
+                    if (booleanValue instanceof Boolean) return booleanValue;
+                    if (booleanValue instanceof Number) return ((Number) booleanValue).intValue() != 0;
+                    return Boolean.parseBoolean(String.valueOf(booleanValue));
+                case "getObject":
+                    return columnValue(columns, rows[index[0]], args[0]);
                 case "wasNull":
                     return false;
                 case "close":
@@ -170,6 +331,18 @@ class KingbaseAgentTest extends JdbcFakeExecutionBehaviorTest {
                     return defaultValue(method.getReturnType());
             }
         });
+    }
+
+    private static Object columnValue(String[] columns, Object[] row, Object key) {
+        if (key instanceof Number) {
+            return row[((Number) key).intValue() - 1];
+        }
+        for (int i = 0; i < columns.length; i++) {
+            if (columns[i].equalsIgnoreCase(String.valueOf(key))) {
+                return row[i];
+            }
+        }
+        return null;
     }
 
     private static ResultSet timestampResultSet(Timestamp timestamp) {

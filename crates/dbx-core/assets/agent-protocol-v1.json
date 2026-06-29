@@ -43,6 +43,7 @@
     "list_schemas",
     "list_tables",
     "list_objects",
+    "list_data_types",
     "completion_assistant_search_v1",
     "get_object_source",
     "get_table_ddl",
@@ -58,6 +59,7 @@
     "fetch_table_read_page",
     "close_table_read_session",
     "get_explain_info",
+    "execute_batch",
     "execute_transaction",
     "disconnect",
     "shutdown"

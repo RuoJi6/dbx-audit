@@ -27,12 +27,20 @@ public interface DatabaseAgent {
 
     List<TableInfo> listTables(String schema);
 
+    default List<TableInfo> listTables(String schema, List<String> objectTypes) {
+        return listTables(schema);
+    }
+
     default List<ObjectInfo> listObjects(String schema) {
         List<ObjectInfo> result = new ArrayList<>();
         for (TableInfo table : listTables(schema)) {
             result.add(new ObjectInfo(table.getName(), table.getTable_type(), schema, table.getComment()));
         }
         return result;
+    }
+
+    default List<String> listDataTypes() {
+        return Collections.emptyList();
     }
 
     default CompletionAssistantResponse completionAssistantSearch(CompletionAssistantRequest request) {
@@ -145,6 +153,14 @@ public interface DatabaseAgent {
             throw new IllegalStateException("Not connected");
         }
         return TransactionExecutor.executeUpdateStatements(conn, statements, schema, this::setSchemaSQL);
+    }
+
+    default QueryResult executeBatch(List<String> statements, String schema) {
+        Connection conn = getConnection();
+        if (conn == null) {
+            throw new IllegalStateException("Not connected");
+        }
+        return BatchExecutor.executeBatchStatements(conn, statements, schema, this::setSchemaSQL);
     }
 
     default String setSchemaSQL(String schema) {

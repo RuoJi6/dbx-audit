@@ -120,6 +120,7 @@ pub enum AgentMethod {
     ListSchemas,
     ListTables,
     ListObjects,
+    ListDataTypes,
     CompletionAssistantSearchV1,
     GetObjectSource,
     GetColumns,
@@ -135,13 +136,14 @@ pub enum AgentMethod {
     FetchTableReadPage,
     CloseTableReadSession,
     GetExplainInfo,
+    ExecuteBatch,
     ExecuteTransaction,
     Disconnect,
     Shutdown,
 }
 
 impl AgentMethod {
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 28] = [
         Self::Handshake,
         Self::Connect,
         Self::TestConnection,
@@ -150,6 +152,7 @@ impl AgentMethod {
         Self::ListSchemas,
         Self::ListTables,
         Self::ListObjects,
+        Self::ListDataTypes,
         Self::CompletionAssistantSearchV1,
         Self::GetObjectSource,
         Self::GetTableDdl,
@@ -165,6 +168,7 @@ impl AgentMethod {
         Self::FetchTableReadPage,
         Self::CloseTableReadSession,
         Self::GetExplainInfo,
+        Self::ExecuteBatch,
         Self::ExecuteTransaction,
         Self::Disconnect,
         Self::Shutdown,
@@ -180,6 +184,7 @@ impl AgentMethod {
             Self::ListSchemas => "list_schemas",
             Self::ListTables => "list_tables",
             Self::ListObjects => "list_objects",
+            Self::ListDataTypes => "list_data_types",
             Self::CompletionAssistantSearchV1 => "completion_assistant_search_v1",
             Self::GetObjectSource => "get_object_source",
             Self::GetTableDdl => "get_table_ddl",
@@ -195,6 +200,7 @@ impl AgentMethod {
             Self::FetchTableReadPage => "fetch_table_read_page",
             Self::CloseTableReadSession => "close_table_read_session",
             Self::GetExplainInfo => "get_explain_info",
+            Self::ExecuteBatch => "execute_batch",
             Self::ExecuteTransaction => "execute_transaction",
             Self::Disconnect => "disconnect",
             Self::Shutdown => "shutdown",
@@ -602,8 +608,21 @@ impl AgentDriverClient {
         schema: &str,
         timeout_duration: Option<Duration>,
     ) -> Result<T, String> {
-        self.call_method_with_timeout(AgentMethod::ListTables, agent_schema_params(database, schema), timeout_duration)
-            .await
+        self.list_tables_filtered(database, schema, None, timeout_duration).await
+    }
+
+    pub async fn list_tables_filtered<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        database: &str,
+        schema: &str,
+        object_types: Option<&[String]>,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, String> {
+        let mut params = agent_schema_params(database, schema);
+        if let Some(object_types) = object_types {
+            params["object_types"] = serde_json::json!(object_types);
+        }
+        self.call_method_with_timeout(AgentMethod::ListTables, params, timeout_duration).await
     }
 
     pub async fn list_objects<T: DeserializeOwned + Send + 'static>(
@@ -614,6 +633,19 @@ impl AgentDriverClient {
     ) -> Result<T, String> {
         self.call_method_with_timeout(AgentMethod::ListObjects, agent_schema_params(database, schema), timeout_duration)
             .await
+    }
+
+    pub async fn list_data_types<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        database: &str,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, String> {
+        self.call_method_with_timeout(
+            AgentMethod::ListDataTypes,
+            serde_json::json!({ "database": database }),
+            timeout_duration,
+        )
+        .await
     }
 
     pub async fn completion_assistant_search<T: DeserializeOwned + Send + 'static>(
@@ -839,6 +871,21 @@ impl AgentDriverClient {
         schema: Option<&str>,
     ) -> Result<T, String> {
         self.call_method(AgentMethod::ExecuteTransaction, agent_transaction_params(database, statements, schema)).await
+    }
+
+    pub async fn execute_batch<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        database: Option<&str>,
+        statements: &[String],
+        schema: Option<&str>,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, String> {
+        self.call_method_with_timeout(
+            AgentMethod::ExecuteBatch,
+            agent_transaction_params(database, statements, schema),
+            timeout_duration,
+        )
+        .await
     }
 
     pub async fn call_mongo_method<T: DeserializeOwned + Send + 'static>(
@@ -1338,6 +1385,7 @@ mod tests {
         assert_eq!(AgentMethod::ListSchemas.as_str(), "list_schemas");
         assert_eq!(AgentMethod::ListTables.as_str(), "list_tables");
         assert_eq!(AgentMethod::ListObjects.as_str(), "list_objects");
+        assert_eq!(AgentMethod::ListDataTypes.as_str(), "list_data_types");
         assert_eq!(AgentMethod::CompletionAssistantSearchV1.as_str(), "completion_assistant_search_v1");
         assert_eq!(AgentMethod::GetObjectSource.as_str(), "get_object_source");
         assert_eq!(AgentMethod::GetColumns.as_str(), "get_columns");
@@ -1352,6 +1400,7 @@ mod tests {
         assert_eq!(AgentMethod::StartTableRead.as_str(), "start_table_read");
         assert_eq!(AgentMethod::FetchTableReadPage.as_str(), "fetch_table_read_page");
         assert_eq!(AgentMethod::CloseTableReadSession.as_str(), "close_table_read_session");
+        assert_eq!(AgentMethod::ExecuteBatch.as_str(), "execute_batch");
         assert_eq!(AgentMethod::ExecuteTransaction.as_str(), "execute_transaction");
         assert_eq!(AgentMethod::Disconnect.as_str(), "disconnect");
         assert_eq!(AgentMethod::Shutdown.as_str(), "shutdown");
@@ -1392,6 +1441,7 @@ mod tests {
         let _execute_query_page = AgentDriverClient::execute_query_page::<serde_json::Value>;
         let _fetch_query_page = AgentDriverClient::fetch_query_page::<serde_json::Value>;
         let _close_query_session = AgentDriverClient::close_query_session::<serde_json::Value>;
+        let _execute_batch = AgentDriverClient::execute_batch::<serde_json::Value>;
         let _execute_transaction = AgentDriverClient::execute_transaction::<serde_json::Value>;
     }
 

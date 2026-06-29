@@ -33,7 +33,7 @@ pub const JDBC_PLUGIN_NOT_INSTALLED: &str =
 pub const PRESTOSQL_JDBC_DRIVER_CLASS: &str = "io.prestosql.jdbc.PrestoDriver";
 const DEFAULT_AGENT_CONNECT_TIMEOUT_SECS: u64 = 30;
 const ACCESS_AGENT_CONNECT_TIMEOUT_SECS: u64 = 30;
-const POOL_CLOSE_TIMEOUT_SECS: u64 = 5;
+const POOL_CLOSE_TIMEOUT_SECS: u64 = 3;
 
 #[cfg(feature = "duckdb-bundled")]
 mod duckdb_types {
@@ -136,6 +136,9 @@ pub struct AppState {
     pub plugins: PluginRegistry,
     pub agent_manager: crate::agent_manager::AgentManager,
     pub nacos_registry: crate::nacos::NacosAdminRegistry,
+    /// PostgreSQL TLS cancel context, keyed by pool_key.
+    /// Used to reconstruct a TLS connector compatible with the original connection when cancelling.
+    postgres_cancel_contexts: Arc<RwLock<HashMap<String, db::postgres::PostgresCancelContext>>>,
     #[cfg(feature = "mq-admin")]
     pub mq_registry: crate::mq::MqAdminRegistry,
 }
@@ -214,6 +217,7 @@ pub async fn connect_mysql_metadata_pool(
     max_connections: usize,
 ) -> Result<(db::mysql::MySqlPool, MysqlMode), String> {
     let url = connection_url_for_endpoint(db_config, host, port);
+    let idle_timeout_secs = Some(db_config.idle_timeout_secs);
     if db_config.needs_bare_mysql() {
         return match db::mysql::connect_bare_with_pool_limit(&url, connect_timeout, max_connections).await {
             Ok(pool) => Ok((pool, MysqlMode::Bare)),
@@ -233,11 +237,12 @@ pub async fn connect_mysql_metadata_pool(
         };
     }
 
-    match db::mysql::connect_with_ca_cert_and_pool_limit(
+    match db::mysql::connect_with_ca_cert_pool_limit_and_idle(
         &url,
         Some(&db_config.ca_cert_path),
         connect_timeout,
         max_connections,
+        idle_timeout_secs,
     )
     .await
     {
@@ -251,11 +256,12 @@ pub async fn connect_mysql_metadata_pool(
                 log::info!(
                     "MySQL metadata connection without a default database failed ({err}); retrying with configured default database."
                 );
-                let pool = db::mysql::connect_with_ca_cert_and_pool_limit(
+                let pool = db::mysql::connect_with_ca_cert_pool_limit_and_idle(
                     &fallback_url,
                     Some(&config.ca_cert_path),
                     connect_timeout,
                     max_connections,
+                    idle_timeout_secs,
                 )
                 .await?;
                 let mode = detect_ob_oracle_mode(config, &pool).await;
@@ -365,6 +371,7 @@ impl AppState {
                 app_version,
             ),
             nacos_registry: crate::nacos::NacosAdminRegistry::new(),
+            postgres_cancel_contexts: Arc::new(RwLock::new(HashMap::new())),
             #[cfg(feature = "mq-admin")]
             mq_registry: crate::mq::MqAdminRegistry::new(),
         }
@@ -420,9 +427,10 @@ impl AppState {
         self.stop_keepalive_task(&pool_key).await;
         self.pool_activity.write().await.insert(pool_key.clone(), PoolActivity::now());
         self.start_keepalive_task(&pool_key, &pool, config).await;
+        let previous_key = pool_key.clone();
         let previous = self.connections.write().await.insert(pool_key, pool);
         if let Some(pool) = previous {
-            close_pool_kind(pool).await;
+            close_pool_kind_with_timeout(previous_key, pool).await;
         }
     }
 
@@ -461,7 +469,7 @@ impl AppState {
         config: &ConnectionConfig,
     ) -> Result<(), String> {
         if let Err(err) = self.ensure_current_connection_attempt(connection_id, Some(attempt)).await {
-            close_pool_kind(pool).await;
+            close_pool_kind_with_timeout(pool_key, pool).await;
             return Err(err);
         }
         self.insert_connection_pool(pool_key, pool, config).await;
@@ -495,6 +503,7 @@ impl AppState {
         let connections = self.connections.clone();
         let keepalive_tasks = self.keepalive_tasks.clone();
         let pool_activity = self.pool_activity.clone();
+        let cancel_contexts = self.postgres_cancel_contexts.clone();
         let running_queries = self.running_queries.clone();
         let idle_timeout = Duration::from_secs(idle_timeout_secs.max(1));
         let handle = tokio::spawn(async move {
@@ -517,6 +526,7 @@ impl AppState {
                         );
                         keepalive_tasks.write().await.remove(&key);
                         pool_activity.write().await.remove(&key);
+                        cancel_contexts.write().await.remove(&key);
                         let removed = connections.write().await.remove(&key);
                         if let Some(pool) = removed {
                             close_pool_kind_with_timeout(key, pool).await;
@@ -533,6 +543,7 @@ impl AppState {
                             log::warn!("Connection keepalive failed for '{key}': {err}; invalidating pool");
                             keepalive_tasks.write().await.remove(&key);
                             pool_activity.write().await.remove(&key);
+                            cancel_contexts.write().await.remove(&key);
                             let removed = connections.write().await.remove(&key);
                             if let Some(pool) = removed {
                                 close_pool_kind_with_timeout(key, pool).await;
@@ -546,6 +557,7 @@ impl AppState {
                             );
                             keepalive_tasks.write().await.remove(&key);
                             pool_activity.write().await.remove(&key);
+                            cancel_contexts.write().await.remove(&key);
                             let removed = connections.write().await.remove(&key);
                             if let Some(pool) = removed {
                                 close_pool_kind_with_timeout(key, pool).await;
@@ -580,6 +592,11 @@ impl AppState {
 
     pub async fn touch_pool_activity(&self, pool_key: &str) {
         self.pool_activity.write().await.insert(pool_key.to_string(), PoolActivity::now());
+    }
+
+    /// Get the PostgreSQL TLS cancel context (used to reconstruct the TLS connector when cancelling a query).
+    pub async fn get_postgres_cancel_context(&self, pool_key: &str) -> Option<db::postgres::PostgresCancelContext> {
+        self.postgres_cancel_contexts.read().await.get(pool_key).cloned()
     }
 
     pub fn pool_activity_touch(&self, pool_key: &str) -> PoolActivityTouch {
@@ -678,7 +695,14 @@ impl AppState {
             | DatabaseType::Gaussdb
             | DatabaseType::Kwdb
             | DatabaseType::Questdb
-            | DatabaseType::OpenGauss => PoolKind::Postgres(db::postgres::connect(&url, connect_timeout).await?),
+            | DatabaseType::OpenGauss => {
+                let pg_pool = db::postgres::connect(&url, connect_timeout).await?;
+                // Build TLS cancel context for reconstructing TLS connection during cancel
+                if let Some(ctx) = db::postgres::build_postgres_cancel_context(&url) {
+                    self.postgres_cancel_contexts.write().await.insert(pool_key.clone(), ctx);
+                }
+                PoolKind::Postgres(pg_pool)
+            }
             DatabaseType::Sqlite => {
                 let extensions = db::sqlite::sqlite_extension_specs_from_url_params(db_config.url_params.as_deref())
                     .into_iter()
@@ -688,11 +712,7 @@ impl AppState {
                     })
                     .collect();
                 PoolKind::Sqlite(
-                    db::sqlite::connect_path_create_if_missing_with_extensions(
-                        &expand_tilde(&db_config.host),
-                        extensions,
-                    )
-                    .await?,
+                    db::sqlite::connect_path_with_extensions(&expand_tilde(&db_config.host), extensions).await?,
                 )
             }
             DatabaseType::Rqlite => {
@@ -858,6 +878,7 @@ impl AppState {
                     &url,
                     username,
                     password,
+                    db_config.url_params.clone(),
                     Some(&db_config.ca_cert_path),
                     connect_timeout,
                 )?;
@@ -1004,7 +1025,7 @@ impl AppState {
         };
 
         if let Err(err) = self.ensure_current_connection_attempt(connection_id, connection_attempt).await {
-            close_pool_kind(pool).await;
+            close_pool_kind_with_timeout(pool_key.clone(), pool).await;
             return Err(err);
         }
         self.insert_connection_pool(pool_key.clone(), pool, &db_config).await;
@@ -1315,9 +1336,10 @@ impl AppState {
 
         self.stop_keepalive_task(pool_key).await;
         self.pool_activity.write().await.remove(pool_key);
+        self.postgres_cancel_contexts.write().await.remove(pool_key);
         let removed = self.connections.write().await.remove(pool_key);
         if let Some(pool) = removed {
-            close_pool_kind(pool).await;
+            close_pool_kind_with_timeout(pool_key.to_string(), pool).await;
             true
         } else {
             false
@@ -1346,9 +1368,10 @@ impl AppState {
         } else {
             self.stop_keepalive_task(&pool_key).await;
             self.pool_activity.write().await.remove(&pool_key);
+            self.postgres_cancel_contexts.write().await.remove(&pool_key);
             let removed = self.connections.write().await.remove(&pool_key);
             if let Some(pool) = removed {
-                close_pool_kind(pool).await;
+                close_pool_kind_with_timeout(pool_key.clone(), pool).await;
             }
         }
         self.get_or_create_pool_for_session(connection_id, database, client_session_id).await
@@ -1375,9 +1398,10 @@ impl AppState {
         }
         self.stop_keepalive_task(&pool_key).await;
         self.pool_activity.write().await.remove(&pool_key);
+        self.postgres_cancel_contexts.write().await.remove(&pool_key);
         let removed = self.connections.write().await.remove(&pool_key);
         if let Some(pool) = removed {
-            close_pool_kind(pool).await;
+            close_pool_kind_with_timeout(pool_key, pool).await;
             Ok(true)
         } else {
             Ok(false)
@@ -1387,9 +1411,10 @@ impl AppState {
     pub async fn remove_pool_by_key(&self, pool_key: &str) -> bool {
         self.stop_keepalive_task(pool_key).await;
         self.pool_activity.write().await.remove(pool_key);
+        self.postgres_cancel_contexts.write().await.remove(pool_key);
         let removed = self.connections.write().await.remove(pool_key);
         if let Some(pool) = removed {
-            close_pool_kind(pool).await;
+            close_pool_kind_with_timeout(pool_key.to_string(), pool).await;
             true
         } else {
             false
@@ -1417,21 +1442,23 @@ impl AppState {
         self.stop_keepalive_tasks(&keys_to_remove).await;
         {
             let mut activity = self.pool_activity.write().await;
+            let mut cancel_contexts = self.postgres_cancel_contexts.write().await;
             for key in &keys_to_remove {
                 activity.remove(key);
+                cancel_contexts.remove(key);
             }
         }
         let mut conns = self.connections.write().await;
         let mut removed = Vec::with_capacity(keys_to_remove.len());
         for key in keys_to_remove {
             if let Some(pool) = conns.remove(&key) {
-                removed.push(pool);
+                removed.push((key, pool));
             }
         }
         drop(conns);
         let closed = !removed.is_empty();
-        for pool in removed {
-            close_pool_kind(pool).await;
+        for (key, pool) in removed {
+            close_pool_kind_with_timeout(key, pool).await;
         }
         Ok(closed)
     }
@@ -1719,11 +1746,14 @@ impl AppState {
                 }
             }
             let mut conns = self.connections.write().await;
+            let mut removed = Vec::with_capacity(dead_keys.len());
             for key in &dead_keys {
                 if let Some(pool) = conns.remove(key) {
-                    close_pool_kind(pool).await;
+                    removed.push((key.clone(), pool));
                 }
             }
+            drop(conns);
+            close_removed_pools(removed).await;
         }
 
         // Re-establish SSH tunnels that have died
@@ -1765,8 +1795,10 @@ impl AppState {
         self.stop_keepalive_tasks(&keys_to_remove).await;
         {
             let mut activity = self.pool_activity.write().await;
+            let mut cancel_contexts = self.postgres_cancel_contexts.write().await;
             for key in &keys_to_remove {
                 activity.remove(key);
+                cancel_contexts.remove(key);
             }
         }
         let mut conns = self.connections.write().await;
@@ -2416,6 +2448,7 @@ mod tests {
             redis_sentinel_tls: false,
             redis_cluster_nodes: String::new(),
             redis_key_separator: default_redis_key_separator(),
+            redis_scan_page_size: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),

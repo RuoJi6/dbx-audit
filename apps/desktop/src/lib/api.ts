@@ -92,6 +92,7 @@ export const reinstallJre = forward("reinstallJre");
 export const uninstallJre = forward("uninstallJre");
 export const listenAgentInstallProgress = forward("listenAgentInstallProgress");
 export const loadSavedSqlLibrary = forward("loadSavedSqlLibrary");
+export const loadSavedSqlFile = forward("loadSavedSqlFile");
 export const saveSavedSqlFolder = forward("saveSavedSqlFolder");
 export const deleteSavedSqlFolder = forward("deleteSavedSqlFolder");
 export const saveSavedSqlFile = forward("saveSavedSqlFile");
@@ -122,6 +123,7 @@ export const listCompletionObjects = forward("listCompletionObjects");
 export const completionAssistantSearch = forward("completionAssistantSearch");
 export const getObjectSource = forward("getObjectSource");
 export const getColumns = forward("getColumns");
+export const listDataTypes = forward("listDataTypes");
 export const listIndexes = forward("listIndexes");
 export const listForeignKeys = forward("listForeignKeys");
 export const listTriggers = forward("listTriggers");
@@ -401,6 +403,7 @@ export const checkMcpServerStatus = forward("checkMcpServerStatus");
 export const installMcpServer = forward("installMcpServer");
 export const checkForUpdates = forward("checkForUpdates");
 export const getSystemProxyUrl = forward("getSystemProxyUrl");
+export const downloadAndInstallUpdate = forward("downloadAndInstallUpdate");
 export const getAppVersion = forward("getAppVersion");
 
 // Layout
@@ -414,6 +417,7 @@ export const loadSidebarLayout = forward("loadSidebarLayout");
 export type {
   AiMessage,
   AiCompletionRequest,
+  AiTaskContract,
   AiStreamChunk,
   AiModelInfo,
   AiChatMessage,
@@ -449,6 +453,7 @@ export type {
   KvKeyMetadata,
   KvKeySummary,
   KvListPrefixResponse,
+  KvListPrefixOptions,
   KvGetResponse,
   KvWriteMode,
   KvCreateMode,

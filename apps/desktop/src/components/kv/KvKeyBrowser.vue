@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from "vue";
+import { computed, onMounted, reactive, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import { ChevronDown, ChevronRight, FolderClosed, FolderOpen, KeyRound, Loader2, Plus, RefreshCw, Search, Trash2 } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
@@ -10,10 +10,11 @@ import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import DangerConfirmDialog from "@/components/editor/DangerConfirmDialog.vue";
 import CustomContextMenu, { type ContextMenuItem } from "@/components/ui/CustomContextMenu.vue";
-import type { KvCreateMode, KvGetResponse, KvKeySummary, KvPutOptions, KvPutResponse, KvValue } from "@/lib/api";
+import type { KvCreateMode, KvGetResponse, KvKeySummary, KvListPrefixOptions, KvPutOptions, KvPutResponse, KvValue } from "@/lib/api";
 import { buildKvKeyTree, flattenVisibleKvKeyTree, preserveKvExpandedGroupIds, type KvKeyTreeNode } from "@/lib/kvKeyTree";
 import { refreshedKvSelectionKey } from "@/lib/kvRefreshSelection";
 import { formatZooKeeperMetadataRows, formatZooKeeperSummaryBadges, prettyPrintJsonText } from "@/lib/kvValueDisplay";
+import { createLazyKvKeyTreeState, flattenLazyKvKeyTree, lazyExpandedKeyFromId, normalizeZooKeeperPath, parentZooKeeperPath, replaceLazyKvChildren, replaceLazyKvFocusedRoot, resetLazyKvKeyTree, type LazyKvKeyTreeNode, type LazyKvKeyTreeRow } from "@/lib/zookeeperLazyKeyTree";
 import { useToast } from "@/composables/useToast";
 
 interface KvKeyBrowserLabels {
@@ -52,11 +53,14 @@ interface KvCreateModeOption {
 }
 
 interface KvKeyBrowserApi {
-  listPrefix: (connectionId: string, prefix: string, limit: number, continuation?: string | null) => Promise<{ keys: KvKeySummary[]; continuation?: string | null }>;
+  listPrefix: (connectionId: string, prefix: string, limit: number, continuation?: string | null, options?: KvListPrefixOptions | null) => Promise<{ keys: KvKeySummary[]; continuation?: string | null }>;
   get: (connectionId: string, key: string) => Promise<KvGetResponse>;
   put: (connectionId: string, key: string, value: KvValue, options?: KvPutOptions | null) => Promise<KvPutResponse>;
   deleteKey: (connectionId: string, key: string) => Promise<{ deleted: number }>;
 }
+
+type BrowserTreeNode = KvKeyTreeNode | LazyKvKeyTreeNode;
+type BrowserTreeRow = { type: "node"; node: BrowserTreeNode; depth: number } | LazyKvKeyTreeRow;
 
 const props = withDefaults(
   defineProps<{
@@ -67,12 +71,14 @@ const props = withDefaults(
     createModeOptions?: KvCreateModeOption[];
     enableNodeActions?: boolean;
     metadataStyle?: "default" | "zookeeper";
+    lazyHierarchy?: boolean;
   }>(),
   {
     supportsCreateModes: false,
     createModeOptions: () => [],
     enableNodeActions: false,
     metadataStyle: "default",
+    lazyHierarchy: false,
   },
 );
 
@@ -99,14 +105,18 @@ const showDeleteConfirm = ref(false);
 const deleting = ref(false);
 const selectedCreateMode = ref<KvCreateMode>("persistent");
 const selectedPrettyValue = ref<string | null>(null);
+const lazyTreeState = reactive(createLazyKvKeyTreeState());
 const pageSize = 200;
 type LoadKeysOptions = {
   preserveSelection?: boolean;
 };
 
 const tree = computed(() => buildKvKeyTree(keys.value));
-const visibleRows = computed(() => flattenVisibleKvKeyTree(tree.value, expandedGroupIds.value));
-const selectedMetadata = computed(() => selectedValue.value?.metadata ?? keys.value.find((key) => key.key === selectedKey.value));
+const visibleRows = computed<BrowserTreeRow[]>(() => {
+  if (props.lazyHierarchy) return flattenLazyKvKeyTree(lazyTreeState, expandedGroupIds.value);
+  return flattenVisibleKvKeyTree(tree.value, expandedGroupIds.value).map((row) => ({ type: "node", node: row.node, depth: row.depth }));
+});
+const selectedMetadata = computed(() => selectedValue.value?.metadata ?? (props.lazyHierarchy && selectedKey.value ? lazyTreeState.nodeByKey.get(selectedKey.value) : keys.value.find((key) => key.key === selectedKey.value)));
 const selectedTextValue = computed(() => {
   const value = selectedValue.value?.value;
   if (!value) return "";
@@ -132,6 +142,11 @@ function preserveExpandedGroups(expandAll = false) {
 }
 
 async function loadKeys(reset = true, options: LoadKeysOptions = {}) {
+  if (props.lazyHierarchy) {
+    await loadLazyRoot(reset, options);
+    return;
+  }
+
   const keyToRestore = options.preserveSelection ? selectedKey.value : null;
   if (reset) {
     loading.value = true;
@@ -166,6 +181,150 @@ async function loadKeys(reset = true, options: LoadKeysOptions = {}) {
   }
 }
 
+async function loadLazyRoot(reset = true, options: LoadKeysOptions = {}) {
+  const keyToRestore = options.preserveSelection ? selectedKey.value : null;
+  if (!reset) {
+    await loadMoreLazyChildren(null);
+    return;
+  }
+
+  const previousExpanded = new Set(expandedGroupIds.value);
+  loading.value = true;
+  loadingMore.value = false;
+  if (!options.preserveSelection) {
+    selectedKey.value = null;
+    selectedValue.value = null;
+  }
+
+  try {
+    const rootPath = normalizeZooKeeperPath(prefix.value);
+    resetLazyKvKeyTree(lazyTreeState, rootPath);
+    const result = await props.api.listPrefix(props.connectionId, rootPath, pageSize, null, { recursive: false });
+    if (rootPath === "/") {
+      replaceLazyKvChildren(lazyTreeState, null, result.keys, result.continuation);
+    } else {
+      const rootSummary = await loadLazyRootSummary(rootPath, result.keys, result.continuation);
+      if (rootSummary) {
+        replaceLazyKvFocusedRoot(lazyTreeState, rootSummary, result.keys, result.continuation);
+      } else {
+        replaceLazyKvChildren(lazyTreeState, null, result.keys, result.continuation);
+      }
+    }
+
+    if (options.preserveSelection) {
+      await restoreLazyExpandedBranches(previousExpanded);
+      expandFocusedRoot(rootPath);
+      if (keyToRestore && lazyTreeState.nodeByKey.has(keyToRestore)) {
+        await loadSelectedKey(keyToRestore);
+      } else {
+        selectedKey.value = null;
+        selectedValue.value = null;
+      }
+    } else {
+      expandedGroupIds.value = focusedRootExpansion(rootPath);
+    }
+  } finally {
+    loading.value = false;
+  }
+}
+
+async function loadLazyRootSummary(rootPath: string, children: KvKeySummary[], continuation?: string | null): Promise<KvKeySummary | null> {
+  try {
+    const rootValue = await props.api.get(props.connectionId, rootPath);
+    if (rootValue.found) return { key: rootValue.key || rootPath, ...(rootValue.metadata ?? {}) };
+    if (children.length === 0 && !continuation) return null;
+  } catch {
+    if (children.length === 0 && !continuation) return null;
+  }
+  return { key: rootPath, numChildren: children.length + (continuation ? 1 : 0) };
+}
+
+function focusedRootExpansion(rootPath: string): Set<string> {
+  const normalized = normalizeZooKeeperPath(rootPath);
+  if (normalized === "/") return new Set();
+  return new Set(
+    focusedPathKeys(normalized)
+      .filter((key) => lazyTreeState.nodeByKey.has(key))
+      .map((key) => `lazy:${key}`),
+  );
+}
+
+function expandFocusedRoot(rootPath: string) {
+  expandedGroupIds.value = new Set([...expandedGroupIds.value, ...focusedRootExpansion(rootPath)]);
+}
+
+function focusedPathKeys(rootPath: string): string[] {
+  const segments = normalizeZooKeeperPath(rootPath).split("/").filter(Boolean);
+  return segments.map((_, index) => `/${segments.slice(0, index + 1).join("/")}`);
+}
+
+async function restoreLazyExpandedBranches(previousExpanded: ReadonlySet<string>) {
+  const restored = new Set<string>();
+  const keysToExpand = [...previousExpanded]
+    .map((id) => lazyExpandedKeyFromId(id))
+    .filter((key): key is string => !!key)
+    .sort((a, b) => a.split("/").length - b.split("/").length);
+
+  for (const key of keysToExpand) {
+    const node = lazyTreeState.nodeByKey.get(key);
+    if (!node?.hasChildren) continue;
+    restored.add(node.id);
+    await loadLazyChildren(key, true);
+  }
+
+  expandedGroupIds.value = restored;
+}
+
+async function loadLazyChildren(parentKey: string, reset = true) {
+  const node = lazyTreeState.nodeByKey.get(parentKey);
+  if (!node || node.loading) return;
+  node.loading = true;
+  try {
+    const continuationToUse = reset ? null : node.continuation;
+    const result = await props.api.listPrefix(props.connectionId, parentKey, pageSize, continuationToUse, { recursive: false });
+    replaceLazyKvChildren(lazyTreeState, parentKey, result.keys, result.continuation, { append: !reset });
+  } finally {
+    const latest = lazyTreeState.nodeByKey.get(parentKey);
+    if (latest) latest.loading = false;
+  }
+}
+
+async function loadMoreLazyChildren(parentKey: string | null) {
+  if (parentKey) {
+    await loadLazyChildren(parentKey, false);
+    return;
+  }
+
+  if (loadingMore.value || !lazyTreeState.rootContinuation) return;
+  loadingMore.value = true;
+  try {
+    const result = await props.api.listPrefix(props.connectionId, lazyTreeState.rootPath, pageSize, lazyTreeState.rootContinuation, { recursive: false });
+    replaceLazyKvChildren(lazyTreeState, null, result.keys, result.continuation, { append: true });
+  } finally {
+    loadingMore.value = false;
+  }
+}
+
+async function refreshLazyParent(parentPath: string) {
+  const normalizedParent = normalizeZooKeeperPath(parentPath);
+  if (normalizedParent === lazyTreeState.rootPath) {
+    if (lazyTreeState.rootPath === "/") {
+      const result = await props.api.listPrefix(props.connectionId, lazyTreeState.rootPath, pageSize, null, { recursive: false });
+      replaceLazyKvChildren(lazyTreeState, null, result.keys, result.continuation);
+    } else {
+      await loadLazyChildren(lazyTreeState.rootPath, true);
+      expandFocusedRoot(lazyTreeState.rootPath);
+    }
+    return;
+  }
+
+  if (lazyTreeState.nodeByKey.has(normalizedParent)) {
+    await loadLazyChildren(normalizedParent, true);
+  } else {
+    await loadLazyRoot(true, { preserveSelection: true });
+  }
+}
+
 async function loadSelectedKey(key: string) {
   selectedKey.value = key;
   selectedPrettyValue.value = null;
@@ -180,36 +339,43 @@ async function loadSelectedKey(key: string) {
   }
 }
 
-function toggleGroup(node: KvKeyTreeNode) {
-  if (node.kind !== "group") return;
+async function toggleGroup(node: BrowserTreeNode) {
+  if (!nodeIsExpandable(node)) return;
   const next = new Set(expandedGroupIds.value);
-  if (next.has(node.id)) next.delete(node.id);
-  else next.add(node.id);
+  if (next.has(node.id)) {
+    next.delete(node.id);
+  } else {
+    next.add(node.id);
+    if (node.kind === "lazy" && node.hasChildren && !node.loaded) {
+      void loadLazyChildren(node.key, true);
+    }
+  }
   expandedGroupIds.value = next;
 }
 
-function nodePath(node: KvKeyTreeNode): string {
+function nodePath(node: BrowserTreeNode): string {
+  if (node.kind === "lazy") return node.key;
   if (node.kind === "leaf") return node.key;
   return `/${node.pathSegments.join("/")}`;
 }
 
-function onRowClick(node: KvKeyTreeNode) {
-  if (node.kind === "group") {
-    toggleGroup(node);
+function onRowClick(node: BrowserTreeNode) {
+  if (nodeIsExpandable(node)) {
+    void toggleGroup(node);
     if (props.enableNodeActions) void loadSelectedKey(nodePath(node));
   } else {
-    void loadSelectedKey(node.key);
+    void loadSelectedKey(nodePath(node));
   }
 }
 
-function onRowDoubleClick(node: KvKeyTreeNode) {
-  if (node.kind === "leaf") {
-    void loadSelectedKey(node.key).then(() => openEditDialog());
+function onRowDoubleClick(node: BrowserTreeNode) {
+  if (!nodeIsExpandable(node)) {
+    void loadSelectedKey(nodePath(node)).then(() => openEditDialog());
   }
 }
 
 function createKeyPrefix(parentPath?: string): string {
-  const path = parentPath ?? prefix.value.trim();
+  const path = props.lazyHierarchy ? normalizeZooKeeperPath(parentPath ?? prefix.value) : (parentPath ?? prefix.value.trim());
   if (!path) return "";
   if (path === "/") return "/";
   return path.endsWith("/") ? path : `${path}/`;
@@ -254,7 +420,11 @@ async function saveKey() {
     const response = await props.api.put(props.connectionId, key, value, putOptions());
     const keyToSelect = response.createdKey || response.key || key;
     showEditDialog.value = false;
-    await loadKeys(true);
+    if (props.lazyHierarchy) {
+      await refreshLazyParent(parentZooKeeperPath(keyToSelect));
+    } else {
+      await loadKeys(true);
+    }
     await loadSelectedKey(keyToSelect);
     toast(props.labels.saved, 2500);
   } catch (error) {
@@ -266,31 +436,36 @@ async function saveKey() {
 
 async function deleteSelectedKey() {
   if (!selectedKey.value) return;
+  const parentPath = parentZooKeeperPath(selectedKey.value);
   deleting.value = true;
   try {
     await props.api.deleteKey(props.connectionId, selectedKey.value);
     showDeleteConfirm.value = false;
     selectedKey.value = null;
     selectedValue.value = null;
-    await loadKeys(true);
+    if (props.lazyHierarchy) {
+      await refreshLazyParent(parentPath);
+    } else {
+      await loadKeys(true);
+    }
     toast(props.labels.deleted, 2500);
   } finally {
     deleting.value = false;
   }
 }
 
-function selectNodeForAction(node: KvKeyTreeNode) {
+function selectNodeForAction(node: BrowserTreeNode) {
   const key = nodePath(node);
   if (selectedKey.value !== key) void loadSelectedKey(key);
   else selectedKey.value = key;
 }
 
-function openDeleteForNode(node: KvKeyTreeNode) {
+function openDeleteForNode(node: BrowserTreeNode) {
   selectNodeForAction(node);
   showDeleteConfirm.value = true;
 }
 
-function nodeContextMenuItems(node: KvKeyTreeNode): ContextMenuItem[] {
+function nodeContextMenuItems(node: BrowserTreeNode): ContextMenuItem[] {
   if (!props.enableNodeActions) return [];
   return [
     {
@@ -307,14 +482,26 @@ function nodeContextMenuItems(node: KvKeyTreeNode): ContextMenuItem[] {
   ];
 }
 
-function onRowContextMenu(event: MouseEvent, node: KvKeyTreeNode, openContextMenu: (event: MouseEvent) => void) {
+function onRowContextMenu(event: MouseEvent, node: BrowserTreeNode, openContextMenu: (event: MouseEvent) => void) {
   if (!props.enableNodeActions) return;
   selectNodeForAction(node);
   openContextMenu(event);
 }
 
-function rowIsSelected(node: KvKeyTreeNode): boolean {
+function rowIsSelected(node: BrowserTreeNode): boolean {
   return nodePath(node) === selectedKey.value;
+}
+
+function nodeIsExpandable(node: BrowserTreeNode): boolean {
+  return node.kind === "group" || (node.kind === "lazy" && node.hasChildren);
+}
+
+function nodeIsExpanded(node: BrowserTreeNode): boolean {
+  return expandedGroupIds.value.has(node.id);
+}
+
+function nodeIsLoading(node: BrowserTreeNode): boolean {
+  return node.kind === "lazy" && node.loading;
 }
 
 function prettifySelectedJson() {
@@ -397,30 +584,39 @@ defineExpose({ focusSearch, refresh });
           {{ labels.empty }}
         </div>
         <div v-else class="h-full overflow-auto py-1 text-sm">
-          <CustomContextMenu v-for="row in visibleRows" :key="row.node.id" :items="nodeContextMenuItems(row.node)" v-slot="{ onContextMenu }">
-            <button
-              type="button"
-              class="flex h-8 w-full items-center gap-1.5 px-2 text-left hover:bg-accent"
-              :class="{ 'bg-accent/70': rowIsSelected(row.node) }"
-              :style="{ paddingLeft: `${8 + row.depth * 18}px` }"
-              @click="onRowClick(row.node)"
-              @dblclick.stop.prevent="onRowDoubleClick(row.node)"
-              @contextmenu="(event) => onRowContextMenu(event, row.node, onContextMenu)"
-            >
-              <template v-if="row.node.kind === 'group'">
-                <ChevronDown v-if="expandedGroupIds.has(row.node.id)" class="h-3.5 w-3.5 shrink-0" />
-                <ChevronRight v-else class="h-3.5 w-3.5 shrink-0" />
-                <FolderOpen v-if="expandedGroupIds.has(row.node.id)" class="h-4 w-4 shrink-0 text-sky-500" />
-                <FolderClosed v-else class="h-4 w-4 shrink-0 text-sky-500" />
-              </template>
-              <template v-else>
-                <span class="w-3.5 shrink-0" />
-                <KeyRound class="h-4 w-4 shrink-0 text-sky-500" />
-              </template>
-              <span class="truncate">{{ row.node.label }}</span>
-            </button>
-          </CustomContextMenu>
-          <div v-if="continuation" class="border-t p-2">
+          <template v-for="row in visibleRows" :key="row.type === 'node' ? row.node.id : row.id">
+            <CustomContextMenu v-if="row.type === 'node'" :items="nodeContextMenuItems(row.node)" v-slot="{ onContextMenu }">
+              <button
+                type="button"
+                class="flex h-8 w-full items-center gap-1.5 px-2 text-left hover:bg-accent"
+                :class="{ 'bg-accent/70': rowIsSelected(row.node) }"
+                :style="{ paddingLeft: `${8 + row.depth * 18}px` }"
+                @click="onRowClick(row.node)"
+                @dblclick.stop.prevent="onRowDoubleClick(row.node)"
+                @contextmenu="(event) => onRowContextMenu(event, row.node, onContextMenu)"
+              >
+                <template v-if="nodeIsExpandable(row.node)">
+                  <Loader2 v-if="nodeIsLoading(row.node)" class="h-3.5 w-3.5 shrink-0 animate-spin" />
+                  <ChevronDown v-else-if="nodeIsExpanded(row.node)" class="h-3.5 w-3.5 shrink-0" />
+                  <ChevronRight v-else class="h-3.5 w-3.5 shrink-0" />
+                  <FolderOpen v-if="nodeIsExpanded(row.node)" class="h-4 w-4 shrink-0 text-sky-500" />
+                  <FolderClosed v-else class="h-4 w-4 shrink-0 text-sky-500" />
+                </template>
+                <template v-else>
+                  <span class="w-3.5 shrink-0" />
+                  <KeyRound class="h-4 w-4 shrink-0 text-sky-500" />
+                </template>
+                <span class="truncate">{{ row.node.label }}</span>
+              </button>
+            </CustomContextMenu>
+            <div v-else class="px-2 py-1" :style="{ paddingLeft: `${8 + row.depth * 18}px` }">
+              <Button size="sm" variant="outline" class="h-7 w-full gap-1.5" :disabled="row.loading || loadingMore" @click="loadMoreLazyChildren(row.parentKey)">
+                <Loader2 v-if="row.loading || (row.parentKey === null && loadingMore)" class="h-3.5 w-3.5 animate-spin" />
+                {{ labels.loadMore }}
+              </Button>
+            </div>
+          </template>
+          <div v-if="!lazyHierarchy && continuation" class="border-t p-2">
             <Button size="sm" variant="outline" class="h-8 w-full gap-1.5" :disabled="loadingMore" @click="loadKeys(false)">
               <Loader2 v-if="loadingMore" class="h-3.5 w-3.5 animate-spin" />
               {{ labels.loadMore }}

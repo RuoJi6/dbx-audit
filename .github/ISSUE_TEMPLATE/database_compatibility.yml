@@ -1,6 +1,6 @@
 name: "🔀 Compatibility Issue / 数据库兼容性问题"
 description: A specific database, version, or SQL dialect incompatibility. / 某个数据库、版本或 SQL 方言不兼容。
-title: "[🔀 Compatibility] "
+title: "[Compatibility] "
 labels: ["bug"]
 body:
   - type: markdown

@@ -94,6 +94,7 @@ pub async fn start_transfer(
             log::warn!("[transfer] failed to sort tables by FK dependency, using original order: {e}");
             tables
         });
+        let mut failed_tables: Vec<String> = Vec::new();
         for (i, table) in tables.iter().enumerate() {
             if transfer::is_cancelled(&req.transfer_id).await {
                 let progress = transfer::TransferProgress {
@@ -153,6 +154,7 @@ pub async fn start_transfer(
                     }
                 }
                 Err(e) => {
+                    failed_tables.push(table.clone());
                     let progress = transfer::TransferProgress {
                         transfer_id: req.transfer_id.clone(),
                         table: table.clone(),
@@ -178,8 +180,16 @@ pub async fn start_transfer(
             total_tables: tables.len(),
             rows_transferred: 0,
             total_rows: None,
-            status: TransferStatus::Done,
-            error: None,
+            status: if failed_tables.is_empty() { TransferStatus::Done } else { TransferStatus::Error },
+            error: if failed_tables.is_empty() {
+                None
+            } else {
+                Some(format!(
+                    "{} table(s) failed: {}",
+                    failed_tables.len(),
+                    failed_tables.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
+                ))
+            },
         };
         if let Ok(json) = serde_json::to_string(&done) {
             let _ = tx.send(json);

@@ -172,4 +172,6 @@ test("builds PostgreSQL role metadata SQL without directly requiring rolbypassrl
   assert.doesNotMatch(listSql, /r\.rolbypassrls/);
   assert.doesNotMatch(grantsSql, /r\.rolbypassrls/);
   assert.match(grantsSql, /AS rolbypassrls/);
+  assert.match(grantsSql, /n\.nspname NOT LIKE 'pg~_%' ESCAPE '~'/);
+  assert.ok(!grantsSql.includes("ESCAPE '\\'"));
 });

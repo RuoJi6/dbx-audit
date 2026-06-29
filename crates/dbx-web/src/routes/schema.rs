@@ -197,6 +197,16 @@ pub async fn list_columns(
     Ok(Json(serde_json::to_value(result).map_err(|e| AppError(e.to_string()))?))
 }
 
+pub async fn list_data_types(
+    State(state): State<Arc<WebState>>,
+    Query(q): Query<SchemaQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let database = q.database.as_deref().unwrap_or("");
+    let result =
+        dbx_core::schema::list_data_types_core(&state.app, &q.connection_id, database).await.map_err(AppError)?;
+    Ok(Json(serde_json::to_value(result).map_err(|e| AppError(e.to_string()))?))
+}
+
 pub async fn list_indexes(
     State(state): State<Arc<WebState>>,
     Query(q): Query<SchemaQuery>,

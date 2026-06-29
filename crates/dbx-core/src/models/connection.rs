@@ -67,6 +67,8 @@ pub struct ConnectionConfig {
     pub redis_cluster_nodes: String,
     #[serde(default = "default_redis_key_separator", skip_serializing_if = "is_default_redis_separator")]
     pub redis_key_separator: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redis_scan_page_size: Option<u64>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub etcd_endpoints: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -209,7 +211,7 @@ pub fn default_idle_timeout_secs() -> u64 {
 }
 
 pub fn default_keepalive_interval_secs() -> u64 {
-    60
+    30
 }
 
 fn default_proxy_port() -> u16 {
@@ -397,6 +399,8 @@ struct ConnectionConfigData {
     #[serde(default = "default_redis_key_separator")]
     pub redis_key_separator: String,
     #[serde(default)]
+    pub redis_scan_page_size: Option<u64>,
+    #[serde(default)]
     pub etcd_endpoints: String,
     #[serde(default)]
     pub gbase_server: String,
@@ -452,6 +456,7 @@ impl From<ConnectionConfigData> for ConnectionConfig {
             redis_sentinel_tls: data.redis_sentinel_tls,
             redis_cluster_nodes: data.redis_cluster_nodes,
             redis_key_separator: data.redis_key_separator,
+            redis_scan_page_size: data.redis_scan_page_size,
             etcd_endpoints: data.etcd_endpoints,
             gbase_server: data.gbase_server,
             informix_server: data.informix_server,
@@ -1075,7 +1080,7 @@ impl ConnectionConfig {
             }
             DatabaseType::Databend => normalize_bare_mysql_url_params(value),
             DatabaseType::Postgres | DatabaseType::Redshift => normalize_postgres_url_params(value, self.ssl),
-            DatabaseType::MongoDb => normalize_mongo_url_params(value, self.ssl),
+            DatabaseType::MongoDb => normalize_mongo_url_params(value, self.ssl, !self.username.trim().is_empty()),
             _ => value.trim_start_matches('?').to_string(),
         }
     }
@@ -1165,13 +1170,17 @@ fn normalize_mysql_url_params(value: &str, force_tls: bool, accept_invalid_certs
     parts.join("&")
 }
 
-fn normalize_mongo_url_params(value: &str, force_tls: bool) -> String {
+fn normalize_mongo_url_params(value: &str, force_tls: bool, default_auth_source: bool) -> String {
     let value = value.trim_start_matches('?');
     let mut parts: Vec<String> = value.split('&').filter(|part| !part.is_empty()).map(str::to_string).collect();
 
     if force_tls {
         parts.retain(|part| !url_param_key_is(part, "tls") && !url_param_key_is(part, "ssl"));
         parts.insert(0, "tls=true".to_string());
+    }
+
+    if default_auth_source && !parts.iter().any(|part| url_param_key_is(part, "authSource")) {
+        parts.push("authSource=admin".to_string());
     }
 
     parts.join("&")
@@ -1582,6 +1591,7 @@ mod tests {
             redis_sentinel_tls: false,
             redis_cluster_nodes: String::new(),
             redis_key_separator: default_redis_key_separator(),
+            redis_scan_page_size: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
@@ -2131,10 +2141,32 @@ mod tests {
     }
 
     #[test]
-    fn mongodb_form_url_without_params_does_not_force_topology_or_auth() {
+    fn mongodb_form_url_without_params_defaults_auth_source_to_admin() {
         let config = mongodb_config("root", "secret", Some("admin"));
 
-        assert_eq!(config.connection_url(), "mongodb://root:secret@10.1.2.3:17000/admin");
+        assert_eq!(config.connection_url(), "mongodb://root:secret@10.1.2.3:17000/admin?authSource=admin");
+    }
+
+    #[test]
+    fn mongodb_form_url_default_database_does_not_change_auth_source() {
+        let config = mongodb_config("root", "secret", Some("app"));
+
+        assert_eq!(config.connection_url(), "mongodb://root:secret@10.1.2.3:17000/app?authSource=admin");
+    }
+
+    #[test]
+    fn mongodb_form_url_without_username_does_not_default_auth_source() {
+        let config = mongodb_config("", "", Some("app"));
+
+        assert_eq!(config.connection_url(), "mongodb://10.1.2.3:17000/app");
+    }
+
+    #[test]
+    fn mongodb_form_url_preserves_explicit_auth_source() {
+        let mut config = mongodb_config("root", "secret", Some("app"));
+        config.url_params = Some("authSource=app".to_string());
+
+        assert_eq!(config.connection_url(), "mongodb://root:secret@10.1.2.3:17000/app?authSource=app");
     }
 
     #[test]
@@ -2222,8 +2254,8 @@ mod tests {
         let mut config = mongodb_config("root", "secret", Some("admin"));
         config.ssl = true;
 
-        assert_eq!(config.connection_url(), "mongodb://root:secret@10.1.2.3:17000/admin?tls=true");
-        assert_eq!(config.redacted_connection_url(), "mongodb://10.1.2.3:17000/admin?tls=true");
+        assert_eq!(config.connection_url(), "mongodb://root:secret@10.1.2.3:17000/admin?tls=true&authSource=admin");
+        assert_eq!(config.redacted_connection_url(), "mongodb://10.1.2.3:17000/admin?tls=true&authSource=admin");
     }
 
     #[test]

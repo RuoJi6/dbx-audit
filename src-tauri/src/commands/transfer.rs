@@ -102,6 +102,7 @@ pub async fn start_transfer(
             }
         }
 
+        let mut failed_tables: Vec<String> = Vec::new();
         for (i, table) in sorted_tables.iter().enumerate() {
             if dbx_core::transfer::is_cancelled(&transfer_id).await {
                 emit_progress(
@@ -176,6 +177,7 @@ pub async fn start_transfer(
                         dbx_core::transfer::clear_cancelled(&transfer_id).await;
                         return;
                     }
+                    failed_tables.push(table.clone());
                     emit_progress(
                         &app,
                         TransferProgress {
@@ -224,6 +226,7 @@ pub async fn start_transfer(
                     return;
                 }
                 Err(e) => {
+                    failed_tables.push("schema objects".to_string());
                     emit_progress(
                         &app,
                         TransferProgress {
@@ -250,8 +253,16 @@ pub async fn start_transfer(
                 total_tables,
                 rows_transferred: 0,
                 total_rows: None,
-                status: TransferStatus::Done,
-                error: None,
+                status: if failed_tables.is_empty() { TransferStatus::Done } else { TransferStatus::Error },
+                error: if failed_tables.is_empty() {
+                    None
+                } else {
+                    Some(format!(
+                        "{} table(s) failed: {}",
+                        failed_tables.len(),
+                        failed_tables.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
+                    ))
+                },
             },
         );
         dbx_core::transfer::clear_cancelled(&transfer_id).await;

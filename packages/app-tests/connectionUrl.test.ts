@@ -1,6 +1,7 @@
 import { strict as assert } from "node:assert";
 import { test } from "vitest";
-import { normalizeMongoConnectionString, parseConnectionUrl } from "../../apps/desktop/src/lib/connectionUrl.ts";
+import { applyParsedConnectionUrl, normalizeMongoConnectionString, parseConnectionUrl } from "../../apps/desktop/src/lib/connectionUrl.ts";
+import { h2FileJdbcUrlWithPath } from "../../apps/desktop/src/lib/h2Connection.ts";
 
 test("parses postgres connection URLs", () => {
   assert.deepEqual(parseConnectionUrl("postgresql://alice:secret@db.example.com:5433/app?sslmode=require"), {
@@ -43,6 +44,32 @@ test("parses mysql URLs with encoded credentials", () => {
   assert.equal(parsed.password, "p@ss");
   assert.equal(parsed.database, "shop");
   assert.equal(parsed.urlParams, "charset=utf8mb4");
+});
+
+test("parses mysql URL name as decoded connection name", () => {
+  const parsed = parseConnectionUrl("mysql://root:123456@localhost/?name=%E5%85%AC%E5%8F%B8+-+%E6%9C%AC%E5%9C%B0Docker&charset=utf8mb4");
+
+  assert.equal(parsed.name, "公司 - 本地Docker");
+  assert.equal(parsed.host, "localhost");
+  assert.equal(parsed.username, "root");
+  assert.equal(parsed.password, "123456");
+  assert.equal(parsed.urlParams, "charset=utf8mb4");
+});
+
+test("consumes mysql URL name when it is the only URL param", () => {
+  const parsed = parseConnectionUrl("mysql://root:123456@localhost/?name=%E5%85%AC%E5%8F%B8+-+%E6%9C%AC%E5%9C%B0Docker");
+
+  assert.equal(parsed.name, "公司 - 本地Docker");
+  assert.equal(parsed.urlParams, "");
+});
+
+test("removes only the connection name from URL params", () => {
+  const parsed = parseConnectionUrl("mysql://root@localhost/app?Name=Analytics+Local&ssl-mode=required");
+
+  assert.equal(parsed.name, "Analytics Local");
+  assert.equal(parsed.database, "app");
+  assert.equal(parsed.urlParams, "ssl-mode=required");
+  assert.equal(parsed.ssl, true);
 });
 
 test("parses mysql TLS URL params into the SSL switch state", () => {
@@ -235,6 +262,59 @@ test("parses SQL Server JDBC URLs with semicolon properties", () => {
   assert.equal(parsed.password, "s@cret");
   assert.equal(parsed.database, "erp");
   assert.equal(parsed.urlParams, "encrypt=true");
+});
+
+test("parses H2 split JDBC URLs as file connections", () => {
+  const source = "jdbc:h2:split:28:C:/dbx-test/h2/sample-db;AUTO_SERVER=TRUE";
+  const parsed = parseConnectionUrl(source);
+
+  assert.equal(parsed.dbType, "h2");
+  assert.equal(parsed.driverProfile, "h2");
+  assert.equal(parsed.driverLabel, "H2");
+  assert.equal(parsed.host, "C:/dbx-test/h2/sample-db");
+  assert.equal(parsed.port, 0);
+  assert.equal(parsed.username, "sa");
+  assert.equal(parsed.password, "");
+  assert.equal(parsed.database, "sample-db");
+  assert.equal(parsed.urlParams, "AUTO_SERVER=TRUE");
+  assert.equal(parsed.connectionString, source);
+});
+
+test("parses H2 TCP JDBC URLs as server connections", () => {
+  const source = "jdbc:h2:tcp://localhost:9123/~/sample-db;USER=sa;PASSWORD=s%40cret;MODE=MySQL";
+  const parsed = parseConnectionUrl(source);
+
+  assert.equal(parsed.dbType, "h2");
+  assert.equal(parsed.driverProfile, "h2");
+  assert.equal(parsed.driverLabel, "H2");
+  assert.equal(parsed.host, "localhost");
+  assert.equal(parsed.port, 9123);
+  assert.equal(parsed.username, "sa");
+  assert.equal(parsed.password, "s@cret");
+  assert.equal(parsed.database, "~/sample-db");
+  assert.equal(parsed.urlParams, "MODE=MySQL");
+  assert.equal(parsed.ssl, false);
+  assert.equal(parsed.connectionString, source);
+});
+
+test("keeps typed H2 credentials when JDBC URL does not include them", () => {
+  const parsed = parseConnectionUrl("jdbc:h2:split:28:C:/dbx-test/h2/sample-db;AUTO_SERVER=TRUE");
+  const applied = applyParsedConnectionUrl({ name: "", db_type: "h2", username: "typed-user", password: "typed-secret" } as any, parsed);
+
+  assert.equal(applied.username, "typed-user");
+  assert.equal(applied.password, "typed-secret");
+});
+
+test("uses H2 JDBC URL credentials when they are included", () => {
+  const parsed = parseConnectionUrl("jdbc:h2:split:28:C:/dbx-test/h2/sample-db;USER=url-user;PASSWORD=url-secret;AUTO_SERVER=TRUE");
+  const applied = applyParsedConnectionUrl({ name: "", db_type: "h2", username: "typed-user", password: "typed-secret" } as any, parsed);
+
+  assert.equal(applied.username, "url-user");
+  assert.equal(applied.password, "url-secret");
+});
+
+test("rebuilds H2 split JDBC URLs with an edited file path", () => {
+  assert.equal(h2FileJdbcUrlWithPath("jdbc:h2:split:28:C:/dbx-test/h2/sample-db;AUTO_SERVER=TRUE", "D:/dbx/new-sample.mv.db"), "jdbc:h2:split:28:D:/dbx/new-sample;AUTO_SERVER=TRUE");
 });
 
 test("parses Oracle JDBC service URLs", () => {

@@ -15,6 +15,7 @@ use tokio::process::Command;
 use tokio::sync::Notify;
 
 const DEFAULT_CODEX_MODELS: &[&str] = &["default", "gpt-5.5", "gpt-5.4-mini"];
+#[cfg(not(windows))]
 const CODEX_PATH_MARKER: &str = "__DBX_CODEX_PATH__";
 
 pub type CodexRunOptions = CliAgentRunOptions;
@@ -27,13 +28,43 @@ fn codex_program(config: &AiConfig) -> String {
 async fn resolve_codex_command(config: &AiConfig) -> CodexCommandSpec {
     let configured = codex_program(config);
     if is_path_like_program(&configured) {
-        return CodexCommandSpec { program: expand_tilde(&configured), args: Vec::new() };
+        let expanded = expand_tilde(&configured);
+        return codex_command_for_program(direct_program_path(&expanded).unwrap_or(expanded));
     }
     if let Some(path) = resolve_program_path(&configured).await {
-        CodexCommandSpec { program: path, args: Vec::new() }
+        codex_command_for_program(path)
     } else {
         CodexCommandSpec { program: configured, args: Vec::new() }
     }
+}
+
+fn codex_command_for_program(program: String) -> CodexCommandSpec {
+    #[cfg(windows)]
+    if let Some(command) = windows_npm_codex_shim_command(&program) {
+        return command;
+    }
+
+    CodexCommandSpec { program, args: Vec::new() }
+}
+
+#[cfg(windows)]
+fn windows_npm_codex_shim_command(program: &str) -> Option<CodexCommandSpec> {
+    let path = Path::new(program);
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    if extension != "cmd" && extension != "bat" {
+        return None;
+    }
+
+    let parent = path.parent()?;
+    let codex_js = parent.join("node_modules").join("@openai").join("codex").join("bin").join("codex.js");
+    if !codex_js.is_file() {
+        return None;
+    }
+
+    let bundled_node = parent.join("node.exe");
+    let node = if bundled_node.is_file() { bundled_node.to_string_lossy().to_string() } else { "node".to_string() };
+
+    Some(CodexCommandSpec { program: node, args: vec![codex_js.to_string_lossy().to_string()] })
 }
 
 fn codex_process_env(config: &AiConfig, command: &CodexCommandSpec) -> Result<Vec<(String, String)>, String> {
@@ -70,19 +101,69 @@ async fn resolve_program_path(program: &str) -> Option<String> {
 
 fn direct_program_path(program: &str) -> Option<String> {
     let path = Path::new(program);
-    if path.is_absolute() && path.is_file() {
-        Some(path.to_string_lossy().to_string())
-    } else {
-        None
+    if !path.is_absolute() {
+        return None;
     }
+
+    if path.is_dir() {
+        return launchable_program_in_dir(path, "codex");
+    }
+
+    if path.is_file() {
+        #[cfg(windows)]
+        return windows_launchable_program_path(path);
+        #[cfg(not(windows))]
+        return Some(path.to_string_lossy().to_string());
+    }
+
+    None
+}
+
+fn launchable_program_in_dir(dir: &Path, program: &str) -> Option<String> {
+    program_path_candidates(dir, program)
+        .into_iter()
+        .find(|candidate| is_launchable_program_path(candidate) && candidate.is_file())
+        .map(|path| path.to_string_lossy().to_string())
+}
+
+#[cfg(windows)]
+fn windows_launchable_program_path(path: &Path) -> Option<String> {
+    if is_windows_launchable_program(path) {
+        return Some(path.to_string_lossy().to_string());
+    }
+    let parent = path.parent()?;
+    let stem = path.file_name()?.to_str()?;
+    program_path_candidates(parent, stem)
+        .into_iter()
+        .find(|candidate| is_windows_launchable_program(candidate))
+        .and_then(|candidate| candidate.is_file().then(|| candidate.to_string_lossy().to_string()))
+}
+
+#[cfg(windows)]
+fn is_windows_launchable_program(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|extension| extension.to_str()).map(str::to_ascii_lowercase).as_deref(),
+        Some("exe" | "cmd" | "bat" | "com")
+    )
 }
 
 fn common_program_path(program: &str) -> Option<String> {
     common_executable_dirs()
         .into_iter()
         .flat_map(|dir| program_path_candidates(&dir, program))
+        .filter(|path| is_launchable_program_path(path))
         .find(|path| path.is_file())
         .map(|path| path.to_string_lossy().to_string())
+}
+
+#[cfg(not(windows))]
+fn is_launchable_program_path(_path: &Path) -> bool {
+    true
+}
+
+#[cfg(windows)]
+fn is_launchable_program_path(path: &Path) -> bool {
+    is_windows_launchable_program(path)
 }
 
 #[cfg(not(windows))]
@@ -96,7 +177,10 @@ fn program_path_candidates(dir: &Path, program: &str) -> Vec<PathBuf> {
     if path.extension().is_some() {
         return vec![dir.join(program)];
     }
-    ["", ".cmd", ".exe", ".bat", ".ps1"].iter().map(|extension| dir.join(format!("{program}{extension}"))).collect()
+    [".cmd", ".exe", ".bat", ".com", "", ".ps1"]
+        .iter()
+        .map(|extension| dir.join(format!("{program}{extension}")))
+        .collect()
 }
 
 #[cfg(not(windows))]
@@ -119,19 +203,23 @@ async fn shell_program_path(program: &str) -> Option<String> {
 
 #[cfg(windows)]
 async fn shell_program_path(program: &str) -> Option<String> {
-    let script = format!("(Get-Command {} -ErrorAction SilentlyContinue).Source", windows_shell_quote(program));
+    let script = format!("(Get-Command -All {} -ErrorAction SilentlyContinue).Source", windows_shell_quote(program));
     let mut command = Command::new("powershell.exe");
     command.args(["-NoProfile", "-Command", &script]);
     command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
     let output = command.output().await.ok()?;
     output.status.success().then_some(())?;
     let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .filter(|path| Path::new(path).is_file())
-        .map(ToString::to_string)
+    first_windows_program_path(&stdout)
+}
+
+#[cfg(windows)]
+fn first_windows_program_path(value: &str) -> Option<String> {
+    let paths = value.lines().map(str::trim).filter(|line| !line.is_empty()).collect::<Vec<_>>();
+    paths
+        .into_iter()
+        .find(|path| is_windows_launchable_program(Path::new(path)) && Path::new(path).is_file())
+        .map(ToOwned::to_owned)
 }
 
 #[cfg(windows)]
@@ -240,6 +328,13 @@ fn validate_codex_program(config: &AiConfig) -> Result<String, String> {
     if starts_with_env_assignment(&program) {
         return Err("[codexCliPathInvalid] Codex CLI path should contain only the executable path. Add environment variables in the Codex CLI environment variables section.".to_string());
     }
+    if is_path_like_program(&program) {
+        let expanded = expand_tilde(&program);
+        let path = Path::new(&expanded);
+        if path.is_dir() && direct_program_path(&expanded).is_none() {
+            return Err("[codexCliPathInvalid] Codex CLI path should point to the Codex executable or a directory containing codex.".to_string());
+        }
+    }
     Ok(program)
 }
 
@@ -347,6 +442,7 @@ pub async fn list_codex_models(config: &AiConfig) -> Result<Vec<AiModelInfo>, St
     validate_codex_program(config)?;
     let command = resolve_codex_command(config).await;
     let output = cli_command(&command.program)
+        .args(command.args.iter().map(String::as_str))
         .args(["debug", "models"])
         .envs(codex_process_env(config, &command)?.iter().map(|(key, value)| (key.as_str(), value.as_str())))
         .output()
@@ -399,28 +495,13 @@ pub async fn test_codex_connection(config: &AiConfig) -> Result<AiTestConnection
     validate_codex_program(config)?;
     let codex_command = resolve_codex_command(config).await;
     let mut command = cli_command(&codex_command.program);
-    command.args(["exec", "--json", "--skip-git-repo-check", "--sandbox", "read-only"]);
+    command.args(codex_command.args.iter().map(String::as_str));
+    command.args(["login", "status"]);
     command.envs(codex_process_env(config, &codex_command)?.iter().map(|(key, value)| (key.as_str(), value.as_str())));
 
-    let model = config.model.trim();
-    if !model.is_empty() && !model.eq_ignore_ascii_case("default") {
-        command.args(["--model", model]);
-    }
-
-    let output = command
-        .arg("Reply with exactly: DBX Codex OK")
-        .output()
-        .await
-        .map_err(|e| classify_codex_spawn_error(&e.to_string()))?;
+    let output = command.output().await.map_err(|e| classify_codex_spawn_error(&e.to_string()))?;
 
     if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if !stdout.contains("DBX Codex OK") {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!(
-                "[codexRunFailed] Codex CLI smoke test returned unexpected output. stdout: {stdout} stderr: {stderr}"
-            ));
-        }
         Ok(AiTestConnectionResult {
             success: true,
             message: format!("OK - {}ms", start.elapsed().as_millis()),
@@ -471,6 +552,7 @@ pub async fn run_codex_agent(
     let mut command = build_codex_exec_command(config, prompt, &options);
     let resolved_command = resolve_codex_command(config).await;
     command.program = resolved_command.program;
+    command.args.splice(0..0, resolved_command.args);
     let env = codex_process_env(config, &command)?;
     run_cli_jsonl_agent(
         CliAgentProcessSpec {
@@ -491,9 +573,15 @@ mod tests {
     #[cfg(not(windows))]
     use super::shell_quote;
     use super::{
-        build_codex_exec_command, codex_cli_env, codex_enabled_tools, codex_process_env, common_executable_dirs,
-        is_path_like_program, merged_path_with_dir, parse_codex_jsonl_event, parse_codex_models,
-        validate_codex_program, CodexRunOptions, DEFAULT_CODEX_MODELS,
+        build_codex_exec_command, codex_cli_env, codex_enabled_tools, is_path_like_program, parse_codex_jsonl_event,
+        parse_codex_models, validate_codex_program, CodexRunOptions, DEFAULT_CODEX_MODELS,
+    };
+    #[cfg(not(windows))]
+    use super::{codex_process_env, common_executable_dirs, merged_path_with_dir};
+    #[cfg(windows)]
+    use super::{
+        direct_program_path, first_windows_program_path, program_path_candidates, resolve_codex_command,
+        windows_npm_codex_shim_command,
     };
     use crate::agent_events::AgentEvent;
     use crate::ai::{AiApiStyle, AiAuthMethod, AiConfig, AiProvider, AiReasoningLevel};
@@ -584,6 +672,134 @@ mod tests {
         assert!(is_path_like_program("~/bin/codex"));
         assert!(is_path_like_program(r"C:\Tools\codex.exe"));
         assert!(!is_path_like_program("codex"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_codex_lookup_prefers_cmd_over_extensionless_shim() {
+        let candidates = program_path_candidates(std::path::Path::new(r"C:\nvm4w\nodejs"), "codex");
+
+        assert_eq!(candidates[0], std::path::Path::new(r"C:\nvm4w\nodejs\codex.cmd"));
+        assert!(candidates.iter().position(|path| path == std::path::Path::new(r"C:\nvm4w\nodejs\codex")).unwrap() > 0);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_shell_lookup_prefers_launchable_command() {
+        let dir = std::env::temp_dir().join(format!("dbx-codex-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let extensionless = dir.join("codex");
+        let cmd = dir.join("codex.cmd");
+        std::fs::write(&extensionless, "#!/bin/sh\n").unwrap();
+        std::fs::write(&cmd, "@echo off\n").unwrap();
+
+        let output = format!("{}\n{}\n", extensionless.display(), cmd.display());
+        let resolved = first_windows_program_path(&output).unwrap();
+
+        assert_eq!(resolved, cmd.to_string_lossy());
+        let _ = std::fs::remove_file(extensionless);
+        let _ = std::fs::remove_file(cmd);
+        let _ = std::fs::remove_dir(dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_direct_extensionless_path_uses_cmd_sibling() {
+        let dir = std::env::temp_dir().join(format!("dbx-codex-direct-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let extensionless = dir.join("codex");
+        let cmd = dir.join("codex.cmd");
+        std::fs::write(&extensionless, "#!/bin/sh\n").unwrap();
+        std::fs::write(&cmd, "@echo off\n").unwrap();
+
+        let resolved = direct_program_path(extensionless.to_string_lossy().as_ref()).unwrap();
+
+        assert_eq!(resolved, cmd.to_string_lossy().as_ref());
+        let _ = std::fs::remove_file(extensionless);
+        let _ = std::fs::remove_file(cmd);
+        let _ = std::fs::remove_dir(dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_direct_extensionless_path_is_not_launchable_without_sibling() {
+        let dir = std::env::temp_dir().join(format!("dbx-codex-direct-missing-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let extensionless = dir.join("codex");
+        std::fs::write(&extensionless, "#!/bin/sh\n").unwrap();
+
+        let resolved = direct_program_path(extensionless.to_string_lossy().as_ref());
+
+        assert!(resolved.is_none());
+        let _ = std::fs::remove_file(extensionless);
+        let _ = std::fs::remove_dir(dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_direct_directory_path_uses_codex_cmd_inside() {
+        let dir = std::env::temp_dir().join(format!("dbx-codex-direct-dir-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let extensionless = dir.join("codex");
+        let cmd = dir.join("codex.cmd");
+        std::fs::write(&extensionless, "#!/bin/sh\n").unwrap();
+        std::fs::write(&cmd, "@echo off\n").unwrap();
+
+        let resolved = direct_program_path(dir.to_string_lossy().as_ref()).unwrap();
+
+        assert_eq!(resolved, cmd.to_string_lossy().as_ref());
+        let _ = std::fs::remove_file(extensionless);
+        let _ = std::fs::remove_file(cmd);
+        let _ = std::fs::remove_dir(dir);
+    }
+
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn windows_configured_nvm_directory_resolves_codex_cmd_shim() {
+        let dir = std::env::temp_dir().join(format!("dbx-codex-nvm-dir-test-{}", std::process::id()));
+        let bin_dir = dir.join("node_modules").join("@openai").join("codex").join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let cmd = dir.join("codex.cmd");
+        let node = dir.join("node.exe");
+        let codex_js = bin_dir.join("codex.js");
+        std::fs::write(&cmd, "@echo off\nnode codex.js %*\n").unwrap();
+        std::fs::write(&node, "").unwrap();
+        std::fs::write(&codex_js, "#!/usr/bin/env node\n").unwrap();
+
+        let mut config = codex_config("default");
+        config.codex_cli_path = Some(dir.to_string_lossy().to_string());
+
+        let command = resolve_codex_command(&config).await;
+
+        assert_eq!(command.program, node.to_string_lossy().as_ref());
+        assert_eq!(command.args, vec![codex_js.to_string_lossy().to_string()]);
+        let _ = std::fs::remove_file(cmd);
+        let _ = std::fs::remove_file(node);
+        let _ = std::fs::remove_file(codex_js);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_npm_codex_cmd_shim_uses_node_directly() {
+        let dir = std::env::temp_dir().join(format!("dbx-codex-npm-shim-test-{}", std::process::id()));
+        let bin_dir = dir.join("node_modules").join("@openai").join("codex").join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let cmd = dir.join("codex.cmd");
+        let node = dir.join("node.exe");
+        let codex_js = bin_dir.join("codex.js");
+        std::fs::write(&cmd, "@echo off\nnode codex.js %*\n").unwrap();
+        std::fs::write(&node, "").unwrap();
+        std::fs::write(&codex_js, "#!/usr/bin/env node\n").unwrap();
+
+        let command = windows_npm_codex_shim_command(cmd.to_string_lossy().as_ref()).unwrap();
+
+        assert_eq!(command.program, node.to_string_lossy().as_ref());
+        assert_eq!(command.args, vec![codex_js.to_string_lossy().to_string()]);
+        let _ = std::fs::remove_file(cmd);
+        let _ = std::fs::remove_file(node);
+        let _ = std::fs::remove_file(codex_js);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -693,6 +909,19 @@ mod tests {
 
         assert!(err.contains("[codexCliPathInvalid]"));
         assert!(err.contains("environment variables section"));
+    }
+
+    #[test]
+    fn rejects_directory_without_codex_in_codex_cli_path() {
+        let dir = std::env::temp_dir().join(format!("dbx-codex-empty-dir-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = codex_config("default");
+        config.codex_cli_path = Some(dir.to_string_lossy().to_string());
+
+        let err = validate_codex_program(&config).unwrap_err();
+
+        assert!(err.contains("[codexCliPathInvalid]"));
+        let _ = std::fs::remove_dir(dir);
     }
 
     #[test]

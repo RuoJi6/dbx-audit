@@ -52,6 +52,7 @@ const assetIcons: Record<string, string> = {
   kylin: "apache_kylin",
   cockroachdb: "cockroachdb",
   db2: "db2",
+  dremio: "dremio",
   bigquery: "bigquery",
   cassandra: "cassandra",
   doris: "doris",

@@ -19,13 +19,16 @@ export interface ConnectionConfig {
   keepalive_interval_secs?: number;
   ssl: boolean;
   ca_cert_path?: string;
+  client_cert_path?: string;
+  client_key_path?: string;
   oracle_connection_type?: "service_name" | "sid";
-  redis_connection_mode?: "standalone" | "sentinel";
+  redis_connection_mode?: "standalone" | "sentinel" | "cluster";
   redis_sentinel_master?: string;
   redis_sentinel_nodes?: string;
   redis_sentinel_username?: string;
   redis_sentinel_password?: string;
   redis_sentinel_tls?: boolean;
+  redis_cluster_nodes?: string;
   redis_key_separator?: string;
   read_only?: boolean;
 }

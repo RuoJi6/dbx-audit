@@ -21,7 +21,6 @@ import * as api from "@/lib/api";
 import type { RedisKeyInfo, RedisScanResult, RedisValue, HistoryEntry } from "@/lib/api";
 import { uuid } from "@/lib/utils";
 import { useConnectionStore } from "@/stores/connectionStore";
-import { useSettingsStore } from "@/stores/settingsStore";
 import { buildRedisKeyTree, collectExpandedGroupIds, collectRedisGroupKeyRaws, flattenVisibleRedisKeyTree, mergeKeysIntoRedisKeyTree, redisKeyToFlatTreeRow, type RedisKeyTreeNode } from "@/lib/redisKeyTree";
 import { classifyRedisCommandSafety } from "@/lib/redisCommandSafety";
 import { isRedisMutatingCommand } from "@/lib/redisCommandTable";
@@ -31,11 +30,11 @@ import { isCancelSearchShortcut } from "@/lib/keyboardShortcuts";
 import { useEditorFontFamilyStyle } from "@/composables/useEditorFontFamilyStyle";
 import { useToast } from "@/composables/useToast";
 import { redisKeySearchPattern } from "@/lib/redisKeyPattern";
+import { REDIS_SCAN_PAGE_SIZE_DEFAULT } from "@/lib/redisKeyPattern";
 
 const { t } = useI18n();
 const { toast } = useToast();
 const connectionStore = useConnectionStore();
-const settingsStore = useSettingsStore();
 const editorFontFamilyStyle = useEditorFontFamilyStyle();
 
 type RedisSearchMode = "key" | "value" | "all";
@@ -115,6 +114,7 @@ const searchPlaceholder = computed(() => {
 });
 const loadingEmptyText = computed(() => (isValueSearchMode.value && valueQuery.value ? t(searchMode.value === "all" ? "redis.searchingAll" : "redis.searchingValues") : t("redis.loadingKeys")));
 const redisKeySeparator = computed(() => connectionStore.getConfig(props.connectionId)?.redis_key_separator ?? ":");
+const redisScanPageSize = computed(() => connectionStore.getConfig(props.connectionId)?.redis_scan_page_size ?? REDIS_SCAN_PAGE_SIZE_DEFAULT);
 watch(redisKeySeparator, () => {
   if (flatKeys.value.length > 0) rebuildTree(false);
 });
@@ -125,6 +125,13 @@ const fetchAllProgressText = computed(() => {
     return t("redis.fetchAllProgress", { loaded: flatKeys.value.length, total: lastTotalKeys.value });
   }
   return t("redis.fetchAllProgressUnknown", { loaded: flatKeys.value.length });
+});
+const keyCountText = computed(() => {
+  if (loading.value && flatKeys.value.length === 0) return loadingEmptyText.value;
+  if (!isSearchMode.value && lastTotalKeys.value > 0) {
+    return t("redis.loadedKeys", { loaded: flatKeys.value.length, total: lastTotalKeys.value });
+  }
+  return t("redis.keys", { count: flatKeys.value.length });
 });
 const selectedKey = computed(() => flatKeys.value.find((key) => key.key_raw === selectedKeyRaw.value) ?? null);
 const dangerDetails = computed(() => {
@@ -202,14 +209,14 @@ function mergeTree(newKeys: RedisKeyInfo[]) {
 }
 
 async function fetchScanPage(): Promise<RedisScanResult> {
-  const pageSize = settingsStore.editorSettings.redisScanPageSize;
+  const pageSize = redisScanPageSize.value;
   return isValueSearchMode.value ? await api.redisScanValues(props.connectionId, props.db, scanCursor.value, "*", valueQuery.value, pageSize, searchMode.value === "all") : await api.redisScanKeysBatch(props.connectionId, props.db, scanCursor.value, effectivePattern.value, pageSize, 1, false);
 }
 
 /// Batch-scan variant that performs multiple SCAN iterations server-side.
 /// Dramatically reduces frontend↔backend roundtrips for bulk loading.
 async function fetchScanBatchPage(maxIterations: number, options: { count?: number; includeTypes?: boolean } = {}): Promise<RedisScanResult> {
-  const pageSize = options.count ?? settingsStore.editorSettings.redisScanPageSize;
+  const pageSize = options.count ?? redisScanPageSize.value;
   // Value search cannot be batched because each key requires a GET.
   if (isValueSearchMode.value) {
     return api.redisScanValues(props.connectionId, props.db, scanCursor.value, "*", valueQuery.value, pageSize, searchMode.value === "all");
@@ -268,23 +275,6 @@ async function streamValueSearch(requestId: number) {
   }
 }
 
-async function fillInitialKeyBatch(requestId: number) {
-  const targetCount = Math.max(1, settingsStore.editorSettings.redisScanPageSize);
-  // Use server-side batching to fill the initial view quickly.
-  // Each batch iteration does one SCAN round-trip; 5 iterations with
-  // COUNT=1000 should return enough keys for most cases.
-  const maxIter = Math.max(1, Math.ceil(targetCount / Math.max(1, settingsStore.editorSettings.redisScanPageSize)));
-  const result = await fetchScanBatchPage(Math.min(maxIter, 8));
-  if (requestId !== searchRequestId) return;
-  appendScanResult(result);
-  // If we still need more keys, do one more batch
-  if (flatKeys.value.length < targetCount && hasMore.value && requestId === searchRequestId) {
-    const result2 = await fetchScanBatchPage(Math.min(maxIter, 8));
-    if (requestId !== searchRequestId) return;
-    appendScanResult(result2);
-  }
-}
-
 async function loadKeys() {
   if (!redisBrowserIsActive) return;
   const requestId = ++searchRequestId;
@@ -297,18 +287,15 @@ async function loadKeys() {
   checkedKeys.value = new Set();
   expandedGroupIds.value = new Set();
   scanCursor.value = 0;
+  lastTotalKeys.value = 0;
   try {
     if (isValueSearchMode.value && !valueQuery.value) {
       hasMore.value = false;
       return;
     }
     const applied = await scanNextPage(requestId);
-    if (applied) {
-      if (isValueSearchMode.value) {
-        await streamValueSearch(requestId);
-      } else {
-        await fillInitialKeyBatch(requestId);
-      }
+    if (applied && isValueSearchMode.value) {
+      await streamValueSearch(requestId);
     }
   } finally {
     if (requestId === searchRequestId) {
@@ -440,6 +427,7 @@ function resetLoadedKeys() {
   checkedKeys.value = new Set();
   expandedGroupIds.value = new Set();
   hasMore.value = false;
+  lastTotalKeys.value = 0;
 }
 
 async function deleteKeyRaws(keys: string[]) {
@@ -986,12 +974,21 @@ defineExpose({ focusSearch });
             <Button variant="ghost" size="icon" class="h-6 w-6 shrink-0" :title="t('redis.createKey')" @click="openCreateKeyDialog">
               <Plus class="h-3 w-3" />
             </Button>
-            <span class="text-xs text-muted-foreground shrink-0 ml-1">{{ loading && flatKeys.length === 0 ? loadingEmptyText : t("redis.keys", { count: flatKeys.length }) }}</span>
+            <span class="text-xs text-muted-foreground shrink-0 ml-1">{{ keyCountText }}</span>
             <Button v-if="checkedKeys.size > 0" variant="ghost" size="sm" class="h-6 text-xs text-destructive shrink-0 ml-1" @click="requestBatchDelete"> <Trash2 class="w-3 h-3 mr-1" />{{ checkedKeys.size }} </Button>
           </div>
 
-          <div v-if="flatKeys.length === 0 && !loading" class="flex-1 flex items-center justify-center text-muted-foreground text-xs">
-            {{ t("redis.noKeys") }}
+          <div v-if="flatKeys.length === 0 && !loading" class="flex-1 flex flex-col items-center justify-center text-muted-foreground text-xs p-4 text-center">
+            <template v-if="hasMore">
+              <span class="mb-3">{{ t("redis.noKeysInScanHint") }}</span>
+              <Button variant="outline" size="sm" class="h-7 text-xs" :disabled="loadingMore" @click="loadMore">
+                <Loader2 v-if="loadingMore" class="w-3 h-3 mr-1.5 animate-spin" />
+                {{ t("redis.loadMoreKeys") }}
+              </Button>
+            </template>
+            <template v-else>
+              {{ t("redis.noKeys") }}
+            </template>
           </div>
           <div v-else-if="loading && flatKeys.length === 0" class="flex-1 flex items-center justify-center gap-2 text-muted-foreground text-xs">
             <Loader2 class="w-3.5 h-3.5 animate-spin" />

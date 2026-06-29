@@ -90,6 +90,14 @@ struct MongoDeleteDocumentsRequest {
     many: bool,
 }
 
+#[derive(Deserialize)]
+struct RedisCommandRequest {
+    connection_name: String,
+    db: u32,
+    command: String,
+    skip_safety_check: Option<bool>,
+}
+
 #[derive(Clone, Serialize)]
 pub struct McpOpenTableEvent {
     pub connection_id: String,
@@ -157,6 +165,8 @@ pub fn start(app_handle: AppHandle, state: Arc<AppState>) {
                     handle_mongo_update_documents_data(&st, body, &mut stream).await;
                 } else if first_line.starts_with("POST /data/mongo/delete-documents") {
                     handle_mongo_delete_documents_data(&st, body, &mut stream).await;
+                } else if first_line.starts_with("POST /data/redis/execute-command") {
+                    handle_redis_execute_command_data(&st, body, &mut stream).await;
                 } else if first_line.starts_with("POST /data/execute-query") {
                     handle_execute_query_data(&st, body, &mut stream).await;
                 } else if first_line.starts_with("POST /execute-query") {
@@ -523,6 +533,57 @@ async fn handle_mongo_delete_documents_data(state: &Arc<AppState>, body: &str, s
     .await
     {
         Ok(deleted) => respond_json(stream, &serde_json::json!({ "affected_rows": deleted })).await,
+        Err(e) => respond_error(stream, "500 Internal Server Error", &e).await,
+    }
+}
+
+async fn handle_redis_execute_command_data(state: &Arc<AppState>, body: &str, stream: &mut tokio::net::TcpStream) {
+    let req: RedisCommandRequest = match serde_json::from_str(body) {
+        Ok(r) => r,
+        Err(_) => {
+            respond_error(stream, "400 Bad Request", "Invalid JSON").await;
+            return;
+        }
+    };
+    let config = match resolve_connection(state, &req.connection_name).await {
+        Ok(c) => c,
+        Err(e) => {
+            respond_error(stream, "404 Not Found", &e).await;
+            return;
+        }
+    };
+    let database = req.db.to_string();
+    if let Err(e) = check_visible_database(&config, &database) {
+        respond_error(stream, "403 Forbidden", &e).await;
+        return;
+    }
+    if let Some(name) = dbx_core::query::connection_readonly_name(state, &config.id).await {
+        let cmd_name = req.command.split_whitespace().next().unwrap_or("");
+        if dbx_core::db::redis_driver::classify_command(cmd_name)
+            != dbx_core::db::redis_driver::RedisCommandSafety::Allowed
+        {
+            respond_error(
+                stream,
+                "403 Forbidden",
+                &format!(
+                    "Read-only mode: connection '{}' has read-only protection enabled. Command '{}' blocked.",
+                    name, cmd_name
+                ),
+            )
+            .await;
+            return;
+        }
+    }
+    match dbx_core::redis_ops::redis_execute_command_core(
+        state,
+        &config.id,
+        req.db,
+        &req.command,
+        req.skip_safety_check.unwrap_or(false),
+    )
+    .await
+    {
+        Ok(result) => respond_json(stream, &result).await,
         Err(e) => respond_error(stream, "500 Internal Server Error", &e).await,
     }
 }

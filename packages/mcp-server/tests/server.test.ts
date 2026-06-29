@@ -192,6 +192,110 @@ test("scoped MCP with writes disabled blocks write SQL", async () => {
   assert.match(result.content[0].text, /SQL_BLOCKED:/);
 });
 
+test("redis execute query points callers to the redis command tool", async () => {
+  const redisConnection: ConnectionConfig = { ...connection, db_type: "redis", database: "0" };
+  const scopedBackend: Backend = {
+    ...backend,
+    findConnection: async () => redisConnection,
+  };
+  const server = createDbxMcpServer(scopedBackend, { isWebMode: true });
+
+  const result = await (server as any)._registeredTools.dbx_execute_query.handler({
+    connection_name: "local",
+    sql: "GET session:1",
+  });
+
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /REDIS_COMMAND_REQUIRED:/);
+  assert.match(result.content[0].text, /dbx_execute_redis_command/);
+});
+
+test("redis command tool executes redis commands on the selected database", async () => {
+  const redisConnection: ConnectionConfig = { ...connection, db_type: "redis", database: "2" };
+  let usedDb = -1;
+  let usedCommand = "";
+  const scopedBackend: Backend = {
+    ...backend,
+    findConnection: async () => redisConnection,
+    executeRedisCommand: async (_config, db, command) => {
+      usedDb = db;
+      usedCommand = command;
+      return { command: "GET", safety: "allowed", value: "value-1" };
+    },
+  };
+  const server = createDbxMcpServer(scopedBackend, { isWebMode: true });
+
+  const result = await (server as any)._registeredTools.dbx_execute_redis_command.handler({
+    connection_name: "local",
+    command: "GET session:1",
+  });
+
+  assert.equal(result.isError, undefined);
+  assert.equal(usedDb, 2);
+  assert.equal(usedCommand, "GET session:1");
+  assert.match(result.content[0].text, /Command: GET/);
+  assert.match(result.content[0].text, /value-1/);
+});
+
+test("redis command tool blocks write commands in read-only MCP sessions", async () => {
+  let executed = false;
+  const redisConnection: ConnectionConfig = { ...connection, db_type: "redis" };
+  const scopedBackend: Backend = {
+    ...backend,
+    findConnection: async () => redisConnection,
+    executeRedisCommand: async () => {
+      executed = true;
+      return { command: "SET", safety: "confirm", value: "OK" };
+    },
+  };
+
+  const result = await withScopedEnv({ DBX_MCP_ALLOW_WRITES: "0" }, () => {
+    const server = createDbxMcpServer(scopedBackend, { isWebMode: true });
+    return (server as any)._registeredTools.dbx_execute_redis_command.handler({
+      connection_name: "local",
+      command: "SET session:1 value",
+    });
+  });
+
+  assert.equal(executed, false);
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /REDIS_COMMAND_BLOCKED:/);
+});
+
+test("redis command tool allows dangerous redis commands only when explicitly enabled", async () => {
+  const redisConnection: ConnectionConfig = { ...connection, db_type: "redis" };
+  let skipSafetyCheck = false;
+  const scopedBackend: Backend = {
+    ...backend,
+    findConnection: async () => redisConnection,
+    executeRedisCommand: async (_config, _db, _command, options) => {
+      skipSafetyCheck = options?.skipSafetyCheck ?? false;
+      return { command: "KEYS", safety: "blocked", value: ["session:1"] };
+    },
+  };
+
+  const blocked = await withScopedEnv({ DBX_MCP_ALLOW_DANGEROUS_SQL: "0" }, () => {
+    const server = createDbxMcpServer(scopedBackend, { isWebMode: true });
+    return (server as any)._registeredTools.dbx_execute_redis_command.handler({
+      connection_name: "local",
+      command: "KEYS *",
+    });
+  });
+  const allowed = await withScopedEnv({ DBX_MCP_ALLOW_DANGEROUS_SQL: "1" }, () => {
+    const server = createDbxMcpServer(scopedBackend, { isWebMode: true });
+    return (server as any)._registeredTools.dbx_execute_redis_command.handler({
+      connection_name: "local",
+      command: "KEYS *",
+    });
+  });
+
+  assert.equal(blocked.isError, true);
+  assert.match(blocked.content[0].text, /REDIS_COMMAND_BLOCKED:/);
+  assert.equal(allowed.isError, undefined);
+  assert.equal(skipSafetyCheck, true);
+  assert.match(allowed.content[0].text, /session:1/);
+});
+
 test("mongodb list tables returns collections from the selected database", async () => {
   let usedDatabase = "";
   const mongoConnection: ConnectionConfig = { ...connection, db_type: "mongodb", database: "admin" };

@@ -61,6 +61,11 @@ public abstract class ConfiguredJdbcAgent extends AbstractJdbcAgent {
     }
 
     @Override
+    public List<String> listDataTypes() {
+        return StandardJdbcMetadata.INSTANCE.listDataTypes(requireConnection());
+    }
+
+    @Override
     public CompletionAssistantResponse completionAssistantSearch(CompletionAssistantRequest request) {
         return StandardJdbcMetadata.INSTANCE.completionAssistantSearch(requireConnection(), profile, configuredDatabase, request);
     }
