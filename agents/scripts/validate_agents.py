@@ -11,21 +11,19 @@ SOURCE_GLOBS = ("*/src/main/**/*.java", "drivers/*/src/main/**/*.java")
 KOTLIN_FILE_SUFFIXES = (".kt", ".kts")
 KOTLIN_SCAN_EXCLUDED_PARTS = {".git", ".gradle", "build"}
 DEFAULT_AGENT_JRE_KEY = "21"
-LEGACY_ORACLE_JRE_KEY = "8"
 NON_JDBC_AGENT_MODULES = {"mongodb", "etcd", "zookeeper"}
-NATIVE_ONLY_AGENT_MODULES = {"xugu"}
+NATIVE_ONLY_AGENT_MODULES = {
+    "oracle": "drivers/oracle-go",
+    "xugu": "drivers/xugu",
+}
 JDBC_ARCHITECTURE_ALLOWLIST = {
     "access": "custom Access metadata and URL behavior pending migration",
     "dameng": "custom Dameng metadata and DDL pending migration",
     "db2": "custom DB2 metadata pending migration",
-    "gaussdb": "custom GaussDB metadata pending migration",
     "gbase8s": "custom GBase 8s metadata pending migration",
     "goldendb": "custom GoldenDB metadata pending migration",
     "informix": "custom Informix metadata pending migration",
     "neo4j": "custom Neo4j transaction/query behavior pending migration",
-    "oracle": "custom Oracle metadata and connection properties pending migration",
-    "oracle-legacy": "custom Oracle legacy metadata and connection properties pending migration",
-    "oracle-10g": "custom Oracle 10g metadata and Java 8 runtime pending migration",
     "sundb": "custom SunDB metadata pending migration",
     "tdengine": "custom TDengine WebSocket JDBC behavior pending migration",
 }
@@ -69,11 +67,13 @@ def included_agent_modules(root: Path) -> set[str]:
 
 
 def agent_modules(root: Path) -> set[str]:
-    native = {name for name in NATIVE_ONLY_AGENT_MODULES if module_dir(root, name).exists()}
+    native = {name for name, path in NATIVE_ONLY_AGENT_MODULES.items() if (root / path).exists()}
     return included_agent_modules(root) | native
 
 
 def module_dir(root: Path, module: str) -> Path:
+    if module in NATIVE_ONLY_AGENT_MODULES:
+        return root / NATIVE_ONLY_AGENT_MODULES[module]
     nested = root / "drivers" / module
     if nested.exists():
         return nested
@@ -162,7 +162,7 @@ def validate_manifest_fields(root: Path, modules: set[str]) -> list[str]:
 
 def validate_jdbc_architecture(root: Path, modules: set[str]) -> list[str]:
     problems: list[str] = []
-    for module in sorted(modules - NON_JDBC_AGENT_MODULES - NATIVE_ONLY_AGENT_MODULES):
+    for module in sorted(modules - NON_JDBC_AGENT_MODULES - set(NATIVE_ONLY_AGENT_MODULES)):
         source = main_class_source(root, module)
         if source is None or not source.exists():
             continue
@@ -228,12 +228,8 @@ def validate_release_runtime_keys(root: Path) -> list[str]:
             f"release workflow must build the default JRE from Java {DEFAULT_AGENT_JRE_KEY}",
         ),
         (
-            rf'oracle-10g\)\s*echo\s*"{LEGACY_ORACLE_JRE_KEY}"',
-            f"oracle-10g must keep JRE key {LEGACY_ORACLE_JRE_KEY}",
-        ),
-        (
             rf'\*\)\s*echo\s*"{DEFAULT_AGENT_JRE_KEY}"',
-            f"non-legacy agents must use JRE key {DEFAULT_AGENT_JRE_KEY}",
+            f"agents must use JRE key {DEFAULT_AGENT_JRE_KEY}",
         ),
         (
             rf'"{DEFAULT_AGENT_JRE_KEY}":\s*\{{\s*"version":\s*"{DEFAULT_AGENT_JRE_KEY}\.',
@@ -249,7 +245,7 @@ def validate_release_runtime_keys(root: Path) -> list[str]:
             problems.append(message)
     forbidden_patterns = [
         (r'jre-key:\s*"17"', "release workflow must not build Java 21 under JRE key 17"),
-        (r'\*\)\s*echo\s*"17"', "non-legacy agents must not use JRE key 17"),
+        (r'\*\)\s*echo\s*"17"', "agents must not use JRE key 17"),
         (r'"17":\s*\{\s*"version":\s*"21\.', "registry must not publish Java 21 under JRE key 17"),
     ]
     for pattern, message in forbidden_patterns:

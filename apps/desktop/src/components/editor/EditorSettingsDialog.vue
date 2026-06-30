@@ -67,7 +67,7 @@ import { normalizeSidebarHiddenTablePrefixes } from "@/lib/sidebarTableNameDispl
 import { normalizeSqlFormatterSettings, type SqlFormatterSettings } from "@/lib/sqlFormatterConfig";
 import { EMPTY_TABLE_COLUMN_TEMPLATE_DATA_TYPE, parseTableColumnTemplateFields, TABLE_COLUMN_TEMPLATE_DATABASE_TYPES } from "@/lib/tableColumnTemplates";
 import { buildMcpCodexConfig, buildMcpJsonConfig, buildMcpOpenCodeConfig, buildMcpVsCodeConfig, type McpEnvEntry } from "@/lib/mcpConfigTemplates";
-import { combineDataTypeForDatabase, getDataTypeOptions, getDefaultLengthForType, isDataTypeLengthDisabled, splitDataType } from "@/lib/tableStructureEditorState";
+import { combineDataTypeForDatabase, dataTypeLengthInputValue, getDataTypeOptions, getDefaultLengthForType, isDataTypeLengthDisabled, splitDataType } from "@/lib/tableStructureEditorState";
 import type { DatabaseType, SqlSnippet } from "@/types/database";
 import { uuid } from "@/lib/utils";
 import { DEFAULT_SQL_SNIPPETS } from "@/lib/sqlCompletion";
@@ -80,6 +80,7 @@ import { useSavedSqlStore } from "@/stores/savedSqlStore";
 import { currentLocale, setLocale, type Locale } from "@/i18n";
 import { LOCALE_OPTIONS } from "@/lib/localeOptions";
 import { DEFAULT_WEB_DAV_AUTO_UPLOAD_INTERVAL_MINUTES, DEFAULT_WEB_DAV_REMOTE_PATH, normalizedWebDavAutoUploadInterval, writeWebDavAutoUploadFields } from "@/lib/webdavAutoUploadConfig";
+import { apiUrl } from "@/lib/webPath";
 
 const { t } = useI18n();
 const settingsStore = useSettingsStore();
@@ -815,7 +816,7 @@ function tableColumnTemplateBaseTypeForSelectedDatabase(row: TableColumnTemplate
 }
 
 function tableColumnTemplateLengthForSelectedDatabase(row: TableColumnTemplateGridRow): string {
-  return splitDataType(tableColumnTemplateDataTypeForSelectedDatabase(row)).params;
+  return dataTypeLengthInputValue(editTableColumnTemplateDatabaseType.value, tableColumnTemplateDataTypeForSelectedDatabase(row));
 }
 
 function setTableColumnTemplateDataTypeForSelectedDatabase(row: TableColumnTemplateGridRow, value: string) {
@@ -1386,7 +1387,7 @@ async function changePassword() {
   changingPassword.value = true;
   passwordMessage.value = "";
   try {
-    const res = await fetch("/api/auth/change-password", {
+    const res = await fetch(apiUrl("/api/auth/change-password"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ old_password: oldPassword.value, new_password: newPassword.value }),

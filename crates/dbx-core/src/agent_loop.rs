@@ -129,7 +129,11 @@ pub async fn run_agent_loop(
         )
         .await;
     }
-    let tools = if is_agent_mode { agent_tools::all_tools(agent_ctx.db_type) } else { agent_tools::read_only_tools() };
+    let tools = if is_agent_mode {
+        agent_tools::all_tools(agent_ctx.db_type)
+    } else {
+        agent_tools::read_only_tools(agent_ctx.db_type)
+    };
     let task_contract = task_contract.cloned();
     let mut conversation_messages: Vec<AiMessage> = messages.to_vec();
     let mut final_text = String::new();

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "vitest";
-import { buildDeploySqlForObjects, convertToSchemaDiffObjects, type TableDiff } from "../../apps/desktop/src/lib/schemaDiff.ts";
+import { buildDeploySqlForObjects, convertToSchemaDiffObjects, schemaDiffDeployTargetSchema, type TableDiff } from "../../apps/desktop/src/lib/schemaDiff.ts";
 
 test("uses generated sync SQL for modified table deployment", () => {
   const tableDiffs: TableDiff[] = [
@@ -43,4 +43,11 @@ test("falls back to source DDL when object sync SQL is unavailable", () => {
   const objects = convertToSchemaDiffObjects(tableDiffs);
 
   assert.equal(buildDeploySqlForObjects(objects), "-- Create table: users\nCREATE TABLE `users` (`id` int);\n");
+});
+
+test("uses mysql target database as schema diff deploy qualifier", () => {
+  assert.equal(schemaDiffDeployTargetSchema("mysql", "target_db", ""), "target_db");
+  assert.equal(schemaDiffDeployTargetSchema("mysql", "target_db", "  "), "target_db");
+  assert.equal(schemaDiffDeployTargetSchema("mysql", "target_db", "explicit_schema"), "explicit_schema");
+  assert.equal(schemaDiffDeployTargetSchema("sqlite", "main", ""), undefined);
 });

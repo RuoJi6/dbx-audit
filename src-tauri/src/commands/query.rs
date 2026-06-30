@@ -439,6 +439,20 @@ pub fn build_data_grid_column_value_filter_condition(
 }
 
 #[tauri::command]
+pub fn build_data_grid_column_values_filter_condition(
+    options: dbx_core::data_grid_sql::DataGridColumnValuesFilterConditionOptions,
+) -> Result<Option<String>, String> {
+    Ok(dbx_core::data_grid_sql::build_data_grid_column_values_filter_condition(options))
+}
+
+#[tauri::command]
+pub fn build_data_grid_column_distinct_values_sql(
+    options: dbx_core::data_grid_sql::DataGridColumnDistinctValuesSqlOptions,
+) -> Result<String, String> {
+    Ok(dbx_core::data_grid_sql::build_data_grid_column_distinct_values_sql(options))
+}
+
+#[tauri::command]
 pub fn build_data_grid_count_sql(options: dbx_core::data_grid_sql::DataGridCountSqlOptions) -> Result<String, String> {
     Ok(dbx_core::data_grid_sql::build_data_grid_count_sql(options))
 }

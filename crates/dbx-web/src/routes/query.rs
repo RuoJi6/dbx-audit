@@ -236,6 +236,18 @@ pub struct BuildDataGridColumnValueFilterConditionRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct BuildDataGridColumnValuesFilterConditionRequest {
+    pub options: dbx_core::data_grid_sql::DataGridColumnValuesFilterConditionOptions,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildDataGridColumnDistinctValuesSqlRequest {
+    pub options: dbx_core::data_grid_sql::DataGridColumnDistinctValuesSqlOptions,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BuildDataGridCountSqlRequest {
     pub options: dbx_core::data_grid_sql::DataGridCountSqlOptions,
 }
@@ -688,6 +700,18 @@ pub async fn build_data_grid_column_value_filter_condition(
     Json(req): Json<BuildDataGridColumnValueFilterConditionRequest>,
 ) -> Json<Option<String>> {
     Json(dbx_core::data_grid_sql::build_data_grid_column_value_filter_condition(req.options))
+}
+
+pub async fn build_data_grid_column_values_filter_condition(
+    Json(req): Json<BuildDataGridColumnValuesFilterConditionRequest>,
+) -> Json<Option<String>> {
+    Json(dbx_core::data_grid_sql::build_data_grid_column_values_filter_condition(req.options))
+}
+
+pub async fn build_data_grid_column_distinct_values_sql(
+    Json(req): Json<BuildDataGridColumnDistinctValuesSqlRequest>,
+) -> Json<String> {
+    Json(dbx_core::data_grid_sql::build_data_grid_column_distinct_values_sql(req.options))
 }
 
 pub async fn build_data_grid_count_sql(Json(req): Json<BuildDataGridCountSqlRequest>) -> Json<String> {

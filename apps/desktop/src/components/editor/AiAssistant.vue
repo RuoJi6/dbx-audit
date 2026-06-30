@@ -17,7 +17,7 @@ import { connectionIconType } from "@/lib/connectionPresentation";
 import DatabaseIcon from "@/components/icons/DatabaseIcon.vue";
 import { useQueryStore } from "@/stores/queryStore";
 import { useToast } from "@/composables/useToast";
-import { buildAiContext, runAgentStream, type AiAction } from "@/lib/ai";
+import { buildAiContext, runAgentStream, isVectorDbType, type AiAction } from "@/lib/ai";
 import { formatAiModelOption } from "@/lib/aiModelPresentation";
 import type { AgentEvent } from "@/lib/tauri";
 import { buildAiAgentPlan } from "@/lib/aiAgentPlan";
@@ -286,6 +286,11 @@ const actionMenuItems = computed(() =>
   })),
 );
 const aiCodeAppearance = computed(() => (isDark.value ? "dark" : "light"));
+
+const showActionButtons = computed(() => {
+  if (!props.connection) return true;
+  return !isVectorDbType(props.connection.db_type);
+});
 
 const { databaseOptions: allDbOptions, loadDatabaseOptions } = useDatabaseOptions();
 
@@ -1312,6 +1317,7 @@ async function openExternalUrl(url: string) {
               item-class="text-xs px-2"
             />
             <LightDropdown
+              v-if="showActionButtons"
               :model-value="activeAction"
               :items="actionMenuItems"
               content-class="w-max min-w-0"

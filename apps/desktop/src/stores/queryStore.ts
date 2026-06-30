@@ -7,21 +7,23 @@ import { orderPinnedFirst } from "@/lib/pinnedItems";
 import { canCancelQueryExecution } from "@/lib/queryExecutionState";
 import { closeAllTabsState, closeOtherTabsState } from "@/lib/tabCloseActions";
 import { buildExplainSql, parseExplainResult, parseDamengExplainText } from "@/lib/explainPlan";
-import { allEditableColumnsWriteable, allPrimaryKeysPresent, sourceColumnsForResult, type EditableQueryInfo } from "@/lib/sqlAnalysis";
+import { allEditableColumnsWriteable, allPrimaryKeysPresent, analyzeEditableQuery, sourceColumnsForResult, type EditableQueryInfo } from "@/lib/sqlAnalysis";
 import { restoreOpenTabsState, serializeOpenTabs } from "@/lib/openTabsPersistence";
 import {
   evaluateMongoAggregateSafety,
   mongoCountToQueryResult,
   mongoDocumentsToQueryResult,
   mongoIndexesToQueryResult,
-  mongoWriteToQueryResult,
   mongoUseToQueryResult,
+  mongoVersionToQueryResult,
+  mongoWriteToQueryResult,
   parseMongoAggregateCommand,
   parseMongoCountDocumentsCommand,
   parseMongoFindCommand,
   parseMongoGetIndexesCommand,
   parseMongoWriteCommand,
   parseMongoUseCommand,
+  parseMongoVersionCommand,
   type MongoAggregateSafetyOptions,
 } from "@/lib/mongoShellCommand";
 import { redisCommandResultToQueryResult } from "@/lib/redisQueryResult";
@@ -36,6 +38,7 @@ import { connectionUsesDatabaseObjectTreeMode, connectionUsesSchemaExecutionCont
 import { queryTimeoutSecsForConnection } from "@/lib/queryTimeout";
 import { sortDataGridRows, type DataGridSortDirection } from "@/lib/dataGridSort";
 import { normalizeResultPageSize } from "@/lib/paginationPageSize";
+import { splitSqlStatementRanges } from "@/lib/sqlStatementRanges";
 import { clearDataGridPendingSnapshotsForTab } from "@/composables/useDataGridEditor";
 import { buildTabResultSnapshot, deleteTabResultSnapshot, readTabResultSnapshot, tabResultCacheKey, writeTabResultSnapshot } from "@/lib/tabResultCache";
 import { decodeQueryResultArchive, encodeQueryResultArchive, type DecodedQueryResultArchive } from "@/lib/queryResultArchive";
@@ -50,6 +53,10 @@ const ACTIVE_TAB_KEY = "dbx-active-tab";
 const ORACLE_LIKE_METADATA_TYPES = new Set<string>(["oracle", "dameng", "oceanbase-oracle"]);
 const BACKGROUND_CLIENT_SESSION_SUFFIXES = ["count", "explain", "export"] as const;
 const CANCEL_QUERY_TIMEOUT_MS = 10_000;
+
+function cloneTabDraft<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
 
 interface BuildQueryResultExportRequestOptions {
   exportId: string;
@@ -81,6 +88,27 @@ function markQueryResultRunsRowsRaw(resultRuns: NonNullable<QueryTab["resultRuns
     if (run.results) markQueryResultsRowsRaw(run.results);
   }
   return resultRuns;
+}
+
+function queryResultSourceLabel(sql: string, database: string | undefined): string | undefined {
+  const analysis = analyzeEditableQuery(sql);
+  if (!analysis) return undefined;
+  const qualifier = analysis.schema || database?.trim();
+  return qualifier ? `${qualifier}.${analysis.tableName}` : analysis.tableName;
+}
+
+function annotateQueryResultSources(results: QueryResult[], sql: string, database: string | undefined, databaseType?: DatabaseType): QueryResult[] {
+  const statements = splitSqlStatementRanges(sql, databaseType);
+  let statementIndex = 0;
+  for (const result of results) {
+    const statement = statements[statementIndex++];
+    if (result.columns.length === 0) continue;
+    if (!statement) continue;
+    result.sourceStatement = statement.sql;
+    const label = queryResultSourceLabel(statement.sql, database);
+    if (label) result.sourceLabel = label;
+  }
+  return results;
 }
 
 async function withFrontendQueryTimeout<T>(promise: Promise<T>, timeoutSecs: number, message: string): Promise<T> {
@@ -232,6 +260,7 @@ export const useQueryStore = defineStore("query", () => {
     tab.queryAnalysis = undefined;
     tab.querySourceColumns = undefined;
     tab.queryEditabilityReason = undefined;
+    tab.mongoEditTarget = undefined;
     if (tab.mode === "query") tab.tableMeta = undefined;
     tab.resultEvicted = options.evicted ? true : undefined;
     tab.resultCacheState = options.evicted ? tab.resultCacheState : undefined;
@@ -275,6 +304,7 @@ export const useQueryStore = defineStore("query", () => {
     tab.queryAnalysis = run.queryAnalysis;
     tab.querySourceColumns = run.querySourceColumns;
     tab.queryEditabilityReason = run.queryEditabilityReason;
+    tab.mongoEditTarget = run.mongoEditTarget;
     tab.tableMeta = run.tableMeta;
     touchResult(tab);
   }
@@ -394,6 +424,7 @@ export const useQueryStore = defineStore("query", () => {
       queryAnalysis: tab.queryAnalysis,
       querySourceColumns: tab.querySourceColumns,
       queryEditabilityReason: tab.queryEditabilityReason,
+      mongoEditTarget: tab.mongoEditTarget,
       tableMeta: tab.tableMeta,
     };
     persistResultRun(tab, run);
@@ -441,6 +472,7 @@ export const useQueryStore = defineStore("query", () => {
       queryAnalysis: tab.queryAnalysis,
       querySourceColumns: tab.querySourceColumns,
       queryEditabilityReason: tab.queryEditabilityReason,
+      mongoEditTarget: tab.mongoEditTarget,
       tableMeta: tab.tableMeta,
     };
     persistResultRun(tab, run);
@@ -533,6 +565,7 @@ export const useQueryStore = defineStore("query", () => {
       objectBrowser: t.objectBrowser,
       objectSource: t.objectSource,
       tableMeta: t.tableMeta,
+      mongoEditTarget: t.mongoEditTarget,
       resultEvicted: t.resultEvicted,
       resultCacheKey: t.resultCacheKey,
     })),
@@ -903,6 +936,7 @@ export const useQueryStore = defineStore("query", () => {
       nacosNamespace: original.nacosNamespace,
       nacosNamespaceName: original.nacosNamespaceName,
       structureTableName: original.structureTableName,
+      structureDraft: original.structureDraft ? cloneTabDraft(original.structureDraft) : undefined,
       objectBrowser: original.objectBrowser ? { ...original.objectBrowser } : undefined,
       objectSource: original.objectSource ? { ...original.objectSource } : undefined,
       tableMeta: original.tableMeta ? { ...original.tableMeta, columns: [...original.tableMeta.columns], primaryKeys: [...original.tableMeta.primaryKeys] } : undefined,
@@ -1223,6 +1257,7 @@ export const useQueryStore = defineStore("query", () => {
     tab.queryAnalysis = patch.queryAnalysis;
     tab.querySourceColumns = patch.querySourceColumns;
     tab.queryEditabilityReason = patch.queryEditabilityReason;
+    tab.mongoEditTarget = undefined;
     tab.tableMeta = patch.tableMeta;
   }
 
@@ -1541,6 +1576,7 @@ export const useQueryStore = defineStore("query", () => {
           current.queryAnalysis = undefined;
           current.querySourceColumns = undefined;
           current.queryEditabilityReason = undefined;
+          current.mongoEditTarget = undefined;
           current.tableMeta = undefined;
           current.resultBaseSql = options?.resultBaseSql ?? sql;
           current.resultSortedSql = options?.resultSortedSql;
@@ -1583,7 +1619,7 @@ export const useQueryStore = defineStore("query", () => {
       if (mongoFind) {
         await connStore.ensureConnected(tab.connectionId);
         console.info("[DBX][executeTabSql:mongo-find:start]", { traceId, collection: mongoFind.collection });
-        const result = await api.mongoFindDocuments(tab.connectionId, tab.database, mongoFind.collection, mongoFind.skip, mongoFind.limit, mongoFind.filter, mongoFind.sort, executionId);
+        const result = await api.mongoFindDocuments(tab.connectionId, tab.database, mongoFind.collection, mongoFind.skip, mongoFind.limit, mongoFind.filter, mongoFind.projection, mongoFind.sort, executionId);
         console.info("[DBX][executeTabSql:mongo-find:done]", {
           traceId,
           rowCount: result.documents.length,
@@ -1599,6 +1635,34 @@ export const useQueryStore = defineStore("query", () => {
           current.queryAnalysis = undefined;
           current.querySourceColumns = undefined;
           current.queryEditabilityReason = undefined;
+          current.mongoEditTarget = current.result.columns.includes("_id") ? { collection: mongoFind.collection, idColumn: "_id" } : undefined;
+          current.tableMeta = undefined;
+          current.resultBaseSql = options?.resultBaseSql ?? sql;
+          current.resultSortedSql = options?.resultSortedSql;
+          syncDisplayedResultRun(current, options?.resultBaseSql ?? sql);
+        }
+        return;
+      }
+      const mongoVersion = conn?.db_type === "mongodb" ? parseMongoVersionCommand(sql) : null;
+      if (mongoVersion) {
+        await connStore.ensureConnected(tab.connectionId);
+        console.info("[DBX][executeTabSql:mongo-version:start]", { traceId });
+        const version = await api.mongoServerVersion(tab.connectionId, tab.database, executionId);
+        console.info("[DBX][executeTabSql:mongo-version:done]", {
+          traceId,
+          version,
+          elapsed: elapsed(),
+        });
+        const current = tabs.value.find((t) => t.id === id);
+        if (current?.executionId === executionId) {
+          current.results = undefined;
+          current.activeResultIndex = undefined;
+          current.result = markQueryResultRowsRaw(mongoVersionToQueryResult(version, performance.now() - startedAt));
+          touchResult(current);
+          current.queryAnalysis = undefined;
+          current.querySourceColumns = undefined;
+          current.queryEditabilityReason = undefined;
+          current.mongoEditTarget = undefined;
           current.tableMeta = undefined;
           current.resultBaseSql = options?.resultBaseSql ?? sql;
           current.resultSortedSql = options?.resultSortedSql;
@@ -1610,7 +1674,7 @@ export const useQueryStore = defineStore("query", () => {
       if (mongoCount) {
         await connStore.ensureConnected(tab.connectionId);
         console.info("[DBX][executeTabSql:mongo-count:start]", { traceId, collection: mongoCount.collection });
-        const result = await api.mongoFindDocuments(tab.connectionId, tab.database, mongoCount.collection, 0, 1, mongoCount.filter, undefined, executionId);
+        const result = await api.mongoFindDocuments(tab.connectionId, tab.database, mongoCount.collection, 0, 1, mongoCount.filter, undefined, undefined, executionId);
         console.info("[DBX][executeTabSql:mongo-count:done]", {
           traceId,
           total: result.total,
@@ -1625,6 +1689,7 @@ export const useQueryStore = defineStore("query", () => {
           current.queryAnalysis = undefined;
           current.querySourceColumns = undefined;
           current.queryEditabilityReason = undefined;
+          current.mongoEditTarget = undefined;
           current.tableMeta = undefined;
           current.resultBaseSql = options?.resultBaseSql ?? sql;
           current.resultSortedSql = options?.resultSortedSql;
@@ -1658,6 +1723,7 @@ export const useQueryStore = defineStore("query", () => {
           current.queryAnalysis = undefined;
           current.querySourceColumns = undefined;
           current.queryEditabilityReason = undefined;
+          current.mongoEditTarget = undefined;
           current.tableMeta = undefined;
           current.resultBaseSql = options?.resultBaseSql ?? sql;
           current.resultSortedSql = options?.resultSortedSql;
@@ -1685,6 +1751,7 @@ export const useQueryStore = defineStore("query", () => {
           current.queryAnalysis = undefined;
           current.querySourceColumns = undefined;
           current.queryEditabilityReason = undefined;
+          current.mongoEditTarget = undefined;
           current.tableMeta = undefined;
           current.resultBaseSql = options?.resultBaseSql ?? sql;
           current.resultSortedSql = options?.resultSortedSql;
@@ -1726,6 +1793,7 @@ export const useQueryStore = defineStore("query", () => {
           current.queryAnalysis = undefined;
           current.querySourceColumns = undefined;
           current.queryEditabilityReason = undefined;
+          current.mongoEditTarget = undefined;
           current.tableMeta = undefined;
           current.resultBaseSql = options?.resultBaseSql ?? sql;
           current.resultSortedSql = options?.resultSortedSql;
@@ -1747,6 +1815,7 @@ export const useQueryStore = defineStore("query", () => {
           current.queryAnalysis = undefined;
           current.querySourceColumns = undefined;
           current.queryEditabilityReason = undefined;
+          current.mongoEditTarget = undefined;
           current.tableMeta = undefined;
           current.resultBaseSql = options?.resultBaseSql ?? sql;
           current.resultSortedSql = options?.resultSortedSql;
@@ -1785,7 +1854,8 @@ export const useQueryStore = defineStore("query", () => {
       });
       const executionPromise = api.executeMulti(tab.connectionId, tab.database, sqlToExecute, executionSchema, executionId, executionOptions);
       const frontendTimeoutSecs = Math.max(queryTimeoutSecs * 2, 60);
-      const results = markQueryResultsRowsRaw(await withFrontendQueryTimeout(executionPromise, queryTimeoutSecs === 0 ? 0 : frontendTimeoutSecs, t("editor.queryTimeoutError", { seconds: frontendTimeoutSecs })));
+      const sourceLabelDatabase = tab.database || conn?.database;
+      const results = annotateQueryResultSources(markQueryResultsRowsRaw(await withFrontendQueryTimeout(executionPromise, queryTimeoutSecs === 0 ? 0 : frontendTimeoutSecs, t("editor.queryTimeoutError", { seconds: frontendTimeoutSecs }))), queryBaseSql, sourceLabelDatabase, effectiveDbType);
       console.info("[DBX][executeTabSql:execute-multi:done]", {
         traceId,
         resultCount: results.length,
@@ -1871,6 +1941,7 @@ export const useQueryStore = defineStore("query", () => {
         current.queryAnalysis = undefined;
         current.querySourceColumns = undefined;
         current.queryEditabilityReason = undefined;
+        current.mongoEditTarget = undefined;
         if (current.mode !== "data") current.tableMeta = undefined;
         current.resultBaseSql = queryBaseSql;
         current.resultSortedSql = options?.resultSortedSql;
@@ -2065,6 +2136,7 @@ export const useQueryStore = defineStore("query", () => {
     tab.queryAnalysis = undefined;
     tab.querySourceColumns = undefined;
     tab.queryEditabilityReason = undefined;
+    tab.mongoEditTarget = undefined;
     syncActiveResultRunFromDisplayed(tab);
   }
 
@@ -2110,6 +2182,7 @@ export const useQueryStore = defineStore("query", () => {
     tab.queryAnalysis = snapshot.queryAnalysis;
     tab.querySourceColumns = snapshot.querySourceColumns;
     tab.queryEditabilityReason = snapshot.queryEditabilityReason;
+    tab.mongoEditTarget = snapshot.mongoEditTarget;
     tab.tableMeta = snapshot.tableMeta;
     tab.resultPageSql = snapshot.resultPageSql;
     tab.resultPageLimit = snapshot.resultPageLimit;

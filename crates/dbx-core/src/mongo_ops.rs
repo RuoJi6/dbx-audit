@@ -123,6 +123,23 @@ pub async fn mongo_drop_collection_core(
     }
 }
 
+pub async fn mongo_server_version_core(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+) -> Result<String, String> {
+    ensure_document_pool(state, connection_id).await?;
+    let connections = state.connections.read().await;
+    match connections.get(connection_id).ok_or("Not found")? {
+        PoolKind::MongoDb(client) => mongo_driver::server_version(client, database).await,
+        PoolKind::Agent(client) => {
+            let mut client = client.lock().await;
+            client.mongo_server_version(database).await
+        }
+        _ => Err("Not a MongoDB connection".to_string()),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn document_find_documents_core(
     state: &AppState,
@@ -132,13 +149,14 @@ pub async fn document_find_documents_core(
     skip: u64,
     limit: i64,
     filter: Option<&str>,
+    projection: Option<&str>,
     sort: Option<&str>,
 ) -> Result<MongoDocumentResult, String> {
     ensure_document_pool(state, connection_id).await?;
     let connections = state.connections.read().await;
     match connections.get(connection_id).ok_or("Not found")? {
         PoolKind::MongoDb(client) => {
-            mongo_driver::find_documents(client, database, collection, skip, limit, filter, sort).await
+            mongo_driver::find_documents(client, database, collection, skip, limit, filter, projection, sort).await
         }
         PoolKind::Elasticsearch(client) => {
             let client = client.clone();
@@ -153,16 +171,18 @@ pub async fn document_find_documents_core(
         }
         PoolKind::Agent(client) => {
             let mut client = client.lock().await;
-            client
-                .mongo_find_documents(serde_json::json!({
-                    "database": database,
-                    "collection": collection,
-                    "skip": skip,
-                    "limit": limit,
-                    "filter": filter,
-                    "sort": sort,
-                }))
-                .await
+            let mut params = serde_json::json!({
+                "database": database,
+                "collection": collection,
+                "skip": skip,
+                "limit": limit,
+                "filter": filter,
+                "sort": sort,
+            });
+            if let Some(projection) = projection {
+                params["projection"] = serde_json::json!(projection);
+            }
+            client.mongo_find_documents(params).await
         }
         _ => Err("Not a MongoDB/Elasticsearch/vector connection".to_string()),
     }
@@ -177,9 +197,11 @@ pub async fn mongo_find_documents_core(
     skip: u64,
     limit: i64,
     filter: Option<&str>,
+    projection: Option<&str>,
     sort: Option<&str>,
 ) -> Result<MongoDocumentResult, String> {
-    document_find_documents_core(state, connection_id, database, collection, skip, limit, filter, sort).await
+    document_find_documents_core(state, connection_id, database, collection, skip, limit, filter, projection, sort)
+        .await
 }
 
 pub async fn mongo_aggregate_documents_core(

@@ -68,6 +68,7 @@ import { classifyAiSqlExecution } from "@/lib/aiSqlExecutionPolicy";
 import { buildHistoryAiAnalysisPrompt } from "@/lib/historyAiAnalysis";
 import { countAvailableAgentDriverUpdates, type AgentDriverUpdateBadgeState } from "@/lib/agentDriverUpdateBadge";
 import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/safeStorage";
+import { apiUrl, webPath } from "@/lib/webPath";
 import { rankSavedSqlHistory } from "@/lib/savedSqlHistory";
 import { isSchemaAware, isSingleDatabase, usesTreeSchemaMode } from "@/lib/databaseFeatureSupport";
 import { codeMirrorSqlDialect, connectionUsesDatabaseObjectTreeMode, effectiveDatabaseTypeForConnection } from "@/lib/jdbcDialect";
@@ -1325,7 +1326,7 @@ function onLoginSuccess() {
   authenticated.value = true;
   setupRequired.value = false;
   needsAuth.value = true;
-  window.history.replaceState(null, "", "/");
+  window.history.replaceState(null, "", webPath("/"));
   initApp();
 }
 
@@ -1453,7 +1454,7 @@ onMounted(async () => {
   );
   if (!isDesktop) {
     try {
-      const res = await fetch("/api/auth/check");
+      const res = await fetch(apiUrl("/api/auth/check"));
       const data = await res.json();
       needsAuth.value = data.required;
       authenticated.value = data.authenticated;
@@ -1462,7 +1463,7 @@ onMounted(async () => {
       /* server unreachable */
     }
     if (needsAuth.value && !authenticated.value) {
-      history.replaceState(null, "", "/login");
+      history.replaceState(null, "", webPath("/login"));
     }
     if (!setupRequired.value && (!needsAuth.value || authenticated.value)) initApp();
     api

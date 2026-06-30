@@ -10,7 +10,7 @@ import SqlExecutionTargetPicker from "./SqlExecutionTargetPicker.vue";
 import CustomContextMenu, { type ContextMenuItem } from "@/components/ui/CustomContextMenu.vue";
 import { copyToClipboard } from "@/lib/clipboard";
 import { resolveExecutableSql, type SqlExecutionSnapshot, type SqlExecutionOverride, type SqlExecutionCandidate } from "@/lib/sqlExecutionTarget";
-import { buildExecutionCandidates, hasMultipleExecutionTargets, supportsExecutionTargetPicker } from "@/lib/sqlStatementRanges";
+import { buildExecutionCandidates, executableStatementRanges, hasMultipleExecutionTargets, supportsExecutionTargetPicker } from "@/lib/sqlStatementRanges";
 import { formatSqlText, type SqlFormatDialect } from "@/lib/sqlFormatter";
 import { formatMongoShellText } from "@/lib/mongoFormatter";
 import { useConnectionStore } from "@/stores/connectionStore";
@@ -332,9 +332,13 @@ function handleTab(view: EditorViewType): boolean {
   return true;
 }
 
-function requestExecute() {
+function requestExecute(options: { forceCurrent?: boolean } = {}) {
   const currentView = view.value;
   if (!currentView) return false;
+  return requestExecuteFromView(currentView, currentView.state.selection.main.head, options);
+}
+
+function requestExecuteFromView(currentView: EditorViewType, cursorPos: number, options: { forceCurrent?: boolean } = {}) {
   const selection = currentView.state.selection.main;
   if (!selection.empty) {
     // Has manual selection → execute directly, skip picker.
@@ -347,9 +351,13 @@ function requestExecute() {
   }
   // No selection → show the execution target picker.
   const doc = currentView.state.doc.toString();
-  const cursorPos = selection.head;
   const candidates = buildExecutionCandidates(doc, cursorPos, props.databaseType);
   if (candidates.length === 0) return false;
+  if (options.forceCurrent) {
+    const candidate = candidates.find((item) => item.kind === "cursor") ?? candidates[0];
+    emit("execute", candidate.sql);
+    return true;
+  }
   if (!settingsStore.editorSettings.showExecutionTargetPicker || !hasMultipleExecutionTargets(doc, props.databaseType)) {
     const preferredKind = settingsStore.editorSettings.executeMode === "current" ? "cursor" : "all";
     const candidate = candidates.find((item) => item.kind === preferredKind) ?? candidates[0];
@@ -502,6 +510,21 @@ function openTableDdlFromContextMenu() {
   focusEditor();
 }
 
+function executableStatementRangeStartingAt(currentView: EditorViewType, lineFrom: number) {
+  return executableStatementRanges(currentView.state.doc.toString(), props.databaseType).find((range) => range.from === lineFrom) ?? null;
+}
+
+function executeSqlStatementFromGutter(currentView: EditorViewType, line: { from: number; to: number }, event: Event): boolean {
+  if (!(event instanceof MouseEvent) || event.button !== 0) return false;
+  const statementRange = executableStatementRangeStartingAt(currentView, line.from);
+  if (!statementRange) return false;
+  event.preventDefault();
+  event.stopPropagation();
+  emit("execute", statementRange.sql);
+  currentView.focus();
+  return true;
+}
+
 function selectSqlLineFromGutter(currentView: EditorViewType, line: { from: number; to: number }, event: Event): boolean {
   if (!(event instanceof MouseEvent) || event.button !== 0) return false;
   event.preventDefault();
@@ -557,7 +580,7 @@ function runKeymapExtension(codeMirrorKeymap: (typeof import("@codemirror/view")
         },
         ...binding(shortcuts.find, openSearch),
         ...binding(shortcuts.replace, openReplace),
-        ...binding(shortcuts.executeSql, requestExecute),
+        ...binding(shortcuts.executeSql, () => requestExecute({ forceCurrent: true })),
         ...binding(shortcuts.saveSql, () => {
           emit("save");
           return true;
@@ -1830,7 +1853,7 @@ onMounted(async () => {
   if (!editorRef.value) return;
 
   const [
-    { EditorView, keymap, rectangularSelection, hoverTooltip, showTooltip, Decoration, tooltips, lineNumbers, highlightActiveLineGutter, highlightSpecialChars, drawSelection, dropCursor, crosshairCursor, ViewPlugin },
+    { EditorView, keymap, rectangularSelection, hoverTooltip, showTooltip, Decoration, tooltips, gutter, GutterMarker, lineNumbers, highlightActiveLineGutter, highlightSpecialChars, drawSelection, dropCursor, crosshairCursor, ViewPlugin },
     { EditorState, Compartment, Prec, StateEffect, StateField },
     langSql,
     { autocompletion, startCompletion, acceptCompletion, closeBrackets, closeBracketsKeymap, snippetCompletion, completionStatus, completionKeymap },
@@ -1955,6 +1978,27 @@ onMounted(async () => {
   const initialSettings = settingsStore.editorSettings;
   const theme = await loadEditorTheme(initialSettings.theme, editorThemeAppearance(), getCurrentCustomThemeColors());
 
+  class RunStatementGutterMarker extends GutterMarker {
+    constructor(private readonly isExecutable: boolean) {
+      super();
+    }
+
+    toDOM() {
+      const marker = document.createElement(this.isExecutable ? "button" : "span");
+      marker.className = this.isExecutable ? "cm-run-statement-marker cm-run-statement-marker--active" : "cm-run-statement-marker";
+      if (this.isExecutable) {
+        marker.setAttribute("type", "button");
+        marker.setAttribute("aria-label", "Execute statement");
+      }
+      marker.innerHTML =
+        '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 5a2 2 0 0 1 3.008-1.728l11.997 6.998a2 2 0 0 1 .003 3.458l-12 7A2 2 0 0 1 5 19z"></path></svg>';
+      return marker;
+    }
+  }
+
+  const executableStatementMarker = new RunStatementGutterMarker(true);
+  const inactiveStatementMarker = new RunStatementGutterMarker(false);
+
   const activeLineHighlighter = ViewPlugin.fromClass(
     class {
       decorations: import("@codemirror/view").DecorationSet;
@@ -1992,6 +2036,15 @@ onMounted(async () => {
           const dom = document.createElement("span");
           dom.style.display = "none";
           return { dom };
+        },
+      }),
+      gutter({
+        class: "cm-run-statement-gutter",
+        lineMarker(currentView, line) {
+          return executableStatementRangeStartingAt(currentView, line.from) ? executableStatementMarker : inactiveStatementMarker;
+        },
+        domEventHandlers: {
+          mousedown: executeSqlStatementFromGutter,
         },
       }),
       lineNumbers({
@@ -2188,9 +2241,20 @@ onMounted(async () => {
                 return rt;
               });
 
-              // Check if identifier has a qualifier (e.g., c.card_name)
+              // Check if identifier has a qualifier (e.g., c.card_name or schema.table)
               const qualifierMatch = /^(.+)\.(.+)$/.exec(identifier);
               const qualifier = qualifierMatch ? qualifierMatch[1] : null;
+
+              // 2b. Qualified identifier (schema.table): check against SQL-parsed referenced tables
+              if (qualifierMatch) {
+                const qQualifier = qualifierMatch[1].toLowerCase();
+                const qTableName = qualifierMatch[2].toLowerCase();
+                const matchedRef = referencedTables.find((rt) => rt.name.toLowerCase() === qTableName && rt.schema?.toLowerCase() === qQualifier);
+                if (matchedRef) {
+                  emit("clickTable", matchedRef.schema ? `${matchedRef.schema}.${matchedRef.name}` : matchedRef.name);
+                  return;
+                }
+              }
               const colName = qualifierMatch ? qualifierMatch[2] : identifier;
               const colLower = colName.toLowerCase();
 
@@ -2573,6 +2637,67 @@ defineExpose({ openSearch, openReplace, scrollCursorIntoView, requestExecute });
 
 :deep(.cm-db-execution-preview) {
   background: var(--dbx-editor-selection-background, rgba(59, 130, 246, 0.35));
+}
+
+:deep(.cm-run-statement-gutter) {
+  min-width: 34px;
+}
+
+:deep(.cm-run-statement-gutter .cm-gutterElement) {
+  box-sizing: border-box;
+  min-width: 34px;
+  padding: 0 5px;
+  line-height: 24px;
+}
+
+:deep(.cm-run-statement-marker) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  width: 24px;
+  height: 24px;
+  margin: 0;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: transparent;
+  vertical-align: middle;
+  white-space: nowrap;
+  transition:
+    color 0.15s,
+    background-color 0.15s;
+  outline: none;
+  user-select: none;
+  flex-shrink: 0;
+}
+
+:deep(.cm-run-statement-marker--active) {
+  background: rgb(16 185 129 / 0.1);
+  color: rgb(4 120 87);
+  cursor: pointer;
+}
+
+:deep(.cm-run-statement-marker--active:hover) {
+  background: rgb(16 185 129 / 0.2);
+  color: rgb(6 95 70);
+}
+
+:deep(.dark .cm-run-statement-marker--active) {
+  color: rgb(110 231 183);
+}
+
+:deep(.dark .cm-run-statement-marker--active:hover) {
+  color: rgb(167 243 208);
+}
+
+:deep(.cm-run-statement-marker svg) {
+  display: block;
+  width: 14px;
+  height: 14px;
+  pointer-events: none;
+  flex-shrink: 0;
 }
 
 :deep(.cm-foldMarker-svg) {

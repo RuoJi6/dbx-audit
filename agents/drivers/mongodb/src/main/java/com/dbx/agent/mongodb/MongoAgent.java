@@ -61,6 +61,11 @@ public final class MongoAgent {
         return element == null || element instanceof JsonNull ? null : element.getAsString();
     }
 
+    static Document documentOrNull(JsonObject object, String key) {
+        String json = stringOrNull(object, key);
+        return json == null || json.isBlank() ? null : Document.parse(json);
+    }
+
     static MongoClientSettings.Builder configureBuilder(JsonObject connObj) {
         String host = connObj.has("host") ? connObj.get("host").getAsString() : "127.0.0.1";
         int port = connObj.has("port") ? connObj.get("port").getAsInt() : 27017;
@@ -350,16 +355,22 @@ public final class MongoAgent {
         String collection = params.get("collection").getAsString();
         long skip = params.has("skip") ? params.get("skip").getAsLong() : 0;
         int limit = params.has("limit") ? params.get("limit").getAsInt() : 50;
-        String filterJson = stringOrNull(params, "filter");
-        String sortJson = stringOrNull(params, "sort");
+        Document filterDoc = documentOrNull(params, "filter");
+        Document projectionDoc = documentOrNull(params, "projection");
+        Document sortDoc = documentOrNull(params, "sort");
 
         var col = c.getDatabase(database).getCollection(collection);
-        Document filterDoc = filterJson != null && !filterJson.isBlank() ? Document.parse(filterJson) : new Document();
+        if (filterDoc == null) {
+            filterDoc = new Document();
+        }
         long total = col.countDocuments(filterDoc);
 
         var iterable = col.find(filterDoc).skip((int) skip).limit(limit);
-        if (sortJson != null && !sortJson.isBlank()) {
-            iterable = iterable.sort(Document.parse(sortJson));
+        if (projectionDoc != null) {
+            iterable = iterable.projection(projectionDoc);
+        }
+        if (sortDoc != null) {
+            iterable = iterable.sort(sortDoc);
         }
 
         List<Map<String, Object>> documents = new ArrayList<>();
@@ -370,6 +381,21 @@ public final class MongoAgent {
         result.put("documents", documents);
         result.put("total", total);
         return result;
+    }
+
+    private static Object serverVersion(JsonObject params) {
+        MongoClient c = requireClient();
+        String database = defaultString(stringOrNull(params, "database"), "admin");
+        Document buildInfo = c.getDatabase(database).runCommand(new Document("buildInfo", 1));
+        return serverVersionFromBuildInfo(buildInfo);
+    }
+
+    static String serverVersionFromBuildInfo(Document buildInfo) {
+        String version = buildInfo.getString("version");
+        if (version == null || version.isBlank()) {
+            throw new IllegalStateException("MongoDB server version not found");
+        }
+        return version;
     }
 
     private static Object insertDocument(JsonObject params) {
@@ -559,6 +585,7 @@ public final class MongoAgent {
             case AgentProtocol.MONGO_METHOD_LIST_COLLECTIONS -> listCollections(params);
             case AgentProtocol.METHOD_LIST_INDEXES -> listIndexes(params);
             case AgentProtocol.MONGO_METHOD_FIND_DOCUMENTS -> findDocuments(params);
+            case AgentProtocol.MONGO_METHOD_SERVER_VERSION -> serverVersion(params);
             case AgentProtocol.MONGO_METHOD_INSERT_DOCUMENT -> insertDocument(params);
             case AgentProtocol.MONGO_METHOD_UPDATE_DOCUMENT -> updateDocument(params);
             case AgentProtocol.MONGO_METHOD_DELETE_DOCUMENT -> deleteDocument(params);

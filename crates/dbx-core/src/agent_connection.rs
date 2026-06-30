@@ -251,9 +251,6 @@ pub fn oracle_alternate_connect_configs(config: &ConnectionConfig, err: &str) ->
     if config.db_type != DatabaseType::Oracle {
         return Vec::new();
     }
-    if config.driver_profile.as_deref() == Some("oracle-10g") {
-        return Vec::new();
-    }
     if config.connection_string.as_deref().is_some_and(|value| !value.trim().is_empty()) {
         return Vec::new();
     }
@@ -400,21 +397,6 @@ fn postgres_like_agent_jdbc_connection_string(
     };
     let base = format!("jdbc:{scheme}://{host}:{port}/{}", database.trim());
     append_agent_url_params(base, config.url_params.as_deref())
-}
-
-pub fn should_retry_oracle_with_10g_driver(config: &ConnectionConfig, err: &str) -> bool {
-    !oracle_auth_fallback_profiles(config, err).is_empty()
-}
-
-pub fn oracle_auth_fallback_profiles(config: &ConnectionConfig, err: &str) -> Vec<&'static str> {
-    if config.db_type != DatabaseType::Oracle {
-        return Vec::new();
-    }
-    let normalized = err.to_lowercase();
-    if !normalized.contains("ora-28040") && !normalized.contains("no matching authentication protocol") {
-        return Vec::new();
-    }
-    Vec::new()
 }
 
 pub fn oracle_alternate_connect_config(config: &ConnectionConfig, err: &str) -> Option<ConnectionConfig> {
@@ -749,10 +731,9 @@ mod tests {
     }
 
     #[test]
-    fn oracle_listener_error_hint_skips_other_databases() {
+    fn oracle_listener_error_hint_skips_non_oracle_databases() {
         let err = "Agent RPC error (-1): ORA-12541: TNS:no listener";
         let mut cfg = config(DatabaseType::Oracle, Some("ORCL"));
-        cfg.driver_profile = Some("oracle-legacy".to_string());
 
         assert!(oracle_error_with_driver_hint(&cfg, err).contains("Service Name"));
 
@@ -907,20 +888,6 @@ mod tests {
         assert_eq!(retry.connection_string.as_deref(), Some("jdbc:oracle:thin:@127.0.0.1:3306:ORCL"));
         assert!(oracle_alternate_connect_config(&retry, "ORA-01017: invalid username/password").is_none());
         assert!(oracle_alternate_connect_config(&cfg, "ORA-12541: TNS:no listener").is_some());
-    }
-
-    #[test]
-    fn oracle_auth_errors_do_not_switch_driver_profiles() {
-        let mut cfg = config(DatabaseType::Oracle, Some("ORCL"));
-        cfg.driver_profile = Some("oracle".to_string());
-
-        assert!(oracle_auth_fallback_profiles(&cfg, "ORA-28040: No matching authentication protocol").is_empty());
-
-        cfg.driver_profile = Some("oracle-legacy".to_string());
-        assert!(oracle_auth_fallback_profiles(&cfg, "ORA-28040: No matching authentication protocol").is_empty());
-
-        cfg.driver_profile = Some("oracle-10g".to_string());
-        assert!(oracle_auth_fallback_profiles(&cfg, "ORA-28040: No matching authentication protocol").is_empty());
     }
 
     #[test]

@@ -164,8 +164,22 @@ export function isSqlKeyword(identifier: string): boolean {
   return SQL_KEYWORDS_SET.has(identifier.toLowerCase());
 }
 
-/** Match identifier against known table names (case-insensitive). */
+/** Match identifier against known table names (case-insensitive). Supports qualified identifiers like schema.table. */
 export function matchTable(identifier: string, tables: Array<{ name: string; schema?: string }>): { name: string; schema?: string } | null {
   const lower = identifier.toLowerCase();
-  return tables.find((t) => t.name.toLowerCase() === lower) ?? null;
+
+  // Direct match (simple table name)
+  const direct = tables.find((t) => t.name.toLowerCase() === lower);
+  if (direct) return direct;
+
+  // Qualified match: schema.table
+  const dotIndex = identifier.indexOf(".");
+  if (dotIndex > 0) {
+    const qualifier = identifier.substring(0, dotIndex).toLowerCase();
+    const name = identifier.substring(dotIndex + 1).toLowerCase();
+    const qualified = tables.find((t) => t.name.toLowerCase() === name && t.schema?.toLowerCase() === qualifier);
+    if (qualified) return qualified;
+  }
+
+  return null;
 }

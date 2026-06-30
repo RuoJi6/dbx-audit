@@ -3,6 +3,7 @@ import type { QueryResult } from "@/types/database";
 export interface MongoFindCommand {
   collection: string;
   filter: string;
+  projection?: string;
   skip: number;
   limit: number;
   sort?: string;
@@ -26,6 +27,10 @@ export interface MongoUseCommand {
   database: string;
 }
 
+export interface MongoVersionCommand {
+  kind: "version";
+}
+
 export type MongoWriteCommand = { kind: "insert"; collection: string; docsJson: string } | { kind: "update"; collection: string; filter: string; update: string; many: boolean } | { kind: "delete"; collection: string; filter: string; many: boolean };
 
 export interface MongoAggregateSafetyOptions {
@@ -45,8 +50,15 @@ export function parseMongoFindCommand(input: string): MongoFindCommand | null {
   if (findCloseIndex < 0) return null;
 
   const findArgs = splitTopLevel(source.slice(findOpenIndex + 1, findCloseIndex));
+  if (findArgs.length > 2 && findArgs.slice(2).some((arg) => arg.trim())) return null;
   const filter = normalizeJsonArgument(findArgs[0] || "{}");
   if (!filter) return null;
+  let projection: string | undefined;
+  if (findArgs[1]?.trim()) {
+    const parsedProjection = normalizeJsonArgument(findArgs[1]);
+    if (!parsedProjection) return null;
+    projection = parsedProjection;
+  }
 
   const chain = source.slice(findCloseIndex + 1).trim();
   if (chain && !chain.startsWith(".")) return null;
@@ -66,6 +78,7 @@ export function parseMongoFindCommand(input: string): MongoFindCommand | null {
   return {
     collection: target.collection,
     filter,
+    ...(projection ? { projection } : {}),
     skip,
     limit,
     sort,
@@ -141,6 +154,11 @@ export function parseMongoUseCommand(input: string): MongoUseCommand | null {
   return {
     database: match[1],
   };
+}
+
+export function parseMongoVersionCommand(input: string): MongoVersionCommand | null {
+  const source = input.trim().replace(/;$/, "").trim();
+  return /^db\s*\.\s*version\s*\(\s*\)$/i.test(source) ? { kind: "version" } : null;
 }
 
 export function parseMongoWriteCommand(input: string): MongoWriteCommand | null {
@@ -269,6 +287,15 @@ export function mongoUseToQueryResult(database: string, executionTimeMs: number)
     columns: ["message"],
     rows: [[`switched to db ${database}`]],
     affected_rows: 0,
+    execution_time_ms: Math.max(0, Math.round(executionTimeMs)),
+  };
+}
+
+export function mongoVersionToQueryResult(version: string, executionTimeMs: number): QueryResult {
+  return {
+    columns: ["version"],
+    rows: [[version]],
+    affected_rows: 1,
     execution_time_ms: Math.max(0, Math.round(executionTimeMs)),
   };
 }

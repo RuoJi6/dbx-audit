@@ -878,6 +878,11 @@ function normalizeSql(sql: string): string {
  * cursor statement and the full document are effectively the same SQL — in
  * that case only a single candidate is returned to avoid duplicates.
  */
+export function executableStatementRanges(sql: string, databaseType?: DatabaseType): SqlTextRange[] {
+  if (databaseType === "redis") return redisExecutableCommandRanges(sql);
+  return splitSqlStatementRanges(sql, databaseType).flatMap((statement) => splitStatementRangeAtSoftStarts(sql, statement, databaseType).map((range) => rangeFor(range, sql)));
+}
+
 export function buildExecutionCandidates(sql: string, cursorPos: number, databaseType?: DatabaseType): SqlExecutionCandidate[] {
   const full = fullSqlRange(sql);
   const cursorStatement = databaseType === "redis" ? redisCommandRangeAtCursor(sql, cursorPos) : statementRangeAtCursor(sql, cursorPos, databaseType);
@@ -911,13 +916,33 @@ function candidateFromRange(range: SqlTextRange, kind: SqlExecutionCandidate["ki
 
 function redisExecutableCommandCount(sql: string): number {
   let count = 0;
-  for (const line of sql.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
+  for (const range of redisExecutableCommandRanges(sql)) {
+    if (!range.sql.trim()) continue;
     count += 1;
     if (count > 1) return count;
   }
   return count;
+}
+
+function redisExecutableCommandRanges(sql: string): SqlTextRange[] {
+  const ranges: SqlTextRange[] = [];
+  let lineStart = 0;
+  while (lineStart <= sql.length) {
+    let lineEnd = sql.indexOf("\n", lineStart);
+    if (lineEnd === -1) lineEnd = sql.length;
+    const rawLine = sql.slice(lineStart, lineEnd);
+    const leadingWhitespace = rawLine.length - rawLine.trimStart().length;
+    const trailingWhitespace = rawLine.length - rawLine.trimEnd().length;
+    const trimmedLine = rawLine.trim();
+    if (trimmedLine && !trimmedLine.startsWith("#")) {
+      const from = lineStart + leadingWhitespace;
+      const to = lineStart + rawLine.length - trailingWhitespace;
+      ranges.push({ from, to, sql: sql.slice(from, to) });
+    }
+    if (lineEnd >= sql.length) break;
+    lineStart = lineEnd + 1;
+  }
+  return ranges;
 }
 
 function redisCommandRangeAtCursor(sql: string, cursorPos: number): SqlTextRange | null {

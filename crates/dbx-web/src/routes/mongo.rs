@@ -73,7 +73,16 @@ pub struct MongoFindRequest {
     pub skip: Option<u64>,
     pub limit: Option<i64>,
     pub filter: Option<String>,
+    pub projection: Option<String>,
     pub sort: Option<String>,
+    pub execution_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MongoServerVersionRequest {
+    pub connection_id: String,
+    pub database: String,
     pub execution_id: Option<String>,
 }
 
@@ -213,6 +222,7 @@ pub async fn find_documents(
             req.skip.unwrap_or(0),
             req.limit.unwrap_or(50),
             req.filter.as_deref(),
+            req.projection.as_deref(),
             req.sort.as_deref(),
         ),
     )
@@ -235,8 +245,22 @@ pub async fn document_find_documents(
             req.skip.unwrap_or(0),
             req.limit.unwrap_or(50),
             req.filter.as_deref(),
+            req.projection.as_deref(),
             req.sort.as_deref(),
         ),
+    )
+    .await?;
+    Ok(Json(serde_json::to_value(result).map_err(|e| AppError(e.to_string()))?))
+}
+
+pub async fn server_version(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<MongoServerVersionRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let result = run_cancellable(
+        &state,
+        req.execution_id.clone(),
+        dbx_core::mongo_ops::mongo_server_version_core(&state.app, &req.connection_id, &req.database),
     )
     .await?;
     Ok(Json(serde_json::to_value(result).map_err(|e| AppError(e.to_string()))?))

@@ -626,8 +626,13 @@ export async function executeQuery(config: ConnectionConfig, sql: string, option
   if (config.db_type === "mongodb") {
     const find = parseMongoFindCommand(sql);
     if (find) {
-      const result = await withTimeout(mongoFindDocuments(config, find.collection, find.skip, find.limit, find.filter, find.sort), resolveTimeoutMs(options));
+      const result = await withTimeout(mongoFindDocuments(config, find.collection, find.skip, find.limit, find.filter, find.projection, find.sort), resolveTimeoutMs(options));
       return mongoDocumentsToQueryResult(result.documents.slice(0, resolveMaxRows(options)), result.total);
+    }
+    const version = parseMongoVersionCommand(sql);
+    if (version) {
+      const result = await withTimeout(mongoServerVersion(config), resolveTimeoutMs(options));
+      return { columns: ["version"], rows: [{ version: result }], row_count: 1 };
     }
     const count = parseMongoCountDocumentsCommand(sql);
     if (count) {
@@ -653,7 +658,7 @@ export async function executeQuery(config: ConnectionConfig, sql: string, option
       const affected = await withTimeout(executeMongoWrite(config, write), resolveTimeoutMs(options));
       return { columns: [], rows: [], row_count: affected };
     }
-    throw new Error("Use MongoDB shell-style commands, for example: db.projects.find({}).limit(100), db.projects.countDocuments({}), db.projects.getIndexes(), db.projects.insertOne({...}), db.projects.updateOne({...}, {$set: {...}}), or db.projects.deleteOne({...})");
+    throw new Error("Use MongoDB shell-style commands, for example: db.projects.find({}).limit(100), db.version(), db.projects.countDocuments({}), db.projects.getIndexes(), db.projects.insertOne({...}), db.projects.updateOne({...}, {$set: {...}}), or db.projects.deleteOne({...})");
   }
   if (isDirectQueryType(config.db_type)) {
     return query(config, sql, undefined, options);
@@ -848,7 +853,7 @@ export async function describeTable(config: ConnectionConfig, table: string, sch
   }));
 }
 
-async function mongoFindDocuments(config: ConnectionConfig, collection: string, skip: number, limit: number, filter: string, sort?: string): Promise<MongoDocumentResult> {
+async function mongoFindDocuments(config: ConnectionConfig, collection: string, skip: number, limit: number, filter: string, projection?: string, sort?: string): Promise<MongoDocumentResult> {
   return bridgeDataRequest<MongoDocumentResult>("/data/mongo/find-documents", {
     connection_name: config.name,
     database: config.database || "",
@@ -856,7 +861,15 @@ async function mongoFindDocuments(config: ConnectionConfig, collection: string, 
     skip,
     limit,
     filter,
+    projection,
     sort,
+  });
+}
+
+async function mongoServerVersion(config: ConnectionConfig): Promise<string> {
+  return bridgeDataRequest<string>("/data/mongo/server-version", {
+    connection_name: config.name,
+    database: config.database || "",
   });
 }
 
@@ -901,7 +914,7 @@ async function mongoAggregateDocuments(config: ConnectionConfig, collection: str
   });
 }
 
-export function mongoDocumentsToQueryResult(documents: unknown[], total: number): QueryResult {
+export function mongoDocumentsToQueryResult(documents: unknown[], _total: number): QueryResult {
   const columns: string[] = [];
   for (const doc of documents) {
     if (isRecord(doc)) {
@@ -951,6 +964,7 @@ export function inferMongoColumns(documents: unknown[]): ColumnInfo[] {
 interface MongoFindCommand {
   collection: string;
   filter: string;
+  projection?: string;
   skip: number;
   limit: number;
   sort?: string;
@@ -980,8 +994,15 @@ export function parseMongoFindCommand(input: string): MongoFindCommand | null {
   const findCloseIndex = findMatchingParen(source, findOpenIndex);
   if (findCloseIndex < 0) return null;
   const findArgs = splitTopLevel(source.slice(findOpenIndex + 1, findCloseIndex));
+  if (findArgs.length > 2 && findArgs.slice(2).some((arg) => arg.trim())) return null;
   const filter = normalizeJsonArgument(findArgs[0] || "{}");
   if (!filter) return null;
+  let projection: string | undefined;
+  if (findArgs[1]?.trim()) {
+    const parsedProjection = normalizeJsonArgument(findArgs[1]);
+    if (!parsedProjection) return null;
+    projection = parsedProjection;
+  }
   const chain = source.slice(findCloseIndex + 1).trim();
   if (chain && !chain.startsWith(".")) return null;
   const sortArg = readChainedCallArgument(chain, "sort");
@@ -994,7 +1015,12 @@ export function parseMongoFindCommand(input: string): MongoFindCommand | null {
   const skip = readChainedIntegerArgument(chain, "skip", 0);
   const limit = readChainedIntegerArgument(chain, "limit", MAX_ROWS);
   if (skip === null || limit === null) return null;
-  return { collection: target.collection, filter, skip, limit, sort };
+  return { collection: target.collection, filter, ...(projection ? { projection } : {}), skip, limit, sort };
+}
+
+export function parseMongoVersionCommand(input: string): boolean {
+  const source = input.trim().replace(/;$/, "").trim();
+  return /^db\s*\.\s*version\s*\(\s*\)$/i.test(source);
 }
 
 export function parseMongoCountDocumentsCommand(input: string): MongoCountDocumentsCommand | null {

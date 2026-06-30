@@ -14,6 +14,9 @@ pub const AGENT_PROTOCOL_VERSION: u32 = 1;
 const RPC_TIMEOUT_SECS: u64 = 30;
 const STARTUP_TIMEOUT_SECS: u64 = 15;
 const STDERR_TAIL_LINES: usize = 20;
+const AGENT_EXIT_DIAGNOSTIC_WAIT_MS: u64 = 200;
+const AGENT_JAVA_TOO_OLD_MESSAGE: &str =
+    "Agent requires Java 21, but DBX started it with an older Java runtime. Use DBX managed JRE 21 or select a Java 21 executable in Driver Manager.";
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -240,16 +243,18 @@ pub enum MongoAgentMethod {
     ListDatabases,
     ListCollections,
     FindDocuments,
+    ServerVersion,
     InsertDocument,
     UpdateDocument,
     DeleteDocument,
 }
 
 impl MongoAgentMethod {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::ListDatabases,
         Self::ListCollections,
         Self::FindDocuments,
+        Self::ServerVersion,
         Self::InsertDocument,
         Self::UpdateDocument,
         Self::DeleteDocument,
@@ -260,6 +265,7 @@ impl MongoAgentMethod {
             Self::ListDatabases => "list_databases",
             Self::ListCollections => "list_collections",
             Self::FindDocuments => "find_documents",
+            Self::ServerVersion => "server_version",
             Self::InsertDocument => "insert_document",
             Self::UpdateDocument => "update_document",
             Self::DeleteDocument => "delete_document",
@@ -378,24 +384,20 @@ impl AgentDriverClient {
         let ready_stdout = match startup_result {
             Ok(Ok(Ok(stdout))) => stdout,
             Ok(Ok(Err(e))) => {
-                return Err(format_agent_process_error(
-                    &e,
-                    child_exit_status(&mut child),
-                    &stderr_tail_snapshot(&stderr_tail),
-                ));
+                return Err(format_agent_startup_error(&e, &mut child, &stderr_tail));
             }
             Ok(Err(e)) => {
-                return Err(format_agent_process_error(
+                return Err(format_agent_startup_error(
                     &format!("Agent startup task failed: {e}"),
-                    child_exit_status(&mut child),
-                    &stderr_tail_snapshot(&stderr_tail),
+                    &mut child,
+                    &stderr_tail,
                 ));
             }
             Err(_) => {
-                return Err(format_agent_process_error(
+                return Err(format_agent_startup_error(
                     &format!("Agent startup timed out ({STARTUP_TIMEOUT_SECS}s)"),
-                    child_exit_status(&mut child),
-                    &stderr_tail_snapshot(&stderr_tail),
+                    &mut child,
+                    &stderr_tail,
                 ));
             }
         };
@@ -922,6 +924,13 @@ impl AgentDriverClient {
         self.call_mongo_method(MongoAgentMethod::FindDocuments, params).await
     }
 
+    pub async fn mongo_server_version<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        database: &str,
+    ) -> Result<T, String> {
+        self.call_mongo_method(MongoAgentMethod::ServerVersion, mongo_database_params(database)).await
+    }
+
     pub async fn mongo_insert_document<T: DeserializeOwned + Send + 'static>(
         &mut self,
         params: Value,
@@ -1105,9 +1114,7 @@ fn agent_java_args(jar_path: &str) -> Vec<String> {
         args.push("-Djava.net.preferIPv4Stack=true".to_string());
     }
 
-    if !agent_jar_path_matches_key(jar_path, "oracle-10g") {
-        args.push("--add-opens=java.sql/java.sql=ALL-UNNAMED".to_string());
-    }
+    args.push("--add-opens=java.sql/java.sql=ALL-UNNAMED".to_string());
 
     args.extend(["-XX:TieredStopAtLevel=1", "-XX:+UseSerialGC", "-jar", jar_path].into_iter().map(str::to_string));
 
@@ -1191,6 +1198,15 @@ fn child_exit_status(child: &mut Child) -> Option<String> {
     }
 }
 
+fn child_exit_status_after_short_wait(child: &mut Child) -> Option<String> {
+    let status = child_exit_status(child);
+    if status.is_some() {
+        return status;
+    }
+    std::thread::sleep(Duration::from_millis(AGENT_EXIT_DIAGNOSTIC_WAIT_MS));
+    child_exit_status(child)
+}
+
 fn stderr_tail_snapshot(stderr_tail: &Arc<Mutex<StderrTail>>) -> StderrTail {
     let snapshot = stderr_tail.lock().map(|tail| tail.snapshot()).unwrap_or_default();
     let mut tail = StderrTail::with_capacity(STDERR_TAIL_LINES);
@@ -1201,20 +1217,44 @@ fn stderr_tail_snapshot(stderr_tail: &Arc<Mutex<StderrTail>>) -> StderrTail {
 }
 
 fn format_agent_process_error(base: &str, exit_status: Option<String>, stderr_tail: &StderrTail) -> String {
-    let mut parts = vec![base.to_string()];
+    let stderr = stderr_tail.snapshot();
+    let mut parts = Vec::new();
+    if let Some(hint) = agent_process_error_hint(&stderr) {
+        parts.push(hint.to_string());
+        parts.push(format!("details: {base}"));
+    } else {
+        parts.push(base.to_string());
+    }
     if let Some(status) = exit_status {
         parts.push(format!("agent process exited with {status}"));
     }
-    let stderr = stderr_tail.snapshot();
     if !stderr.is_empty() {
         parts.push(format!("recent stderr:\n{stderr}"));
     }
     parts.join(". ")
 }
 
+fn agent_process_error_hint(stderr: &str) -> Option<&'static str> {
+    let lower = stderr.to_ascii_lowercase();
+    if lower.contains("unsupportedclassversionerror")
+        && (lower.contains("class file version 65.0") || lower.contains("only recognizes class file versions up to"))
+    {
+        return Some(AGENT_JAVA_TOO_OLD_MESSAGE);
+    }
+    None
+}
+
+fn format_agent_startup_error(base: &str, child: &mut Child, stderr_tail: &Arc<Mutex<StderrTail>>) -> String {
+    format_agent_process_error(base, child_exit_status_after_short_wait(child), &stderr_tail_snapshot(stderr_tail))
+}
+
 impl AgentDriverClient {
     fn format_agent_process_error(&mut self, base: &str) -> String {
-        format_agent_process_error(base, child_exit_status(&mut self.child), &stderr_tail_snapshot(&self.stderr_tail))
+        format_agent_process_error(
+            base,
+            child_exit_status_after_short_wait(&mut self.child),
+            &stderr_tail_snapshot(&self.stderr_tail),
+        )
     }
 }
 
@@ -1229,12 +1269,15 @@ mod tests {
     use super::{
         agent_close_query_session_params, agent_handshake_params, agent_java_args, agent_object_source_params,
         agent_proxy_env_vars, agent_schema_params, agent_schema_table_params, agent_supports_capability,
-        agent_transaction_params, format_agent_process_error, is_unsupported_handshake_error, mongo_collection_params,
-        mongo_database_params, mongo_document_id_params, read_agent_line, AgentCapability, AgentDriverClient,
-        AgentHandshake, AgentKvMethod, AgentMethod, AgentTableReadCloseParams, AgentTableReadPageParams,
-        AgentTableReadStartParams, MongoAgentMethod, StderrTail, AGENT_PROTOCOL_VERSION,
+        agent_transaction_params, format_agent_process_error, format_agent_startup_error,
+        is_unsupported_handshake_error, mongo_collection_params, mongo_database_params, mongo_document_id_params,
+        read_agent_line, start_stderr_collector, AgentCapability, AgentDriverClient, AgentHandshake, AgentKvMethod,
+        AgentMethod, AgentTableReadCloseParams, AgentTableReadPageParams, AgentTableReadStartParams, MongoAgentMethod,
+        StderrTail, AGENT_PROTOCOL_VERSION,
     };
     use std::io::Cursor;
+    use std::process::{Command, Stdio};
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn agent_java_args_include_oracle_network_compatibility_flags() {
@@ -1249,13 +1292,6 @@ mod tests {
         let args = agent_java_args("/tmp/dbx-agent-dameng.jar");
 
         assert!(args.iter().any(|arg| arg == "--add-opens=java.sql/java.sql=ALL-UNNAMED"));
-    }
-
-    #[test]
-    fn agent_java_args_skip_module_flags_for_oracle_10g_profile() {
-        let args = agent_java_args("/tmp/dbx/drivers/oracle-10g/agent.jar");
-
-        assert!(!args.iter().any(|arg| arg == "--add-opens=java.sql/java.sql=ALL-UNNAMED"));
     }
 
     #[test]
@@ -1327,6 +1363,30 @@ mod tests {
         assert!(message.contains("recent stderr:"));
         assert!(message.contains("NoClassDefFoundError"));
         assert!(message.contains("HiveAgent.connect"));
+    }
+
+    #[test]
+    fn startup_error_waits_briefly_for_exit_status_and_stderr_tail() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 0.05; echo 'java.lang.UnsupportedClassVersionError: class file version 65.0' >&2; exit 1")
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("child should start");
+        let stderr_tail = Arc::new(Mutex::new(StderrTail::default()));
+        start_stderr_collector(child.stderr.take().expect("stderr should be piped"), Arc::clone(&stderr_tail));
+
+        let message = format_agent_startup_error(
+            "Failed to read startup line from agent: end of stream",
+            &mut child,
+            &stderr_tail,
+        );
+
+        assert!(message.contains("Failed to read startup line from agent: end of stream"));
+        assert!(message.contains("agent process exited with exit status: 1"));
+        assert!(message.contains("Agent requires Java 21"));
+        assert!(message.contains("details: Failed to read startup line from agent: end of stream"));
+        assert!(message.contains("UnsupportedClassVersionError"));
     }
 
     #[test]
@@ -1411,6 +1471,7 @@ mod tests {
         assert_eq!(MongoAgentMethod::ListDatabases.as_str(), "list_databases");
         assert_eq!(MongoAgentMethod::ListCollections.as_str(), "list_collections");
         assert_eq!(MongoAgentMethod::FindDocuments.as_str(), "find_documents");
+        assert_eq!(MongoAgentMethod::ServerVersion.as_str(), "server_version");
         assert_eq!(MongoAgentMethod::InsertDocument.as_str(), "insert_document");
         assert_eq!(MongoAgentMethod::UpdateDocument.as_str(), "update_document");
         assert_eq!(MongoAgentMethod::DeleteDocument.as_str(), "delete_document");
@@ -1450,6 +1511,7 @@ mod tests {
         let _mongo_list_databases = AgentDriverClient::mongo_list_databases::<serde_json::Value>;
         let _mongo_list_collections = AgentDriverClient::mongo_list_collections::<serde_json::Value>;
         let _mongo_find_documents = AgentDriverClient::mongo_find_documents::<serde_json::Value>;
+        let _mongo_server_version = AgentDriverClient::mongo_server_version::<serde_json::Value>;
         let _mongo_insert_document = AgentDriverClient::mongo_insert_document::<serde_json::Value>;
         let _mongo_update_document = AgentDriverClient::mongo_update_document::<serde_json::Value>;
         let _mongo_delete_document = AgentDriverClient::mongo_delete_document::<serde_json::Value>;

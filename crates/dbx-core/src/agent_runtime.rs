@@ -127,13 +127,6 @@ pub async fn call_daemon_method_with_timeout<T: DeserializeOwned + Send + 'stati
 
 fn runtime_agent_key_candidates(db_type: &DatabaseType, driver_profile: Option<&str>) -> Option<Vec<&'static str>> {
     let primary = db_type_to_agent_key(db_type, driver_profile)?;
-    if *db_type == DatabaseType::Oracle {
-        return match driver_profile {
-            Some("oracle-legacy") => Some(vec![primary, "oracle-legacy"]),
-            Some("oracle-10g") => Some(vec![primary, "oracle-10g"]),
-            _ => Some(vec![primary]),
-        };
-    }
     Some(vec![primary])
 }
 

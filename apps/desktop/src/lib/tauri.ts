@@ -35,7 +35,17 @@ import type { CollectionInfo } from "@/types/database";
 import type { SidebarObjectKind } from "@/lib/databaseObjectCapabilities";
 import type { AiConfig, AiTestConnectionResult } from "@/stores/settingsStore";
 import type { QueryEditability } from "@/lib/sqlAnalysis";
-import type { DataGridColumnValueFilterConditionOptions, DataGridContextFilterConditionOptions, DataGridCountSqlOptions, DataGridCopyInsertStatementOptions, DataGridCopyUpdateStatementOptions, DataGridSaveStatementOptions, HiveTablePropertiesSqlOptions } from "@/lib/dataGridSql";
+import type {
+  DataGridColumnDistinctValuesSqlOptions,
+  DataGridColumnValueFilterConditionOptions,
+  DataGridColumnValuesFilterConditionOptions,
+  DataGridContextFilterConditionOptions,
+  DataGridCountSqlOptions,
+  DataGridCopyInsertStatementOptions,
+  DataGridCopyUpdateStatementOptions,
+  DataGridSaveStatementOptions,
+  HiveTablePropertiesSqlOptions,
+} from "@/lib/dataGridSql";
 import type { DataCompareFromTablesOptions, DataCompareFromTablesPreparation, DataCompareSyncPlan, DataCompareSyncPlanOptions, DataComparePreparation, DataComparePreparationOptions } from "@/lib/dataCompare";
 import type { SchemaDiffPreparation, SchemaDiffPreparationOptions, TableDiff, FunctionDiff, SequenceDiff, RuleDiff, OwnerDiff } from "@/lib/schemaDiff";
 import type { BuildTableStructureChangeSqlOptions, BuildSingleColumnAlterSqlOptions, TableStructureChangeSql } from "@/lib/tableStructureEditorSql";
@@ -982,6 +992,15 @@ export async function buildDataGridColumnValueFilterCondition(options: DataGridC
   return result ?? undefined;
 }
 
+export async function buildDataGridColumnValuesFilterCondition(options: DataGridColumnValuesFilterConditionOptions): Promise<string | undefined> {
+  const result = await invoke<string | null>("build_data_grid_column_values_filter_condition", { options });
+  return result ?? undefined;
+}
+
+export async function buildDataGridColumnDistinctValuesSql(options: DataGridColumnDistinctValuesSqlOptions): Promise<string> {
+  return invoke("build_data_grid_column_distinct_values_sql", { options });
+}
+
 export async function buildDataGridCountSql(options: DataGridCountSqlOptions): Promise<string> {
   return invoke("build_data_grid_count_sql", { options });
 }
@@ -1630,12 +1649,16 @@ export async function vectorListCollections(connectionId: string): Promise<Colle
   return mongoListCollections(connectionId, "default");
 }
 
-export async function mongoFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, sort?: string, executionId?: string): Promise<MongoDocumentResult> {
-  return invoke("mongo_find_documents", { connectionId, database, collection, skip, limit, filter, sort, executionId });
+export async function mongoFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, projection?: string, sort?: string, executionId?: string): Promise<MongoDocumentResult> {
+  return invoke("mongo_find_documents", { connectionId, database, collection, skip, limit, filter, projection, sort, executionId });
 }
 
-export async function documentFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, sort?: string, executionId?: string): Promise<MongoDocumentResult> {
-  return invoke("document_find_documents", { connectionId, database, collection, skip, limit, filter, sort, executionId });
+export async function documentFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, projection?: string, sort?: string, executionId?: string): Promise<MongoDocumentResult> {
+  return invoke("document_find_documents", { connectionId, database, collection, skip, limit, filter, projection, sort, executionId });
+}
+
+export async function mongoServerVersion(connectionId: string, database: string, executionId?: string): Promise<string> {
+  return invoke("mongo_server_version", { connectionId, database, executionId });
 }
 
 export async function mongoAggregateDocuments(connectionId: string, database: string, collection: string, pipelineJson: string, maxRows?: number, executionId?: string): Promise<MongoDocumentResult> {

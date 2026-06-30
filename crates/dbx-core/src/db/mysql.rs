@@ -23,6 +23,7 @@ use crate::types::{
 use super::file_validator::validate_file_path;
 
 pub type MySqlPool = mysql_async::Pool;
+const MYSQL_TCP_KEEPALIVE_MS: u32 = 30_000;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MySqlQueryDialect {
@@ -456,7 +457,7 @@ fn create_pool(
         .stmt_cache_size(0)
         .prefer_socket(false)
         .pool_opts(Some(pool_opts))
-        .tcp_keepalive(Some(30u32))
+        .tcp_keepalive(Some(MYSQL_TCP_KEEPALIVE_MS))
         .setup(mysql_setup_queries(url));
     if let Some(ssl_opts) = mysql_ssl_opts(base_ssl_opts, url, ca_cert_path, &tls_url.files)? {
         builder = builder.ssl_opts(ssl_opts);
@@ -1153,7 +1154,10 @@ fn filter_list_tables_fallback(
 
     tables
         .into_iter()
-        .filter(|table| crate::sql::contains_or_fuzzy_match(&table.name, filter))
+        .filter(|table| {
+            crate::sql::contains_or_fuzzy_match(&table.name, filter)
+                || table.comment.as_deref().is_some_and(|comment| crate::sql::contains_or_fuzzy_match(comment, filter))
+        })
         .filter(|table| if table.table_type.eq_ignore_ascii_case("VIEW") { wants_view } else { wants_table })
         .skip(offset.unwrap_or(0))
         .take(limit.unwrap_or(usize::MAX))
@@ -1195,12 +1199,18 @@ fn list_tables_sql(
                 value.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
             });
             sql.push_str(&format!(
-                " AND (LOWER(TABLE_NAME) LIKE {} ESCAPE '\\\\' OR LOWER(TABLE_NAME) LIKE {} ESCAPE '\\\\')",
+                " AND (LOWER(TABLE_NAME) LIKE {} ESCAPE '\\\\' OR LOWER(TABLE_COMMENT) LIKE {} ESCAPE '\\\\' OR LOWER(TABLE_NAME) LIKE {} ESCAPE '\\\\' OR LOWER(TABLE_COMMENT) LIKE {} ESCAPE '\\\\')",
                 quote_value(&pattern),
+                quote_value(&pattern),
+                quote_value(&fuzzy_pattern),
                 quote_value(&fuzzy_pattern)
             ));
         } else {
-            sql.push_str(&format!(" AND LOWER(TABLE_NAME) LIKE {} ESCAPE '\\\\'", quote_value(&pattern)));
+            sql.push_str(&format!(
+                " AND (LOWER(TABLE_NAME) LIKE {} ESCAPE '\\\\' OR LOWER(TABLE_COMMENT) LIKE {} ESCAPE '\\\\')",
+                quote_value(&pattern),
+                quote_value(&pattern)
+            ));
         }
     }
     sql.push_str(" ORDER BY TABLE_NAME");
@@ -3050,7 +3060,9 @@ mod tests {
         assert!(sql.contains("FROM information_schema.TABLES"));
         assert!(sql.contains("TABLE_SCHEMA = 'app'"));
         assert!(sql.contains("LOWER(TABLE_NAME) LIKE '%user\\\\_\\\\%%' ESCAPE '\\\\'"));
+        assert!(sql.contains("LOWER(TABLE_COMMENT) LIKE '%user\\\\_\\\\%%' ESCAPE '\\\\'"));
         assert!(sql.contains("LOWER(TABLE_NAME) LIKE '%u%s%e%r%\\\\_%\\\\%%' ESCAPE '\\\\'"));
+        assert!(sql.contains("LOWER(TABLE_COMMENT) LIKE '%u%s%e%r%\\\\_%\\\\%%' ESCAPE '\\\\'"));
         assert!(sql.contains("ORDER BY TABLE_NAME"));
         assert!(sql.contains("LIMIT 101"));
         assert!(sql.contains("OFFSET 200"));
@@ -3061,7 +3073,9 @@ mod tests {
         let sql = list_tables_sql("app", Some("sysu"), Some(100), None, None);
 
         assert!(sql.contains("LOWER(TABLE_NAME) LIKE '%sysu%' ESCAPE '\\\\'"));
+        assert!(sql.contains("LOWER(TABLE_COMMENT) LIKE '%sysu%' ESCAPE '\\\\'"));
         assert!(sql.contains("LOWER(TABLE_NAME) LIKE '%s%y%s%u%' ESCAPE '\\\\'"));
+        assert!(sql.contains("LOWER(TABLE_COMMENT) LIKE '%s%y%s%u%' ESCAPE '\\\\'"));
     }
 
     #[test]
@@ -3069,7 +3083,9 @@ mod tests {
         let sql = list_tables_sql("app", Some("u"), Some(100), None, None);
 
         assert!(sql.contains("LOWER(TABLE_NAME) LIKE '%u%' ESCAPE '\\\\'"));
+        assert!(sql.contains("LOWER(TABLE_COMMENT) LIKE '%u%' ESCAPE '\\\\'"));
         assert_eq!(sql.matches("LOWER(TABLE_NAME) LIKE").count(), 1);
+        assert_eq!(sql.matches("LOWER(TABLE_COMMENT) LIKE").count(), 1);
         assert!(!sql.contains(" OR LOWER(TABLE_NAME) LIKE"));
     }
 
@@ -3115,7 +3131,7 @@ mod tests {
             TableInfo {
                 name: "audit_2025".to_string(),
                 table_type: "BASE TABLE".to_string(),
-                comment: None,
+                comment: Some("purchase order history".to_string()),
                 parent_schema: None,
                 parent_name: None,
             },
@@ -3123,6 +3139,17 @@ mod tests {
         let filtered = filter_list_tables_fallback(rows, Some("audit"), Some(1), Some(1), Some(&["TABLE".to_string()]));
 
         assert_eq!(filtered.iter().map(|table| table.name.as_str()).collect::<Vec<_>>(), vec!["audit_2025"]);
+
+        let rows = vec![TableInfo {
+            name: "t_0001".to_string(),
+            table_type: "BASE TABLE".to_string(),
+            comment: Some("food orders".to_string()),
+            parent_schema: None,
+            parent_name: None,
+        }];
+        let filtered = filter_list_tables_fallback(rows, Some("ood"), None, None, Some(&["TABLE".to_string()]));
+
+        assert_eq!(filtered.iter().map(|table| table.name.as_str()).collect::<Vec<_>>(), vec!["t_0001"]);
     }
 
     #[test]
@@ -3417,6 +3444,12 @@ UNIQUE KEY(`tenant_id`, `name``part`)
             server closed session with no notification";
 
         assert!(mysql_error_should_retry_without_ssl(error));
+    }
+
+    #[test]
+    fn mysql_tcp_keepalive_uses_milliseconds_not_seconds() {
+        assert_eq!(MYSQL_TCP_KEEPALIVE_MS, 30_000);
+        assert!(MYSQL_TCP_KEEPALIVE_MS >= 1_000);
     }
 
     #[test]

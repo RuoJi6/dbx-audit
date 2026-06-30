@@ -109,6 +109,39 @@ class MongoAgentTest {
     }
 
     @Test
+    void parsesOptionalDocumentParameters() {
+        JsonObject params = new JsonObject();
+        params.addProperty("projection", "{\"title\":1,\"_id\":0}");
+        params.addProperty("filter", "");
+
+        Document projection = MongoAgent.documentOrNull(params, "projection");
+
+        assertNotNull(projection);
+        assertEquals(1, projection.get("title"));
+        assertEquals(0, projection.get("_id"));
+        assertEquals(null, MongoAgent.documentOrNull(params, "filter"));
+        assertEquals(null, MongoAgent.documentOrNull(params, "sort"));
+    }
+
+    @Test
+    void serverVersionMethodIsRecognizedOverJsonRpc() {
+        String response = MongoAgent.handleRequest(
+            "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"server_version\","
+                + "\"params\":{\"database\":\"admin\"}}");
+
+        JsonObject json = JsonParser.parseString(response).getAsJsonObject();
+        assertEquals(9, json.get("id").getAsInt());
+        assertEquals("Not connected", json.getAsJsonObject("error").get("message").getAsString());
+        assertFalse(json.getAsJsonObject("error").get("message").getAsString().contains("Unknown method"));
+    }
+
+    @Test
+    void extractsServerVersionFromBuildInfo() {
+        assertEquals("4.4.29", MongoAgent.serverVersionFromBuildInfo(new Document("version", "4.4.29")));
+        assertThrows(IllegalStateException.class, () -> MongoAgent.serverVersionFromBuildInfo(new Document("ok", 1)));
+    }
+
+    @Test
     void convertsMongoIndexDocumentToIndexInfo() {
         Document index = new Document("name", "idx_user_status")
             .append("key", new Document("user_id", 1).append("status", -1))

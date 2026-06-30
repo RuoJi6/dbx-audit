@@ -49,7 +49,7 @@ class DamengAgentMetadataTest {
         String allTablesSql = String.join("\n", JdbcMetadataSqlFake.statements);
         Assertions.assertTrue(tablesSql.contains("COMMENTS"), tablesSql);
         Assertions.assertTrue(allTablesSql.contains("ALL_OBJECTS"), allTablesSql);
-        Assertions.assertTrue(allTablesSql.contains("MATERIALIZED_VIEW"), allTablesSql);
+        Assertions.assertTrue(allTablesSql.contains("USER_MVIEWS"), allTablesSql);
         Assertions.assertFalse(allTablesSql.contains("ALL_MVIEWS"), allTablesSql);
         Assertions.assertFalse(tablesSql.contains("ALL_TABLES"), tablesSql);
         Assertions.assertFalse(tablesSql.contains("ALL_VIEWS"), tablesSql);
@@ -229,11 +229,9 @@ class DamengAgentMetadataTest {
                             : List.of()
                     );
                 }
-                if (sql.contains("ALL_OBJECTS") && sql.contains("MATERIALIZED VIEW")) {
+                if (sql.contains("USER_MVIEWS") && sql.contains("ALL_OBJECTS")) {
                     return metadataStatement(
-                        includeMaterializedView
-                            ? List.of(Arrays.asList("USER_SUMMARY_MV", "mv comment"))
-                            : List.of()
+                        includeMaterializedView ? List.of(Arrays.asList("USER_SUMMARY_MV", "mv comment")) : List.of()
                     );
                 }
                 if (sql.contains("ALL_OBJECTS")) {
