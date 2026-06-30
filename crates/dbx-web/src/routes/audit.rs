@@ -1168,6 +1168,7 @@ async fn scan_document_target(
         request.limit.max(1) as i64,
         None,
         None,
+        None,
     )
     .await
     {

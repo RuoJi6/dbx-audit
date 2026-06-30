@@ -19,7 +19,7 @@ import { createConcurrencyLimiter, mapWithConcurrency, schemaDiffMetadataConcurr
 import { normalizeSchemaDiffCompareOptions } from "@/types/schemaDiff";
 import type { SchemaDiffCompareOptions, SchemaDiffConfig } from "@/types/schemaDiff";
 import type { ObjectSourceKind, TableInfo } from "@/types/database";
-import { buildDeploySqlForObjects, convertToSchemaDiffObjects, groupDiffObjects, type OperationGroup, type SchemaDiffObject, type DiffOperationType, type DiffObjectKind, type SchemaDiffPreparation, type TableSchemaDetail } from "@/lib/schemaDiff";
+import { buildDeploySqlForObjects, convertToSchemaDiffObjects, groupDiffObjects, schemaDiffDeployTargetSchema, type OperationGroup, type SchemaDiffObject, type DiffOperationType, type DiffObjectKind, type SchemaDiffPreparation, type TableSchemaDetail } from "@/lib/schemaDiff";
 import { compileSchemaDiffTableFilter, filterSchemaDiffTables } from "@/lib/schemaDiffTableFilter";
 import { Splitpanes, Pane } from "splitpanes";
 import "splitpanes/dist/splitpanes.css";
@@ -390,7 +390,7 @@ async function handleCompare() {
       sourceOwners: srcOwners,
       targetOwners: tgtOwners,
       databaseType: dbType,
-      targetSchema: targetSchema.value,
+      targetSchema: schemaDiffDeployTargetSchema(dbType, targetDatabase.value, targetSchema.value),
       ignoreComments: ignoreComments.value,
       cascadeDelete: opts?.cascadeDelete ?? false,
       compareColumnOrder: opts.compareColumnOrder,

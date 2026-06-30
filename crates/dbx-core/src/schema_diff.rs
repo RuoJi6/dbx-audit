@@ -957,6 +957,8 @@ fn column_def(col: &ColumnInfo, db_type: DatabaseType) -> String {
 
 fn qualified_name(name: &str, db_type: DatabaseType, schema: Option<&str>) -> String {
     schema
+        .map(str::trim)
+        .filter(|schema| !schema.is_empty())
         .map(|schema| format!("{}.{}", quote_id(schema, db_type), quote_id(name, db_type)))
         .unwrap_or_else(|| quote_id(name, db_type))
 }
@@ -1658,6 +1660,69 @@ mod tests {
             ]
             .join("\n")
         );
+    }
+
+    #[test]
+    fn mysql_schema_sync_sql_qualifies_tables_with_target_database() {
+        let diffs = vec![TableDiff {
+            diff_type: "modified".to_string(),
+            object_type: None,
+            name: "notify_channel_config".to_string(),
+            columns: Some(vec![ColumnDiff {
+                diff_type: "modified".to_string(),
+                name: "config_json".to_string(),
+                source: Some(column("config_json", "json", Some("渠道配置"))),
+                target: Some(column("config_json", "json", Some("Config"))),
+                changes: vec!["comment: Config → 渠道配置".to_string()],
+            }]),
+            indexes: None,
+            foreign_keys: None,
+            triggers: None,
+            ddl: None,
+            target_ddl: None,
+            source_table_comment: None,
+            target_table_comment: None,
+            sync_sql: None,
+        }];
+
+        assert_eq!(
+            generate_schema_sync_sql(&diffs, &[], &[], &[], &[], DatabaseType::Mysql, Some("target_db"), false),
+            [
+                "-- Alter table: notify_channel_config",
+                "ALTER TABLE `target_db`.`notify_channel_config`",
+                "  MODIFY COLUMN `config_json` json NOT NULL COMMENT '渠道配置';",
+            ]
+            .join("\n")
+        );
+    }
+
+    #[test]
+    fn blank_target_schema_does_not_generate_empty_qualifier() {
+        let diffs = vec![TableDiff {
+            diff_type: "modified".to_string(),
+            object_type: None,
+            name: "notify_channel_config".to_string(),
+            columns: Some(vec![ColumnDiff {
+                diff_type: "modified".to_string(),
+                name: "config_json".to_string(),
+                source: Some(column("config_json", "json", Some("渠道配置"))),
+                target: Some(column("config_json", "json", Some("Config"))),
+                changes: vec!["comment: Config → 渠道配置".to_string()],
+            }]),
+            indexes: None,
+            foreign_keys: None,
+            triggers: None,
+            ddl: None,
+            target_ddl: None,
+            source_table_comment: None,
+            target_table_comment: None,
+            sync_sql: None,
+        }];
+
+        let sql = generate_schema_sync_sql(&diffs, &[], &[], &[], &[], DatabaseType::Mysql, Some("  "), false);
+
+        assert!(sql.contains("ALTER TABLE `notify_channel_config`"));
+        assert!(!sql.contains("``."));
     }
 
     #[test]

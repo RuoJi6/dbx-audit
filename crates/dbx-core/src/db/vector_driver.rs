@@ -152,9 +152,17 @@ pub async fn test_connection(client: &VectorClient, timeout: Duration) -> Result
 }
 
 pub async fn list_collections(client: &VectorClient) -> Result<Vec<CollectionInfo>, String> {
+    list_collections_with_db(client, "").await
+}
+
+/// List collections, passing an optional database name (used by Milvus).
+pub(crate) async fn list_collections_with_db(
+    client: &VectorClient,
+    database: &str,
+) -> Result<Vec<CollectionInfo>, String> {
     match client.kind {
         VectorDbKind::Qdrant => list_qdrant_collections(client).await,
-        VectorDbKind::Milvus => list_milvus_collections(client).await,
+        VectorDbKind::Milvus => list_milvus_collections(client, database).await,
         VectorDbKind::Weaviate => list_weaviate_collections(client).await,
         VectorDbKind::ChromaDb => list_chroma_collections(client).await,
     }
@@ -176,9 +184,10 @@ async fn list_qdrant_collections(client: &VectorClient) -> Result<Vec<Collection
     Ok(infos)
 }
 
-async fn list_milvus_collections(client: &VectorClient) -> Result<Vec<CollectionInfo>, String> {
+async fn list_milvus_collections(client: &VectorClient, database: &str) -> Result<Vec<CollectionInfo>, String> {
+    let db_name = if database.is_empty() { "default" } else { database };
     let body = send_json(
-        client.post("/v2/vectordb/collections/list").json(&serde_json::json!({ "dbName": "default" })),
+        client.post("/v2/vectordb/collections/list").json(&serde_json::json!({ "dbName": db_name })),
         "Milvus",
     )
     .await?;
@@ -424,11 +433,11 @@ fn starts_with_http_method(input: &str) -> bool {
     ["GET ", "POST ", "PUT ", "DELETE "].iter().any(|prefix| input.to_ascii_uppercase().starts_with(prefix))
 }
 
-fn path_segment(value: &str) -> String {
+pub(crate) fn path_segment(value: &str) -> String {
     utf8_percent_encode(value, PATH_SEGMENT_ENCODE_SET).to_string()
 }
 
-fn query_value(value: &str) -> String {
+pub(crate) fn query_value(value: &str) -> String {
     utf8_percent_encode(value, QUERY_VALUE_ENCODE_SET).to_string()
 }
 

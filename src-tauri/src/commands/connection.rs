@@ -4,8 +4,7 @@ use tauri::State;
 
 pub use dbx_core::agent_connection::{
     agent_connect_params, mongo_legacy_error_with_auth_hint, mongo_uses_legacy_driver, oracle_alternate_connect_config,
-    oracle_auth_fallback_profiles, oracle_error_with_driver_hint, should_retry_mongo_with_legacy_driver,
-    should_retry_oracle_with_10g_driver,
+    oracle_error_with_driver_hint, should_retry_mongo_with_legacy_driver,
 };
 pub use dbx_core::connection::{
     agent_connect_timeout, connect_bare_metadata_pool, connect_mysql_metadata_pool, connection_url_for_endpoint,
@@ -67,7 +66,7 @@ async fn test_agent_connection(
             &config.db_type,
             config.driver_profile.as_deref(),
             AgentMethod::TestConnection,
-            connect_params.clone(),
+            connect_params,
             Some(agent_connect_timeout(config)),
         )
         .await;
@@ -92,34 +91,6 @@ async fn test_agent_connection(
                 .map_err(|alternate_err| {
                     format!("{err}\n\nFallback with alternate Oracle descriptor failed: {alternate_err}")
                 })?;
-        } else if should_retry_oracle_with_10g_driver(config, &err) {
-            let mut fallback_errors = Vec::new();
-            let mut connected = false;
-            for profile in oracle_auth_fallback_profiles(config, &err) {
-                match state
-                    .agent_manager
-                    .call_daemon_method_with_timeout::<serde_json::Value>(
-                        &config.db_type,
-                        Some(profile),
-                        AgentMethod::TestConnection,
-                        connect_params.clone(),
-                        Some(agent_connect_timeout(config)),
-                    )
-                    .await
-                {
-                    Ok(_) => {
-                        connected = true;
-                        break;
-                    }
-                    Err(fallback_err) => fallback_errors.push(format!("{profile}: {fallback_err}")),
-                }
-            }
-            if !connected {
-                return Err(format!(
-                    "{err}\n\nFallback with legacy Oracle drivers failed: {}",
-                    fallback_errors.join("\n")
-                ));
-            }
         } else {
             return Err(oracle_error_with_driver_hint(config, &err));
         }
@@ -139,7 +110,7 @@ async fn connect_agent_pool(
     let connect_result = client
         .call_method_with_timeout::<serde_json::Value>(
             AgentMethod::Connect,
-            connect_params.clone(),
+            connect_params,
             Some(agent_connect_timeout(config)),
         )
         .await;
@@ -161,33 +132,6 @@ async fn connect_agent_pool(
                 .map_err(|alternate_err| {
                     format!("{err}\n\nFallback with alternate Oracle descriptor failed: {alternate_err}")
                 })?;
-        } else if should_retry_oracle_with_10g_driver(config, &err) {
-            let mut fallback_errors = Vec::new();
-            let mut connected_client = None;
-            for profile in oracle_auth_fallback_profiles(config, &err) {
-                match state.agent_manager.spawn(&config.db_type, Some(profile)).await {
-                    Ok(mut fallback_client) => {
-                        match fallback_client
-                            .call_method_with_timeout::<serde_json::Value>(
-                                AgentMethod::Connect,
-                                connect_params.clone(),
-                                Some(agent_connect_timeout(config)),
-                            )
-                            .await
-                        {
-                            Ok(_) => {
-                                connected_client = Some(fallback_client);
-                                break;
-                            }
-                            Err(fallback_err) => fallback_errors.push(format!("{profile}: {fallback_err}")),
-                        }
-                    }
-                    Err(fallback_err) => fallback_errors.push(format!("{profile}: {fallback_err}")),
-                }
-            }
-            client = connected_client.ok_or_else(|| {
-                format!("{err}\n\nFallback with legacy Oracle drivers failed: {}", fallback_errors.join("\n"))
-            })?;
         } else {
             return Err(oracle_error_with_driver_hint(config, &err));
         }

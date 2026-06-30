@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildExecutionCandidates, fullSqlRange, hasMultipleExecutionTargets, splitSqlStatementRanges, statementRangeAtCursor, supportsExecutionTargetPicker } from "../sqlStatementRanges";
+import { buildExecutionCandidates, executableStatementRanges, fullSqlRange, hasMultipleExecutionTargets, splitSqlStatementRanges, statementRangeAtCursor, supportsExecutionTargetPicker } from "../sqlStatementRanges";
 
 function indexOf(sql: string, needle: string, occurrence = 1): number {
   let from = 0;
@@ -232,6 +232,22 @@ describe("statementRangeAtCursor", () => {
   });
 });
 
+describe("executableStatementRanges", () => {
+  it("returns statement ranges starting only at statement starts", () => {
+    const sql = "SELECT *\nFROM users\nWHERE active = 1;\nSELECT 2;";
+    const ranges = executableStatementRanges(sql);
+    expect(rangeSqlTexts(ranges)).toEqual(["SELECT *\nFROM users\nWHERE active = 1", "SELECT 2"]);
+    expect(ranges.map((range) => range.from)).toEqual([0, sql.indexOf("SELECT 2")]);
+  });
+
+  it("returns Redis executable command lines", () => {
+    const sql = "GET user:1\n# comment\n  DEL user:2  ";
+    const ranges = executableStatementRanges(sql, "redis");
+    expect(rangeSqlTexts(ranges)).toEqual(["GET user:1", "DEL user:2"]);
+    expect(ranges.map((range) => range.from)).toEqual([0, sql.indexOf("DEL")]);
+  });
+});
+
 describe("fullSqlRange", () => {
   it("returns the trimmed full document", () => {
     const sql = "  SELECT 1;  \n";
@@ -258,10 +274,11 @@ describe("buildExecutionCandidates", () => {
     expect(candidateKinds(candidates)).toEqual(["cursor", "all"]);
   });
 
-  it("uses only the cursor SQL for the first candidate when it is missing a semicolon", () => {
-    const sql = "SELECT 1\nSELECT 2;\nSELECT 3;";
-    const candidates = buildExecutionCandidates(sql, indexOf(sql, "1"));
-    expect(candidateSummaries(candidates)).toEqual(["cursor:SELECT 1", "all:SELECT 1\nSELECT 2;\nSELECT 3;"]);
+  it("uses the cursor statement for the first candidate when there is no selection", () => {
+    const sql = "SELECT *\nFROM users\nWHERE active = 1";
+    const candidates = buildExecutionCandidates(sql, indexOf(sql, "users"));
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0].kind).toBe("all");
   });
 
   it("uses the current command line for Redis cursor candidates", () => {

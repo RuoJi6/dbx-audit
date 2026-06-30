@@ -113,6 +113,17 @@ pub async fn test_connection(client: &Client, timeout: Duration, database: Optio
     .await
 }
 
+pub async fn server_version(client: &Client, database: &str) -> Result<String, String> {
+    let database = database.trim();
+    let database = if database.is_empty() { "admin" } else { database };
+    let result = client.database(database).run_command(doc! { "buildInfo": 1 }).await.map_err(|e| e.to_string())?;
+    server_version_from_build_info(&result)
+}
+
+fn server_version_from_build_info(result: &Document) -> Result<String, String> {
+    result.get_str("version").map(str::to_string).map_err(|e| format!("MongoDB server version not found: {e}"))
+}
+
 pub async fn list_databases(client: &Client) -> Result<Vec<String>, String> {
     client.list_database_names().await.map_err(|e| e.to_string())
 }
@@ -193,6 +204,7 @@ pub async fn find_documents(
     skip: u64,
     limit: i64,
     filter: Option<&str>,
+    projection: Option<&str>,
     sort: Option<&str>,
 ) -> Result<MongoDocumentResult, String> {
     let col = client.database(database).collection::<Document>(collection);
@@ -212,6 +224,14 @@ pub async fn find_documents(
     };
 
     let mut find = col.find(filter_doc).skip(skip).limit(limit);
+    if let Some(p) = projection {
+        if !p.trim().is_empty() {
+            let json: serde_json::Value =
+                serde_json::from_str(p).map_err(|e| format!("Invalid projection JSON: {e}"))?;
+            let projection_doc = json_object_to_document(&json).map_err(|e| format!("Invalid projection: {e}"))?;
+            find = find.projection(projection_doc);
+        }
+    }
     if let Some(s) = sort {
         if !s.trim().is_empty() {
             let json: serde_json::Value = serde_json::from_str(s).map_err(|e| format!("Invalid sort JSON: {e}"))?;
@@ -842,6 +862,32 @@ mod tests {
             doc.get("updated_at"),
             Some(Bson::DateTime(value)) if value.timestamp_millis() == 1_781_099_971_287
         ));
+    }
+
+    #[test]
+    fn json_object_to_document_parses_find_projection() {
+        let value = serde_json::json!({
+            "title": 1,
+            "_id": 0,
+        });
+        let doc = json_object_to_document(&value).unwrap();
+
+        assert!(matches!(doc.get("title"), Some(Bson::Int64(1))));
+        assert!(matches!(doc.get("_id"), Some(Bson::Int64(0))));
+    }
+
+    #[test]
+    fn server_version_from_build_info_reads_version_field() {
+        let version = server_version_from_build_info(&doc! { "version": "4.4.29" }).unwrap();
+
+        assert_eq!(version, "4.4.29");
+    }
+
+    #[test]
+    fn server_version_from_build_info_rejects_missing_version() {
+        let error = server_version_from_build_info(&doc! { "ok": 1 }).unwrap_err();
+
+        assert!(error.contains("MongoDB server version not found"));
     }
 
     #[test]

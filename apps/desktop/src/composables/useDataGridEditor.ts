@@ -34,6 +34,10 @@ type GridScrollerRef =
 export interface CustomSaveHandler {
   save: (changes: { dirtyRows: Map<number, Map<number, CellValue>>; newRows: CellValue[][]; deletedRows: Set<number>; columns: string[]; rows: CellValue[][] }) => Promise<void>;
   preview?: (changes: { dirtyRows: Map<number, Map<number, CellValue>>; newRows: CellValue[][]; deletedRows: Set<number>; columns: string[]; rows: CellValue[][] }) => Promise<string[]>;
+  canInsert?: boolean;
+  canDelete?: boolean;
+  readonlyColumns?: string[];
+  targetLabel?: string;
 }
 
 export interface UseDataGridEditorOptions {
@@ -89,6 +93,12 @@ const pendingChangesCache = new Map<string, PendingChangesSnapshot>();
 const closingPendingSnapshotTabs = new Set<string>();
 const BEFORE_TAB_SWITCH_EVENT = "dbx:before-tab-switch";
 const MAX_PENDING_CHANGES_HISTORY = 100;
+
+function dataGridRowsIdentityChanged(previousRows: CellValue[][] | undefined, nextRows: CellValue[][]): boolean {
+  if (!previousRows) return true;
+  if (previousRows.length !== nextRows.length) return true;
+  return previousRows.some((row, index) => row !== nextRows[index]);
+}
 
 function cacheKeyBelongsToTab(cacheKey: string, tabId: string) {
   return cacheKey === tabId || cacheKey.startsWith(`${tabId}-`);
@@ -834,6 +844,17 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     options.emit("reload", sql.value, searchText.value, options.currentWhereInput.value, orderByInput.value.trim() || undefined, pageSize.value, (currentPage.value - 1) * pageSize.value);
   }
 
+  function applyDirtyRowsToResult() {
+    for (const [sourceIndex, changes] of dirtyRows.value) {
+      const row = result.value.rows[sourceIndex];
+      if (row) {
+        for (const [colIdx, value] of changes) {
+          row[colIdx] = value;
+        }
+      }
+    }
+  }
+
   async function saveChanges() {
     saveError.value = "";
     isSaving.value = true;
@@ -853,6 +874,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
         isSaving.value = false;
         return;
       }
+      applyDirtyRowsToResult();
       dirtyRows.value.clear();
       newRows.value = [];
       deletedRows.value.clear();
@@ -931,14 +953,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     } catch (e) {
       console.warn("[DBX] failed to record data grid history", e);
     }
-    for (const [sourceIndex, changes] of dirtyRows.value) {
-      const row = result.value.rows[sourceIndex];
-      if (row) {
-        for (const [colIdx, value] of changes) {
-          row[colIdx] = value;
-        }
-      }
-    }
+    applyDirtyRowsToResult();
     dirtyRows.value.clear();
     newRows.value = [];
     deletedRows.value.clear();
@@ -963,9 +978,15 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
 
   // Pending changes reference rows by sourceIndex. When the result set changes
   // (e.g. different WHERE clause, pagination), stale indices point to wrong rows.
+  let previousResultRows = result.value.rows;
   watch(
     () => result.value.rows,
-    () => {
+    (rows) => {
+      if (!dataGridRowsIdentityChanged(previousResultRows, rows)) {
+        previousResultRows = rows;
+        return;
+      }
+      previousResultRows = rows;
       pendingScrollRestore = undefined;
       discardChanges();
     },

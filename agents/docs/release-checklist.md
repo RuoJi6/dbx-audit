@@ -113,15 +113,9 @@ Current external-driver agents include BigQuery and SunDB.
 
 ## 6. JRE Selection
 
-Most agents are built for the default JRE key `21`, backed by JDK 21 in the release workflow.
+Java agents are built for the default JRE key `21`, backed by JDK 21 in the release workflow. Native agents do not require a JRE.
 
-Special case:
-
-- `oracle-10g` uses JRE key `8`.
-
-If another agent needs a different runtime:
-
-- Update the release workflow JRE detection logic.
+If another agent needs a different runtime, update the release workflow JRE detection logic.
 - Document why in the module or release notes.
 - Verify DBX can download the matching runtime artifact.
 
@@ -183,8 +177,7 @@ After the GitHub release finishes:
 - Download or inspect `agent-registry.json`.
 - Confirm every expected agent appears under `drivers`.
 - Confirm labels preserve spaces, for example `Google BigQuery`.
-- Confirm `oracle-10g` uses JRE key `8`.
-- Confirm other agents use JRE key `21`.
+- Confirm Java agents use JRE key `21`.
 - Confirm `external_driver_required` is correct.
 - Confirm every jar URL, sha256, and size is present.
 - Spot-check at least one agent jar manifest:

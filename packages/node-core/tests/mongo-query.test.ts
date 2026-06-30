@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "vitest";
-import { executeQuery, inferMongoColumns, mongoAggregateWriteStage, mongoDocumentsToQueryResult, parseMongoAggregateCommand, parseMongoCountDocumentsCommand, parseMongoFindCommand, parseMongoGetIndexesCommand, parseMongoWriteCommand } from "../src/database.js";
+import { executeQuery, inferMongoColumns, mongoAggregateWriteStage, mongoDocumentsToQueryResult, parseMongoAggregateCommand, parseMongoCountDocumentsCommand, parseMongoFindCommand, parseMongoGetIndexesCommand, parseMongoVersionCommand, parseMongoWriteCommand } from "../src/database.js";
 
 test("parseMongoFindCommand accepts shell-style find commands", () => {
   assert.deepEqual(parseMongoFindCommand('db.getCollection("operation_logs").find({"level":"info"}).sort({"ts":-1}).skip(5).limit(10)'), {
@@ -34,6 +34,20 @@ test("parseMongoFindCommand accepts Compass-style unquoted keys and ObjectId", (
   assert.equal(command.collection, "products");
   assert.equal(command.limit, 1);
   assert.deepEqual(JSON.parse(command.filter), { _id: { $oid: "6a045a92d2971e44243771a1" } });
+});
+
+test("parseMongoFindCommand accepts projection arguments", () => {
+  const command = parseMongoFindCommand("db.jobs.find({status: 'open'}, {title: 1, _id: 0}).sort({title: 1})");
+  assert.ok(command);
+  assert.equal(command.collection, "jobs");
+  assert.deepEqual(JSON.parse(command.filter), { status: "open" });
+  assert.deepEqual(JSON.parse(command.projection || "{}"), { title: 1, _id: 0 });
+  assert.deepEqual(JSON.parse(command.sort || "{}"), { title: 1 });
+});
+
+test("parseMongoVersionCommand accepts db.version", () => {
+  assert.equal(parseMongoVersionCommand("db.version();"), true);
+  assert.equal(parseMongoVersionCommand("db.jobs.version()"), false);
 });
 
 test("parseMongoWriteCommand accepts unquoted update operator keys", () => {

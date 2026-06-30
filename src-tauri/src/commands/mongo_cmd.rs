@@ -81,6 +81,7 @@ pub async fn mongo_find_documents(
     skip: u64,
     limit: i64,
     filter: Option<String>,
+    projection: Option<String>,
     sort: Option<String>,
     execution_id: Option<String>,
 ) -> Result<MongoDocumentResult, String> {
@@ -96,6 +97,7 @@ pub async fn mongo_find_documents(
             skip,
             limit,
             filter.as_deref(),
+            projection.as_deref(),
             sort.as_deref(),
         ),
     )
@@ -112,6 +114,7 @@ pub async fn document_find_documents(
     skip: u64,
     limit: i64,
     filter: Option<String>,
+    projection: Option<String>,
     sort: Option<String>,
     execution_id: Option<String>,
 ) -> Result<MongoDocumentResult, String> {
@@ -127,10 +130,23 @@ pub async fn document_find_documents(
             skip,
             limit,
             filter.as_deref(),
+            projection.as_deref(),
             sort.as_deref(),
         ),
     )
     .await
+}
+
+#[tauri::command]
+pub async fn mongo_server_version(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    database: String,
+    execution_id: Option<String>,
+) -> Result<String, String> {
+    let app = state.inner().clone();
+    run_cancellable(&app, execution_id, dbx_core::mongo_ops::mongo_server_version_core(&app, &connection_id, &database))
+        .await
 }
 
 #[tauri::command]

@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { AlertTriangle, Check, ChevronDown, ChevronUp, Copy, Database, Info, KeyRound, Loader2, Maximize2, Plus, RefreshCw, Save, Settings, SlidersHorizontal, Trash2, X } from "@lucide/vue";
+import { AlertTriangle, Check, ChevronDown, Copy, Database, Info, KeyRound, ListChevronsUpDown, Loader2, Maximize2, Plus, RefreshCw, Save, Settings, SlidersHorizontal, Trash2, X } from "@lucide/vue";
 import { DropdownMenu, DropdownMenuCheckboxItem, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -27,6 +27,7 @@ import { PRESET_FIELDS_TEMPLATE_ID, createTableColumnTemplateDrafts } from "@/li
 import { getTableMetadataCapabilities } from "@/lib/tableMetadataCapabilities";
 import { canAddTableStructureColumn, getTableStructureCapabilities } from "@/lib/tableStructureCapabilities";
 import { connectionObjectTreeQuerySchema, tableStructureDatabaseTypeForConnection } from "@/lib/jdbcDialect";
+import type { TableStructureEditorDraft } from "@/types/database";
 import {
   buildStructureTargetLabel,
   combineDataTypeForDatabase,
@@ -34,6 +35,7 @@ import {
   createForeignKeyDrafts,
   createIndexDrafts,
   createTriggerDrafts,
+  dataTypeLengthInputValue,
   generateIndexName,
   generateUniqueIndexName,
   getColumnEditorControls,
@@ -78,9 +80,11 @@ const props = defineProps<{
   database: string;
   schema?: string;
   tableName: string;
+  draft?: TableStructureEditorDraft;
 }>();
 
 const emit = defineEmits<{
+  "update:draft": [draft: TableStructureEditorDraft | undefined];
   saved: [commentChanged: boolean];
   close: [];
   openSettings: [initialTab?: string, initialSection?: string];
@@ -596,6 +600,54 @@ let sqlPreviewDebounceTimer: ReturnType<typeof setTimeout> | undefined;
 let deferredSqlPreviewRefresh = false;
 let keydownListenerRegistered = false;
 let skipNextRefreshVersion = false;
+let restoringDraft = false;
+let syncingDraft = false;
+let draftHydrated = false;
+
+function cloneDraftValue<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function createCurrentDraft(initialized = true): TableStructureEditorDraft {
+  return {
+    activeTab: activeTab.value as TableStructureEditorDraft["activeTab"],
+    newTableName: newTableName.value,
+    tableComment: tableComment.value,
+    originalTableComment: originalTableComment.value,
+    columns: cloneDraftValue(columns.value),
+    indexes: cloneDraftValue(indexes.value),
+    foreignKeys: cloneDraftValue(foreignKeys.value),
+    triggers: cloneDraftValue(triggers.value),
+    initialized,
+  };
+}
+
+function syncDraftToParent() {
+  if (!draftHydrated) return;
+  if (restoringDraft || syncingDraft) return;
+  syncingDraft = true;
+  emit("update:draft", createCurrentDraft());
+  syncingDraft = false;
+}
+
+function restoreDraft(draft: TableStructureEditorDraft) {
+  restoringDraft = true;
+  activeTab.value = draft.activeTab || "columns";
+  newTableName.value = draft.newTableName || "";
+  tableComment.value = draft.tableComment || "";
+  originalTableComment.value = draft.originalTableComment || "";
+  columns.value = cloneDraftValue(draft.columns || []);
+  indexes.value = cloneDraftValue(draft.indexes || []);
+  foreignKeys.value = cloneDraftValue(draft.foreignKeys || []);
+  triggers.value = cloneDraftValue(draft.triggers || []);
+  restoringDraft = false;
+  draftHydrated = true;
+}
+
+function markDraftHydratedAndSync() {
+  draftHydrated = true;
+  syncDraftToParent();
+}
 
 function hasPendingStructureChanges(): boolean {
   if (isCreateMode.value) {
@@ -728,6 +780,11 @@ const canApply = computed(
   () => !loading.value && !saving.value && !postSaveRefreshing.value && !secondaryMetadataLoading.value && !sqlPreviewLoading.value && pendingStatements.value.length > 0 && warnings.value.length === 0 && !!props.connectionId && (isCreateMode.value ? !!newTableName.value.trim() : !!props.tableName),
 );
 
+function clearDraft() {
+  draftHydrated = false;
+  emit("update:draft", undefined);
+}
+
 function resetState() {
   activeTab.value = "columns";
   loading.value = false;
@@ -751,6 +808,12 @@ function resetState() {
   originalTableComment.value = "";
 }
 
+async function reloadStructureFromDatabase() {
+  if (isCreateMode.value) return;
+  draftHydrated = false;
+  await loadStructure(false, FULL_STRUCTURE_REFRESH_SCOPE, true, { blockSecondaryMetadata: true });
+}
+
 function setSecondaryMetadataLoading(scope: StructureRefreshScope, value: boolean) {
   if (scope.indexes && tableMetadataCapabilities.value.indexes) indexesLoading.value = value;
   if (scope.foreignKeys && tableMetadataCapabilities.value.foreignKeys) foreignKeysLoading.value = value;
@@ -771,7 +834,7 @@ async function fetchTableCommentValue(connectionId: string, database: string, sc
   }
 }
 
-async function loadStructure(silent = false, scope: StructureRefreshScope = FULL_STRUCTURE_REFRESH_SCOPE, showErrors = true, options: { blockSecondaryMetadata?: boolean } = {}) {
+async function loadStructure(silent = false, scope: StructureRefreshScope = FULL_STRUCTURE_REFRESH_SCOPE, showErrors = true, options: { blockSecondaryMetadata?: boolean; preserveDraft?: boolean } = {}) {
   const connectionId = props.connectionId;
   const database = props.database;
   const schema = metadataSchema.value;
@@ -782,6 +845,7 @@ async function loadStructure(silent = false, scope: StructureRefreshScope = FULL
   setSecondaryMetadataLoading(scope, true);
   errorMessage.value = "";
   let secondaryMetadataScheduled = false;
+  let loadedSuccessfully = false;
   try {
     await store.ensureConnected(connectionId);
 
@@ -830,6 +894,7 @@ async function loadStructure(silent = false, scope: StructureRefreshScope = FULL
     if (options.blockSecondaryMetadata) {
       await secondaryMetadataPromise;
     }
+    loadedSuccessfully = true;
   } catch (e: any) {
     if (showErrors) {
       errorMessage.value = e?.message || String(e);
@@ -841,6 +906,9 @@ async function loadStructure(silent = false, scope: StructureRefreshScope = FULL
       setSecondaryMetadataLoading(scope, false);
     }
     if (!silent) loading.value = false;
+    if (!options.preserveDraft && loadedSuccessfully && requestId === structureLoadRequestId) {
+      markDraftHydratedAndSync();
+    }
   }
 }
 
@@ -898,28 +966,103 @@ function removeNewColumn(column: EditableStructureColumn) {
   columns.value = columns.value.filter((item) => item.id !== column.id);
 }
 
-function canMoveColumn(index: number, direction: -1 | 1): boolean {
+type ColumnDragState = {
+  columnId: string;
+  sourceIndex: number;
+  insertionIndex: number;
+};
+
+const columnDragState = ref<ColumnDragState | null>(null);
+
+function canDragColumn(index: number): boolean {
   if (loading.value || saving.value) return false;
-  if (!Number.isInteger(index) || (direction !== -1 && direction !== 1)) return false;
-  const targetIndex = index + direction;
-  if (targetIndex < 0 || targetIndex >= columns.value.length) return false;
-  if (columns.value[index]?.markedForDrop || columns.value[targetIndex]?.markedForDrop) return false;
-  // Draft columns can always swap order among themselves —
-  // ADD COLUMN statement order determines their final physical placement.
-  if (!columns.value[index]?.original && !columns.value[targetIndex]?.original) return true;
-  return canShowColumnMoveControls.value;
+  if (!Number.isInteger(index) || index < 0 || index >= columns.value.length) return false;
+  const column = columns.value[index];
+  if (!column || column.markedForDrop) return false;
+  if (!column.original) return true;
+  return canShowColumnDragControls.value;
 }
 
-const canShowColumnMoveControls = computed(() => isCreateMode.value || structureCapabilities.value.reorderColumn);
+function canDropColumnAt(sourceIndex: number, insertionIndex: number): boolean {
+  if (!canDragColumn(sourceIndex)) return false;
+  if (!Number.isInteger(insertionIndex) || insertionIndex < 0 || insertionIndex > columns.value.length) return false;
+  if (insertionIndex === sourceIndex || insertionIndex === sourceIndex + 1) return false;
+  const sourceColumn = columns.value[sourceIndex];
+  if (!sourceColumn) return false;
+  const crossedColumns = insertionIndex < sourceIndex ? columns.value.slice(insertionIndex, sourceIndex) : columns.value.slice(sourceIndex + 1, insertionIndex);
+  if (crossedColumns.some((column) => column.markedForDrop)) return false;
+  if (canShowColumnDragControls.value) return true;
+  if (sourceColumn.original) return false;
+  return crossedColumns.every((column) => !column.original);
+}
 
-function moveColumn(index: number, direction: -1 | 1) {
-  if (!canMoveColumn(index, direction)) return;
-  const targetIndex = index + direction;
+const canShowColumnDragControls = computed(() => isCreateMode.value || structureCapabilities.value.reorderColumn);
+
+function moveColumnTo(index: number, insertionIndex: number) {
+  if (!canDropColumnAt(index, insertionIndex)) return;
   const nextColumns = [...columns.value];
   const [column] = nextColumns.splice(index, 1);
   if (!column) return;
-  nextColumns.splice(targetIndex, 0, column);
+  const adjustedInsertionIndex = insertionIndex > index ? insertionIndex - 1 : insertionIndex;
+  nextColumns.splice(adjustedInsertionIndex, 0, column);
   columns.value = nextColumns;
+}
+
+function onColumnDragStart(index: number, event: DragEvent) {
+  if (!canDragColumn(index)) {
+    event.preventDefault();
+    return;
+  }
+  const column = columns.value[index];
+  if (!column) return;
+  columnDragState.value = {
+    columnId: column.id,
+    sourceIndex: index,
+    insertionIndex: index,
+  };
+  if (event.dataTransfer) {
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", column.name || column.id);
+  }
+}
+
+function onColumnDragOver(index: number, event: DragEvent) {
+  const state = columnDragState.value;
+  if (!state || columns.value[index]?.markedForDrop) return;
+  const insertionIndex = columnDragInsertionIndex(index, event);
+  if (!canDropColumnAt(state.sourceIndex, insertionIndex)) return;
+  event.preventDefault();
+  state.insertionIndex = insertionIndex;
+  if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+}
+
+function onColumnDrop(index: number, event: DragEvent) {
+  const state = columnDragState.value;
+  if (!state) return;
+  event.preventDefault();
+  moveColumnTo(state.sourceIndex, columnDragInsertionIndex(index, event));
+  columnDragState.value = null;
+}
+
+function onColumnDragEnd() {
+  columnDragState.value = null;
+}
+
+function columnRowClass(column: EditableStructureColumn, index: number) {
+  const dragState = columnDragState.value;
+  return {
+    "bg-destructive/5 opacity-60": column.markedForDrop,
+    "opacity-55": dragState?.columnId === column.id,
+    "bg-primary/5 shadow-[inset_0_2px_0_var(--primary)]": dragState && canDropColumnAt(dragState.sourceIndex, index) && dragState.insertionIndex === index,
+    "bg-primary/5 shadow-[inset_0_-2px_0_var(--primary)]": dragState && canDropColumnAt(dragState.sourceIndex, index + 1) && dragState.insertionIndex === index + 1,
+  };
+}
+
+function columnDragInsertionIndex(index: number, event: DragEvent): number {
+  const target = event.currentTarget;
+  if (!(target instanceof HTMLElement)) return index;
+  const rect = target.getBoundingClientRect();
+  return event.clientY > rect.top + rect.height / 2 ? index + 1 : index;
 }
 
 function toggleDropColumn(column: EditableStructureColumn) {
@@ -1210,6 +1353,7 @@ async function applyChanges() {
     ddlFetched.value = false;
     ddlContent.value = "";
     if (isCreateMode.value) {
+      clearDraft();
       emit("saved", tableComment.value !== originalTableComment.value);
       emit("close");
     } else {
@@ -1279,13 +1423,21 @@ onMounted(() => {
   resetState();
   registerStructureEditorShortcuts();
   void loadDynamicDataTypeOptions();
-  void loadStructure();
+  if (props.draft?.initialized) {
+    restoreDraft(props.draft);
+  } else if (isCreateMode.value) {
+    markDraftHydratedAndSync();
+  } else {
+    void loadStructure(false, FULL_STRUCTURE_REFRESH_SCOPE, true, { blockSecondaryMetadata: true });
+  }
 });
 
 onActivated(() => {
   registerStructureEditorShortcuts();
   void loadDynamicDataTypeOptions();
-  if (!isCreateMode.value) void loadStructure(true);
+  if (props.draft?.initialized && !draftHydrated) {
+    restoreDraft(props.draft);
+  }
 });
 onDeactivated(unregisterStructureEditorShortcuts);
 onBeforeUnmount(() => {
@@ -1321,9 +1473,14 @@ watch(
   [isCreateMode, databaseType, () => props.schema, () => props.tableName, newTableName, tableComment, columns, indexes, foreignKeys, triggers],
   () => {
     scheduleSqlPreviewRefresh();
+    syncDraftToParent();
   },
   { deep: true, immediate: true },
 );
+
+watch(activeTab, () => {
+  syncDraftToParent();
+});
 
 watch(secondaryMetadataLoading, (value) => {
   if (value || !deferredSqlPreviewRefresh) return;
@@ -1358,7 +1515,7 @@ watch(activeTab, (tab) => {
       <Database :class="[structureIconClass, 'text-muted-foreground']" />
       <span class="min-w-0 flex-1 truncate font-medium">{{ targetLabel || t("editor.noDatabase") }}</span>
       <Badge variant="outline">{{ connection?.driver_label || databaseType }}</Badge>
-      <Button v-if="!isCreateMode" variant="ghost" size="sm" :class="structureToolbarButtonClass" :disabled="loading || saving" @click="loadStructure()">
+      <Button v-if="!isCreateMode" variant="ghost" size="sm" :class="structureToolbarButtonClass" :disabled="loading || saving" @click="reloadStructureFromDatabase">
         <RefreshCw :class="structureIconClass" />
         {{ t("structureEditor.refresh") }}
       </Button>
@@ -1480,7 +1637,7 @@ watch(activeTab, (tab) => {
                 </tr>
               </thead>
               <tbody>
-                <tr v-for="(column, index) in columns" :key="column.id" :class="column.markedForDrop ? 'bg-destructive/5 opacity-60' : ''" :data-new-column-row="!column.original ? 'true' : undefined">
+                <tr v-for="(column, index) in columns" :key="column.id" :class="columnRowClass(column, index)" :data-new-column-row="!column.original ? 'true' : undefined" @dragover="onColumnDragOver(index, $event)" @drop="onColumnDrop(index, $event)">
                   <td :class="[structureCellClass, 'text-muted-foreground']">
                     <div class="flex items-center gap-1">
                       <span>{{ index + 1 }}</span>
@@ -1506,7 +1663,12 @@ watch(activeTab, (tab) => {
                     <Input v-else :model-value="splitDataType(column.dataType).baseType" :class="[structureMonoControlClass, 'w-full']" disabled />
                   </td>
                   <td v-if="columnEditorControls.length" :class="structureCellClass">
-                    <Input :model-value="splitDataType(column.dataType).params" :class="structureMonoControlClass" :disabled="isColumnLengthDisabled(column)" @update:model-value="column.dataType = combineDataTypeForDatabase(databaseType, splitDataType(column.dataType).baseType, String($event))" />
+                    <Input
+                      :model-value="dataTypeLengthInputValue(databaseType, column.dataType)"
+                      :class="structureMonoControlClass"
+                      :disabled="isColumnLengthDisabled(column)"
+                      @update:model-value="column.dataType = combineDataTypeForDatabase(databaseType, splitDataType(column.dataType).baseType, String($event))"
+                    />
                   </td>
                   <td v-if="columnEditorControls.nullable" :class="structureCellClass">
                     <label class="flex items-center gap-1.5">
@@ -1701,14 +1863,21 @@ watch(activeTab, (tab) => {
                   </td>
                   <td :class="structureLastCellClass">
                     <div class="flex min-w-0 items-center justify-start gap-0.5 overflow-hidden">
-                      <template v-if="canShowColumnMoveControls || !column.original">
-                        <Button type="button" variant="ghost" size="icon" :class="structureActionButtonClass" :disabled="!canMoveColumn(index, -1)" :title="t('structureEditor.moveColumnUp')" :aria-label="t('structureEditor.moveColumnUp')" @click.stop.prevent="moveColumn(index, -1)">
-                          <ChevronUp :class="structureIconClass" />
-                        </Button>
-                        <Button type="button" variant="ghost" size="icon" :class="structureActionButtonClass" :disabled="!canMoveColumn(index, 1)" :title="t('structureEditor.moveColumnDown')" :aria-label="t('structureEditor.moveColumnDown')" @click.stop.prevent="moveColumn(index, 1)">
-                          <ChevronDown :class="structureIconClass" />
-                        </Button>
-                      </template>
+                      <Button
+                        v-if="canShowColumnDragControls || !column.original"
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        :class="[structureActionButtonClass, canDragColumn(index) ? 'cursor-grab active:cursor-grabbing' : 'cursor-not-allowed']"
+                        :disabled="!canDragColumn(index)"
+                        :title="t('structureEditor.dragColumn')"
+                        :aria-label="t('structureEditor.dragColumn')"
+                        draggable="true"
+                        @dragstart="onColumnDragStart(index, $event)"
+                        @dragend="onColumnDragEnd"
+                      >
+                        <ListChevronsUpDown :class="structureIconClass" />
+                      </Button>
                       <Button
                         v-if="column.original"
                         variant="ghost"

@@ -5,7 +5,7 @@ mod models;
 mod window_state_guard;
 
 use commands::connection::AppState;
-use dbx_core::storage::{DesktopIconTheme, DesktopSettings, Storage};
+use dbx_core::storage::{maybe_import_user_data_db, DesktopIconTheme, DesktopSettings, Storage};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -530,8 +530,14 @@ pub fn run() {
 
             let default_data_dir =
                 app.path().app_data_dir().map_err(|e| e.to_string()).expect("Failed to resolve app data dir");
-            let data_dir = data_dir::resolve_data_dir(default_data_dir);
+            let data_dir_resolution = data_dir::resolve_data_dir_with_mode(default_data_dir);
+            let data_dir = data_dir_resolution.data_dir.clone();
             std::fs::create_dir_all(&data_dir).expect("Failed to create data dir");
+            let alternative_data_dir = data_dir::alternative_data_dir(&data_dir_resolution);
+            match maybe_import_user_data_db(&data_dir, alternative_data_dir.as_deref()) {
+                Ok(result) => eprintln!("[STARTUP] data db fallback import: {result:?}"),
+                Err(err) => eprintln!("[STARTUP] data db fallback import failed: {err}"),
+            }
             let db_path = data_dir.join("dbx.db");
 
             let t = Instant::now();
@@ -548,7 +554,7 @@ pub fn run() {
             apply_debug_log_level(desktop_settings.debug_logging_enabled);
             eprintln!("[STARTUP] storage ready in {:?}", t.elapsed());
 
-            let default_agent_dir = data_dir::uses_custom_data_dir().then(|| data_dir.join("agents"));
+            let default_agent_dir = data_dir_resolution.uses_custom_data_dir().then(|| data_dir.join("agents"));
             let (plugin_dir, agent_dir) = commands::app_settings::resolve_driver_store_dirs_from_settings(
                 &desktop_settings,
                 &data_dir,
@@ -758,6 +764,8 @@ pub fn run() {
             commands::query::build_data_grid_copy_insert_statement,
             commands::query::build_data_grid_context_filter_condition,
             commands::query::build_data_grid_column_value_filter_condition,
+            commands::query::build_data_grid_column_values_filter_condition,
+            commands::query::build_data_grid_column_distinct_values_sql,
             commands::query::build_data_grid_count_sql,
             commands::query::build_hive_table_properties_sql,
             commands::query::build_export_insert_statements,
@@ -849,6 +857,7 @@ pub fn run() {
             commands::mongo_cmd::mongo_drop_collection,
             commands::mongo_cmd::document_find_documents,
             commands::mongo_cmd::mongo_find_documents,
+            commands::mongo_cmd::mongo_server_version,
             commands::mongo_cmd::mongo_aggregate_documents,
             commands::mongo_cmd::mongo_insert_document,
             commands::mongo_cmd::mongo_insert_documents,

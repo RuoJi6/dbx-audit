@@ -24,8 +24,6 @@ Each agent runs as a standalone process and communicates with DBX via stdin/stdo
 | gbase8a | GBase 8a | External GBase 8a JDBC |
 | gbase8s | GBase 8s | External GBase 8s JDBC |
 | oracle | Oracle 10g+ | go-ora native agent |
-| oracle-legacy | Oracle 11g/12c/18c/19c | ojdbc8 (compatibility fallback) |
-| oracle-10g | Oracle 10g | ojdbc6 (compatibility fallback, JRE 8) |
 | h2 | H2 | H2 JDBC |
 | snowflake | Snowflake | Snowflake JDBC |
 | trino | Trino (Presto) | Trino JDBC |
@@ -37,7 +35,6 @@ Each agent runs as a standalone process and communicates with DBX via stdin/stdo
 | bigquery | Google BigQuery | BigQuery JDBC |
 | kylin | Apache Kylin | Kylin JDBC |
 | sundb | SunDB | SunDB JDBC |
-| gaussdb | GaussDB | GaussDB JDBC |
 | tdengine | TDengine | taos-jdbcdriver (WebSocket, REST fallback) |
 | yashandb | 崖山 YashanDB | YashanDB JDBC |
 | xugu | 虚谷 XuguDB | XuguDB Go native agent |
@@ -48,11 +45,11 @@ Each agent runs as a standalone process and communicates with DBX via stdin/stdo
 
 ## Multi-JRE Support
 
-Most Java agents target JRE 21. Native agents, such as `oracle` and `xugu`, do not require a JRE. Agents that still require legacy Java runtimes (e.g. compatibility fallback `oracle-10g` uses JRE 8) declare their JRE version in the registry. DBX downloads and manages multiple JRE installations automatically.
+Most Java agents target JRE 21. Native agents, such as `oracle` and `xugu`, do not require a JRE. DBX downloads and manages the JRE 21 installation automatically for Java agents.
 
 ## Build
 
-Requires JDK 8 and 21 (Gradle toolchain auto-downloads if needed).
+Requires JDK 21 (Gradle toolchain auto-downloads if needed).
 
 ```bash
 ./gradlew shadowJar
@@ -64,7 +61,7 @@ Output JARs are in `drivers/{module}/build/libs/`. Native agents build from `dri
 
 ### Local DBX Runtime Test
 
-When changing `agents/drivers/<db_type>/` or shared Java agent protocol code, rebuild the target agent and replace the runtime JAR used by the local DBX app:
+When changing a Java agent under `agents/drivers/<db_type>/` or shared Java agent protocol code, rebuild the target agent and replace the runtime JAR used by the local DBX app:
 
 ```bash
 ./gradlew :<db_type>:shadowJar
@@ -73,6 +70,8 @@ cp agents/drivers/<db_type>/build/libs/*-all.jar ~/.dbx/agents/drivers/<db_type>
 ```
 
 Restart DBX or disconnect and reconnect the database so the new agent process loads the replacement JAR.
+
+Native agents such as `oracle` and `xugu` use the `agent` executable in the driver directory instead of `agent.jar`.
 
 ## Development
 

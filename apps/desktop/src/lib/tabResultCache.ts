@@ -2,6 +2,7 @@ import type { QueryResult, QueryTab } from "@/types/database";
 import { decode, encode } from "@msgpack/msgpack";
 import { toRaw } from "vue";
 import { isTauriRuntime } from "@/lib/tauriRuntime";
+import { apiUrl } from "@/lib/webPath";
 
 const DB_NAME = "dbx-tab-runtime-cache";
 const DB_VERSION = 1;
@@ -20,6 +21,7 @@ export interface TabResultSnapshot {
   queryAnalysis?: QueryTab["queryAnalysis"];
   querySourceColumns?: QueryTab["querySourceColumns"];
   queryEditabilityReason?: QueryTab["queryEditabilityReason"];
+  mongoEditTarget?: QueryTab["mongoEditTarget"];
   tableMeta?: QueryTab["tableMeta"];
   resultPageSql?: string;
   resultPageLimit?: number;
@@ -38,6 +40,8 @@ interface ColumnarQueryResult {
   execution_time_ms: number;
   truncated?: boolean;
   has_more?: boolean;
+  sourceLabel?: string;
+  sourceStatement?: string;
 }
 
 type QueryResultRunSnapshot = NonNullable<QueryTab["resultRuns"]>[number];
@@ -129,6 +133,8 @@ function stripSessionIds(result: QueryResult | undefined): QueryResult | undefin
     truncated: result.truncated,
     session_id: undefined,
     has_more: result.has_more,
+    sourceLabel: result.sourceLabel,
+    sourceStatement: result.sourceStatement,
   };
 }
 
@@ -157,6 +163,8 @@ function toColumnarResult(result: QueryResult | undefined): ColumnarQueryResult 
     execution_time_ms: result.execution_time_ms,
     truncated: result.truncated,
     has_more: result.has_more,
+    sourceLabel: result.sourceLabel,
+    sourceStatement: result.sourceStatement,
   });
 }
 
@@ -172,6 +180,8 @@ function fromColumnarResult(result: ColumnarQueryResult | undefined): QueryResul
     truncated: result.truncated,
     session_id: undefined,
     has_more: result.has_more,
+    sourceLabel: result.sourceLabel,
+    sourceStatement: result.sourceStatement,
   };
 }
 
@@ -245,7 +255,7 @@ async function writeRemoteRuntimeCache(key: string, bytes: Uint8Array, stats: { 
       });
       return true;
     }
-    const response = await fetch("/api/tab-runtime-cache", {
+    const response = await fetch(apiUrl("/api/tab-runtime-cache"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -270,7 +280,7 @@ async function readRemoteRuntimeCache(key: string): Promise<Uint8Array | undefin
       const entry = await invoke<{ payloadBase64?: string } | null>("load_tab_runtime_cache", { key });
       return entry?.payloadBase64 ? base64ToBytes(entry.payloadBase64) : undefined;
     }
-    const response = await fetch(`/api/tab-runtime-cache?key=${encodeURIComponent(key)}`);
+    const response = await fetch(apiUrl(`/api/tab-runtime-cache?key=${encodeURIComponent(key)}`));
     if (!response.ok) return undefined;
     const entry = (await response.json()) as { payloadBase64?: string } | null;
     return entry?.payloadBase64 ? base64ToBytes(entry.payloadBase64) : undefined;
@@ -288,7 +298,7 @@ async function deleteRemoteRuntimeCache(key: string): Promise<void> {
       await invoke("delete_tab_runtime_cache", { key });
       return;
     }
-    await fetch(`/api/tab-runtime-cache?key=${encodeURIComponent(key)}`, { method: "DELETE" });
+    await fetch(apiUrl(`/api/tab-runtime-cache?key=${encodeURIComponent(key)}`), { method: "DELETE" });
   } catch (error) {
     console.warn("[DBX][tab-result-cache:remote-delete:error]", { key, error });
   }
@@ -359,6 +369,7 @@ export function buildTabResultSnapshot(tab: QueryTab): TabResultSnapshot | undef
     queryAnalysis: tab.queryAnalysis ? clonePlain(tab.queryAnalysis) : undefined,
     querySourceColumns: tab.querySourceColumns ? [...tab.querySourceColumns] : undefined,
     queryEditabilityReason: tab.queryEditabilityReason,
+    mongoEditTarget: tab.mongoEditTarget ? clonePlain(tab.mongoEditTarget) : undefined,
     tableMeta: tab.tableMeta ? clonePlain(tab.tableMeta) : undefined,
     resultPageSql: tab.resultPageSql,
     resultPageLimit: tab.resultPageLimit,

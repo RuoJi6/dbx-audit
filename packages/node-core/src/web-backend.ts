@@ -1,6 +1,6 @@
 import type { ConnectionConfig } from "./connections.js";
 import type { TableInfo, ColumnInfo, QueryOptions, QueryResult } from "./database.js";
-import { collectionListToTableInfos, evaluateMongoAggregateSafety, evaluateMongoWriteSafety, inferMongoColumns, mongoDocumentsToQueryResult, parseMongoAggregateCommand, parseMongoCountDocumentsCommand, parseMongoFindCommand, parseMongoGetIndexesCommand, parseMongoWriteCommand, type CollectionInfo, type MongoWriteCommand } from "./database.js";
+import { collectionListToTableInfos, evaluateMongoAggregateSafety, evaluateMongoWriteSafety, inferMongoColumns, mongoDocumentsToQueryResult, parseMongoAggregateCommand, parseMongoCountDocumentsCommand, parseMongoFindCommand, parseMongoGetIndexesCommand, parseMongoVersionCommand, parseMongoWriteCommand, type CollectionInfo, type MongoWriteCommand } from "./database.js";
 import type { RedisCommandOptions, RedisCommandResult } from "./redis-command.js";
 import { sqlSafetyFromEnv } from "./sql-safety.js";
 
@@ -140,11 +140,23 @@ export async function executeQuery(config: ConnectionConfig, sql: string, option
           skip: find.skip,
           limit: find.limit,
           filter: find.filter,
+          projection: find.projection,
           sort: find.sort,
         }),
       });
       const result = (await res.json()) as { documents: unknown[]; total: number };
       return mongoDocumentsToQueryResult(result.documents.slice(0, options?.maxRows ?? result.documents.length), result.total);
+    }
+    if (parseMongoVersionCommand(sql)) {
+      const res = await apiFetch("/api/mongo/server-version", {
+        method: "POST",
+        body: JSON.stringify({
+          connectionId: config.id,
+          database: config.database || "",
+        }),
+      });
+      const version = (await res.json()) as string;
+      return { columns: ["version"], rows: [{ version }], row_count: 1 };
     }
     const count = parseMongoCountDocumentsCommand(sql);
     if (count) {
@@ -201,7 +213,7 @@ export async function executeQuery(config: ConnectionConfig, sql: string, option
       const affected = await executeMongoWrite(config, write);
       return { columns: [], rows: [], row_count: affected };
     }
-    throw new Error("Use MongoDB shell-style commands, for example: db.projects.find({}).limit(100), db.projects.countDocuments({}), db.projects.getIndexes(), db.projects.insertOne({...}), db.projects.updateOne({...}, {$set: {...}}), or db.projects.deleteOne({...})");
+    throw new Error("Use MongoDB shell-style commands, for example: db.projects.find({}).limit(100), db.version(), db.projects.countDocuments({}), db.projects.getIndexes(), db.projects.insertOne({...}), db.projects.updateOne({...}, {$set: {...}}), or db.projects.deleteOne({...})");
   }
   const res = await apiFetch("/api/query/execute", {
     method: "POST",

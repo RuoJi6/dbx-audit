@@ -1,4 +1,5 @@
 // HTTP fetch API for message queue admin (web mode)
+import { apiUrl } from "@/lib/webPath";
 import type {
   MqClusterInfo,
   TenantInfo,
@@ -33,7 +34,7 @@ import type {
 } from "@/types/mq";
 
 async function post<T>(path: string, body: unknown): Promise<T> {
-  const resp = await fetch(path, {
+  const resp = await fetch(apiUrl(path), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),

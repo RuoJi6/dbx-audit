@@ -26,11 +26,7 @@ test("uses the unified Oracle driver for legacy Oracle profiles", () => {
   assert.equal(
     showAgentDriverInstallHint(
       "oracle",
-      [
-        { db_type: "oracle", installed: false },
-        { db_type: "oracle-legacy", installed: false },
-        { db_type: "oracle-10g", installed: true },
-      ],
+      [{ db_type: "oracle", installed: false }],
       "oracle-10g",
     ),
     true,
@@ -38,11 +34,7 @@ test("uses the unified Oracle driver for legacy Oracle profiles", () => {
   assert.equal(
     showAgentDriverInstallHint(
       "oracle",
-      [
-        { db_type: "oracle", installed: true },
-        { db_type: "oracle-legacy", installed: false },
-        { db_type: "oracle-10g", installed: false },
-      ],
+      [{ db_type: "oracle", installed: true }],
       "oracle",
     ),
     false,
@@ -50,11 +42,7 @@ test("uses the unified Oracle driver for legacy Oracle profiles", () => {
   assert.equal(
     showAgentDriverInstallHint(
       "oracle",
-      [
-        { db_type: "oracle", installed: true },
-        { db_type: "oracle-legacy", installed: true },
-        { db_type: "oracle-10g", installed: false },
-      ],
+      [{ db_type: "oracle", installed: true }],
       "oracle-legacy",
     ),
     false,

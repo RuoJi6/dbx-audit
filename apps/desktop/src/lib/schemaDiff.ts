@@ -117,6 +117,20 @@ export interface SchemaDiffPreparation {
   syncSql: string;
 }
 
+const MYSQL_LIKE_SCHEMA_DIFF_TARGET_TYPES = new Set<DatabaseType>(["mysql", "doris", "starrocks", "goldendb", "sundb", "databend", "gbase"]);
+
+export function schemaDiffDeployTargetSchema(databaseType: DatabaseType | undefined, targetDatabase: string, targetSchema?: string): string | undefined {
+  const schema = targetSchema?.trim();
+  if (schema) return schema;
+
+  const database = targetDatabase.trim();
+  if (databaseType && MYSQL_LIKE_SCHEMA_DIFF_TARGET_TYPES.has(databaseType) && database) {
+    return database;
+  }
+
+  return undefined;
+}
+
 // Unified object type for UI display
 export type DiffOperationType = "modify" | "create" | "delete" | "none";
 export type DiffObjectKind = "table" | "view" | "function" | "sequence" | "rule" | "owner" | "index" | "trigger" | "foreignKey";

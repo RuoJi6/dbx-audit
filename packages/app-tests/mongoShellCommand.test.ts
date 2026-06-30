@@ -10,8 +10,10 @@ import {
   parseMongoCountDocumentsCommand,
   parseMongoFindCommand,
   parseMongoGetIndexesCommand,
+  parseMongoVersionCommand,
   parseMongoWriteCommand,
 } from "../../apps/desktop/src/lib/mongoShellCommand.ts";
+import { buildMongoUpdateDocument as buildMongoDocumentUpdate, formatMongoShellLiteral as formatMongoDocumentShellLiteral } from "../../apps/desktop/src/lib/mongoDocumentValues.ts";
 
 test("parseMongoFindCommand parses db collection find with an empty JSON filter", () => {
   assert.deepEqual(parseMongoFindCommand("db.users.find({})"), {
@@ -66,8 +68,26 @@ test("parseMongoFindCommand accepts single-quoted string values and unquoted sor
   assert.deepEqual(JSON.parse(command.sort || "{}"), { price: -1 });
 });
 
+test("parseMongoFindCommand parses projection arguments", () => {
+  const command = parseMongoFindCommand(`db.jobs.find({ status: "open" }, {
+    title: 1,
+    _id: 0
+  }).sort({ title: 1 })`);
+  assert.ok(command);
+  assert.equal(command.collection, "jobs");
+  assert.deepEqual(JSON.parse(command.filter), { status: "open" });
+  assert.deepEqual(JSON.parse(command.projection || "{}"), { title: 1, _id: 0 });
+  assert.deepEqual(JSON.parse(command.sort || "{}"), { title: 1 });
+});
+
 test("parseMongoFindCommand rejects unsupported mongo shell commands", () => {
   assert.equal(parseMongoFindCommand("db.users.drop()"), null);
+  assert.equal(parseMongoFindCommand("db.users.find({}, {}, { hint: { name: 1 } })"), null);
+});
+
+test("parseMongoVersionCommand parses db.version", () => {
+  assert.deepEqual(parseMongoVersionCommand("db.version();"), { kind: "version" });
+  assert.equal(parseMongoVersionCommand("db.jobs.version()"), null);
 });
 
 test("parseMongoWriteCommand accepts unquoted insert and update commands", () => {
@@ -196,4 +216,26 @@ test("mongoDocumentsToQueryResult turns mongo documents into grid rows", () => {
   assert.equal(result.affected_rows, 12);
   assert.equal(result.execution_time_ms, 5);
   assert.equal(result.truncated, true);
+});
+
+test("buildMongoUpdateDocument ignores _id and preserves typed values", () => {
+  const changes = new Map<number, string | number | boolean | null>([
+    [0, "other-id"],
+    [1, "42"],
+    [2, '{"role":"admin"}'],
+    [3, null],
+  ]);
+
+  const update = buildMongoDocumentUpdate(changes, ["_id", "age", "profile", "nickname"]);
+
+  assert.deepEqual(update, {
+    $set: {
+      age: 42,
+      profile: { role: "admin" },
+    },
+    $unset: {
+      nickname: "",
+    },
+  });
+  assert.equal(formatMongoDocumentShellLiteral(update), '{"$set":{"age":42,"profile":{"role":"admin"}},"$unset":{"nickname":""}}');
 });
