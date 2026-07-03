@@ -2,7 +2,7 @@
 import { computed, ref } from "vue";
 import { useI18n } from "vue-i18n";
 import { translateBackendError } from "@/i18n/backend-errors";
-import { Upload, Download, FolderPlus, RefreshCw, ChevronsLeft } from "@lucide/vue";
+import { Upload, Download, FolderPlus, RefreshCw, ChevronsLeft, ChevronsUp } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip";
 import LightDropdown from "@/components/ui/LightDropdown.vue";
@@ -45,6 +45,10 @@ function createNewGroup() {
   void connectionTreeRef.value?.createNewGroup();
 }
 
+function collapseAllTreeNodes() {
+  connectionTreeRef.value?.collapseAllTreeNodes();
+}
+
 function focusSearch(): boolean {
   return connectionTreeRef.value?.focusSearch() ?? false;
 }
@@ -65,7 +69,7 @@ defineExpose({ focusSearch });
                 model-value=""
                 :items="importSourceItems"
                 :aria-label="t('sidebar.import')"
-                :trigger-icon="Download"
+                :trigger-icon="Upload"
                 trigger-class="inline-flex h-6 w-5 items-center justify-center rounded-md outline-none hover:bg-muted hover:text-foreground focus-visible:ring-0"
                 trigger-icon-class="h-4 w-4"
                 content-class="w-44"
@@ -83,10 +87,18 @@ defineExpose({ focusSearch });
         <Tooltip>
           <TooltipTrigger as-child>
             <Button variant="ghost" size="icon" class="h-5 w-5" @click="emit('export')">
-              <Upload class="h-3 w-3" />
+              <Download class="h-3 w-3" />
             </Button>
           </TooltipTrigger>
           <TooltipContent>{{ t("sidebar.export") }}</TooltipContent>
+        </Tooltip>
+        <Tooltip>
+          <TooltipTrigger as-child>
+            <Button variant="ghost" size="icon" class="h-5 w-5" @click="collapseAllTreeNodes">
+              <ChevronsUp class="h-3 w-3" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>{{ t("sidebar.collapseAll") }}</TooltipContent>
         </Tooltip>
         <Tooltip>
           <TooltipTrigger as-child>

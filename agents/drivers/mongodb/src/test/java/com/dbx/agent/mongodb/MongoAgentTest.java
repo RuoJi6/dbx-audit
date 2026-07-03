@@ -20,6 +20,7 @@ import java.security.PrivateKey;
 import java.util.Base64;
 import java.util.Date;
 import org.bson.Document;
+import org.bson.types.ObjectId;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -133,6 +134,33 @@ class MongoAgentTest {
         assertEquals(9, json.get("id").getAsInt());
         assertEquals("Not connected", json.getAsJsonObject("error").get("message").getAsString());
         assertFalse(json.getAsJsonObject("error").get("message").getAsString().contains("Unknown method"));
+    }
+
+    @Test
+    void updateDocumentsMethodIsRecognizedOverJsonRpc() {
+        String response = MongoAgent.handleRequest(
+            "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"update_documents\","
+                + "\"params\":{\"database\":\"app\",\"collection\":\"orders\",\"filter_json\":\"{}\","
+                + "\"update_json\":\"{\\\"$set\\\":{\\\"data\\\":null}}\",\"many\":true}}");
+
+        JsonObject json = JsonParser.parseString(response).getAsJsonObject();
+        assertEquals(10, json.get("id").getAsInt());
+        assertEquals("Not connected", json.getAsJsonObject("error").get("message").getAsString());
+        assertFalse(json.getAsJsonObject("error").get("message").getAsString().contains("Unknown method"));
+    }
+
+    @Test
+    void deleteDocumentsMethodIsRecognizedOverJsonRpc() {
+        String response = MongoAgent.handleRequest(
+            "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"delete_documents\","
+                + "\"params\":{\"database\":\"app\",\"collection\":\"orders\","
+                + "\"filter_json\":\"{\\\"status\\\":\\\"draft\\\"}\",\"many\":true}}");
+
+        JsonObject json = JsonParser.parseString(response).getAsJsonObject();
+        assertEquals(11, json.get("id").getAsInt());
+        assertEquals("Not connected", json.getAsJsonObject("error").get("message").getAsString());
+        assertFalse(json.getAsJsonObject("error").get("message").getAsString().contains("Unknown method"));
+        assertTrue(AgentProtocol.MONGO_LEGACY_METHODS.contains(AgentProtocol.MONGO_METHOD_DELETE_DOCUMENTS));
     }
 
     @Test
@@ -342,6 +370,25 @@ class MongoAgentTest {
     }
 
     @Test
+    void convertValueKeepsObjectIdAsStringByDefault() {
+        assertEquals(
+            "507f1f77bcf86cd799439011",
+            MongoAgent.convertValue(new ObjectId("507f1f77bcf86cd799439011"))
+        );
+    }
+
+    @Test
+    void bsonToExtendedJsonUsesMongoExtendedJson() {
+        Document doc = new Document("_id", new ObjectId("507f1f77bcf86cd799439011"))
+            .append("created_at", Date.from(java.time.Instant.parse("2026-06-10T13:59:31.287Z")));
+
+        assertEquals(
+            "{\"_id\":{\"$oid\":\"507f1f77bcf86cd799439011\"},\"created_at\":{\"$date\":\"2026-06-10T13:59:31.287Z\"}}",
+            new com.google.gson.Gson().toJson(MongoAgent.bsonToExtendedJson(doc))
+        );
+    }
+
+    @Test
     void documentForWriteParsesMongoShellIsoDateStrings() {
         Document doc = MongoAgent.documentForWrite("{\"$set\":{\"CreateDate\":\"ISODate(\\\"2026-06-10T13:59:31.287Z\\\")\"}}");
 
@@ -364,6 +411,17 @@ class MongoAgentTest {
         Document set = (Document) doc.get("$set");
         assertTrue(set.get("CreateDate") instanceof Date);
         assertEquals(1_755_138_343_718L, ((Date) set.get("CreateDate")).getTime());
+    }
+
+    @Test
+    void bulkUpdateRequiresOperatorDocument() {
+        Document update = MongoAgent.documentForWrite("{\"$set\":{\"data\":null}}");
+        MongoAgent.requireBulkUpdateOperatorDocument(update);
+
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> MongoAgent.requireBulkUpdateOperatorDocument(MongoAgent.documentForWrite("{\"data\":null}"))
+        );
     }
 
     // ─── helpers ───

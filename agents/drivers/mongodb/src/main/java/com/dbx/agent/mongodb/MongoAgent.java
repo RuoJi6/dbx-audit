@@ -45,12 +45,17 @@ import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManager;
 import javax.net.ssl.TrustManagerFactory;
 import org.bson.Document;
+import org.bson.json.JsonMode;
+import org.bson.json.JsonWriterSettings;
 import org.bson.types.ObjectId;
 
 public final class MongoAgent {
     private static final Gson GSON = new Gson();
     private static final DateTimeFormatter DATE_FORMAT = DateTimeFormatter.ISO_INSTANT.withZone(ZoneOffset.UTC);
     private static final long JS_MAX_SAFE_INTEGER = 9_007_199_254_740_991L;
+    private static final JsonWriterSettings EXTENDED_JSON_SETTINGS = JsonWriterSettings.builder()
+        .outputMode(JsonMode.RELAXED)
+        .build();
     private static MongoClient client;
 
     private MongoAgent() {
@@ -383,6 +388,44 @@ public final class MongoAgent {
         return result;
     }
 
+    /**
+     * MongoDB Extended JSON read path for transfer; output follows the driver's
+     * relaxed Extended JSON representation rather than the UI display format.
+     */
+    private static Object findDocumentsExtendedJson(JsonObject params) {
+        MongoClient c = requireClient();
+        String database = params.get("database").getAsString();
+        String collection = params.get("collection").getAsString();
+        long skip = params.has("skip") ? params.get("skip").getAsLong() : 0;
+        int limit = params.has("limit") ? params.get("limit").getAsInt() : 50;
+        Document filterDoc = documentOrNull(params, "filter");
+        Document projectionDoc = documentOrNull(params, "projection");
+        Document sortDoc = documentOrNull(params, "sort");
+
+        var col = c.getDatabase(database).getCollection(collection);
+        if (filterDoc == null) {
+            filterDoc = new Document();
+        }
+        long total = col.countDocuments(filterDoc);
+
+        var iterable = col.find(filterDoc).skip((int) skip).limit(limit);
+        if (projectionDoc != null) {
+            iterable = iterable.projection(projectionDoc);
+        }
+        if (sortDoc != null) {
+            iterable = iterable.sort(sortDoc);
+        }
+
+        List<JsonObject> documents = new ArrayList<>();
+        for (Document document : iterable) {
+            documents.add(bsonToExtendedJson(document));
+        }
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("documents", documents);
+        result.put("total", total);
+        return result;
+    }
+
     private static Object serverVersion(JsonObject params) {
         MongoClient c = requireClient();
         String database = defaultString(stringOrNull(params, "database"), "admin");
@@ -434,6 +477,22 @@ public final class MongoAgent {
         return Collections.singletonMap("modified_count", result.getModifiedCount());
     }
 
+    private static Object updateDocuments(JsonObject params) {
+        MongoClient c = requireClient();
+        String database = params.get("database").getAsString();
+        String collection = params.get("collection").getAsString();
+        String filterJson = params.get("filter_json").getAsString();
+        String updateJson = params.get("update_json").getAsString();
+        boolean many = params.get("many").getAsBoolean();
+
+        var col = c.getDatabase(database).getCollection(collection);
+        Document filter = documentForWrite(filterJson);
+        Document update = documentForWrite(updateJson);
+        requireBulkUpdateOperatorDocument(update);
+        var result = many ? col.updateMany(filter, update) : col.updateOne(filter, update);
+        return Collections.singletonMap("modified_count", result.getModifiedCount());
+    }
+
     static Document documentForWrite(String docJson) {
         Document doc = Document.parse(docJson);
         convertMongoShellDates(doc);
@@ -458,6 +517,14 @@ public final class MongoAgent {
         return true;
     }
 
+    static void requireBulkUpdateOperatorDocument(Document doc) {
+        if (!isUpdateOperatorDocument(doc)) {
+            // updateOne/updateMany are shell-style bulk updates here; replacements stay on the
+            // single-document save path so a broad filter cannot replace many documents by accident.
+            throw new IllegalArgumentException("Bulk update requires update operators such as $set");
+        }
+    }
+
     private static Object deleteDocument(JsonObject params) {
         MongoClient c = requireClient();
         String database = params.get("database").getAsString();
@@ -469,12 +536,31 @@ public final class MongoAgent {
         return Collections.singletonMap("deleted_count", result.getDeletedCount());
     }
 
+    private static Object deleteDocuments(JsonObject params) {
+        MongoClient c = requireClient();
+        String database = params.get("database").getAsString();
+        String collection = params.get("collection").getAsString();
+        String filterJson = params.get("filter_json").getAsString();
+        boolean many = params.get("many").getAsBoolean();
+
+        var col = c.getDatabase(database).getCollection(collection);
+        Document filter = documentForWrite(filterJson);
+        // Shell deleteOne/deleteMany use a filter document, unlike the row-view
+        // delete path which always targets a single _id.
+        var result = many ? col.deleteMany(filter) : col.deleteOne(filter);
+        return Collections.singletonMap("deleted_count", result.getDeletedCount());
+    }
+
     private static Map<String, Object> bsonToJson(Document doc) {
         Map<String, Object> result = new LinkedHashMap<>();
         for (Map.Entry<String, Object> entry : doc.entrySet()) {
             result.put(entry.getKey(), convertValue(entry.getValue()));
         }
         return result;
+    }
+
+    static JsonObject bsonToExtendedJson(Document doc) {
+        return JsonParser.parseString(doc.toJson(EXTENDED_JSON_SETTINGS)).getAsJsonObject();
     }
 
     static Object convertValue(Object value) {
@@ -585,10 +671,13 @@ public final class MongoAgent {
             case AgentProtocol.MONGO_METHOD_LIST_COLLECTIONS -> listCollections(params);
             case AgentProtocol.METHOD_LIST_INDEXES -> listIndexes(params);
             case AgentProtocol.MONGO_METHOD_FIND_DOCUMENTS -> findDocuments(params);
+            case AgentProtocol.MONGO_METHOD_FIND_DOCUMENTS_EXTENDED_JSON -> findDocumentsExtendedJson(params);
             case AgentProtocol.MONGO_METHOD_SERVER_VERSION -> serverVersion(params);
             case AgentProtocol.MONGO_METHOD_INSERT_DOCUMENT -> insertDocument(params);
             case AgentProtocol.MONGO_METHOD_UPDATE_DOCUMENT -> updateDocument(params);
+            case AgentProtocol.MONGO_METHOD_UPDATE_DOCUMENTS -> updateDocuments(params);
             case AgentProtocol.MONGO_METHOD_DELETE_DOCUMENT -> deleteDocument(params);
+            case AgentProtocol.MONGO_METHOD_DELETE_DOCUMENTS -> deleteDocuments(params);
             case AgentProtocol.METHOD_DISCONNECT, AgentProtocol.METHOD_SHUTDOWN -> {
                 if (client != null) {
                     client.close();

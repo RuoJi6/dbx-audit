@@ -22,6 +22,7 @@ interface RowItem {
   newIndex?: number;
   data: CellValue[];
   isNew: boolean;
+  isDraft?: boolean;
   isDeleted: boolean;
   isDirtyCol: boolean[];
   status: string;
@@ -139,13 +140,13 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
   }
 
   function rowsToExport(rowIds?: number[]): RowItem[] {
-    if (!rowIds?.length) return displayItems.value;
+    if (rowIds === undefined) return displayItems.value.filter((item) => !item.isDraft);
     const rowIdSet = new Set(rowIds);
-    return displayItems.value.filter((item) => rowIdSet.has(item.id));
+    return displayItems.value.filter((item) => rowIdSet.has(item.id) && !item.isDraft);
   }
 
   async function resultToExport(rowIds?: number[], onProgress?: (info: { rowsExported: number; totalRows: number | null }) => void, useFullExport = true): Promise<{ columns: string[]; rows: CellValue[][] }> {
-    if (useFullExport && !rowIds?.length && fullExportResult) {
+    if (useFullExport && rowIds === undefined && fullExportResult) {
       const result = await fullExportResult(onProgress);
       if (result) return { columns: result.columns, rows: result.rows };
     }
@@ -161,23 +162,23 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
 
   function targetedRows(): RowItem[] {
     if (hasRowSelection.value && selectedRowIds.value.size > 0) {
-      return displayItems.value.filter((item) => selectedRowIds.value.has(item.id));
+      return displayItems.value.filter((item) => selectedRowIds.value.has(item.id) && !item.isDraft);
     }
     const range = selectedRange.value;
     if (range && range.startRow !== range.endRow) {
-      return displayItems.value.slice(range.startRow, range.endRow + 1);
+      return displayItems.value.slice(range.startRow, range.endRow + 1).filter((item) => !item.isDraft);
     }
     if (!contextCell.value) return [];
     const item = getRowItem(contextCell.value.rowId);
-    return item ? [item] : [];
+    return item && !item.isDraft ? [item] : [];
   }
 
   function updateEligibleRows(): RowItem[] {
-    return targetedRows().filter((item) => !item.isNew && !item.isDeleted);
+    return targetedRows().filter((item) => !item.isNew && !item.isDraft && !item.isDeleted);
   }
 
   function updateCopyKey(): string {
-    const rows = updateEligibleRows().map((item) => item.id);
+    const rows = copyStatementRowsKey(updateEligibleRows());
     return JSON.stringify({
       databaseType: databaseType.value ?? null,
       schema: tableMeta.value?.schema ?? null,
@@ -190,7 +191,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
   }
 
   function insertCopyKey(excludePrimaryKeys: boolean): string {
-    const rows = insertEligibleRows().map((item) => item.id);
+    const rows = copyStatementRowsKey(insertEligibleRows());
     return JSON.stringify({
       databaseType: databaseType.value ?? null,
       schema: tableMeta.value?.schema ?? null,
@@ -201,6 +202,11 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
       excludePrimaryKeys,
       rows,
     });
+  }
+
+  function copyStatementRowsKey(rows: RowItem[]): Array<{ id: number; data: CellValue[] }> {
+    // Prepared copy SQL depends on current cell values; edited rows keep the same id while their data changes.
+    return rows.map((item) => ({ id: item.id, data: item.data }));
   }
 
   function insertCopyCache(excludePrimaryKeys: boolean): CopyStatementCache {
@@ -389,7 +395,8 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
 
   async function copySelectedRowsTsv() {
     if (!hasRowSelection.value || selectedRowIds.value.size === 0) return;
-    const rows = displayItems.value.filter((item) => selectedRowIds.value.has(item.id)).map((item) => item.data);
+    const rows = displayItems.value.filter((item) => selectedRowIds.value.has(item.id) && !item.isDraft).map((item) => item.data);
+    if (rows.length === 0) return;
     await copyText(formatSelectionAsTsv({ columns: columns.value, rows }));
   }
 
@@ -417,30 +424,31 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
   async function copyCell() {
     if (!contextCell.value || contextCell.value.col < 0) return;
     const item = getRowItem(contextCell.value.rowId);
+    if (!item || item.isDraft) return;
     const val = item?.data[contextCell.value.col] ?? null;
     await copyText(displayCellValue(val));
   }
 
   async function copyRow() {
     if (hasRowSelection.value && selectedRowIds.value.size > 0) {
-      const items = displayItems.value.filter((item) => selectedRowIds.value.has(item.id));
+      const items = displayItems.value.filter((item) => selectedRowIds.value.has(item.id) && !item.isDraft);
       await copyRowsAsJson(items);
       return;
     }
     const range = selectedRange.value;
     if (range && range.startRow !== range.endRow) {
-      const items = displayItems.value.slice(range.startRow, range.endRow + 1);
+      const items = displayItems.value.slice(range.startRow, range.endRow + 1).filter((item) => !item.isDraft);
       await copyRowsAsJson(items);
       return;
     }
     if (!contextCell.value) return;
     const item = getRowItem(contextCell.value.rowId);
-    if (!item) return;
+    if (!item || item.isDraft) return;
     await copyRowsAsJson([item]);
   }
 
   function insertEligibleRows(): RowItem[] {
-    return targetedRows();
+    return targetedRows().filter((item) => !item.isDraft);
   }
 
   async function copyRowAsInsert() {
@@ -480,7 +488,10 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
 
   async function copyAll() {
     const header = columns.value.join("\t");
-    const body = displayItems.value.map((item) => item.data.map((c) => displayCellValue(c)).join("\t")).join("\n");
+    const body = displayItems.value
+      .filter((item) => !item.isDraft)
+      .map((item) => item.data.map((c) => displayCellValue(c)).join("\t"))
+      .join("\n");
     await copyText(`${header}\n${body}`);
   }
 
@@ -501,7 +512,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
         if (await exportQueryResultViaBackend("csv", rowIds)) return;
         if (await exportFullTableDataViaBackend("csv", rowIds)) return;
 
-        const needsFullExport = !rowIds?.length && !!fullExportResult;
+        const needsFullExport = rowIds === undefined && !!fullExportResult;
         if (needsFullExport && exportProgressDialog && exportProgressState) {
           exportProgressState.value = {
             title: t("exportProgress.title"),
@@ -705,7 +716,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
           if (!path) return;
           outputPath = path as string;
         }
-        const needsFullExport = !rowIds?.length && !!fullExportResult;
+        const needsFullExport = rowIds === undefined && !!fullExportResult;
         if (needsFullExport && exportProgressDialog && exportProgressState) {
           exportProgressState.value = {
             title: t("exportProgress.title"),
@@ -815,7 +826,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
 
   async function exportFullTableDataViaBackend(format: "csv" | "xlsx" | "json" | "markdown" | "sql", rowIds?: number[]): Promise<boolean> {
     const meta = tableMeta.value;
-    if (rowIds?.length || context.value !== "table-data" || !meta || !connectionId.value || !database.value) {
+    if (rowIds !== undefined || context.value !== "table-data" || !meta || !connectionId.value || !database.value) {
       return false;
     }
 
@@ -894,7 +905,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
   }
 
   async function exportQueryResultViaBackend(format: "csv" | "xlsx", rowIds?: number[]): Promise<boolean> {
-    if (rowIds?.length || context.value !== "results" || !queryResultExportRequest) {
+    if (rowIds !== undefined || context.value !== "results" || !queryResultExportRequest) {
       return false;
     }
 

@@ -108,10 +108,10 @@ import type { BuildEditableObjectSourceSqlInput, BuildRoutineRenameObjectSourceI
 import type { BuildViewDdlInput } from "@/lib/viewDdl";
 import type { BuildRenameObjectSqlOptions } from "@/lib/objectRenameSql";
 import type { CreateDatabaseSqlOptions } from "@/lib/createDatabaseSql";
-import type { DatabaseNameSqlOptions, DropTableChildObjectSqlOptions, DropObjectSqlOptions, DuplicateTableStructureSqlOptions, SchemaNameSqlOptions, TableAdminSqlOptions } from "@/lib/dbAdminSql";
+import type { DatabaseNameSqlOptions, DropTableChildObjectSqlOptions, DropObjectSqlOptions, DuplicateTableStructureSqlOptions, CopyTableDataSqlOptions, SchemaNameSqlOptions, TableAdminSqlOptions } from "@/lib/dbAdminSql";
 import type { BuildDatabaseSqlExportOptions, BuildExportInsertStatementsOptions } from "@/lib/databaseExport";
 import type { DataCompareFromTablesOptions, DataCompareFromTablesPreparation, DataCompareSyncPlan, DataCompareSyncPlanOptions, DataComparePreparation, DataComparePreparationOptions } from "@/lib/dataCompare";
-import { apiUrl } from "@/lib/webPath";
+import { apiUrl, apiWebSocketUrl } from "@/lib/webPath";
 import type { DataGridSavePreparation } from "./tauri";
 import type {
   NacosConfigHistoryKey,
@@ -657,6 +657,22 @@ export async function executeInTransaction(connectionId: string, database: strin
   return post("/api/query/execute-in-transaction", { connectionId, database, statements, schema });
 }
 
+export async function beginManualTransaction(_connectionId: string, _database: string, _schema?: string): Promise<string> {
+  throw new Error("Manual transaction management is only available in the desktop app.");
+}
+
+export async function executeInManualTransaction(_txnSessionId: string, _sql: string, _database: string, _schema?: string, _maxRows?: number): Promise<QueryResult[]> {
+  throw new Error("Manual transaction management is only available in the desktop app.");
+}
+
+export async function commitManualTransaction(_txnSessionId: string): Promise<QueryResult> {
+  throw new Error("Manual transaction management is only available in the desktop app.");
+}
+
+export async function rollbackManualTransaction(_txnSessionId: string): Promise<QueryResult> {
+  throw new Error("Manual transaction management is only available in the desktop app.");
+}
+
 export async function cancelQuery(executionId: string): Promise<boolean> {
   const result = await post<boolean | { cancelled?: boolean }>("/api/query/cancel", { executionId });
   return typeof result === "boolean" ? result : result.cancelled === true;
@@ -758,6 +774,10 @@ export async function buildDropSchemaSql(options: SchemaNameSqlOptions): Promise
 
 export async function buildDuplicateTableStructureSql(options: DuplicateTableStructureSqlOptions): Promise<string> {
   return post("/api/query/build-duplicate-table-structure-sql", { options });
+}
+
+export async function buildCopyTableDataSql(options: CopyTableDataSqlOptions): Promise<string> {
+  return post("/api/query/build-copy-table-data-sql", { options });
 }
 
 export async function buildExecutableObjectSourceStatements(input: BuildEditableObjectSourceSqlInput): Promise<string[]> {
@@ -977,6 +997,14 @@ export async function saveAiConfig(config: AiConfig): Promise<void> {
   return post("/api/ai/config", { config });
 }
 
+export async function saveAiProviderConfig(provider: string, config: AiConfig): Promise<void> {
+  return post("/api/ai/provider-config", { provider, config });
+}
+
+export async function loadAiProviderConfigs(): Promise<Record<string, AiConfig>> {
+  return get("/api/ai/provider-configs");
+}
+
 export async function loadAiConfig(): Promise<AiConfig | null> {
   return get("/api/ai/config");
 }
@@ -992,6 +1020,14 @@ export async function loadDesktopSettings(): Promise<DesktopSettings> {
 
 export async function saveDesktopSettings(settings: DesktopSettings): Promise<void> {
   safeLocalStorageSet(DESKTOP_SETTINGS_STORAGE_KEY, JSON.stringify({ ...DEFAULT_DESKTOP_SETTINGS, ...settings }));
+}
+
+export async function completeAppClose(_action: "quit" | "hide"): Promise<void> {
+  return undefined;
+}
+
+export async function requestAppClose(): Promise<void> {
+  return undefined;
 }
 
 export interface DriverStoreMigrationResult {
@@ -1595,6 +1631,10 @@ export async function redisPubSubPublish(connectionId: string, db: number, chann
   return post("/api/redis/pubsub/publish", { connectionId, db, channel, message });
 }
 
+export async function redisPubSubConnect(connectionId: string): Promise<WebSocket> {
+  return new WebSocket(apiWebSocketUrl(`/api/redis/pubsub/ws?connectionId=${encodeURIComponent(connectionId)}`));
+}
+
 export async function redisSlowlogGet(connectionId: string, count: number, nodeHost?: string, nodePort?: number): Promise<RedisSlowlogEntry[]> {
   return post("/api/redis/slowlog-get", { connectionId, count, nodeHost, nodePort });
 }
@@ -1711,12 +1751,20 @@ export async function nacosRawRequest(connectionId: string, req: NacosRawRequest
 // MongoDB
 // ---------------------------------------------------------------------------
 
+export async function documentListDatabases(connectionId: string): Promise<string[]> {
+  return post("/api/document-store/list-databases", { connectionId });
+}
+
 export async function mongoListDatabases(connectionId: string): Promise<string[]> {
-  return post("/api/mongo/list-databases", { connectionId });
+  return documentListDatabases(connectionId);
+}
+
+export async function documentListCollections(connectionId: string, database: string): Promise<CollectionInfo[]> {
+  return post("/api/document-store/list-collections", { connectionId, database });
 }
 
 export async function mongoListCollections(connectionId: string, database: string): Promise<CollectionInfo[]> {
-  return post("/api/mongo/list-collections", { connectionId, database });
+  return documentListCollections(connectionId, database);
 }
 
 export async function mongoCreateDatabase(connectionId: string, database: string): Promise<void> {
@@ -1732,16 +1780,20 @@ export async function mongoDropCollection(connectionId: string, database: string
 }
 
 export async function elasticsearchListIndices(connectionId: string): Promise<string[]> {
-  const collections = await mongoListCollections(connectionId, "default");
+  const collections = await documentListCollections(connectionId, "default");
   return collections.map((c) => c.name);
 }
 
-export async function vectorListCollections(connectionId: string): Promise<CollectionInfo[]> {
-  return mongoListCollections(connectionId, "default");
+export async function vectorListCollections(connectionId: string, database?: string): Promise<CollectionInfo[]> {
+  return documentListCollections(connectionId, database || "default");
+}
+
+export async function vectorGetCollectionDetail(connectionId: string, database: string, collection: string): Promise<CollectionInfo> {
+  return post("/api/mongo/vector-collection-detail", { connectionId, database, collection });
 }
 
 export async function mongoFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, projection?: string, sort?: string, executionId?: string): Promise<MongoDocumentResult> {
-  return post("/api/mongo/find-documents", { connectionId, database, collection, skip, limit, filter, projection, sort, executionId });
+  return documentFindDocuments(connectionId, database, collection, skip, limit, filter, projection, sort, executionId);
 }
 
 export async function documentFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, projection?: string, sort?: string, executionId?: string): Promise<MongoDocumentResult> {
@@ -1756,24 +1808,44 @@ export async function mongoAggregateDocuments(connectionId: string, database: st
   return post("/api/mongo/aggregate-documents", { connectionId, database, collection, pipelineJson, maxRows, executionId });
 }
 
+export async function mongoCreateIndex(connectionId: string, database: string, collection: string, keysJson: string, optionsJson?: string): Promise<{ name: string }> {
+  return post("/api/mongo/create-index", { connectionId, database, collection, keysJson, optionsJson });
+}
+
+export async function mongoDropIndexes(connectionId: string, database: string, collection: string, indexesJson?: string, single = false): Promise<{ dropped_names: string[]; affected_rows: number }> {
+  return post("/api/mongo/drop-indexes", { connectionId, database, collection, indexesJson, single });
+}
+
 export async function mongoInsertDocument(connectionId: string, database: string, collection: string, docJson: string): Promise<string> {
-  return post("/api/mongo/insert-document", { connectionId, database, collection, docJson });
+  return documentInsertDocument(connectionId, database, collection, docJson);
+}
+
+export async function documentInsertDocument(connectionId: string, database: string, collection: string, docJson: string): Promise<string> {
+  return post("/api/document-store/insert-document", { connectionId, database, collection, docJson });
 }
 
 export async function mongoInsertDocuments(connectionId: string, database: string, collection: string, docsJson: string): Promise<{ affected_rows: number }> {
   return post("/api/mongo/insert-documents", { connectionId, database, collection, docsJson });
 }
 
-export async function mongoUpdateDocument(connectionId: string, database: string, collection: string, id: string, docJson: string): Promise<number> {
-  return post("/api/mongo/update-document", { connectionId, database, collection, id, docJson });
+export async function mongoUpdateDocument(connectionId: string, database: string, collection: string, id: string, docJson: string, routing?: string): Promise<number> {
+  return documentUpdateDocument(connectionId, database, collection, id, docJson, routing);
+}
+
+export async function documentUpdateDocument(connectionId: string, database: string, collection: string, id: string, docJson: string, routing?: string): Promise<number> {
+  return post("/api/document-store/update-document", { connectionId, database, collection, id, docJson, routing });
 }
 
 export async function mongoUpdateDocuments(connectionId: string, database: string, collection: string, filterJson: string, updateJson: string, many: boolean): Promise<{ affected_rows: number }> {
   return post("/api/mongo/update-documents", { connectionId, database, collection, filterJson, updateJson, many });
 }
 
-export async function mongoDeleteDocument(connectionId: string, database: string, collection: string, id: string): Promise<number> {
-  return post("/api/mongo/delete-document", { connectionId, database, collection, id });
+export async function mongoDeleteDocument(connectionId: string, database: string, collection: string, id: string, routing?: string): Promise<number> {
+  return documentDeleteDocument(connectionId, database, collection, id, routing);
+}
+
+export async function documentDeleteDocument(connectionId: string, database: string, collection: string, id: string, routing?: string): Promise<number> {
+  return post("/api/document-store/delete-document", { connectionId, database, collection, id, routing });
 }
 
 export async function mongoDeleteDocuments(connectionId: string, database: string, collection: string, filterJson: string, many: boolean): Promise<{ affected_rows: number }> {
@@ -1821,11 +1893,13 @@ export async function checkMcpServerStatus(): Promise<import("./tauri").McpServe
   return {
     installed: false,
     npm_available: false,
+    node_path: null,
     node_version: null,
     current_version: null,
     latest_version: null,
     update_available: false,
     bin_path: null,
+    script_path: null,
     install_command: "npm install -g @dbx-app/mcp-server@latest --registry=https://registry.npmjs.org",
     update_command: "npm install -g @dbx-app/mcp-server@latest --registry=https://registry.npmjs.org",
     error: "MCP Server status is only available in the desktop app.",

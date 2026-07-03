@@ -134,6 +134,17 @@ describe("sqlCompletion scoped context classification", () => {
     expect(context.suggestColumns).toBe(true);
   });
 
+  it("classifies unqualified WHERE field input as column context", () => {
+    const sql = "SELECT * FROM A1User WHERE userc";
+    const context = getSqlCompletionContext(sql, sql.length);
+
+    expect(context.contextKind).toBe("column");
+    expect(context.prefix).toBe("userc");
+    expect(context.referencedTables).toEqual(expect.arrayContaining([expect.objectContaining({ name: "A1User" })]));
+    expect(context.suggestColumns).toBe(true);
+    expect(context.suggestRoutines).toBe(false);
+  });
+
   it("classifies CALL routine contexts", () => {
     const sql = "CALL usp_";
     const context = getSqlCompletionContext(sql, sql.length);
@@ -167,6 +178,17 @@ describe("sqlCompletion scoped context classification", () => {
     const context = getSqlCompletionContext(sql, sql.length);
 
     expect(context.referencedTables).toEqual(expect.arrayContaining([expect.objectContaining({ schema: "dbo", name: "Users", alias: "u" }), expect.objectContaining({ name: "Orders", alias: "o" })]));
+  });
+
+  it("treats schema-qualified table prefixes in FROM as table completion input", () => {
+    const sql = "SELECT * FROM dws_game_sdk_base.di";
+    const context = getSqlCompletionContext(sql, sql.length);
+
+    expect(context.qualifier).toBe("dws_game_sdk_base");
+    expect(context.prefix).toBe("di");
+    expect(context.suggestTables).toBe(true);
+    expect(context.exclusiveTableSuggestions).toBe(true);
+    expect(context.suggestColumns).toBe(true);
   });
 
   it("exposes CTEs as table-like referenced tables", () => {
