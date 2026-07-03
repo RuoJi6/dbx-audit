@@ -22,6 +22,7 @@ pub mod database_export;
 pub mod database_search_sql;
 pub mod db;
 pub mod db_admin_sql;
+pub mod document_ops;
 pub mod driver_runtime;
 pub mod external;
 pub mod history;
@@ -90,6 +91,7 @@ pub async fn race_download(
             client
                 .get(&url)
                 .header(reqwest::header::USER_AGENT, ua)
+                .header(reqwest::header::ACCEPT_ENCODING, "identity")
                 .send()
                 .await
                 .and_then(|r| r.error_for_status())

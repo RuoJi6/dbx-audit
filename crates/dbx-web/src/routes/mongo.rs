@@ -99,6 +99,26 @@ pub struct MongoAggregateRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct MongoCreateIndexRequest {
+    pub connection_id: String,
+    pub database: String,
+    pub collection: String,
+    pub keys_json: String,
+    pub options_json: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MongoDropIndexesRequest {
+    pub connection_id: String,
+    pub database: String,
+    pub collection: String,
+    pub indexes_json: Option<String>,
+    pub single: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MongoInsertRequest {
     pub connection_id: String,
     pub database: String,
@@ -144,6 +164,7 @@ pub struct MongoUpdateRequest {
     pub collection: String,
     pub id: String,
     pub doc_json: String,
+    pub routing: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -153,6 +174,7 @@ pub struct MongoDeleteRequest {
     pub database: String,
     pub collection: String,
     pub id: String,
+    pub routing: Option<String>,
 }
 
 pub async fn list_databases(
@@ -167,10 +189,33 @@ pub async fn list_databases(
 pub async fn list_collections(
     State(state): State<Arc<WebState>>,
     Json(req): Json<MongoCollectionRequest>,
-) -> Result<Json<Vec<dbx_core::db::vector_driver::CollectionInfo>>, AppError> {
+) -> Result<Json<Vec<dbx_core::document_ops::CollectionInfo>>, AppError> {
     let result = dbx_core::mongo_ops::mongo_list_collections_core(&state.app, &req.connection_id, &req.database)
         .await
         .map_err(AppError)?;
+    Ok(Json(result))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VectorCollectionDetailRequest {
+    pub connection_id: String,
+    pub database: String,
+    pub collection: String,
+}
+
+pub async fn vector_collection_detail(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<VectorCollectionDetailRequest>,
+) -> Result<Json<dbx_core::db::vector_driver::CollectionInfo>, AppError> {
+    let result = dbx_core::schema::get_vector_collection_detail_core(
+        &state.app,
+        &req.connection_id,
+        &req.database,
+        &req.collection,
+    )
+    .await
+    .map_err(AppError)?;
     Ok(Json(result))
 }
 
@@ -214,30 +259,7 @@ pub async fn find_documents(
     let result = run_cancellable(
         &state,
         req.execution_id.clone(),
-        dbx_core::mongo_ops::mongo_find_documents_core(
-            &state.app,
-            &req.connection_id,
-            &req.database,
-            &req.collection,
-            req.skip.unwrap_or(0),
-            req.limit.unwrap_or(50),
-            req.filter.as_deref(),
-            req.projection.as_deref(),
-            req.sort.as_deref(),
-        ),
-    )
-    .await?;
-    Ok(Json(serde_json::to_value(result).map_err(|e| AppError(e.to_string()))?))
-}
-
-pub async fn document_find_documents(
-    State(state): State<Arc<WebState>>,
-    Json(req): Json<MongoFindRequest>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let result = run_cancellable(
-        &state,
-        req.execution_id.clone(),
-        dbx_core::mongo_ops::document_find_documents_core(
+        dbx_core::document_ops::find_documents_core(
             &state.app,
             &req.connection_id,
             &req.database,
@@ -286,12 +308,48 @@ pub async fn aggregate_documents(
     Ok(Json(serde_json::to_value(result).map_err(|e| AppError(e.to_string()))?))
 }
 
+pub async fn create_index(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<MongoCreateIndexRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    ensure_writable(&state.app, &req.connection_id, "Create index").await?;
+    let name = dbx_core::mongo_ops::mongo_create_index_core(
+        &state.app,
+        &req.connection_id,
+        &req.database,
+        &req.collection,
+        &req.keys_json,
+        req.options_json.as_deref(),
+    )
+    .await
+    .map_err(AppError)?;
+    Ok(Json(serde_json::json!({ "name": name })))
+}
+
+pub async fn drop_indexes(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<MongoDropIndexesRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    ensure_writable(&state.app, &req.connection_id, "Drop indexes").await?;
+    let result = dbx_core::mongo_ops::mongo_drop_indexes_core(
+        &state.app,
+        &req.connection_id,
+        &req.database,
+        &req.collection,
+        req.indexes_json.as_deref(),
+        req.single,
+    )
+    .await
+    .map_err(AppError)?;
+    Ok(Json(serde_json::to_value(result).map_err(|e| AppError(e.to_string()))?))
+}
+
 pub async fn insert_document(
     State(state): State<Arc<WebState>>,
     Json(req): Json<MongoInsertRequest>,
 ) -> Result<Json<String>, AppError> {
     ensure_writable(&state.app, &req.connection_id, "Insert").await?;
-    let result = dbx_core::mongo_ops::mongo_insert_document_core(
+    let result = dbx_core::document_ops::insert_document_core(
         &state.app,
         &req.connection_id,
         &req.database,
@@ -325,13 +383,14 @@ pub async fn update_document(
     Json(req): Json<MongoUpdateRequest>,
 ) -> Result<Json<u64>, AppError> {
     ensure_writable(&state.app, &req.connection_id, "Update").await?;
-    let result = dbx_core::mongo_ops::mongo_update_document_core(
+    let result = dbx_core::document_ops::update_document_core(
         &state.app,
         &req.connection_id,
         &req.database,
         &req.collection,
         &req.id,
         &req.doc_json,
+        req.routing.as_deref(),
     )
     .await
     .map_err(AppError)?;
@@ -362,12 +421,13 @@ pub async fn delete_document(
     Json(req): Json<MongoDeleteRequest>,
 ) -> Result<Json<u64>, AppError> {
     ensure_writable(&state.app, &req.connection_id, "Delete").await?;
-    let result = dbx_core::mongo_ops::mongo_delete_document_core(
+    let result = dbx_core::document_ops::delete_document_core(
         &state.app,
         &req.connection_id,
         &req.database,
         &req.collection,
         &req.id,
+        req.routing.as_deref(),
     )
     .await
     .map_err(AppError)?;

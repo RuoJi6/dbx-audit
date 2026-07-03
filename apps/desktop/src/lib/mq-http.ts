@@ -2,6 +2,7 @@
 import { apiUrl } from "@/lib/webPath";
 import type {
   MqClusterInfo,
+  ClusterInfo,
   TenantInfo,
   TenantConfig,
   NamespaceRef,
@@ -29,8 +30,11 @@ import type {
   MqIssuedToken,
   BacklogStats,
   PeekedMessage,
+  PeekMessagesOptions,
   MqRawRequest,
   MqRawResponse,
+  SendMessageRequest,
+  SendMessageResponse,
 } from "@/types/mq";
 
 async function post<T>(path: string, body: unknown): Promise<T> {
@@ -134,8 +138,8 @@ export async function mqClearBacklog(connectionId: string, topic: TopicRef, sub:
   return post("/api/mq/subscriptions/clear-backlog", { connectionId, topic, sub });
 }
 
-export async function mqPeekMessages(connectionId: string, topic: TopicRef, sub: string, count: number): Promise<PeekedMessage[]> {
-  return post("/api/mq/subscriptions/peek-messages", { connectionId, topic, sub, count });
+export async function mqPeekMessages(connectionId: string, topic: TopicRef, sub: string, count: number, options?: PeekMessagesOptions): Promise<PeekedMessage[]> {
+  return post("/api/mq/subscriptions/peek-messages", { connectionId, topic, sub, count, options });
 }
 
 export async function mqExpireMessages(connectionId: string, topic: TopicRef, sub: string, expireSeconds: number): Promise<void> {
@@ -202,6 +206,14 @@ export async function mqGetBacklog(connectionId: string, topic: TopicRef, sub?: 
   return post("/api/mq/monitoring/backlog", { connectionId, topic, sub });
 }
 
+export async function mqGetClusterInfo(connectionId: string): Promise<ClusterInfo> {
+  return post("/api/mq/monitoring/cluster-info", { connectionId });
+}
+
 export async function mqRawRequest(connectionId: string, req: MqRawRequest): Promise<MqRawResponse> {
   return post("/api/mq/raw", { connectionId, req });
+}
+
+export async function mqSendMessage(connectionId: string, req: SendMessageRequest): Promise<SendMessageResponse> {
+  return post("/api/mq/send-message", { connectionId, req });
 }

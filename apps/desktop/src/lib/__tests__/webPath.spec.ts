@@ -11,6 +11,8 @@ describe("webPath", () => {
     expect(dbxWebBasePath("/", "/dbx/")).toBe("/dbx");
     expect(webPath("/login", "/dbx")).toBe("/dbx/login");
     expect(webPath("/", "/dbx")).toBe("/dbx/");
+    expect(webPath("/icons/database/mysql.svg", "/dbx")).toBe("/dbx/icons/database/mysql.svg");
+    expect(webPath("/icons/ai/openai.svg", "/dbx")).toBe("/dbx/icons/ai/openai.svg");
     expect(apiUrl("/auth/check", "/dbx")).toBe("/dbx/api/auth/check");
     expect(apiUrl("/api/auth/check", "/dbx")).toBe("/dbx/api/auth/check");
     expect(apiUrl("api/auth/check", "/dbx")).toBe("/dbx/api/auth/check");

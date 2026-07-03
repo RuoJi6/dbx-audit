@@ -30,6 +30,7 @@ const props = defineProps<{
   showSqlLibrary: boolean;
   showDriverStore: boolean;
   showAuditPanel: boolean;
+  showSettingsPage: boolean;
   checkingUpdates: boolean;
   hasUpdateAvailable: boolean;
   agentDriverUpdateCount: number;
@@ -505,7 +506,7 @@ const toolbarDropdownTriggerClass = `inline-flex h-8 items-center gap-1 rounded-
 
     <Tooltip>
       <TooltipTrigger as-child>
-        <Button variant="ghost" size="icon" class="h-8 w-8 shrink-0" @click="emit('open-settings')">
+        <Button variant="ghost" size="icon" class="h-8 w-8 shrink-0" :class="{ 'bg-accent': showSettingsPage }" @click="emit('open-settings')">
           <Settings class="h-4 w-4" />
         </Button>
       </TooltipTrigger>

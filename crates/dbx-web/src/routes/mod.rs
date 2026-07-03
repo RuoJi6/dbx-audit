@@ -6,6 +6,7 @@ pub mod cloud_sync;
 pub mod connection;
 pub mod data_compare;
 pub mod database_export;
+pub mod document_store;
 pub mod etcd;
 pub mod history;
 pub mod jdbc;

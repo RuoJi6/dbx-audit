@@ -2,16 +2,20 @@ import { strict as assert } from "node:assert";
 import { test } from "vitest";
 import {
   evaluateMongoAggregateSafety,
+  evaluateMongoWriteSafety,
   mongoAggregateWriteStage,
   mongoCountToQueryResult,
   mongoDocumentsToQueryResult,
   mongoIndexesToQueryResult,
   parseMongoAggregateCommand,
+  parseMongoCommand,
   parseMongoCountDocumentsCommand,
   parseMongoFindCommand,
   parseMongoGetIndexesCommand,
   parseMongoVersionCommand,
   parseMongoWriteCommand,
+  splitMongoCommands,
+  splitMongoCommandRanges,
 } from "../../apps/desktop/src/lib/mongoShellCommand.ts";
 import { buildMongoUpdateDocument as buildMongoDocumentUpdate, formatMongoShellLiteral as formatMongoDocumentShellLiteral } from "../../apps/desktop/src/lib/mongoDocumentValues.ts";
 
@@ -90,6 +94,21 @@ test("parseMongoVersionCommand parses db.version", () => {
   assert.equal(parseMongoVersionCommand("db.jobs.version()"), null);
 });
 
+test("parseMongoCommand normalizes outer comments around a command", () => {
+  const parsed = parseMongoCommand(`
+    // current database
+    use accounting;
+    // keep working here
+  `);
+  assert.deepEqual(parsed, {
+    text: "use accounting;",
+    command: {
+      kind: "use",
+      database: "accounting",
+    },
+  });
+});
+
 test("parseMongoWriteCommand accepts unquoted insert and update commands", () => {
   assert.deepEqual(parseMongoWriteCommand("db.products.insertOne({name: 'demo', price: 1})"), {
     kind: "insert",
@@ -103,6 +122,64 @@ test("parseMongoWriteCommand accepts unquoted insert and update commands", () =>
     update: '{"$set": {"stock": 3}}',
     many: false,
   });
+});
+
+test("parseMongoWriteCommand parses createIndex with optional options", () => {
+  assert.deepEqual(parseMongoWriteCommand("db.users.createIndex({email: 1}, {unique: true, name: 'users_email_unique'})"), {
+    kind: "createIndex",
+    collection: "users",
+    keys: '{"email": 1}',
+    options: '{"unique": true, "name": "users_email_unique"}',
+  });
+});
+
+test("parseMongoWriteCommand parses dropIndex and dropIndexes variants", () => {
+  assert.deepEqual(parseMongoWriteCommand('db.users.dropIndex("users_email_unique")'), {
+    kind: "dropIndex",
+    collection: "users",
+    index: '"users_email_unique"',
+  });
+  assert.deepEqual(parseMongoWriteCommand("db.users.dropIndex({email: 1})"), {
+    kind: "dropIndex",
+    collection: "users",
+    index: '{"email": 1}',
+  });
+  assert.deepEqual(parseMongoWriteCommand("db.users.dropIndexes()"), {
+    kind: "dropIndexes",
+    collection: "users",
+  });
+  assert.deepEqual(parseMongoWriteCommand("db.users.dropIndexes({email: 1})"), {
+    kind: "dropIndexes",
+    collection: "users",
+    indexes: '{"email": 1}',
+  });
+  assert.deepEqual(parseMongoWriteCommand('db.users.dropIndexes("*")'), {
+    kind: "dropIndexes",
+    collection: "users",
+    indexes: '"*"',
+  });
+  assert.deepEqual(parseMongoWriteCommand('db.users.dropIndexes(["a_1", "b_1"])'), {
+    kind: "dropIndexes",
+    collection: "users",
+    indexes: '["a_1", "b_1"]',
+  });
+});
+
+test("parseMongoWriteCommand rejects invalid dropIndex/dropIndexes variants", () => {
+  assert.equal(parseMongoWriteCommand("db.users.dropIndex()"), null);
+  assert.equal(parseMongoWriteCommand('db.users.dropIndex("*")'), null);
+  assert.equal(parseMongoWriteCommand('db.users.dropIndex(["a_1"])'), null);
+  assert.equal(parseMongoWriteCommand('db.users.dropIndexes([{"a":1}])'), null);
+});
+
+test("evaluateMongoWriteSafety blocks dangerous dropIndexes shapes unless enabled", () => {
+  const dropAll = parseMongoWriteCommand("db.users.dropIndexes()");
+  assert.ok(dropAll);
+  assert.match(evaluateMongoWriteSafety(dropAll, { allowWrites: true }).reason || "", /DBX_MCP_ALLOW_DANGEROUS_SQL=1/);
+
+  const dropOne = parseMongoWriteCommand('db.users.dropIndexes("users_email_unique")');
+  assert.ok(dropOne);
+  assert.equal(evaluateMongoWriteSafety(dropOne, { allowWrites: true }).allowed, true);
 });
 
 test("parseMongoCountDocumentsCommand parses db collection countDocuments", () => {
@@ -150,6 +227,69 @@ test("parseMongoGetIndexesCommand parses collection index commands", () => {
     collection: "audit.logs",
   });
   assert.equal(parseMongoGetIndexesCommand("db.web_log.getIndexes({})"), null);
+});
+
+test("splitMongoCommands keeps semicolon-separated mongo commands in order", () => {
+  const commands = splitMongoCommands(`
+    db.users.insertOne({ name: "A" });
+    db.users.insertOne({ name: "B" });
+  `);
+  assert.deepEqual(
+    commands.map(({ text, command }) => ({ kind: command.kind, text })),
+    [
+      { kind: "insert", text: 'db.users.insertOne({ name: "A" })' },
+      { kind: "insert", text: 'db.users.insertOne({ name: "B" })' },
+    ],
+  );
+});
+
+test("splitMongoCommands splits top-level line starts without semicolons", () => {
+  const commands = splitMongoCommands(`
+    use accounting
+    db.getCollection("entries")
+      .find({ status: "open" })
+      .limit(5)
+  `);
+  assert.deepEqual(
+    commands.map(({ text, command }) => ({ kind: command.kind, text })),
+    [
+      { kind: "use", text: "use accounting" },
+      { kind: "find", text: 'db.getCollection("entries")\n      .find({ status: "open" })\n      .limit(5)' },
+    ],
+  );
+});
+
+test("splitMongoCommandRanges preserve document offsets for newline-separated commands", () => {
+  const source = `
+    use accounting
+    db.getCollection("entries")
+      .find({ status: "open" })
+      .limit(5)
+  `;
+  const commands = splitMongoCommandRanges(source);
+
+  assert.deepEqual(
+    commands.map(({ from, to, text, command }) => ({
+      from,
+      to,
+      text,
+      kind: command.kind,
+    })),
+    [
+      {
+        from: source.indexOf("use accounting"),
+        to: source.indexOf("use accounting") + "use accounting".length,
+        text: "use accounting",
+        kind: "use",
+      },
+      {
+        from: source.indexOf('db.getCollection("entries")'),
+        to: source.indexOf('      .limit(5)') + "      .limit(5)".length,
+        text: 'db.getCollection("entries")\n      .find({ status: "open" })\n      .limit(5)',
+        kind: "find",
+      },
+    ],
+  );
 });
 
 test("evaluateMongoAggregateSafety blocks write stages unless MCP write flags allow them", () => {

@@ -379,6 +379,62 @@ test("copy MongoDB rows as INSERT excludes _id for insert without primary keys",
   assert.equal(clipboardMock.copyToClipboard.mock.calls[0][0], 'db.getCollection("accounting_reconciliations").insertMany([{"status":"done"},{"status":"draft"}]);');
 });
 
+test("copy row as INSERT refreshes prepared SQL after row data changes", async () => {
+  const contextCell = ref({ rowId: 1, rowIndex: 0, col: 0 });
+  const row = {
+    id: 1,
+    data: [1, "before"],
+    isNew: false,
+    isDeleted: false,
+    isDirtyCol: [false, false],
+    status: "",
+  };
+  apiMock.buildDataGridCopyInsertStatement
+    .mockResolvedValueOnce("INSERT INTO users (id, name) VALUES (1, 'before');")
+    .mockResolvedValueOnce("INSERT INTO users (id, name) VALUES (1, 'after');");
+  const composable = useDataGridExport({
+    columns: computed(() => ["id", "name"]),
+    displayItems: computed(() => [row]),
+    sql: computed(() => undefined),
+    tableMeta: computed(() => ({
+      tableName: "users",
+      primaryKeys: ["id"],
+    })),
+    databaseType: computed(() => "mysql"),
+    connectionId: computed(() => "conn-1"),
+    database: computed(() => "db"),
+    context: computed(() => "table-data"),
+    sourceColumns: computed(() => undefined),
+    columnTypes: computed(() => undefined),
+    whereInput: computed(() => undefined),
+    orderBy: computed(() => undefined),
+    exportBatchSize: computed(() => 1000),
+    hasCellSelection: computed(() => false),
+    selectedCells: computed(() => ({ columns: [], rows: [] })),
+    selectedRange: computed(() => null),
+    contextCell,
+    getRowItem: () => row,
+    selectedRowIds: ref(new Set<number>()),
+    hasRowSelection: computed(() => false),
+  });
+
+  await composable.prefetchRowAsInsertStatement(false);
+  await composable.copyRowAsInsert();
+  row.data = [1, "after"];
+  await composable.prefetchRowAsInsertStatement(false);
+  await composable.copyRowAsInsert();
+
+  assert.equal(apiMock.buildDataGridCopyInsertStatement.mock.calls.length, 2);
+  assert.deepEqual(apiMock.buildDataGridCopyInsertStatement.mock.calls.map((call) => call[0].rows), [
+    [[1, "before"]],
+    [[1, "after"]],
+  ]);
+  assert.deepEqual(clipboardMock.copyToClipboard.mock.calls.map((call) => call[0]), [
+    "INSERT INTO users (id, name) VALUES (1, 'before');",
+    "INSERT INTO users (id, name) VALUES (1, 'after');",
+  ]);
+});
+
 test("default data grid export file names use sanitized base names and compact local timestamps", () => {
   vi.useFakeTimers();
   try {

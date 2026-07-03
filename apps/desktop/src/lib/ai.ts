@@ -70,7 +70,7 @@ export interface AiRequestInput {
   context: AiContext;
 }
 
-function buildAgentRequest(input: AiRequestInput, history?: api.AiMessage[]): { messages: api.AiMessage[]; systemPrompt: string; taskContract: api.AiTaskContract; maxTokens: number; temperature: number } {
+function buildAgentRequest(input: AiRequestInput, history?: api.AiMessage[]): { messages: api.AiMessage[]; systemPrompt: string; taskContract: api.AiTaskContract; maxTokens: number } {
   const isZh = isChineseLocale(currentLocale());
   const systemPrompt = buildSystemPrompt(input.action, input.context, input.mode);
   const userPrompt = buildUserPrompt(input.action, input.context, input.instruction, isZh);
@@ -84,23 +84,22 @@ function buildAgentRequest(input: AiRequestInput, history?: api.AiMessage[]): { 
 
   const params = actionParams(input.action);
   const maxTokens = input.config.enableThinking ? Math.max(params.maxTokens, 8192) : params.maxTokens;
-  return { messages, systemPrompt, taskContract, maxTokens, temperature: params.temperature };
+  return { messages, systemPrompt, taskContract, maxTokens };
 }
 
 export async function runAiAction(input: AiRequestInput, history?: api.AiMessage[]): Promise<string> {
-  const { messages, systemPrompt, taskContract, maxTokens, temperature } = buildAgentRequest(input, history);
+  const { messages, systemPrompt, taskContract, maxTokens } = buildAgentRequest(input, history);
   return api.aiComplete({
     config: input.config,
     systemPrompt,
     messages,
     taskContract,
     maxTokens,
-    temperature,
   });
 }
 
 export async function runAiStream(input: AiRequestInput, history: api.AiMessage[] | undefined, onDelta: (delta: string) => void, sessionId?: string, onReasoningDelta?: (delta: string) => void): Promise<void> {
-  const { messages, systemPrompt, taskContract, maxTokens, temperature } = buildAgentRequest(input, history);
+  const { messages, systemPrompt, taskContract, maxTokens } = buildAgentRequest(input, history);
   const sid = sessionId || uuid();
 
   await api.aiStream(
@@ -111,7 +110,6 @@ export async function runAiStream(input: AiRequestInput, history: api.AiMessage[
       messages,
       taskContract,
       maxTokens,
-      temperature,
     },
     (chunk) => {
       if (!chunk.done) {
@@ -123,7 +121,7 @@ export async function runAiStream(input: AiRequestInput, history: api.AiMessage[
 }
 
 export async function runAgentStream(input: AiRequestInput, history: api.AiMessage[] | undefined, onEvent: (event: AgentEvent) => void, sessionId?: string): Promise<string> {
-  const { messages, systemPrompt, taskContract, maxTokens, temperature } = buildAgentRequest(input, history);
+  const { messages, systemPrompt, taskContract, maxTokens } = buildAgentRequest(input, history);
   const sid = sessionId || uuid();
 
   return api.aiAgentStream(
@@ -134,7 +132,6 @@ export async function runAgentStream(input: AiRequestInput, history: api.AiMessa
       messages,
       taskContract,
       maxTokens,
-      temperature,
     },
     input.context.connectionId,
     input.context.database,
@@ -155,14 +152,14 @@ export function buildUserPrompt(action: AiAction, context: AiContext, instructio
   return [`Action: ${action}`, skillInstruction, "", "User request:", userRequest].join("\n");
 }
 
-function actionParams(action: AiAction): { maxTokens: number; temperature: number } {
+function actionParams(action: AiAction): { maxTokens: number } {
   switch (action) {
     case "explain":
-      return { maxTokens: 3200, temperature: 0.2 };
+      return { maxTokens: 3200 };
     case "sampleData":
-      return { maxTokens: 2400, temperature: 0.1 };
+      return { maxTokens: 2400 };
     default:
-      return { maxTokens: 2400, temperature: 0.15 };
+      return { maxTokens: 2400 };
   }
 }
 
@@ -393,7 +390,7 @@ export async function buildAiContext(tab: QueryTab, connection: ConnectionConfig
   // Vector databases: load collections instead of SQL tables
   if (isVectorDbType(databaseType)) {
     try {
-      const collections = await api.vectorListCollections(tab.connectionId);
+      const collections = await api.vectorListCollections(tab.connectionId, tab.database);
 
       // Find the currently opened collection (tab.sql is UUID for ChromaDB, name for others)
       const currentCollection = collections.find((c) => c.id === tab.sql || c.name === tab.sql);
