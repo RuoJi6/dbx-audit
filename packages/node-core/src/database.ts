@@ -780,11 +780,6 @@ export async function executeQuery(config: ConnectionConfig, sql: string, option
     return convertBridgeQueryResult(result, options);
   }
   if (config.db_type === "mongodb") {
-    const find = parseMongoFindCommand(sql);
-    if (find) {
-      const result = await withTimeout(mongoFindDocuments(config, find.collection, find.skip, find.limit, find.filter, find.projection, find.sort), resolveTimeoutMs(options));
-      return mongoDocumentsToQueryResult(result.documents.slice(0, resolveMaxRows(options)), result.total);
-    }
     const version = parseMongoVersionCommand(sql);
     if (version) {
       const result = await withTimeout(mongoServerVersion(config), resolveTimeoutMs(options));
@@ -794,6 +789,11 @@ export async function executeQuery(config: ConnectionConfig, sql: string, option
     if (count) {
       const result = await withTimeout(mongoFindDocuments(config, count.collection, 0, 1, count.filter), resolveTimeoutMs(options));
       return { columns: ["count"], rows: [{ count: result.total }], row_count: 1 };
+    }
+    const find = parseMongoFindCommand(sql);
+    if (find) {
+      const result = await withTimeout(mongoFindDocuments(config, find.collection, find.skip, find.limit, find.filter, find.projection, find.sort), resolveTimeoutMs(options));
+      return mongoDocumentsToQueryResult(result.documents.slice(0, resolveMaxRows(options)), result.total);
     }
     const aggregate = parseMongoAggregateCommand(sql);
     if (aggregate) {
@@ -806,6 +806,11 @@ export async function executeQuery(config: ConnectionConfig, sql: string, option
     if (getIndexes) {
       const result = await withTimeout(mongoAggregateDocuments(config, getIndexes.collection, '[{"$indexStats":{}}]', resolveMaxRows(options)), resolveTimeoutMs(options));
       return mongoDocumentsToQueryResult(result.documents.slice(0, resolveMaxRows(options)), result.total);
+    }
+    const collectionStats = parseMongoCollectionStatsCommand(sql);
+    if (collectionStats) {
+      const result = await withTimeout(mongoCollectionStats(config, collectionStats.collection, collectionStats.scale), resolveTimeoutMs(options));
+      return mongoCollectionStatsToQueryResult(collectionStats.metric, result);
     }
     const write = parseMongoWriteCommand(sql);
     if (write) {
@@ -829,7 +834,7 @@ export async function executeQuery(config: ConnectionConfig, sql: string, option
       return { columns: [], rows: [], row_count: result.affectedRows };
     }
     throw new Error(
-      "Use MongoDB shell-style commands, for example: db.projects.find({}).limit(100), db.version(), db.projects.countDocuments({}), db.projects.getIndexes(), db.projects.createIndex({...}), db.projects.dropIndex(\"name\"), db.projects.dropIndexes(), db.projects.insertOne({...}), db.projects.updateOne({...}, {$set: {...}}), or db.projects.deleteOne({...})",
+      "Use MongoDB shell-style commands, for example: db.projects.find({}).limit(100), db.version(), db.projects.countDocuments({}), db.projects.count({}), db.projects.getIndexes(), db.projects.dataSize(), db.projects.storageSize(1024), db.projects.totalIndexSize(), db.projects.stats(), db.projects.createIndex({...}), db.projects.dropIndex(\"name\"), db.projects.dropIndexes(), db.projects.insertOne({...}), db.projects.updateOne({...}, {$set: {...}}), or db.projects.deleteOne({...})",
     );
   }
   if (isDirectQueryType(config.db_type)) {
@@ -1045,6 +1050,19 @@ async function mongoServerVersion(config: ConnectionConfig): Promise<string> {
   });
 }
 
+async function mongoCollectionStats(
+  config: ConnectionConfig,
+  collection: string,
+  scale?: number,
+): Promise<Record<string, unknown>> {
+  return bridgeDataRequest<Record<string, unknown>>("/data/mongo/collection-stats", {
+    connection_name: config.name,
+    database: config.database || "",
+    collection,
+    scale,
+  });
+}
+
 async function executeMongoWrite(
   config: ConnectionConfig,
   command: MongoWriteCommand,
@@ -1107,6 +1125,26 @@ async function mongoAggregateDocuments(config: ConnectionConfig, collection: str
     pipeline_json: pipelineJson,
     max_rows: maxRows,
   });
+}
+
+export function mongoCollectionStatsToQueryResult(
+  metric: MongoCollectionStatsMetric,
+  stats: Record<string, unknown>,
+): QueryResult {
+  if (metric === "stats") {
+    const columns = ["count", "size", "avgObjSize", "storageSize", "totalIndexSize", "nindexes"];
+    const row: Record<string, unknown> = {};
+    for (const column of columns) {
+      row[column] = column in stats ? toCellValue(stats[column]) : null;
+    }
+    return { columns, rows: [row], row_count: 1 };
+  }
+  const sourceField = metric === "dataSize" ? "size" : metric;
+  return {
+    columns: [metric],
+    rows: [{ [metric]: sourceField in stats ? toCellValue(stats[sourceField]) : null }],
+    row_count: 1,
+  };
 }
 
 export function mongoDocumentsToQueryResult(documents: unknown[], _total: number): QueryResult {
@@ -1179,6 +1217,14 @@ interface MongoGetIndexesCommand {
   collection: string;
 }
 
+type MongoCollectionStatsMetric = "stats" | "dataSize" | "storageSize" | "totalIndexSize";
+
+interface MongoCollectionStatsCommand {
+  collection: string;
+  metric: MongoCollectionStatsMetric;
+  scale?: number;
+}
+
 export type MongoWriteCommand =
   | { kind: "insert"; collection: string; docsJson: string }
   | { kind: "update"; collection: string; filter: string; update: string; many: boolean }
@@ -1206,6 +1252,7 @@ export function parseMongoFindCommand(input: string): MongoFindCommand | null {
   }
   const chain = source.slice(findCloseIndex + 1).trim();
   if (chain && !chain.startsWith(".")) return null;
+  if (findChainedMethodCallIndex(chain, "count") >= 0) return null;
   const sortArg = readChainedCallArgument(chain, "sort");
   let sort: string | undefined;
   if (sortArg !== undefined) {
@@ -1226,7 +1273,17 @@ export function parseMongoVersionCommand(input: string): boolean {
 
 export function parseMongoCountDocumentsCommand(input: string): MongoCountDocumentsCommand | null {
   const source = input.trim().replace(/;$/, "").trim();
-  const target = parseCollectionMethodTarget(source, "countDocuments");
+  // Accept deprecated Mongo shell count helpers for old server workflows, but
+  // keep DBX's internal execution mapped to the countDocuments result shape.
+  return (
+    parseCollectionCountCommand(source, "countDocuments") ??
+    parseCollectionCountCommand(source, "count") ??
+    parseFindCountCommand(source)
+  );
+}
+
+function parseCollectionCountCommand(source: string, method: "countDocuments" | "count"): MongoCountDocumentsCommand | null {
+  const target = parseCollectionMethodTarget(source, method);
   if (!target) return null;
   const openIndex = source.indexOf("(", target.methodCallIndex);
   const closeIndex = findMatchingParen(source, openIndex);
@@ -1234,6 +1291,20 @@ export function parseMongoCountDocumentsCommand(input: string): MongoCountDocume
   const args = splitTopLevel(source.slice(openIndex + 1, closeIndex));
   if (args.length > 1 && args.slice(1).some((arg) => arg.trim())) return null;
   const filter = normalizeJsonArgument(args[0] || "{}");
+  return filter ? { collection: target.collection, filter } : null;
+}
+
+function parseFindCountCommand(source: string): MongoCountDocumentsCommand | null {
+  const target = parseCollectionMethodTarget(source, "find");
+  if (!target) return null;
+  const findOpenIndex = source.indexOf("(", target.methodCallIndex);
+  const findCloseIndex = findMatchingParen(source, findOpenIndex);
+  if (findCloseIndex < 0) return null;
+  const chain = source.slice(findCloseIndex + 1).trim();
+  if (!hasSingleEmptyChainedCall(chain, "count")) return null;
+  const findArgs = splitTopLevel(source.slice(findOpenIndex + 1, findCloseIndex));
+  if (findArgs.length > 2 && findArgs.slice(2).some((arg) => arg.trim())) return null;
+  const filter = normalizeJsonArgument(findArgs[0] || "{}");
   return filter ? { collection: target.collection, filter } : null;
 }
 
@@ -1255,6 +1326,19 @@ export function parseMongoGetIndexesCommand(input: string): MongoGetIndexesComma
   const args = parseMethodArgs(source, target.methodCallIndex);
   if (!args || args.some((arg) => arg.trim())) return null;
   return { collection: target.collection };
+}
+
+export function parseMongoCollectionStatsCommand(input: string): MongoCollectionStatsCommand | null {
+  const source = input.trim().replace(/;$/, "").trim();
+  for (const metric of ["stats", "dataSize", "storageSize", "totalIndexSize"] as const) {
+    const target = parseCollectionMethodTarget(source, metric);
+    if (!target) continue;
+    const args = parseMethodArgs(source, target.methodCallIndex);
+    if (!args) return null;
+    const scale = parseMongoCollectionStatsScale(args);
+    return scale === null ? null : { collection: target.collection, metric, ...(scale === undefined ? {} : { scale }) };
+  }
+  return null;
 }
 
 export function mongoAggregateWriteStage(pipelineJson: string): "$out" | "$merge" | null {
@@ -1410,6 +1494,19 @@ function readChainedCallArgument(chain: string, method: string): string | undefi
   return closeIndex < 0 ? undefined : chain.slice(openIndex + 1, closeIndex);
 }
 
+function hasSingleEmptyChainedCall(chain: string, method: string): boolean {
+  const trimmed = chain.trim();
+  const match = chainedMethodCallPattern(method).exec(trimmed);
+  if (!match || match.index !== 0) return false;
+  const openIndex = trimmed.indexOf("(", match.index);
+  const closeIndex = findMatchingParen(trimmed, openIndex);
+  return (
+    closeIndex >= 0 &&
+    !trimmed.slice(openIndex + 1, closeIndex).trim() &&
+    !trimmed.slice(closeIndex + 1).trim()
+  );
+}
+
 function findChainedMethodCallIndex(source: string, method: string): number {
   return chainedMethodCallPattern(method).exec(source)?.index ?? -1;
 }
@@ -1457,6 +1554,16 @@ function parseMongoDropIndexesArgument(args: string[]): string | undefined | nul
   if (typeof parsed === "string") return normalized;
   if (isNonEmptyRecord(parsed)) return normalized;
   return Array.isArray(parsed) && parsed.length > 0 && parsed.every((item) => typeof item === "string") ? normalized : null;
+}
+
+function parseMongoCollectionStatsScale(args: string[]): number | undefined | null {
+  if (args.length === 1 && !args[0]?.trim()) return undefined;
+  if (args.length !== 1) return null;
+  const raw = args[0].trim();
+  if (!/^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/.test(raw)) return null;
+  const scale = Number(raw);
+  if (!Number.isFinite(scale)) return null;
+  return scale;
 }
 
 function convertSingleQuotedStrings(source: string): string {
