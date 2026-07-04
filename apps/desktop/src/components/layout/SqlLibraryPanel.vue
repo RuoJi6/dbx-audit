@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, reactive, ref } from "vue";
 import { useI18n } from "vue-i18n";
-import { Download, FileInput, FilePlus, FileText, FolderCog, FolderClosed, FolderOpen, FolderPlus, Library, LocateFixed, Pencil, Search, Trash2, Upload, X, ArrowDownWideNarrow } from "@lucide/vue";
+import { ArrowDownWideNarrow, Download, FileInput, FilePlus, FileText, FolderCog, FolderClosed, FolderOpen, FolderPlus, Library, LocateFixed, Pencil, Search, Trash2, Upload, X } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import CustomContextMenu, { type ContextMenuItem as CtxMenuItem } from "@/components/ui/CustomContextMenu.vue";
+import LightTooltip from "@/components/ui/LightTooltip.vue";
 import { useToast } from "@/composables/useToast";
 import { isTauriRuntime } from "@/lib/tauriRuntime";
 import * as api from "@/lib/api";
@@ -48,6 +49,19 @@ function isConnectionVisible(connectionId: string) {
 function getConnectionLabel(connectionId: string) {
   const conn = connectionStore.connections.find((c) => c.id === connectionId);
   return conn?.name || connectionId;
+}
+
+function folderPath(folder: SavedSqlFolder) {
+  const folderById = new Map(savedSqlStore.allFolders.map((item) => [item.id, item]));
+  const parts: string[] = [];
+  const seen = new Set<string>();
+  let current: SavedSqlFolder | undefined = folder;
+  while (current && !seen.has(current.id)) {
+    seen.add(current.id);
+    parts.unshift(current.name);
+    current = current.parentFolderId ? folderById.get(current.parentFolderId) : undefined;
+  }
+  return parts.join(" / ");
 }
 
 function activeImportConnectionId() {
@@ -585,6 +599,14 @@ async function executeBatchDelete() {
   toast(t("sqlLibrary.batchDeleteSuccess", { count: fileIds.length + folderIds.length }), 2000);
 }
 
+async function moveFilesToFolder(fileIds: string[], folderId?: string) {
+  const movableIds = [...new Set(fileIds)].filter((id) => savedSqlStore.getFile(id));
+  if (movableIds.length === 0) return;
+  await savedSqlStore.moveFilesToFolder(movableIds, folderId);
+  clearSelection();
+  toast(t("sqlLibrary.moveSuccess", { count: movableIds.length }), 2000);
+}
+
 async function openFile(file: SavedSqlFile) {
   if (suppressNextRowClick.value) return;
   const loadedFile = await savedSqlStore.ensureFileContent(file.id);
@@ -716,13 +738,52 @@ function handleFolderClick(folder: SavedSqlFolder, event: MouseEvent) {
 
 const contextTarget = ref<SavedSqlFolder | SavedSqlFile | "panel" | null>(null);
 
+function folderMoveMenuItems(fileIds: string[]): CtxMenuItem[] {
+  const files = [...new Set(fileIds)].map((id) => savedSqlStore.getFile(id)).filter((file): file is SavedSqlFile => Boolean(file));
+  const allInUnfiled = files.length > 0 && files.every((file) => !file.folderId);
+  const folderItems = savedSqlStore.allFoldersTreeOrder
+    .filter((folder) => isConnectionVisible(folder.connectionId))
+    .map((folder) => ({
+      label: folderPath(folder),
+      action: () =>
+        moveFilesToFolder(
+          files.map((file) => file.id),
+          folder.id,
+        ),
+      disabled: files.every((file) => file.folderId === folder.id),
+      icon: FolderClosed,
+    }));
+
+  return [
+    {
+      label: t("sqlLibrary.unfiled"),
+      action: () =>
+        moveFilesToFolder(
+          files.map((file) => file.id),
+          undefined,
+        ),
+      disabled: files.length === 0 || allInUnfiled,
+      icon: FolderOpen,
+    },
+    ...(folderItems.length > 0 ? [{ label: "", separator: true }, ...folderItems] : []),
+  ];
+}
+
 const contextMenuItems = computed<CtxMenuItem[]>(() => {
   const target = contextTarget.value;
   if (!target) return [];
 
   // If there's selection, show batch delete option
   if (hasSelection.value) {
+    const selectedFiles = Array.from(selectedFileIds.value);
     return [
+      {
+        label: t("sqlLibrary.moveSelectedToFolder", { count: selectedFiles.length }),
+        icon: FolderClosed,
+        children: folderMoveMenuItems(selectedFiles),
+        visible: selectedFiles.length > 0,
+      },
+      { label: "", separator: true, visible: selectedFiles.length > 0 },
       {
         label: t("sqlLibrary.batchDelete", { count: selectedCount.value }),
         action: confirmBatchDelete,
@@ -738,8 +799,8 @@ const contextMenuItems = computed<CtxMenuItem[]>(() => {
     return [
       { label: t("savedSql.newFolder"), action: openNewFolderInput, icon: FolderPlus },
       { label: t("savedSql.newQuery"), action: () => openNewQueryInFolder(), icon: FilePlus },
-      { label: t("sqlLibrary.importDirectory"), action: () => importDirectoryIntoLibrary(), icon: Upload },
-      { label: t("sqlLibrary.exportLibrary"), action: () => exportFolderContents(), icon: Download },
+      { label: t("sqlLibrary.importDirectory"), action: () => importDirectoryIntoLibrary(), icon: Download },
+      { label: t("sqlLibrary.exportLibrary"), action: () => exportFolderContents(), icon: Upload },
       { label: "", separator: true },
       { label: t("sqlLibrary.openStorageDirectory"), action: openSqlStorageDirectory, icon: LocateFixed },
       { label: t("sqlLibrary.chooseSyncDirectory"), action: chooseSyncDirectory, icon: FolderCog },
@@ -755,6 +816,7 @@ const contextMenuItems = computed<CtxMenuItem[]>(() => {
     return [
       { label: t("savedSql.open"), action: () => openFile(target), icon: FileText },
       { label: t("sqlLibrary.exportFile"), action: () => exportSingleFile(target), icon: FileInput },
+      { label: t("sqlLibrary.moveToFolder"), icon: FolderClosed, children: folderMoveMenuItems([target.id]) },
       { label: "", separator: true },
       { label: t("savedSql.renameFile"), action: () => startRenameFile(target), icon: Pencil },
       { label: "", separator: true },
@@ -769,8 +831,8 @@ const contextMenuItems = computed<CtxMenuItem[]>(() => {
   return [
     { label: t("savedSql.newFolder"), action: () => openNewFolderInput(target.id), icon: FolderPlus },
     { label: t("savedSql.newQuery"), action: () => openNewQueryInFolder(target), icon: FilePlus },
-    { label: t("sqlLibrary.importIntoFolder"), action: () => importDirectoryIntoLibrary(target), icon: Upload },
-    { label: t("sqlLibrary.exportFolder"), action: () => exportFolderContents(target), icon: Download },
+    { label: t("sqlLibrary.importIntoFolder"), action: () => importDirectoryIntoLibrary(target), icon: Download },
+    { label: t("sqlLibrary.exportFolder"), action: () => exportFolderContents(target), icon: Upload },
     { label: "", separator: true },
     { label: t("savedSql.renameFolder"), action: () => startRenameFolder(target), icon: Pencil },
     { label: "", separator: true },
@@ -1019,21 +1081,31 @@ function showDropInside(targetId: string) {
       <span class="text-[13px] font-medium">{{ t("sqlLibrary.title") }}</span>
       <span v-if="hasSelection" class="text-[12px] text-muted-foreground ml-1">({{ selectedCount }})</span>
       <span class="flex-1" />
-      <Button variant="ghost" size="icon" class="h-5 w-5" :title="sortMode === 'folder' ? t('sqlLibrary.sortByDate') : t('sqlLibrary.sortByFolder')" @click="sortMode = sortMode === 'folder' ? 'date' : 'folder'">
-        <ArrowDownWideNarrow :class="['h-3 w-3', sortMode === 'date' ? 'text-primary' : '']" />
-      </Button>
-      <Button variant="ghost" size="icon" class="h-5 w-5" :title="t('savedSql.newFolder')" @click="openNewFolderInput">
-        <FolderPlus class="h-3 w-3" />
-      </Button>
-      <Button variant="ghost" size="icon" class="h-5 w-5" :title="t('sqlLibrary.importDirectory')" @click="importDirectoryIntoLibrary()">
-        <Upload class="h-3 w-3" />
-      </Button>
-      <Button variant="ghost" size="icon" class="h-5 w-5" :title="t('sqlLibrary.exportLibrary')" @click="exportFolderContents()">
-        <Download class="h-3 w-3" />
-      </Button>
-      <Button variant="ghost" size="icon" class="h-5 w-5" @click="emit('close')">
-        <X class="h-3 w-3" />
-      </Button>
+      <LightTooltip :text="sortMode === 'folder' ? t('sqlLibrary.sortByDate') : t('sqlLibrary.sortByFolder')" side="bottom" :delay="0" :close-delay="0" nowrap>
+        <Button variant="ghost" size="icon" class="h-5 w-5" @click="sortMode = sortMode === 'folder' ? 'date' : 'folder'">
+          <ArrowDownWideNarrow :class="['h-3 w-3', sortMode === 'date' ? 'text-primary' : '']" />
+        </Button>
+      </LightTooltip>
+      <LightTooltip :text="t('savedSql.newFolder')" side="bottom" :delay="0" :close-delay="0" nowrap>
+        <Button variant="ghost" size="icon" class="h-5 w-5" @click="openNewFolderInput">
+          <FolderPlus class="h-3 w-3" />
+        </Button>
+      </LightTooltip>
+      <LightTooltip :text="t('sqlLibrary.importDirectory')" side="bottom" :delay="0" :close-delay="0" nowrap>
+        <Button variant="ghost" size="icon" class="h-5 w-5" @click="importDirectoryIntoLibrary()">
+          <Download class="h-3 w-3" />
+        </Button>
+      </LightTooltip>
+      <LightTooltip :text="t('sqlLibrary.exportLibrary')" side="bottom" :delay="0" :close-delay="0" nowrap>
+        <Button variant="ghost" size="icon" class="h-5 w-5" @click="exportFolderContents()">
+          <Upload class="h-3 w-3" />
+        </Button>
+      </LightTooltip>
+      <LightTooltip :text="t('common.close')" side="bottom" :delay="0" :close-delay="0" nowrap>
+        <Button variant="ghost" size="icon" class="h-5 w-5" @click="emit('close')">
+          <X class="h-3 w-3" />
+        </Button>
+      </LightTooltip>
     </div>
 
     <div class="border-b shrink-0 px-2 py-1">
