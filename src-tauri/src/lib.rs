@@ -12,10 +12,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 #[cfg(target_os = "macos")]
+use tauri::menu::Menu;
+#[cfg(target_os = "macos")]
 use tauri::menu::{AboutMetadata, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::RunEvent;
 use tauri::{
-    menu::{Menu, MenuBuilder},
+    menu::MenuBuilder,
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
 use tauri::{Emitter, Manager};
@@ -24,6 +26,7 @@ use tauri_plugin_deep_link::DeepLinkExt;
 
 const DESKTOP_TRAY_ID: &str = "main-tray";
 const APP_CLOSE_REQUESTED_EVENT: &str = "dbx-app-close-requested";
+#[cfg(target_os = "macos")]
 const APP_MENU_QUIT_ID: &str = "app-menu-quit";
 
 pub struct CloseBehaviorState {
@@ -37,10 +40,6 @@ impl CloseBehaviorState {
 
     pub(crate) fn allow_next_exit(&self) {
         self.confirmed_exit.store(true, Ordering::Relaxed);
-    }
-
-    pub(crate) fn is_exit_confirmed(&self) -> bool {
-        self.confirmed_exit.load(Ordering::Relaxed)
     }
 
     fn take_confirmed_exit(&self) -> bool {
@@ -67,8 +66,8 @@ fn should_show_main_window_after_setup() -> bool {
     true
 }
 
-fn should_confirm_app_exit_request(exit_code: Option<i32>, confirmed_exit: bool) -> bool {
-    exit_code != Some(tauri::RESTART_EXIT_CODE) && !confirmed_exit
+fn should_confirm_app_exit_request(target_os: &str, exit_code: Option<i32>, confirmed_exit: bool) -> bool {
+    should_hide_window_on_close(target_os) && exit_code != Some(tauri::RESTART_EXIT_CODE) && !confirmed_exit
 }
 
 fn native_window_decorations_override(target_os: &str) -> Option<bool> {
@@ -449,10 +448,11 @@ mod tests {
 
     #[test]
     fn only_user_requested_app_exit_needs_frontend_confirmation() {
-        assert!(should_confirm_app_exit_request(None, false));
-        assert!(should_confirm_app_exit_request(Some(0), false));
-        assert!(!should_confirm_app_exit_request(Some(0), true));
-        assert!(!should_confirm_app_exit_request(Some(tauri::RESTART_EXIT_CODE), false));
+        assert!(should_confirm_app_exit_request("windows", None, false));
+        assert!(should_confirm_app_exit_request("macos", Some(0), false));
+        assert!(!should_confirm_app_exit_request("windows", Some(0), true));
+        assert!(!should_confirm_app_exit_request("windows", Some(tauri::RESTART_EXIT_CODE), false));
+        assert!(!should_confirm_app_exit_request("linux", Some(0), false));
     }
 
     #[test]
@@ -652,15 +652,18 @@ pub fn run() {
             );
 
             let state = if let Some(agent_dir) = agent_dir {
-                Arc::new(AppState::new_with_plugin_and_agent_dir_and_app_version(
+                AppState::new_with_plugin_and_agent_dir_and_app_version(
                     storage,
                     plugin_dir,
                     agent_dir,
                     env!("CARGO_PKG_VERSION"),
-                ))
+                )
             } else {
-                Arc::new(AppState::new_with_plugin_dir_and_app_version(storage, plugin_dir, env!("CARGO_PKG_VERSION")))
+                AppState::new_with_plugin_dir_and_app_version(storage, plugin_dir, env!("CARGO_PKG_VERSION"))
             };
+            state.set_duckdb_worker_process_isolation_enabled(desktop_settings.duckdb_worker_process_isolation);
+            state.set_duckdb_worker_max_processes(desktop_settings.duckdb_worker_max_processes);
+            let state = Arc::new(state);
             app.manage(state.clone());
             commands::redis_pubsub_server::start_pubsub_server(state.clone());
             app.manage(commands::saved_sql::SavedSqlStorageState { data_dir: data_dir.clone() });
@@ -734,6 +737,12 @@ pub fn run() {
             commands::app_settings::get_driver_store_path,
             commands::app_settings::load_pinned_tree_node_ids,
             commands::app_settings::save_pinned_tree_node_ids,
+            commands::app_settings::load_editor_settings,
+            commands::app_settings::save_editor_settings,
+            commands::app_settings::load_open_tabs_state,
+            commands::app_settings::save_open_tabs_state,
+            commands::app_settings::load_saved_sql_editor_positions,
+            commands::app_settings::save_saved_sql_editor_positions,
             commands::app_settings::load_native_debug_logs,
             commands::audit::audit_start_scan,
             commands::audit::audit_cancel_scan,
@@ -748,6 +757,9 @@ pub fn run() {
             commands::cloud_sync::webdav_password_status,
             commands::cloud_sync::save_webdav_saved_password,
             commands::cloud_sync::forget_webdav_saved_password,
+            commands::cloud_sync::webdav_sync_secrets_status,
+            commands::cloud_sync::save_webdav_sync_secrets_preference,
+            commands::cloud_sync::forget_webdav_sync_secrets_passphrase,
             commands::cloud_sync::webdav_sync_upload,
             commands::cloud_sync::webdav_sync_download,
             commands::connection::test_connection,
@@ -797,6 +809,8 @@ pub fn run() {
             commands::schema::list_sequences,
             commands::schema::list_rules,
             commands::schema::list_owners,
+            commands::schema::list_extensions,
+            commands::schema::list_available_extensions,
             commands::schema_diff::prepare_schema_diff,
             commands::schema_diff::generate_schema_sync_sql,
             commands::schema_cache::save_schema_cache,
@@ -839,6 +853,7 @@ pub fn run() {
             commands::query::build_truncate_table_sql,
             commands::query::build_drop_database_sql,
             commands::query::build_create_schema_sql,
+            commands::query::build_update_database_properties_sql,
             commands::query::build_drop_schema_sql,
             commands::query::build_duplicate_table_structure_sql,
             commands::query::build_copy_table_data_sql,
@@ -1100,6 +1115,7 @@ pub fn run() {
             commands::agents::import_agents_from_zip,
             commands::agents::import_agent_jar_cmd,
             commands::system_fonts::list_system_fonts,
+            commands::ssh_config::list_ssh_config_hosts,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -1112,7 +1128,7 @@ pub fn run() {
                     .try_state::<CloseBehaviorState>()
                     .map(|state| state.take_confirmed_exit())
                     .unwrap_or(false);
-                if should_confirm_app_exit_request(*code, confirmed_exit) {
+                if should_confirm_app_exit_request(std::env::consts::OS, *code, confirmed_exit) {
                     api.prevent_exit();
                     request_app_close(app_handle, "quit");
                 }

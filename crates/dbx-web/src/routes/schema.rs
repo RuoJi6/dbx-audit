@@ -132,8 +132,21 @@ pub async fn list_objects(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let database = q.database.as_deref().unwrap_or("");
     let schema = q.schema.as_deref().unwrap_or("");
-    let result =
-        dbx_core::schema::list_objects_core(&state.app, &q.connection_id, database, schema).await.map_err(AppError)?;
+    let object_types = q.object_types.as_ref().map(|value| {
+        value.split(',').map(str::trim).filter(|value| !value.is_empty()).map(str::to_string).collect::<Vec<_>>()
+    });
+    let result = dbx_core::schema::list_objects_core(
+        &state.app,
+        &q.connection_id,
+        database,
+        schema,
+        q.filter.as_deref(),
+        q.limit,
+        q.offset,
+        object_types.as_deref(),
+    )
+    .await
+    .map_err(AppError)?;
     Ok(Json(serde_json::to_value(result).map_err(|e| AppError(e.to_string()))?))
 }
 
@@ -317,5 +330,28 @@ pub async fn list_owners(
     let schema = q.schema.as_deref().unwrap_or("");
     let result =
         dbx_core::schema::list_owners_core(&state.app, &q.connection_id, database, schema).await.map_err(AppError)?;
+    Ok(Json(serde_json::to_value(result).map_err(|e| AppError(e.to_string()))?))
+}
+
+pub async fn list_extensions(
+    State(state): State<Arc<WebState>>,
+    Query(q): Query<SchemaQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let database = q.database.as_deref().unwrap_or("");
+    let schema = q.schema.as_deref().unwrap_or("");
+    let result = dbx_core::schema::list_extensions_core(&state.app, &q.connection_id, database, schema)
+        .await
+        .map_err(AppError)?;
+    Ok(Json(serde_json::to_value(result).map_err(|e| AppError(e.to_string()))?))
+}
+
+pub async fn list_available_extensions(
+    State(state): State<Arc<WebState>>,
+    Query(q): Query<SchemaQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let database = q.database.as_deref().unwrap_or("");
+    let result = dbx_core::schema::list_available_extensions_core(&state.app, &q.connection_id, database)
+        .await
+        .map_err(AppError)?;
     Ok(Json(serde_json::to_value(result).map_err(|e| AppError(e.to_string()))?))
 }

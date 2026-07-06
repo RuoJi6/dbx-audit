@@ -3,7 +3,7 @@ import { computed, ref, nextTick, onBeforeUnmount, onMounted } from "vue";
 import { useI18n } from "vue-i18n";
 import { onClickOutside } from "@vueuse/core";
 import { DynamicScroller, DynamicScrollerItem, RecycleScroller } from "vue-virtual-scroller";
-import { Braces, Copy, Eye, FileText, Terminal, Trash2, Save, RefreshCw, Plus, Loader2, Pencil, WrapText, IndentIncrease, IndentDecrease, ArrowUp, ArrowDown, ArrowUpDown } from "@lucide/vue";
+import { Braces, Copy, Eye, FileText, Terminal, Trash2, Save, RefreshCw, Plus, Loader2, Pencil, WrapText, IndentIncrease, IndentDecrease, ArrowUp, ArrowDown, ArrowUpDown, Search } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
@@ -11,15 +11,15 @@ import { Switch } from "@/components/ui/switch";
 import { Sheet, SheetContent, SheetFooter, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import DangerConfirmDialog from "@/components/editor/DangerConfirmDialog.vue";
 import RedisJsonTree from "./RedisJsonTree.vue";
-import * as api from "@/lib/api";
-import type { RedisKeyInfo, RedisValue } from "@/lib/api";
+import * as api from "@/lib/backend/api";
+import type { RedisKeyInfo, RedisValue } from "@/lib/backend/api";
 import { useToast } from "@/composables/useToast";
 import { useTheme } from "@/composables/useTheme";
 import { useEditorFontFamilyStyle } from "@/composables/useEditorFontFamilyStyle";
-import { createRedisShikiJsonHighlighter, type RedisJsonHighlighter } from "@/lib/redisJsonHighlighter";
-import { copyToClipboard } from "@/lib/clipboard";
-import { formatTtl } from "@/lib/ttlFormat";
-import { canEditRedisMemberDetail, clampRedisMemberDetailSheetWidth, formatRedisMemberDetail, getRedisMemberSelectionKey } from "@/lib/redisValuePresentation";
+import { createRedisShikiJsonHighlighter, type RedisJsonHighlighter } from "@/lib/redis/redisJsonHighlighter";
+import { copyToClipboard } from "@/lib/common/clipboard";
+import { formatTtl } from "@/lib/common/ttlFormat";
+import { canEditRedisMemberDetail, clampRedisMemberDetailSheetWidth, formatRedisMemberDetail, getRedisMemberSelectionKey } from "@/lib/redis/redisValuePresentation";
 
 const { t } = useI18n();
 const { toast } = useToast();
@@ -78,6 +78,9 @@ const redisJsonWordWrap = ref(readRedisJsonWordWrap());
 const redisJsonHighlighter = ref<RedisJsonHighlighter>();
 const hashSortBy = ref<"field" | "value" | null>(null);
 const hashSortDir = ref<"asc" | "desc">("asc");
+const hashSearchQuery = ref("");
+const activeHashSearchQuery = ref("");
+const searchLoading = ref(false);
 
 function toggleHashSort(column: "field" | "value") {
   if (hashSortBy.value === column && hashSortDir.value === "desc") {
@@ -110,6 +113,47 @@ const hashCollectionRows = computed<RedisCollectionRow[]>(() =>
     value,
   })),
 );
+
+let hashSearchTimer: ReturnType<typeof setTimeout> | null = null;
+let hashSearchRequestId = 0;
+
+function onHashSearchInput() {
+  if (hashSearchTimer) clearTimeout(hashSearchTimer);
+  hashSearchTimer = setTimeout(() => void onHashSearch(), 400);
+}
+
+function onHashSearchKeydown(event: KeyboardEvent) {
+  if (event.key === "Enter") {
+    if (hashSearchTimer) clearTimeout(hashSearchTimer);
+    hashSearchTimer = null;
+    void onHashSearch();
+    return;
+  }
+  if (event.key === "Escape") {
+    if (hashSearchTimer) clearTimeout(hashSearchTimer);
+    hashSearchTimer = null;
+    hashSearchQuery.value = "";
+    void onHashSearch();
+  }
+}
+
+async function onHashSearch() {
+  const query = hashSearchQuery.value.trim();
+  if (!data.value) return;
+  const requestId = ++hashSearchRequestId;
+  searchLoading.value = true;
+  try {
+    const result = await api.redisLoadMore(props.connectionId, props.db, props.keyRaw, "hash", 0, 200, query || undefined);
+    if (requestId !== hashSearchRequestId) return;
+    const items = Array.isArray(result.value) ? result.value : [];
+    activeHashSearchQuery.value = query;
+    collectionItems.value = items;
+    scanCursor.value = result.scan_cursor ?? undefined;
+    clearSelectedMember();
+  } finally {
+    if (requestId === hashSearchRequestId) searchLoading.value = false;
+  }
+}
 
 const selectedMemberDetail = computed(() => formatRedisMemberDetail(selectedMemberRaw.value));
 const selectedMemberJsonDetail = computed(() => selectedMemberDetail.value.json ?? null);
@@ -213,11 +257,12 @@ function escapeHtml(value: string): string {
 const deleteDetails = computed(() => {
   const pending = pendingDelete.value;
   if (!pending) return "";
-  if (pending.kind === "key") return t("dangerDialog.redisKeyDetails", { key: props.keyDisplay });
-  if (pending.kind === "hash") return t("dangerDialog.redisHashFieldDetails", { key: props.keyDisplay, field: pending.field });
-  if (pending.kind === "list") return t("dangerDialog.redisListItemDetails", { key: props.keyDisplay, index: pending.index });
-  if (pending.kind === "zset") return t("dangerDialog.redisSetMemberDetails", { key: props.keyDisplay, member: pending.member });
-  return t("dangerDialog.redisSetMemberDetails", { key: props.keyDisplay, member: pending.member });
+  const key = formatValue(props.keyDisplay);
+  if (pending.kind === "key") return t("dangerDialog.redisKeyDetails", { key });
+  if (pending.kind === "hash") return t("dangerDialog.redisHashFieldDetails", { key, field: formatValue(pending.field) });
+  if (pending.kind === "list") return t("dangerDialog.redisListItemDetails", { key, index: pending.index });
+  if (pending.kind === "zset") return t("dangerDialog.redisSetMemberDetails", { key, member: formatValue(pending.member) });
+  return t("dangerDialog.redisSetMemberDetails", { key, member: formatValue(pending.member) });
 });
 
 const isBinaryStringValue = computed(() => data.value?.key_type === "string" && data.value?.value_is_binary);
@@ -240,6 +285,12 @@ function collectionCountLabel(kind: "items" | "fields" | "members", loaded: numb
 
 async function load(options: { selectDefaultMember?: boolean } = {}) {
   const shouldSelectDefaultMember = options.selectDefaultMember ?? true;
+  if (hashSearchTimer) clearTimeout(hashSearchTimer);
+  hashSearchTimer = null;
+  hashSearchRequestId++;
+  hashSearchQuery.value = "";
+  activeHashSearchQuery.value = "";
+  searchLoading.value = false;
   loading.value = true;
   try {
     const loadedValue = await api.redisGetValue(props.connectionId, props.db, props.keyRaw);
@@ -265,10 +316,14 @@ async function load(options: { selectDefaultMember?: boolean } = {}) {
 }
 
 async function loadMore() {
-  if (!data.value || !hasMore.value || loadingMore.value) return;
+  if (!data.value || !hasMore.value || loadingMore.value || (data.value.key_type === "hash" && searchLoading.value)) return;
+  const keyType = data.value.key_type;
+  const hashFilter = keyType === "hash" ? activeHashSearchQuery.value || undefined : undefined;
+  const requestId = hashSearchRequestId;
   loadingMore.value = true;
   try {
-    const result = await api.redisLoadMore(props.connectionId, props.db, props.keyRaw, data.value.key_type, scanCursor.value!, 200);
+    const result = await api.redisLoadMore(props.connectionId, props.db, props.keyRaw, keyType, scanCursor.value!, 200, hashFilter);
+    if (keyType === "hash" && requestId !== hashSearchRequestId) return;
     const newItems = Array.isArray(result.value) ? result.value : [];
     collectionItems.value = [...collectionItems.value, ...newItems];
     scanCursor.value = result.scan_cursor ?? undefined;
@@ -465,7 +520,7 @@ async function copyInsertStatement() {
 }
 
 function copyMember(value: unknown) {
-  void copyText(formatRedisMemberDetail(value).text);
+  void copyText(formatRedisMemberDetail(value).rawText);
 }
 
 function selectMember(title: string, value: unknown, context: RedisMemberContext) {
@@ -581,12 +636,12 @@ function startResizeZsetColumns(event: PointerEvent) {
 }
 
 function startEditMember() {
-  memberEditValue.value = selectedMemberDetail.value.text;
+  memberEditValue.value = selectedMemberDetail.value.rawText;
   isEditingMember.value = true;
 }
 
 function cancelEditMember() {
-  memberEditValue.value = selectedMemberDetail.value.text;
+  memberEditValue.value = selectedMemberDetail.value.rawText;
   isEditingMember.value = false;
 }
 
@@ -802,6 +857,7 @@ onBeforeUnmount(() => {
   stopResizeMemberSheet();
   stopResizeHashColumns();
   stopResizeZsetColumns();
+  if (hashSearchTimer) clearTimeout(hashSearchTimer);
 });
 </script>
 
@@ -815,7 +871,7 @@ onBeforeUnmount(() => {
       <!-- Header -->
       <div class="shrink-0 border-b bg-background">
         <div class="flex h-9 items-center gap-2 px-4">
-          <span class="dbx-editor-font-family min-w-0 flex-1 truncate text-sm font-semibold">{{ data.key_display }}</span>
+          <span class="dbx-editor-font-family min-w-0 flex-1 truncate text-sm font-semibold">{{ formatValue(data.key_display) }}</span>
           <Button variant="ghost" size="icon" class="h-7 w-7 shrink-0" @click="load"><RefreshCw class="h-3.5 w-3.5" /></Button>
           <Button variant="ghost" size="icon" class="h-7 w-7 shrink-0" @click="copyValue"><Copy class="h-3.5 w-3.5" /></Button>
           <Button variant="ghost" size="icon" class="h-7 w-7 shrink-0" :title="t('redis.copyInsertStatement')" @click="copyInsertStatement"><Terminal class="h-3.5 w-3.5" /></Button>
@@ -906,7 +962,7 @@ onBeforeUnmount(() => {
               @click="viewMember(`#${row.index}`, row.value, { kind: 'list', index: row.index })"
             >
               <div class="px-3 py-1.5 text-xs text-muted-foreground border-r">{{ row.index }}</div>
-              <div class="px-3 py-1.5 truncate">{{ row.value }}</div>
+              <div class="px-3 py-1.5 truncate">{{ formatValue(row.value) }}</div>
               <div class="flex items-center justify-center gap-1">
                 <Button variant="ghost" size="icon" class="h-5 w-5 opacity-0 group-hover:opacity-100" :title="t('redis.viewMember')" @click.stop="viewMember(`#${row.index}`, row.value, { kind: 'list', index: row.index })"><Eye class="w-3 h-3" /></Button>
                 <Button variant="ghost" size="icon" class="h-5 w-5 opacity-0 group-hover:opacity-100" :title="t('redis.copyMember')" @click.stop="copyMember(row.value)"><Copy class="w-3 h-3" /></Button>
@@ -946,7 +1002,7 @@ onBeforeUnmount(() => {
               :style="{ height: `${REDIS_COLLECTION_ROW_HEIGHT}px` }"
               @click="viewMember(t('redis.member'), row.value, { kind: 'set', member: String(row.value) })"
             >
-              <div class="px-3 py-1.5 truncate">{{ row.value }}</div>
+              <div class="px-3 py-1.5 truncate">{{ formatValue(row.value) }}</div>
               <div class="flex items-center justify-center gap-1">
                 <Button variant="ghost" size="icon" class="h-5 w-5 opacity-0 group-hover:opacity-100" :title="t('redis.viewMember')" @click.stop="viewMember(t('redis.member'), row.value, { kind: 'set', member: String(row.value) })"><Eye class="w-3 h-3" /></Button>
                 <Button variant="ghost" size="icon" class="h-5 w-5 opacity-0 group-hover:opacity-100" :title="t('redis.copyMember')" @click.stop="copyMember(row.value)"><Copy class="w-3 h-3" /></Button>
@@ -968,7 +1024,11 @@ onBeforeUnmount(() => {
       <!-- Hash -->
       <div v-else-if="data.key_type === 'hash'" ref="hashTableRef" class="flex-1 flex flex-col overflow-hidden">
         <div class="flex items-center gap-2 px-4 py-1.5 border-b shrink-0">
-          <span class="text-xs text-muted-foreground">{{ collectionCountLabel("fields", collectionItems.length, data.total) }}</span>
+          <span class="text-xs text-muted-foreground shrink-0">{{ collectionCountLabel("fields", collectionItems.length, activeHashSearchQuery ? null : data.total) }}</span>
+          <div class="relative flex-1 max-w-60">
+            <Search class="pointer-events-none absolute left-1.5 top-1/2 h-3 w-3 -translate-y-1/2 text-muted-foreground/80" />
+            <Input v-model="hashSearchQuery" class="h-6 w-full pl-5 pr-2 text-xs" :placeholder="t('redis.searchFields')" @input="onHashSearchInput" @keydown="onHashSearchKeydown" />
+          </div>
           <span class="flex-1" />
           <Input v-model="newField" class="h-6 w-24 text-xs" placeholder="field" />
           <Input v-model="newValue" class="h-6 w-32 text-xs" placeholder="value" @keydown.enter="hashSet" />
@@ -1004,8 +1064,8 @@ onBeforeUnmount(() => {
               :class="{ 'bg-accent/60': isSelectedMember(String(row.value.field), row.value.value) }"
               @click="viewMember(String(row.value.field), row.value.value, { kind: 'hash', field: String(row.value.field) })"
             >
-              <div class="px-3 py-1.5 text-blue-500 truncate border-r">{{ row.value.field }}</div>
-              <div class="px-3 py-1.5 truncate text-muted-foreground">{{ row.value.value }}</div>
+              <div class="px-3 py-1.5 text-blue-500 truncate border-r">{{ formatValue(row.value.field) }}</div>
+              <div class="px-3 py-1.5 truncate text-muted-foreground">{{ formatValue(row.value.value) }}</div>
               <div class="flex items-center justify-center gap-1">
                 <Button
                   variant="ghost"
@@ -1027,7 +1087,7 @@ onBeforeUnmount(() => {
           </template>
           <template #after>
             <div v-if="hasMore" class="p-2">
-              <Button variant="outline" size="sm" class="w-full h-7 text-xs" :disabled="loadingMore" @click="loadMore">
+              <Button variant="outline" size="sm" class="w-full h-7 text-xs" :disabled="loadingMore || searchLoading" @click="loadMore">
                 <Loader2 v-if="loadingMore" class="w-3 h-3 mr-1.5 animate-spin" />
                 {{ t("redis.loadMoreKeys") }}
               </Button>
@@ -1071,8 +1131,8 @@ onBeforeUnmount(() => {
               <div class="px-3 py-1.5 text-muted-foreground text-xs border-r min-w-0 truncate" :title="String(row.value.score)">
                 {{ row.value.score }}
               </div>
-              <div class="px-3 py-1.5 min-w-0 truncate" :title="String(row.value.member)">
-                {{ row.value.member }}
+              <div class="px-3 py-1.5 min-w-0 truncate" :title="formatValue(row.value.member)">
+                {{ formatValue(row.value.member) }}
               </div>
               <div class="flex items-center justify-center gap-1">
                 <Button
@@ -1156,7 +1216,7 @@ onBeforeUnmount(() => {
         <div class="absolute inset-y-0 left-0 z-10 w-2 -translate-x-1 cursor-col-resize border-l border-transparent hover:border-primary/60" @pointerdown.prevent="startResizeMemberSheet" />
         <SheetHeader class="border-b px-5 py-4 pr-12">
           <SheetTitle class="flex items-center gap-2">
-            <span class="truncate">{{ selectedMemberTitle || t("redis.memberDetail") }}</span>
+            <span class="truncate">{{ selectedMemberTitle ? formatValue(selectedMemberTitle) : t("redis.memberDetail") }}</span>
             <Badge variant="outline" class="shrink-0 text-xs">{{ selectedMemberDetail.format.toUpperCase() }}</Badge>
           </SheetTitle>
         </SheetHeader>
@@ -1218,7 +1278,7 @@ onBeforeUnmount(() => {
             <Pencil class="h-4 w-4" />
             {{ t("redis.editMember") }}
           </Button>
-          <Button variant="outline" @click="copyText(selectedMemberDetail.text)">
+          <Button variant="outline" @click="copyText(selectedMemberDetail.rawText)">
             <Copy class="h-4 w-4" />
             {{ t("redis.copyMember") }}
           </Button>

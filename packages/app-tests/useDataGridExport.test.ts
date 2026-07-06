@@ -9,6 +9,7 @@ const apiMock = vi.hoisted(() => ({
   cancelQueryResultExport: vi.fn(),
   startTableExport: vi.fn(),
   cancelTableExport: vi.fn(),
+  saveEditorSettings: vi.fn(async () => {}),
   exportQueryResultCsv: vi.fn(),
   exportQueryResultXlsx: vi.fn(),
   exportQueryResultJson: vi.fn(),
@@ -20,9 +21,9 @@ const clipboardMock = vi.hoisted(() => ({
   copyToClipboard: vi.fn(),
 }));
 
-vi.mock("@/lib/api", () => apiMock);
-vi.mock("@/lib/clipboard", () => clipboardMock);
-vi.mock("@/lib/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+vi.mock("@/lib/backend/api", () => apiMock);
+vi.mock("@/lib/common/clipboard", () => clipboardMock);
+vi.mock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
 vi.mock("@/composables/useToast", () => ({ useToast: () => ({ toast: vi.fn() }) }));
 vi.mock("vue-i18n", () => ({ useI18n: () => ({ t: (key: string) => key }) }));
 

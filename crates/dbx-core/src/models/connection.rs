@@ -166,6 +166,13 @@ pub struct SshTunnelConfig {
     /// the `SSH_AUTH_SOCK` environment variable.
     #[serde(default)]
     pub ssh_agent_sock_path: String,
+    /// Login method: `"password"`, `"key"`, `"agent"`, or `"none"`.
+    /// Empty string means an older saved connection predating this field —
+    /// the backend falls back to probing key > password > agent based on
+    /// which fields are non-empty. When set to a specific method the backend
+    /// only tries that method (after the standard `none` probe).
+    #[serde(default)]
+    pub auth_method: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
