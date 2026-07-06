@@ -324,9 +324,19 @@ pub async fn redis_load_more(
     key_type: String,
     cursor: u64,
     count: usize,
+    filter: Option<String>,
 ) -> Result<RedisValue, String> {
-    dbx_core::redis_ops::redis_load_more_in_db_core(&state, &connection_id, db, &key_raw, &key_type, cursor, count)
-        .await
+    dbx_core::redis_ops::redis_load_more_in_db_core(
+        &state,
+        &connection_id,
+        db,
+        &key_raw,
+        &key_type,
+        cursor,
+        count,
+        filter.as_deref(),
+    )
+    .await
 }
 
 #[tauri::command]

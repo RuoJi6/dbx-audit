@@ -789,6 +789,7 @@ pub async fn redis_load_more_in_db_core(
     key_type: &str,
     cursor: u64,
     count: usize,
+    filter: Option<&str>,
 ) -> Result<redis_driver::RedisValue, String> {
     ensure_redis_pool(state, connection_id).await?;
     let connections = state.connections.read().await;
@@ -799,12 +800,12 @@ pub async fn redis_load_more_in_db_core(
                 RedisConnection::Direct(con) => {
                     let mut con = con.lock().await;
                     redis_driver::select_db(&mut *con, db).await?;
-                    redis_driver::load_more_collection(&mut *con, &key, key_type, cursor, count).await
+                    redis_driver::load_more_collection(&mut *con, &key, key_type, cursor, count, filter).await
                 }
                 RedisConnection::Cluster(cluster) => {
                     redis_driver::ensure_cluster_db(db)?;
                     let mut con = redis_driver::cluster_key_connection(cluster, &key).await?;
-                    redis_driver::load_more_collection(&mut con, &key, key_type, cursor, count).await
+                    redis_driver::load_more_collection(&mut con, &key, key_type, cursor, count, filter).await
                 }
             }
         }

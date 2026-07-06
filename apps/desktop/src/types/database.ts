@@ -172,6 +172,25 @@ export interface SshTunnelConfig {
   expose_lan?: boolean;
   use_ssh_agent?: boolean;
   ssh_agent_sock_path?: string;
+  /**
+   * UI-facing choice of login method. Drives which credential inputs the
+   * connection dialog shows; the backend still probes "none" then falls
+   * back to key > password > agent based on which fields are non-empty,
+   * independent of this selector (see `db/ssh_tunnel.rs`).
+   *
+   * `"agent"` is a legacy value: it's no longer offered as a dropdown
+   * choice for new connections, but is preserved and displayed read-only
+   * for connections that already have `use_ssh_agent` configured.
+   */
+  auth_method?: "password" | "key" | "agent" | "none";
+}
+
+export interface SshConfigHostEntry {
+  alias: string;
+  host_name?: string;
+  port?: number;
+  user?: string;
+  identity_file?: string;
 }
 
 export interface ProxyTunnelConfig {
@@ -381,6 +400,13 @@ export interface RuleInfo {
   definition: string;
 }
 
+export interface ExtensionInfo {
+  name: string;
+  version: string;
+  comment?: string | null;
+  schema?: string | null;
+}
+
 export interface OwnerInfo {
   object_name: string;
   object_type: string;
@@ -507,11 +533,14 @@ export type TreeNodeType =
   | "group-sequences"
   | "group-packages"
   | "group-partitions"
+  | "group-extensions"
+  | "extension"
   | "object-browser"
   | "user-admin"
   | "saved-sql-root"
   | "saved-sql-folder"
   | "saved-sql-file"
+  | "table-search-control"
   | "load-more"
   | "column"
   | "index"
@@ -570,9 +599,10 @@ export interface TreeNode {
   partitionParentSchema?: string;
   partitionParentName?: string;
   hiddenChildren?: TreeNode[];
+  tableSearchParentId?: string;
   savedSqlId?: string;
   savedSqlFolderId?: string;
-  meta?: ColumnInfo | IndexInfo | ForeignKeyInfo | TriggerInfo | VectorCollectionMeta;
+  meta?: ColumnInfo | IndexInfo | ForeignKeyInfo | TriggerInfo | ExtensionInfo | VectorCollectionMeta;
   loadMore?: {
     parentId: string;
     offset: number;
@@ -587,10 +617,10 @@ export interface TableStructureEditorDraft {
   newTableName: string;
   tableComment: string;
   originalTableComment: string;
-  columns: import("@/lib/tableStructureEditorSql").EditableStructureColumn[];
-  indexes: import("@/lib/tableStructureEditorSql").EditableStructureIndex[];
-  foreignKeys: import("@/lib/tableStructureEditorSql").EditableStructureForeignKey[];
-  triggers: import("@/lib/tableStructureEditorSql").EditableStructureTrigger[];
+  columns: import("@/lib/table/tableStructureEditorSql").EditableStructureColumn[];
+  indexes: import("@/lib/table/tableStructureEditorSql").EditableStructureIndex[];
+  foreignKeys: import("@/lib/table/tableStructureEditorSql").EditableStructureForeignKey[];
+  triggers: import("@/lib/table/tableStructureEditorSql").EditableStructureTrigger[];
   initialized: boolean;
 }
 
@@ -631,7 +661,7 @@ export interface QueryTab {
   resultRuns?: QueryResultRun[];
   activeResultRunId?: string;
   resultAutoSave?: boolean;
-  explainPlan?: import("@/lib/explainPlan").ParsedExplainPlan;
+  explainPlan?: import("@/lib/diagram/explainPlan").ParsedExplainPlan;
   explainError?: string;
   explainSql?: string;
   lastExplainedSql?: string;

@@ -556,12 +556,12 @@ fn mysql_ssl_opts(
 ) -> Result<Option<mysql_async::SslOpts>, String> {
     let ca_cert_path = ca_cert_path.map(str::trim).filter(|path| !path.is_empty());
     let has_client_identity = files.sslcert.as_deref().is_some() || files.sslkey.as_deref().is_some();
-    if !mysql_url_requires_ssl(url) && !has_client_identity {
+    if !mysql_url_attempts_ssl(url) && !has_client_identity {
         return Ok(None);
     }
 
     let mut ssl_opts = base_ssl_opts.unwrap_or_default();
-    if let Some(ca_cert_path) = ca_cert_path.filter(|_| mysql_url_requires_ssl(url) || has_client_identity) {
+    if let Some(ca_cert_path) = ca_cert_path.filter(|_| mysql_url_attempts_ssl(url) || has_client_identity) {
         ssl_opts = ssl_opts.with_root_certs(vec![PathBuf::from(ca_cert_path).into()]);
         if !mysql_url_verifies_identity(url) {
             ssl_opts = ssl_opts.with_danger_skip_domain_validation(true);
@@ -841,11 +841,62 @@ fn ssl_fallback_url(url: &str) -> Option<String> {
     if mysql_url_requires_ssl(url) {
         return None;
     }
-    if url.contains("ssl-mode=preferred") {
-        Some(url.replace("ssl-mode=preferred", "ssl-mode=disabled"))
-    } else if !url.contains("ssl-mode=") {
-        let sep = if url.contains('?') { "&" } else { "?" };
-        Some(format!("{url}{sep}ssl-mode=disabled"))
+
+    let (base_url, fragment) = url.split_once('#').map_or((url, ""), |(base, fragment)| (base, fragment));
+    let Some(query_start) = base_url.find('?') else {
+        let mut fallback = format!("{base_url}?ssl-mode=disabled");
+        if !fragment.is_empty() {
+            fallback.push('#');
+            fallback.push_str(fragment);
+        }
+        return Some(fallback);
+    };
+    let prefix = &base_url[..query_start];
+    let query_string = &base_url[query_start + 1..];
+    let mut changed = false;
+    let mut kept_params = Vec::new();
+
+    for param in query_string.split('&') {
+        if param.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = param.split_once('=') else {
+            kept_params.push(param.to_string());
+            continue;
+        };
+        if (key.eq_ignore_ascii_case("ssl-mode") || key.eq_ignore_ascii_case("sslmode"))
+            && matches!(value.to_ascii_lowercase().replace('-', "_").as_str(), "preferred" | "prefer")
+        {
+            if !changed {
+                kept_params.push("ssl-mode=disabled".to_string());
+            }
+            changed = true;
+        } else {
+            kept_params.push(param.to_string());
+        }
+    }
+
+    if !changed
+        && !kept_params.iter().any(|part| {
+            part.split_once('=')
+                .is_some_and(|(key, _)| key.eq_ignore_ascii_case("ssl-mode") || key.eq_ignore_ascii_case("sslmode"))
+        })
+    {
+        kept_params.push("ssl-mode=disabled".to_string());
+        changed = true;
+    }
+
+    if changed {
+        let mut fallback = prefix.to_string();
+        if !kept_params.is_empty() {
+            fallback.push('?');
+            fallback.push_str(&kept_params.join("&"));
+        }
+        if !fragment.is_empty() {
+            fallback.push('#');
+            fallback.push_str(fragment);
+        }
+        Some(fallback)
     } else {
         None
     }
@@ -869,6 +920,25 @@ fn mysql_url_requires_ssl(url: &str) -> bool {
                     value.to_ascii_lowercase().replace('-', "_").as_str(),
                     "required" | "require" | "verify_ca" | "verify_identity"
                 ))
+    })
+}
+
+fn mysql_url_attempts_ssl(url: &str) -> bool {
+    if mysql_url_requires_ssl(url) {
+        return true;
+    }
+
+    let Some((_, query)) = url.split_once('?') else {
+        return false;
+    };
+    query.split('&').any(|segment| {
+        let Some((key, value)) = segment.split_once('=') else {
+            return false;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        (key.eq_ignore_ascii_case("ssl-mode") || key.eq_ignore_ascii_case("sslmode"))
+            && matches!(value.to_ascii_lowercase().replace('-', "_").as_str(), "preferred" | "prefer")
     })
 }
 
@@ -1011,6 +1081,11 @@ fn mysql_async_url(url: &str) -> Cow<'_, str> {
             changed = true;
             match value.to_ascii_lowercase().replace('-', "_").as_str() {
                 "disabled" | "disable" => filtered.push("require_ssl=false".to_string()),
+                "preferred" | "prefer" => {
+                    filtered.push("require_ssl=true".to_string());
+                    filtered.push("verify_ca=false".to_string());
+                    filtered.push("verify_identity=false".to_string());
+                }
                 "required" | "require" => {
                     filtered.push("require_ssl=true".to_string());
                     filtered.push("verify_ca=false".to_string());
@@ -3573,6 +3648,35 @@ UNIQUE KEY(`tenant_id`, `name``part`)
     }
 
     #[test]
+    fn mysql_preferred_tls_attempts_ssl_without_requiring_it() {
+        let url = "mysql://root@localhost/db?ssl-mode=preferred&charset=utf8mb4";
+
+        assert!(!mysql_url_requires_ssl(url));
+        assert!(mysql_url_attempts_ssl(url));
+        assert_eq!(
+            ssl_fallback_url(url),
+            Some("mysql://root@localhost/db?ssl-mode=disabled&charset=utf8mb4".to_string())
+        );
+        assert!(mysql_ssl_opts(None, url, None, &MySqlTlsFiles::default()).unwrap().is_some());
+    }
+
+    #[test]
+    fn mysql_preferred_tls_handles_sslmode_prefer_alias() {
+        let url = "mysql://root@localhost/db?sslmode=prefer&charset=utf8mb4#session";
+
+        assert!(!mysql_url_requires_ssl(url));
+        assert!(mysql_url_attempts_ssl(url));
+        assert_eq!(
+            ssl_fallback_url(url),
+            Some("mysql://root@localhost/db?ssl-mode=disabled&charset=utf8mb4#session".to_string())
+        );
+        assert_eq!(
+            ssl_fallback_url("mysql://root@localhost/db#session"),
+            Some("mysql://root@localhost/db?ssl-mode=disabled#session".to_string())
+        );
+    }
+
+    #[test]
     fn mysql_unknown_error_can_retry_with_text_protocol() {
         let error = "error returned from database: 1105 (HY000): Unknown error";
 
@@ -3694,6 +3798,16 @@ UNIQUE KEY(`tenant_id`, `name``part`)
     #[test]
     fn mysql_async_url_translates_standard_required_ssl_mode() {
         let url = "mysql://host:3306/db?ssl-mode=required&charset=utf8mb4";
+
+        assert_eq!(
+            mysql_async_url(url).as_ref(),
+            "mysql://host:3306/db?require_ssl=true&verify_ca=false&verify_identity=false"
+        );
+    }
+
+    #[test]
+    fn mysql_async_url_translates_preferred_ssl_mode_to_tls_attempt() {
+        let url = "mysql://host:3306/db?ssl-mode=preferred&charset=utf8mb4";
 
         assert_eq!(
             mysql_async_url(url).as_ref(),

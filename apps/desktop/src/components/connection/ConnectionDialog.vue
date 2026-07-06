@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
-import { uuid } from "@/lib/utils";
+import { uuid } from "@/lib/common/utils";
 import { useI18n } from "vue-i18n";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
@@ -13,37 +13,37 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Switch } from "@/components/ui/switch";
-import type { ConnectionConfig, DatabaseType, HttpTunnelConfig, JdbcDriverInfo, JdbcMavenBundleInfo, ProxyTunnelConfig, SshTunnelConfig, TransportLayerConfig } from "@/types/database";
+import type { ConnectionConfig, DatabaseType, HttpTunnelConfig, JdbcDriverInfo, JdbcMavenBundleInfo, ProxyTunnelConfig, SshConfigHostEntry, SshTunnelConfig, TransportLayerConfig } from "@/types/database";
 import type { MqAdminConfig, MqAuth, MqSystemKind } from "@/types/mq";
 import type { NacosAdminConfig, NacosAuthConfig } from "@/types/nacos";
-import { useConnectionStore } from "@/stores/connectionStore";
-import { REDIS_SCAN_PAGE_SIZE_DEFAULT, REDIS_SCAN_PAGE_SIZE_MIN, REDIS_SCAN_PAGE_SIZE_MAX, REDIS_SCAN_PAGE_SIZE_OPTIONS } from "@/lib/redisKeyPattern";
+import { CONNECTION_ATTEMPT_CANCELLED_MESSAGE, useConnectionStore } from "@/stores/connectionStore";
+import { REDIS_SCAN_PAGE_SIZE_DEFAULT, REDIS_SCAN_PAGE_SIZE_MIN, REDIS_SCAN_PAGE_SIZE_MAX, REDIS_SCAN_PAGE_SIZE_OPTIONS } from "@/lib/redis/redisKeyPattern";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useToast } from "@/composables/useToast";
 import DatabaseIcon from "@/components/icons/DatabaseIcon.vue";
-import * as api from "@/lib/api";
-import { isTauriRuntime } from "@/lib/tauriRuntime";
-import { applyParsedConnectionUrl, normalizeMongoConnectionString, parseConnectionUrl } from "@/lib/connectionUrl";
-import { parseConnectionDeepLink, type ConnectionDeepLinkDraft } from "@/lib/connectionDeepLink";
-import { connectionUrlPlaceholder as getUrlPlaceholder } from "@/lib/connectionPresentation";
-import { h2ConnectionModeForConfig, h2FileJdbcUrlWithPath, h2FilePathFromJdbcUrl, isH2SplitJdbcUrl, type H2ConnectionMode } from "@/lib/h2Connection";
-import { firstZooKeeperEndpoint, normalizeZooKeeperConnectString } from "@/lib/zookeeperConnection";
-import { isLocalFileTypeDb } from "@/lib/connectionFile";
-import { MQ_PINNED_VERSION_OPTIONS, pinnedVersionToSelection, selectionToPinnedVersion } from "@/lib/mqPinnedVersionOptions";
-import { mongodbAuthFailureHint, mongoUrlParam, mongoUrlParamIsTrue, normalizeMongoTlsFormState, setMongoUrlParam, setMongoUrlParamBoolean } from "@/lib/mongoConnectionOptions";
-import { mysqlCleartextPasswordAuthEnabled, setMysqlCleartextPasswordAuthEnabled } from "@/lib/mysqlConnectionOptions";
-import { copyToClipboard } from "@/lib/clipboard";
-import { agentDriverInstallKey, appendAgentDriverUpdateHint, hasAgentDriverUpdate, showAgentDriverInstallHint, type AgentDriverInstallState } from "@/lib/agentDriverInstallHint";
-import { prestoSqlBuiltinDriverPaths } from "@/lib/prestoSqlBuiltinDriver";
-import { SQLITE_DATABASE_FILE_EXTENSIONS } from "@/lib/databaseFileDetection";
-import { connectionAttemptOriginalErrorMessage, connectionAttemptTimeoutMessage, connectionAttemptTimeoutMs } from "@/lib/connectionAttemptTimeout";
-import { driverInstallProgressPercent, type DriverInstallProgress } from "@/lib/driverInstallProgressUi";
-import { ArrowLeft, ArrowDown, ArrowUp, CheckSquare, ChevronRight, CircleHelp, Copy, ExternalLink, FilePlus2, FolderOpen, GripVertical, Grid3X3, KeyRound, Link2, List, ListFilter, Loader2, Pipette, Plus, Search, ShieldCheck, Square, Trash2 } from "@lucide/vue";
-import { buildDraftVisibleDatabasesConnectionId, connectionCanChooseVisibleDatabases, initialVisibleDatabaseSelection, visibleDatabaseSelectionIsStale } from "@/lib/connectionVisibleDatabases";
-import { canSaveVisibleDatabaseSelection, connectionUsesVisibleSchemaFilter, filterDatabaseNamesForVisiblePicker, isSystemDatabaseName, normalizeVisibleDatabaseSelection, buildDraftVisibleSchemasConnectionId, normalizeVisibleSchemaSelection } from "@/lib/visibleDatabases";
-import { isSchemaAware } from "@/lib/databaseFeatureSupport";
+import * as api from "@/lib/backend/api";
+import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
+import { applyParsedConnectionUrl, normalizeMongoConnectionString, parseConnectionUrl } from "@/lib/connection/connectionUrl";
+import { parseConnectionDeepLink, type ConnectionDeepLinkDraft } from "@/lib/connection/connectionDeepLink";
+import { connectionUrlPlaceholder as getUrlPlaceholder } from "@/lib/connection/connectionPresentation";
+import { h2ConnectionModeForConfig, h2FileJdbcUrlWithPath, h2FilePathFromJdbcUrl, isH2SplitJdbcUrl, type H2ConnectionMode } from "@/lib/database/h2Connection";
+import { firstZooKeeperEndpoint, normalizeZooKeeperConnectString } from "@/lib/zookeeper/zookeeperConnection";
+import { isLocalFileTypeDb } from "@/lib/connection/connectionFile";
+import { MQ_PINNED_VERSION_OPTIONS, pinnedVersionToSelection, selectionToPinnedVersion } from "@/lib/mq/mqPinnedVersionOptions";
+import { mongodbAuthFailureHint, mongoUrlParam, mongoUrlParamIsTrue, normalizeMongoTlsFormState, setMongoUrlParam, setMongoUrlParamBoolean } from "@/lib/mongo/mongoConnectionOptions";
+import { mysqlCleartextPasswordAuthEnabled, setMysqlCleartextPasswordAuthEnabled } from "@/lib/database/mysqlConnectionOptions";
+import { copyToClipboard } from "@/lib/common/clipboard";
+import { agentDriverInstallKey, appendAgentDriverUpdateHint, hasAgentDriverUpdate, showAgentDriverInstallHint, type AgentDriverInstallState } from "@/lib/connection/agentDriverInstallHint";
+import { prestoSqlBuiltinDriverPaths } from "@/lib/database/prestoSqlBuiltinDriver";
+import { SQLITE_DATABASE_FILE_EXTENSIONS } from "@/lib/database/databaseFileDetection";
+import { connectionAttemptOriginalErrorMessage, connectionAttemptTimeoutMessage, connectionAttemptTimeoutMs } from "@/lib/connection/connectionAttemptTimeout";
+import { driverInstallProgressPercent, type DriverInstallProgress } from "@/lib/connection/driverInstallProgressUi";
+import { ArrowLeft, ArrowDown, ArrowUp, CheckSquare, ChevronRight, CircleHelp, Copy, ExternalLink, FilePlus2, FolderOpen, GripVertical, Grid3X3, KeyRound, Link2, List, ListFilter, Loader2, Pencil, Pipette, Plus, Search, ShieldCheck, Square, Trash2 } from "@lucide/vue";
+import { buildDraftVisibleDatabasesConnectionId, connectionCanChooseVisibleDatabases, initialVisibleDatabaseSelection, visibleDatabaseSelectionIsStale } from "@/lib/connection/connectionVisibleDatabases";
+import { canSaveVisibleDatabaseSelection, connectionUsesVisibleSchemaFilter, filterDatabaseNamesForVisiblePicker, isSystemDatabaseName, normalizeVisibleDatabaseSelection, buildDraftVisibleSchemasConnectionId, normalizeVisibleSchemaSelection } from "@/lib/database/visibleDatabases";
+import { isSchemaAware } from "@/lib/database/databaseFeatureSupport";
 import VisibleSchemasDialog from "@/components/sidebar/VisibleSchemasDialog.vue";
-import { oceanbaseModeConnectionPatch, oceanbaseSubModeFromConfig } from "@/lib/oceanbaseConnectionMode";
+import { oceanbaseModeConnectionPatch, oceanbaseSubModeFromConfig } from "@/lib/database/oceanbaseConnectionMode";
 import { translateBackendError } from "@/i18n/backend-errors";
 
 type DbOption = { value: string; label: string };
@@ -200,7 +200,22 @@ function defaultSshTunnel(): SshTunnelConfig {
     expose_lan: false,
     use_ssh_agent: false,
     ssh_agent_sock_path: "",
+    auth_method: "password",
   };
+}
+
+/**
+ * Infers a login method for connections saved before `auth_method` existed
+ * (or imported from a source that never set it), so the dropdown shows a
+ * sensible current state instead of defaulting blindly to "password".
+ * Mirrors the priority `connect_and_authenticate` actually uses at connect
+ * time (key > password > agent > none) — see `db/ssh_tunnel.rs`.
+ */
+function inferSshAuthMethod(hop: Partial<SshTunnelConfig>): "password" | "key" | "agent" | "none" {
+  if (hop.key_path?.trim()) return "key";
+  if (hop.password) return "password";
+  if (hop.use_ssh_agent) return "agent";
+  return "none";
 }
 
 function normalizeSshTunnel(hop: Partial<SshTunnelConfig>): SshTunnelConfig {
@@ -218,6 +233,7 @@ function normalizeSshTunnel(hop: Partial<SshTunnelConfig>): SshTunnelConfig {
     expose_lan: !!hop.expose_lan,
     use_ssh_agent: !!hop.use_ssh_agent,
     ssh_agent_sock_path: hop.ssh_agent_sock_path || "",
+    auth_method: hop.auth_method || inferSshAuthMethod(hop),
   };
 }
 
@@ -346,6 +362,7 @@ const mongoUseUrl = ref(false);
 const jdbcDriverPathsInput = ref("");
 const jdbcDrivers = ref<JdbcDriverInfo[]>([]);
 const jdbcMavenBundles = ref<JdbcMavenBundleInfo[]>([]);
+const sshConfigHosts = ref<SshConfigHostEntry[]>([]);
 const agentDrivers = ref<AgentDriverInstallState[]>([]);
 const selectedJdbcDriverPath = ref("");
 const jdbcManualClasspathOpen = ref(false);
@@ -2796,6 +2813,7 @@ watch(
     if (!props.prefillConfig?.oneTime) {
       void loadJdbcDrivers();
       void loadAgentDrivers();
+      void loadSshConfigHosts();
     }
     // Preload database names so the summary count is accurate right away.
     void nextTick(() => {
@@ -2930,6 +2948,33 @@ function updateSelectedProxyType(value: unknown) {
   resetTestState();
 }
 
+/**
+ * "agent" is legacy-only: it's never chosen from this dropdown, only ever
+ * inherited from a connection saved before this selector existed. Once the
+ * user picks something else, the option (and its underlying checkbox) is
+ * gone from the form for good.
+ */
+function isLegacySshAgentMethod(hop: Partial<SshTunnelConfig> | null | undefined) {
+  return hop?.auth_method === "agent";
+}
+
+function updateSelectedSshAuthMethod(value: unknown) {
+  const layer = selectedSshLayer.value;
+  if (!layer) return;
+  layer.auth_method = value === "key" ? "key" : value === "none" ? "none" : "password";
+  // Scrub credential fields that do not apply to the selected method so
+  // they are not accidentally submitted or used by the backend fallback.
+  if (layer.auth_method !== "password") layer.password = "";
+  if (layer.auth_method !== "key") {
+    layer.key_path = "";
+    layer.key_passphrase = "";
+  }
+  if (layer.auth_method !== "key") {
+    layer.use_ssh_agent = false;
+  }
+  resetTestState();
+}
+
 function validateTransportLayers(config: LegacyConnectionConfig) {
   const layers = config.transport_layers || [];
   layers.forEach((layer, index) => {
@@ -2991,8 +3036,10 @@ async function save() {
           emit("connectSucceeded", config.name);
         })
         .catch((e: any) => {
+          const message = String(e?.message || e);
+          if (message.includes(CONNECTION_ATTEMPT_CANCELLED_MESSAGE)) return;
           if (config.one_time) void store.removeConnection(config.id);
-          emit("connectFailed", mongodbAuthFailureHint(String(e?.message || e)));
+          emit("connectFailed", mongodbAuthFailureHint(message));
         });
       return;
     }
@@ -3010,6 +3057,28 @@ const dialogTitle = ref("");
 watch([() => editingId.value, () => open.value], () => {
   dialogTitle.value = editingId.value ? t("connection.editTitle") : t("connection.title");
 });
+
+const sshConfigHostAliases = computed(() => sshConfigHosts.value.map((entry) => entry.alias));
+
+/**
+ * Prefills user/port/key_path from a matching ~/.ssh/config alias, without
+ * overwriting values the user already changed away from the form defaults.
+ * This is a UX preview only — the authoritative resolution happens in the
+ * Rust backend at connect time (see resolve_ssh_tunnel_config), so imported
+ * configs that never touched this UI still resolve correctly.
+ */
+function applySshConfigHostAliasPrefill(target: SshTunnelConfig) {
+  const entry = sshConfigHosts.value.find((candidate) => candidate.alias === target.host);
+  if (!entry) return;
+  if (target.user === DEFAULT_SSH_USER && entry.user) target.user = entry.user;
+  if (target.port === 22 && entry.port) target.port = entry.port;
+  if (!target.key_path && entry.identity_file) {
+    target.key_path = entry.identity_file;
+    if ((!target.auth_method || target.auth_method === "password") && !target.password?.trim()) {
+      target.auth_method = "key";
+    }
+  }
+}
 
 async function browseSshKeyPath(target?: SshTunnelConfig | null) {
   if (isTauriRuntime()) {
@@ -3224,6 +3293,14 @@ async function loadJdbcDrivers() {
   } catch {
     jdbcDrivers.value = [];
     jdbcMavenBundles.value = [];
+  }
+}
+
+async function loadSshConfigHosts() {
+  try {
+    sshConfigHosts.value = await api.listSshConfigHosts();
+  } catch {
+    sshConfigHosts.value = [];
   }
 }
 
@@ -4731,7 +4808,10 @@ function openExternalUrl(url: string) {
                   <template v-if="selectedSshLayer">
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelSmallClass">{{ t("connection.sshHost") }}</Label>
-                      <Input v-model="selectedSshLayer.host" class="col-span-2" placeholder="ssh.example.com" :disabled="selectedSshLayer.enabled === false" />
+                      <Input v-model="selectedSshLayer.host" class="col-span-2" list="ssh-config-host-aliases" :placeholder="t('connection.sshHostPlaceholder')" :disabled="selectedSshLayer.enabled === false" @change="applySshConfigHostAliasPrefill(selectedSshLayer!)" />
+                      <datalist id="ssh-config-host-aliases">
+                        <option v-for="alias in sshConfigHostAliases" :key="alias" :value="alias" />
+                      </datalist>
                       <Input v-model.number="selectedSshLayer.port" type="number" min="1" max="65535" class="col-span-1" :disabled="selectedSshLayer.enabled === false" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
@@ -4739,10 +4819,20 @@ function openExternalUrl(url: string) {
                       <Input v-model="selectedSshLayer.user" class="col-span-3" placeholder="root" :disabled="selectedSshLayer.enabled === false" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label :class="connectionLabelSmallClass">{{ t("connection.sshPassword") }}</Label>
-                      <PasswordInput v-model="selectedSshLayer.password" class="col-span-3" :placeholder="t('connection.sshPasswordPlaceholder')" :disabled="selectedSshLayer.enabled === false" />
+                      <Label :class="connectionLabelSmallClass">{{ t("connection.sshAuthMethod") }}</Label>
+                      <Select :model-value="selectedSshLayer.auth_method || 'password'" :disabled="selectedSshLayer.enabled === false" @update:model-value="updateSelectedSshAuthMethod">
+                        <SelectTrigger class="col-span-3 h-9">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="password">{{ t("connection.sshAuthMethodPassword") }}</SelectItem>
+                          <SelectItem value="key">{{ t("connection.sshAuthMethodKey") }}</SelectItem>
+                          <SelectItem value="none">{{ t("connection.sshAuthMethodNone") }}</SelectItem>
+                          <SelectItem v-if="isLegacySshAgentMethod(selectedSshLayer)" value="agent" disabled>{{ t("connection.sshAuthMethodAgentLegacy") }}</SelectItem>
+                        </SelectContent>
+                      </Select>
                     </div>
-                    <div class="grid grid-cols-4 items-center gap-4">
+                    <div v-if="selectedSshLayer.auth_method === 'key'" class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelSmallClass">{{ t("connection.sshKeyPath") }}</Label>
                       <div class="col-span-3 flex items-center gap-1">
                         <Input v-model="selectedSshLayer.key_path" class="flex-1" placeholder="~/.ssh/id_rsa" :disabled="selectedSshLayer.enabled === false" />
@@ -4756,21 +4846,31 @@ function openExternalUrl(url: string) {
                         </Tooltip>
                       </div>
                     </div>
-                    <div class="grid grid-cols-4 items-center gap-4">
+                    <div v-if="selectedSshLayer.auth_method === 'key'" class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelSmallClass">{{ t("connection.sshKeyPassphrase") }}</Label>
                       <PasswordInput v-model="selectedSshLayer.key_passphrase" class="col-span-3" :placeholder="t('connection.sshKeyPassphrasePlaceholder')" :disabled="selectedSshLayer.enabled === false" />
                     </div>
-                    <div class="grid grid-cols-4 items-center gap-4">
+                    <div v-if="!selectedSshLayer.auth_method || selectedSshLayer.auth_method === 'password'" class="grid grid-cols-4 items-center gap-4">
+                      <Label :class="connectionLabelSmallClass">{{ t("connection.sshPassword") }}</Label>
+                      <PasswordInput v-model="selectedSshLayer.password" class="col-span-3" :placeholder="t('connection.sshPasswordPlaceholder')" :disabled="selectedSshLayer.enabled === false" />
+                    </div>
+                    <div v-if="selectedSshLayer.auth_method === 'none'" class="grid grid-cols-4 items-center gap-4">
                       <span />
-                      <label class="col-span-3 flex items-center gap-2 cursor-pointer">
-                        <input type="checkbox" v-model="selectedSshLayer.use_ssh_agent" class="mr-0" :disabled="selectedSshLayer.enabled === false" />
-                        <span class="text-xs text-muted-foreground">{{ t("connection.sshUseAgent") }}</span>
-                      </label>
+                      <p class="col-span-3 text-xs text-muted-foreground">{{ t("connection.sshAuthMethodNoneHint") }}</p>
                     </div>
-                    <div v-if="selectedSshLayer.use_ssh_agent" class="grid grid-cols-4 items-center gap-4">
-                      <Label :class="connectionLabelSmallClass">{{ t("connection.sshAgentSockPath") }}</Label>
-                      <Input v-model="selectedSshLayer.ssh_agent_sock_path" class="col-span-3" :placeholder="t('connection.sshAgentSockPathPlaceholder')" :disabled="selectedSshLayer.enabled === false" />
-                    </div>
+                    <template v-if="isLegacySshAgentMethod(selectedSshLayer)">
+                      <div class="grid grid-cols-4 items-center gap-4">
+                        <span />
+                        <label class="col-span-3 flex items-center gap-2 cursor-pointer">
+                          <input type="checkbox" v-model="selectedSshLayer.use_ssh_agent" class="mr-0" :disabled="selectedSshLayer.enabled === false" />
+                          <span class="text-xs text-muted-foreground">{{ t("connection.sshUseAgent") }}</span>
+                        </label>
+                      </div>
+                      <div v-if="selectedSshLayer.use_ssh_agent" class="grid grid-cols-4 items-center gap-4">
+                        <Label :class="connectionLabelSmallClass">{{ t("connection.sshAgentSockPath") }}</Label>
+                        <Input v-model="selectedSshLayer.ssh_agent_sock_path" class="col-span-3" :placeholder="t('connection.sshAgentSockPathPlaceholder')" :disabled="selectedSshLayer.enabled === false" />
+                      </div>
+                    </template>
                     <div class="grid grid-cols-4 items-center gap-4">
                       <span />
                       <label class="col-span-3 flex items-center gap-2 cursor-pointer">

@@ -15,6 +15,7 @@ use super::json_value_for_js;
 
 const STREAM_ENTRY_LIMIT: usize = 100;
 const COLLECTION_PAGE_SIZE: usize = 200;
+const HASH_FILTER_SCAN_MAX_ITERATIONS: usize = 10;
 const DEFAULT_REDIS_DATABASES: u32 = 16;
 const CLUSTER_CURSOR_NODE_BITS: u64 = 16;
 const CLUSTER_CURSOR_NODE_MASK: u64 = (1 << CLUSTER_CURSOR_NODE_BITS) - 1;
@@ -1758,7 +1759,7 @@ where
         }
         "hash" => {
             let len: u64 = redis::cmd("HLEN").arg(key).query_async(con).await.unwrap_or(0);
-            let (next_cursor, items) = hscan_page_raw(con, key, 0, COLLECTION_PAGE_SIZE).await?;
+            let (next_cursor, items) = hscan_page_raw(con, key, 0, COLLECTION_PAGE_SIZE, None).await?;
             let cursor = if next_cursor > 0 { Some(next_cursor) } else { None };
             (serde_json::Value::Array(items), false, Some(len), cursor)
         }
@@ -2204,6 +2205,7 @@ pub async fn load_more_collection<C>(
     key_type: &str,
     cursor: u64,
     count: usize,
+    filter_query: Option<&str>,
 ) -> Result<RedisValue, String>
 where
     C: ConnectionLike + Send + Sync + Unpin,
@@ -2230,7 +2232,11 @@ where
             (serde_json::Value::Array(items), cursor)
         }
         "hash" => {
-            let (next, items) = hscan_page_raw(con, key, cursor, count).await?;
+            let (next, items) = if let Some(query) = filter_query.filter(|query| !query.is_empty()) {
+                hscan_filtered_page_raw(con, key, cursor, count, query).await?
+            } else {
+                hscan_page_raw(con, key, cursor, count, None).await?
+            };
             let cursor = if next > 0 { Some(next) } else { None };
             (serde_json::Value::Array(items), cursor)
         }
@@ -2254,19 +2260,56 @@ async fn hscan_page_raw<C>(
     key: &[u8],
     cursor: u64,
     count: usize,
+    match_pattern: Option<&str>,
 ) -> Result<(u64, Vec<serde_json::Value>), String>
 where
     C: ConnectionLike + Send + Sync + Unpin,
 {
-    let raw: RedisRawValue = redis::cmd("HSCAN")
-        .arg(key)
-        .arg(cursor)
-        .arg("COUNT")
-        .arg(count)
-        .query_async(con)
-        .await
-        .map_err(|e| e.to_string())?;
+    let mut cmd = redis::cmd("HSCAN");
+    cmd.arg(key).arg(cursor).arg("COUNT").arg(count);
+    if let Some(pattern) = match_pattern {
+        cmd.arg("MATCH").arg(pattern);
+    }
+    let raw: RedisRawValue = cmd.query_async(con).await.map_err(|e| e.to_string())?;
     parse_scan_pairs(raw, "hash")
+}
+
+async fn hscan_filtered_page_raw<C>(
+    con: &mut C,
+    key: &[u8],
+    cursor: u64,
+    count: usize,
+    query: &str,
+) -> Result<(u64, Vec<serde_json::Value>), String>
+where
+    C: ConnectionLike + Send + Sync + Unpin,
+{
+    let mut cur = cursor;
+    let mut items = Vec::new();
+    let target = count.max(1);
+
+    for _ in 0..HASH_FILTER_SCAN_MAX_ITERATIONS {
+        let (next, page) = hscan_page_raw(con, key, cur, target, None).await?;
+        items.extend(page.into_iter().filter(|item| hash_entry_matches_query(item, query)));
+        cur = next;
+        // HSCAN MATCH only checks field names, so value search has to filter returned pairs client-side.
+        // Keep a hard scan bound so sparse value matches cannot turn one UI search into a full hash walk.
+        if cur == 0 || items.len() >= target {
+            break;
+        }
+    }
+
+    Ok((cur, items))
+}
+
+fn hash_entry_matches_query(item: &serde_json::Value, query: &str) -> bool {
+    let query = query.to_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+    let field = item.get("field").and_then(serde_json::Value::as_str).unwrap_or_default();
+    let value = item.get("value").and_then(serde_json::Value::as_str).unwrap_or_default();
+    field.to_lowercase().contains(&query) || value.to_lowercase().contains(&query)
 }
 
 async fn sscan_page_raw<C>(
@@ -2430,6 +2473,11 @@ mod tests {
         ])
     }
 
+    fn hscan_response(cursor: &str, pairs: Vec<(&str, &str)>) -> RedisRawValue {
+        let entries = pairs.into_iter().flat_map(|(field, value)| [bulk(field), bulk(value)]).collect();
+        RedisRawValue::Array(vec![bulk(cursor), RedisRawValue::Array(entries)])
+    }
+
     #[test]
     fn parses_stream_entries() {
         let raw = RedisRawValue::Array(vec![RedisRawValue::Array(vec![
@@ -2558,6 +2606,48 @@ mod tests {
         assert_eq!(result.keys[0].key_display, key);
         assert_eq!(result.keys[0].key_raw, redis_key_bytes_to_raw(key.as_bytes()));
         assert_eq!(con.command_count("SCAN"), 2);
+    }
+
+    #[tokio::test]
+    async fn filtered_hash_load_more_matches_fields_and_keeps_scan_cursor() {
+        let mut con = FakeRedisConnection::new(vec![
+            hscan_response("512", vec![("user:1", "Ada")]),
+            hscan_response("0", vec![("user:2", "Bob")]),
+        ]);
+
+        let result = super::load_more_collection(&mut con, b"hash-key", "hash", 0, 1, Some("user")).await.unwrap();
+
+        assert_eq!(result.scan_cursor, Some(512));
+        assert_eq!(result.value, serde_json::json!([{ "field": "user:1", "value": "Ada" }]));
+        assert_eq!(con.command_count("HSCAN"), 1);
+        assert!(!con.commands[0].contains("\r\nMATCH\r\n"));
+    }
+
+    #[tokio::test]
+    async fn filtered_hash_load_more_matches_values() {
+        let mut con =
+            FakeRedisConnection::new(vec![hscan_response("0", vec![("status", "Ada Lovelace"), ("name", "Bob")])]);
+
+        let result = super::load_more_collection(&mut con, b"hash-key", "hash", 0, 20, Some("lovelace")).await.unwrap();
+
+        assert_eq!(result.scan_cursor, None);
+        assert_eq!(result.value, serde_json::json!([{ "field": "status", "value": "Ada Lovelace" }]));
+        assert_eq!(con.command_count("HSCAN"), 1);
+        assert!(!con.commands[0].contains("\r\nMATCH\r\n"));
+    }
+
+    #[tokio::test]
+    async fn filtered_hash_load_more_caps_sparse_scan_iterations() {
+        let responses = (1..=super::HASH_FILTER_SCAN_MAX_ITERATIONS + 1)
+            .map(|cursor| hscan_response(&cursor.to_string(), vec![]))
+            .collect();
+        let mut con = FakeRedisConnection::new(responses);
+
+        let result = super::load_more_collection(&mut con, b"hash-key", "hash", 0, 20, Some("missing")).await.unwrap();
+
+        assert_eq!(result.scan_cursor, Some(super::HASH_FILTER_SCAN_MAX_ITERATIONS as u64));
+        assert_eq!(result.value, serde_json::json!([]));
+        assert_eq!(con.command_count("HSCAN"), super::HASH_FILTER_SCAN_MAX_ITERATIONS);
     }
 
     #[test]

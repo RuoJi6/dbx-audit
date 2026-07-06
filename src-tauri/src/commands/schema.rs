@@ -138,8 +138,22 @@ pub async fn list_objects(
     connection_id: String,
     database: String,
     schema: String,
+    filter: Option<String>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+    object_types: Option<Vec<String>>,
 ) -> Result<Vec<db::ObjectInfo>, String> {
-    dbx_core::schema::list_objects_core(&state, &connection_id, &database, &schema).await
+    dbx_core::schema::list_objects_core(
+        &state,
+        &connection_id,
+        &database,
+        &schema,
+        filter.as_deref(),
+        limit,
+        offset,
+        object_types.as_deref(),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -277,4 +291,23 @@ pub async fn list_owners(
     schema: String,
 ) -> Result<Vec<db::OwnerInfo>, String> {
     dbx_core::schema::list_owners_core(&state, &connection_id, &database, &schema).await
+}
+
+#[tauri::command]
+pub async fn list_extensions(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    database: String,
+    schema: String,
+) -> Result<Vec<db::ExtensionInfo>, String> {
+    dbx_core::schema::list_extensions_core(&state, &connection_id, &database, &schema).await
+}
+
+#[tauri::command]
+pub async fn list_available_extensions(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    database: String,
+) -> Result<Vec<db::ExtensionInfo>, String> {
+    dbx_core::schema::list_available_extensions_core(&state, &connection_id, &database).await
 }
