@@ -44,6 +44,11 @@ impl MySqlQueryDialect {
     }
 }
 
+pub enum MySqlQueryStreamItem {
+    Columns { columns: Vec<String>, column_types: Vec<String> },
+    Row(Vec<serde_json::Value>),
+}
+
 fn quote_value(s: &str) -> String {
     format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
 }
@@ -426,16 +431,43 @@ pub async fn connect_with_ca_cert_pool_limit_idle_and_setup(
     idle_timeout_secs: Option<u64>,
     extra_setup_queries: &[String],
 ) -> Result<MySqlPool, String> {
+    connect_with_ca_cert_pool_limit_idle_and_setup_database(
+        url,
+        ca_cert_path,
+        fallback_timeout,
+        max_connections,
+        idle_timeout_secs,
+        None,
+        extra_setup_queries,
+    )
+    .await
+}
+
+pub async fn connect_with_ca_cert_pool_limit_idle_and_setup_database(
+    url: &str,
+    ca_cert_path: Option<&str>,
+    fallback_timeout: Duration,
+    max_connections: usize,
+    idle_timeout_secs: Option<u64>,
+    setup_database: Option<&str>,
+    extra_setup_queries: &[String],
+) -> Result<MySqlPool, String> {
     let timeout = super::parse_connect_timeout_with_fallback(url, fallback_timeout);
-    let pool = create_pool(url, ca_cert_path, max_connections, idle_timeout_secs, extra_setup_queries)?;
+    let pool = create_pool(url, ca_cert_path, max_connections, idle_timeout_secs, setup_database, extra_setup_queries)?;
     let result = verify_pool_connection(&pool, timeout).await;
 
     if let Err(ref e) = result {
         if mysql_error_should_retry_without_ssl(e) {
             if let Some(fallback_url) = ssl_fallback_url(url) {
                 log::info!("SSL handshake failed, retrying with ssl-mode=disabled");
-                let fallback_pool =
-                    create_pool(&fallback_url, None, max_connections, idle_timeout_secs, extra_setup_queries)?;
+                let fallback_pool = create_pool(
+                    &fallback_url,
+                    None,
+                    max_connections,
+                    idle_timeout_secs,
+                    setup_database,
+                    extra_setup_queries,
+                )?;
                 return match verify_pool_connection(&fallback_pool, timeout).await {
                     Ok(()) => Ok(fallback_pool),
                     Err(e) => Err(e),
@@ -458,6 +490,7 @@ fn create_pool(
     ca_cert_path: Option<&str>,
     max_connections: usize,
     idle_timeout_secs: Option<u64>,
+    setup_database: Option<&str>,
     extra_setup_queries: &[String],
 ) -> Result<MySqlPool, String> {
     let tls_url = mysql_tls_url(url)?;
@@ -474,12 +507,16 @@ fn create_pool(
         .with_constraints(mysql_async::PoolConstraints::new(1, max_connections).unwrap())
         .with_inactive_connection_ttl(inactive_ttl)
         .with_reset_connection(max_connections > 1);
+    let setup_queries = match setup_database {
+        Some(database) => mysql_setup_queries_for_database(url, Some(database), extra_setup_queries),
+        None => mysql_setup_queries(url, extra_setup_queries),
+    };
     let mut builder = mysql_async::OptsBuilder::from_opts(opts)
         .stmt_cache_size(0)
         .prefer_socket(false)
         .pool_opts(Some(pool_opts))
         .tcp_keepalive(Some(MYSQL_TCP_KEEPALIVE_MS))
-        .setup(mysql_setup_queries(url, extra_setup_queries));
+        .setup(setup_queries);
     if let Some(ssl_opts) = mysql_ssl_opts(base_ssl_opts, url, ca_cert_path, &tls_url.files)? {
         builder = builder.ssl_opts(ssl_opts);
     }
@@ -584,9 +621,17 @@ fn mysql_ssl_opts(
 }
 
 fn mysql_setup_queries(url: &str, extra_setup_queries: &[String]) -> Vec<String> {
+    mysql_setup_queries_for_database(url, None, extra_setup_queries)
+}
+
+fn mysql_setup_queries_for_database(
+    url: &str,
+    setup_database: Option<&str>,
+    extra_setup_queries: &[String],
+) -> Vec<String> {
     let charset = mysql_connection_charset(url).unwrap_or("utf8mb4");
     let catalog = mysql_connection_catalog(url);
-    let database = mysql_connection_database(url);
+    let database = setup_database.map(ToOwned::to_owned).or_else(|| mysql_connection_database(url));
     let mut queries = Vec::new();
     if let Some(database) = database.as_deref() {
         queries.push(format!("USE {}", quote_identifier(database)));
@@ -824,6 +869,9 @@ fn mysql_error_should_retry_without_ssl(error: &str) -> bool {
         || error.contains("handshake")
         || error.contains("tls connection")
         || error.contains("server closed session")
+        // Some MySQL-compatible servers report a preferred-TLS attempt as a
+        // normal server error instead of a TLS handshake error.
+        || (error.contains("client asked for ssl") && error.contains("server does not have this capability"))
 }
 
 fn mysql_error_should_retry_with_text_protocol(error: &str) -> bool {
@@ -1142,8 +1190,19 @@ pub async fn connect_bare_with_pool_limit_and_setup(
     max_connections: usize,
     extra_setup_queries: &[String],
 ) -> Result<MySqlPool, String> {
+    connect_bare_with_pool_limit_and_setup_database(url, fallback_timeout, max_connections, None, extra_setup_queries)
+        .await
+}
+
+pub async fn connect_bare_with_pool_limit_and_setup_database(
+    url: &str,
+    fallback_timeout: Duration,
+    max_connections: usize,
+    setup_database: Option<&str>,
+    extra_setup_queries: &[String],
+) -> Result<MySqlPool, String> {
     let timeout = super::parse_connect_timeout_with_fallback(url, fallback_timeout);
-    let pool = create_pool(url, None, max_connections, None, extra_setup_queries)?;
+    let pool = create_pool(url, None, max_connections, None, setup_database, extra_setup_queries)?;
     verify_pool_connection(&pool, timeout).await.map(|_| pool)
 }
 
@@ -2427,29 +2486,55 @@ pub async fn stream_query_rows(
     mut on_row: impl FnMut(&[serde_json::Value]) -> Result<(), String>,
 ) -> Result<u64, String> {
     let mut conn = get_conn_with_health_check(pool).await?;
+    stream_query_result_on_conn(&mut conn, sql, bare, max_rows, dialect, cancelled, |item| {
+        if let MySqlQueryStreamItem::Row(row) = item {
+            on_row(&row)?;
+        }
+        Ok(())
+    })
+    .await
+}
+
+pub async fn stream_query_result_on_conn(
+    conn: &mut mysql_async::Conn,
+    sql: &str,
+    bare: bool,
+    max_rows: Option<usize>,
+    dialect: MySqlQueryDialect,
+    cancelled: &AtomicBool,
+    mut on_item: impl FnMut(MySqlQueryStreamItem) -> Result<(), String>,
+) -> Result<u64, String> {
     let row_limit = max_rows.unwrap_or(usize::MAX);
 
     if bare || prefers_text_protocol_query(sql, dialect) {
-        stream_query_rows_text(&mut conn, sql, row_limit, cancelled, &mut on_row).await
+        stream_query_result_text(conn, sql, row_limit, cancelled, &mut on_item).await
     } else {
-        match stream_query_rows_prepared(&mut conn, sql, row_limit, cancelled, &mut on_row).await {
+        match stream_query_result_prepared(conn, sql, row_limit, cancelled, &mut on_item).await {
             Ok(rows) => Ok(rows),
             Err(err) if mysql_error_should_retry_with_text_protocol(&err) => {
-                stream_query_rows_text(&mut conn, sql, row_limit, cancelled, &mut on_row).await
+                stream_query_result_text(conn, sql, row_limit, cancelled, &mut on_item).await
             }
             Err(err) => Err(err),
         }
     }
 }
 
-async fn stream_query_rows_text(
+async fn stream_query_result_text(
     conn: &mut mysql_async::Conn,
     sql: &str,
     row_limit: usize,
     cancelled: &AtomicBool,
-    on_row: &mut impl FnMut(&[serde_json::Value]) -> Result<(), String>,
+    on_item: &mut impl FnMut(MySqlQueryStreamItem) -> Result<(), String>,
 ) -> Result<u64, String> {
     let mut result = conn.query_iter(sql).await.map_err(|e| e.to_string())?;
+    if !advance_to_result_set_with_columns(&mut result).await? {
+        return Ok(0);
+    }
+    let columns: Vec<String> = result.columns_ref().iter().map(|c| c.name_str().to_string()).collect();
+    let column_types: Vec<String> =
+        result.columns_ref().iter().map(|c| mysql_column_type_name(c.column_type())).collect();
+    on_item(MySqlQueryStreamItem::Columns { columns, column_types })?;
+
     let mut stream = result
         .stream::<mysql_async::Row>()
         .await
@@ -2466,21 +2551,29 @@ async fn stream_query_rows_text(
         }
         let row = row.map_err(|e| e.to_string())?;
         let values: Vec<serde_json::Value> = (0..row.len()).map(|i| mysql_value_to_json(&row, i)).collect();
-        on_row(&values)?;
+        on_item(MySqlQueryStreamItem::Row(values))?;
         rows_exported += 1;
     }
 
     Ok(rows_exported)
 }
 
-async fn stream_query_rows_prepared(
+async fn stream_query_result_prepared(
     conn: &mut mysql_async::Conn,
     sql: &str,
     row_limit: usize,
     cancelled: &AtomicBool,
-    on_row: &mut impl FnMut(&[serde_json::Value]) -> Result<(), String>,
+    on_item: &mut impl FnMut(MySqlQueryStreamItem) -> Result<(), String>,
 ) -> Result<u64, String> {
     let mut result = conn.exec_iter(sql, ()).await.map_err(|e| e.to_string())?;
+    let columns: Vec<String> = result.columns_ref().iter().map(|c| c.name_str().to_string()).collect();
+    if columns.is_empty() {
+        return Ok(0);
+    }
+    let column_types: Vec<String> =
+        result.columns_ref().iter().map(|c| mysql_column_type_name(c.column_type())).collect();
+    on_item(MySqlQueryStreamItem::Columns { columns, column_types })?;
+
     let mut stream = result
         .stream::<mysql_async::Row>()
         .await
@@ -2497,7 +2590,7 @@ async fn stream_query_rows_prepared(
         }
         let row = row.map_err(|e| e.to_string())?;
         let values: Vec<serde_json::Value> = (0..row.len()).map(|i| mysql_value_to_json(&row, i)).collect();
-        on_row(&values)?;
+        on_item(MySqlQueryStreamItem::Row(values))?;
         rows_exported += 1;
     }
 
@@ -3605,6 +3698,14 @@ UNIQUE KEY(`tenant_id`, `name``part`)
     }
 
     #[test]
+    fn mysql_server_without_ssl_capability_retries_without_ssl() {
+        let error =
+            "MySQL connection failed: Driver error: `Client asked for SSL but server does not have this capability'";
+
+        assert!(mysql_error_should_retry_without_ssl(error));
+    }
+
+    #[test]
     fn mysql_tcp_keepalive_uses_milliseconds_not_seconds() {
         assert_eq!(MYSQL_TCP_KEEPALIVE_MS, 30_000);
         assert!(MYSQL_TCP_KEEPALIVE_MS >= 1_000);
@@ -3716,6 +3817,17 @@ UNIQUE KEY(`tenant_id`, `name``part`)
         let queries = mysql_setup_queries("mysql://root:secret@localhost:3306/db%2Fname?charset=utf8mb4", &[]);
 
         assert_eq!(queries, vec!["USE `db/name`", "SET NAMES utf8mb4"]);
+    }
+
+    #[test]
+    fn mysql_setup_queries_can_select_database_without_url_path() {
+        let queries = mysql_setup_queries_for_database(
+            "mysql://root:secret@localhost:3306?charset=utf8mb4",
+            Some("app`proxy"),
+            &[],
+        );
+
+        assert_eq!(queries, vec!["USE `app``proxy`", "SET NAMES utf8mb4"]);
     }
 
     #[test]

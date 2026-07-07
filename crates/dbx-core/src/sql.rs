@@ -109,6 +109,7 @@ struct SqlDialectProfile {
     supports_oracle_plsql_blocks: bool,
     supports_slash_line_block_delimiter: bool,
     supports_custom_delimiter_commands: bool,
+    supports_mysql_routine_blocks: bool,
     supports_dollar_quoted_strings: bool,
     supports_go_batch_separator: bool,
     keeps_sqlserver_module_batch_at_cursor: bool,
@@ -121,6 +122,7 @@ impl Default for SqlDialectProfile {
             supports_oracle_plsql_blocks: false,
             supports_slash_line_block_delimiter: false,
             supports_custom_delimiter_commands: true,
+            supports_mysql_routine_blocks: false,
             supports_dollar_quoted_strings: true,
             supports_go_batch_separator: false,
             keeps_sqlserver_module_batch_at_cursor: false,
@@ -146,7 +148,7 @@ impl SqlDialectProfile {
     }
 
     fn mysql_compatible() -> Self {
-        Self { supports_hash_line_comments: true, ..Self::default() }
+        Self { supports_hash_line_comments: true, supports_mysql_routine_blocks: true, ..Self::default() }
     }
 
     fn oracle_like() -> Self {
@@ -387,6 +389,19 @@ impl SqlStatementSplitter {
                         self.buffer.push(ch);
                     } else if self.custom_delimiter.is_some() {
                         self.buffer.push(ch);
+                    } else if self.options.profile.supports_mysql_routine_blocks
+                        && starts_with_mysql_routine_block(&self.buffer)
+                    {
+                        let mut candidate = self.buffer.clone();
+                        candidate.push(ch);
+                        if mysql_routine_block_is_complete(&candidate) {
+                            // The final semicolon is the client-side statement delimiter.
+                            // Keep semicolons inside BEGIN...END, but do not send the
+                            // delimiter after END to the MySQL server.
+                            self.push_current_statement(&mut statements);
+                        } else {
+                            self.buffer.push(ch);
+                        }
                     } else if self.options.profile.supports_oracle_plsql_blocks
                         && starts_with_oracle_plsql_block(&self.buffer)
                     {
@@ -783,16 +798,26 @@ fn split_sql_statement_ranges_with_options(sql: &str, options: SqlParsingOptions
                 && custom_delimiter.is_none()
                 && !(options.profile.supports_custom_delimiter_commands && is_on_delimiter_line(sql, start, i)) =>
             {
-                let is_oracle_plsql =
-                    options.profile.supports_oracle_plsql_blocks && starts_with_oracle_plsql_block(&sql[start..i]);
-                if is_oracle_plsql {
-                    if !oracle_plsql_block_is_complete(&sql[start..i + ch.len_utf8()]) {
+                let is_mysql_routine =
+                    options.profile.supports_mysql_routine_blocks && starts_with_mysql_routine_block(&sql[start..i]);
+                if is_mysql_routine {
+                    if !mysql_routine_block_is_complete(&sql[start..i + ch.len_utf8()]) {
                         i += ch.len_utf8();
                         continue;
                     }
-                    push_statement_range(&mut ranges, sql, start, i + ch.len_utf8(), options);
-                } else {
                     push_statement_range(&mut ranges, sql, start, i, options);
+                } else {
+                    let is_oracle_plsql =
+                        options.profile.supports_oracle_plsql_blocks && starts_with_oracle_plsql_block(&sql[start..i]);
+                    if is_oracle_plsql {
+                        if !oracle_plsql_block_is_complete(&sql[start..i + ch.len_utf8()]) {
+                            i += ch.len_utf8();
+                            continue;
+                        }
+                        push_statement_range(&mut ranges, sql, start, i + ch.len_utf8(), options);
+                    } else {
+                        push_statement_range(&mut ranges, sql, start, i, options);
+                    }
                 }
                 i += ch.len_utf8();
                 start = i;
@@ -1007,6 +1032,217 @@ fn starts_with_sqlserver_module_ddl(sql: &str) -> bool {
 
 fn is_sqlserver_module_keyword(token: &str) -> bool {
     ["FUNCTION", "PROC", "PROCEDURE", "TRIGGER", "VIEW"].iter().any(|keyword| token.eq_ignore_ascii_case(keyword))
+}
+
+fn starts_with_mysql_routine_block(sql: &str) -> bool {
+    is_mysql_routine_ddl_start(sql) && mysql_routine_tokens(sql).iter().any(|token| token.eq_ignore_ascii_case("BEGIN"))
+}
+
+fn is_mysql_routine_ddl_start(sql: &str) -> bool {
+    let executable = leading_executable_sql_with_options(sql, SqlParsingOptions::mysql_compatible());
+    let tokens = first_sql_tokens(executable, 16);
+    if tokens.first().is_none_or(|token| !token.eq_ignore_ascii_case("CREATE")) {
+        return false;
+    }
+
+    for token in tokens.iter().skip(1) {
+        if ["PROCEDURE", "FUNCTION", "TRIGGER", "EVENT"].iter().any(|keyword| token.eq_ignore_ascii_case(keyword)) {
+            return true;
+        }
+        if [
+            "DATABASE",
+            "INDEX",
+            "LOGFILE",
+            "ROLE",
+            "SCHEMA",
+            "SERVER",
+            "SPATIAL",
+            "TABLE",
+            "TEMPORARY",
+            "UNIQUE",
+            "USER",
+            "VIEW",
+        ]
+        .iter()
+        .any(|keyword| token.eq_ignore_ascii_case(keyword))
+        {
+            return false;
+        }
+    }
+
+    false
+}
+
+fn mysql_routine_block_is_complete(sql: &str) -> bool {
+    if !starts_with_mysql_routine_block(sql) {
+        return false;
+    }
+
+    let tokens = mysql_routine_tokens(sql);
+    let mut begin_depth = 0usize;
+    let mut saw_begin = false;
+
+    for (index, token) in tokens.iter().enumerate() {
+        if token == ";" {
+            continue;
+        }
+        if token.eq_ignore_ascii_case("BEGIN") {
+            if previous_mysql_routine_word(&tokens, index).is_some_and(|previous| previous.eq_ignore_ascii_case("END"))
+            {
+                continue;
+            }
+            saw_begin = true;
+            begin_depth += 1;
+            continue;
+        }
+        if token.eq_ignore_ascii_case("END") && saw_begin {
+            if next_mysql_routine_word(&tokens, index).is_some_and(is_mysql_control_block_suffix) {
+                continue;
+            }
+            begin_depth = begin_depth.saturating_sub(1);
+        }
+    }
+
+    saw_begin && begin_depth == 0 && tokens.last().is_some_and(|token| token == ";")
+}
+
+fn is_mysql_control_block_suffix(token: &str) -> bool {
+    ["IF", "LOOP", "CASE", "REPEAT", "WHILE"].iter().any(|keyword| token.eq_ignore_ascii_case(keyword))
+}
+
+fn previous_mysql_routine_word(tokens: &[String], index: usize) -> Option<&str> {
+    tokens[..index].iter().rev().find(|token| token.as_str() != ";").map(String::as_str)
+}
+
+fn next_mysql_routine_word(tokens: &[String], index: usize) -> Option<&str> {
+    tokens.get(index + 1..)?.iter().find(|token| token.as_str() != ";").map(String::as_str)
+}
+
+fn mysql_routine_tokens(sql: &str) -> Vec<String> {
+    let chars = sql.chars().collect::<Vec<_>>();
+    let mut tokens = Vec::new();
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut in_backtick = false;
+    let mut i = 0;
+
+    while i < chars.len() {
+        let ch = chars[i];
+        let next = chars.get(i + 1).copied();
+
+        if in_line_comment {
+            if ch == '\n' {
+                in_line_comment = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_block_comment {
+            if ch == '*' && next == Some('/') {
+                in_block_comment = false;
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+
+        if in_single_quote {
+            if ch == '\\' && next.is_some() {
+                i += 2;
+                continue;
+            }
+            if ch == '\'' {
+                if next == Some('\'') {
+                    i += 2;
+                    continue;
+                }
+                in_single_quote = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_double_quote {
+            if ch == '\\' && next.is_some() {
+                i += 2;
+                continue;
+            }
+            if ch == '"' {
+                if next == Some('"') {
+                    i += 2;
+                    continue;
+                }
+                in_double_quote = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_backtick {
+            if ch == '`' {
+                if next == Some('`') {
+                    i += 2;
+                    continue;
+                }
+                in_backtick = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if ch == '-' && next == Some('-') {
+            in_line_comment = true;
+            i += 2;
+            continue;
+        }
+        if ch == '#' {
+            in_line_comment = true;
+            i += 1;
+            continue;
+        }
+        if ch == '/' && next == Some('*') {
+            in_block_comment = true;
+            i += 2;
+            continue;
+        }
+        if ch == '\'' {
+            in_single_quote = true;
+            i += 1;
+            continue;
+        }
+        if ch == '"' {
+            in_double_quote = true;
+            i += 1;
+            continue;
+        }
+        if ch == '`' {
+            in_backtick = true;
+            i += 1;
+            continue;
+        }
+        if ch == ';' {
+            tokens.push(";".to_string());
+            i += 1;
+            continue;
+        }
+        if ch == '_' || ch.is_ascii_alphabetic() {
+            let start = i;
+            i += 1;
+            while i < chars.len() && is_sql_ident_char(chars[i]) {
+                i += 1;
+            }
+            tokens.push(chars[start..i].iter().collect::<String>().to_ascii_uppercase());
+            continue;
+        }
+
+        i += 1;
+    }
+
+    tokens
 }
 
 fn first_sql_tokens(sql: &str, limit: usize) -> Vec<String> {
@@ -2512,12 +2748,74 @@ DELIMITER ;";
     }
 
     #[test]
+    fn mysql_routine_without_delimiter_keeps_body_together() {
+        let sql = "\
+CREATE PROCEDURE p()
+BEGIN
+  SELECT 1;
+  SELECT 2;
+END;
+SELECT 3;";
+        assert_eq!(
+            split_sql_statements_for_database(sql, DatabaseType::Mysql),
+            vec!["CREATE PROCEDURE p()\nBEGIN\n  SELECT 1;\n  SELECT 2;\nEND", "SELECT 3"]
+        );
+    }
+
+    #[test]
+    fn mysql_routine_without_delimiter_handles_nested_end_suffixes() {
+        let sql = "\
+CREATE PROCEDURE p()
+BEGIN
+  IF 1 = 1 THEN
+    SELECT 'ok';
+  END IF;
+END;
+SELECT 2;";
+        assert_eq!(
+            split_sql_statements_for_database(sql, DatabaseType::Mysql),
+            vec!["CREATE PROCEDURE p()\nBEGIN\n  IF 1 = 1 THEN\n    SELECT 'ok';\n  END IF;\nEND", "SELECT 2"]
+        );
+    }
+
+    #[test]
+    fn mysql_routine_without_delimiter_handles_loop_end_suffixes() {
+        let sql = "\
+CREATE PROCEDURE p_loop()
+BEGIN
+  WHILE 1 = 0 DO
+    SELECT 'while; still body';
+  END WHILE;
+  REPEAT
+    SELECT 'repeat; still body';
+  UNTIL 1 = 1 END REPEAT;
+END;
+SELECT 2;";
+        assert_eq!(
+            split_sql_statements_for_database(sql, DatabaseType::Mysql),
+            vec![
+                "CREATE PROCEDURE p_loop()\nBEGIN\n  WHILE 1 = 0 DO\n    SELECT 'while; still body';\n  END WHILE;\n  REPEAT\n    SELECT 'repeat; still body';\n  UNTIL 1 = 1 END REPEAT;\nEND",
+                "SELECT 2",
+            ]
+        );
+    }
+
+    #[test]
+    fn mysql_regular_begin_transaction_still_splits_without_delimiter() {
+        assert_eq!(
+            split_sql_statements_for_database("BEGIN; INSERT INTO t VALUES (1); COMMIT;", DatabaseType::Mysql),
+            vec!["BEGIN", "INSERT INTO t VALUES (1)", "COMMIT"]
+        );
+    }
+
+    #[test]
     fn sql_dialect_profiles_map_database_types_to_parser_capabilities() {
         let default = SqlDialectProfile::for_database_type(DatabaseType::Postgres);
         assert_eq!(default, SqlDialectProfile::default());
         assert!(default.supports_custom_delimiter_commands);
         assert!(default.supports_dollar_quoted_strings);
         assert!(!default.supports_hash_line_comments);
+        assert!(!default.supports_mysql_routine_blocks);
         assert!(!default.supports_oracle_plsql_blocks);
         assert!(!default.supports_slash_line_block_delimiter);
         assert!(!default.supports_go_batch_separator);
@@ -2526,6 +2824,7 @@ DELIMITER ;";
         let mysql = SqlDialectProfile::for_database_type(DatabaseType::Mysql);
         assert_eq!(mysql, SqlDialectProfile::mysql_compatible());
         assert!(mysql.supports_hash_line_comments);
+        assert!(mysql.supports_mysql_routine_blocks);
         assert!(SqlDialectProfile::for_database_type(DatabaseType::Doris).supports_hash_line_comments);
         assert!(SqlDialectProfile::for_database_type(DatabaseType::StarRocks).supports_hash_line_comments);
         assert!(SqlDialectProfile::for_database_type(DatabaseType::ManticoreSearch).supports_hash_line_comments);

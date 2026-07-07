@@ -332,6 +332,7 @@ export interface ObjectSource {
   object_type: ObjectSourceKind;
   schema?: string | null;
   source: string;
+  editable?: boolean;
 }
 
 export interface ColumnInfo {
@@ -556,6 +557,7 @@ export type TreeNodeType =
   | "mongo-buckets"
   | "mongo-bucket"
   | "mongo-collection"
+  | "vector-database"
   | "vector-collection"
   | "elasticsearch-index";
 
@@ -611,6 +613,11 @@ export interface TreeNode {
 }
 
 export type TableInfoTab = "columns" | "indexes" | "foreignKeys" | "triggers" | "ddl";
+
+export interface TableStructureEditorTarget {
+  kind: "column" | "index";
+  name: string;
+}
 
 export interface TableStructureEditorDraft {
   activeTab: TableInfoTab;
@@ -687,6 +694,7 @@ export interface QueryTab {
   structureTableName?: string;
   structureInitialTab?: TableInfoTab;
   structureInitialTabRequestId?: number;
+  structureInitialTarget?: TableStructureEditorTarget;
   structureDraft?: TableStructureEditorDraft;
   objectBrowser?: {
     schema?: string;
@@ -774,6 +782,7 @@ export interface SavedSqlLibrary {
 
 export interface VectorCollectionMeta {
   dimension?: number;
+  collectionId?: string;
 }
 
 export interface CollectionInfo {

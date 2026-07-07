@@ -3,14 +3,18 @@ use std::fs::File;
 use std::path::Path;
 
 use calamine::{open_workbook_auto, Data, Reader};
+use chrono::{DateTime, NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};
 
 use crate::connection::AppState;
 use crate::models::connection::DatabaseType;
-use crate::transfer::{execute_on_pool, generate_insert_typed, get_columns_for_transfer, qualified_table};
+use crate::transfer::{
+    execute_on_pool, generate_insert_typed, get_columns_for_transfer, qualified_table, quote_identifier,
+};
 
 pub const DEFAULT_PREVIEW_LIMIT: usize = 50;
 pub const DEFAULT_BATCH_SIZE: usize = 500;
+pub const CREATE_TABLE_INFERENCE_ROWS: usize = 100;
 pub const MAX_NON_STREAMING_IMPORT_BYTES: u64 = 100 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
@@ -24,6 +28,18 @@ pub struct ParsedImportFile {
 pub struct ImportSqlBatch {
     pub sql: String,
     pub row_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportCreateTableColumn {
+    pub name: String,
+    pub data_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportCreateTablePlan {
+    pub sql: String,
+    pub columns: Vec<ImportCreateTableColumn>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,6 +147,8 @@ pub struct TableImportRequest {
     pub parse_options: TableImportParseOptions,
     pub mappings: Vec<TableImportColumnMapping>,
     pub mode: TableImportMode,
+    #[serde(default)]
+    pub create_table: bool,
     pub batch_size: usize,
 }
 
@@ -790,6 +808,241 @@ pub fn truncate_sql(table: &str, schema: &str, db_type: &DatabaseType) -> String
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImportInferredType {
+    Boolean,
+    Integer,
+    Decimal,
+    Date,
+    Timestamp,
+    Json,
+    Text,
+}
+
+fn merge_inferred_type(current: Option<ImportInferredType>, next: ImportInferredType) -> ImportInferredType {
+    let Some(current) = current else {
+        return next;
+    };
+    if current == next {
+        return current;
+    }
+    match (current, next) {
+        (ImportInferredType::Text, _) | (_, ImportInferredType::Text) => ImportInferredType::Text,
+        (ImportInferredType::Integer, ImportInferredType::Decimal)
+        | (ImportInferredType::Decimal, ImportInferredType::Integer) => ImportInferredType::Decimal,
+        (ImportInferredType::Date, ImportInferredType::Timestamp)
+        | (ImportInferredType::Timestamp, ImportInferredType::Date) => ImportInferredType::Timestamp,
+        _ => ImportInferredType::Text,
+    }
+}
+
+fn has_numeric_leading_zero(value: &str) -> bool {
+    let unsigned = value.trim_start_matches(['+', '-']);
+    let bytes = unsigned.as_bytes();
+    bytes.len() > 1 && bytes[0] == b'0' && bytes[1].is_ascii_digit()
+}
+
+fn is_likely_date(value: &str) -> bool {
+    ["%Y-%m-%d", "%Y/%m/%d"].iter().any(|format| NaiveDate::parse_from_str(value, format).is_ok())
+}
+
+fn is_likely_timestamp(value: &str) -> bool {
+    if DateTime::parse_from_rfc3339(value).is_ok() {
+        return true;
+    }
+    ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S%.f", "%Y/%m/%d %H:%M:%S%.f", "%Y/%m/%dT%H:%M:%S%.f"]
+        .iter()
+        .any(|format| NaiveDateTime::parse_from_str(value, format).is_ok())
+}
+
+fn infer_string_type(value: &str) -> ImportInferredType {
+    let value = value.trim();
+    if value.is_empty() {
+        return ImportInferredType::Text;
+    }
+    if is_likely_timestamp(value) {
+        return ImportInferredType::Timestamp;
+    }
+    if is_likely_date(value) {
+        return ImportInferredType::Date;
+    }
+    if !has_numeric_leading_zero(value) {
+        if value.parse::<i64>().is_ok() || value.parse::<u64>().is_ok() {
+            return ImportInferredType::Integer;
+        }
+        if (value.contains('.') || value.contains('e') || value.contains('E'))
+            && value.parse::<f64>().is_ok_and(|number| number.is_finite())
+        {
+            return ImportInferredType::Decimal;
+        }
+    }
+    ImportInferredType::Text
+}
+
+fn infer_value_type(value: &serde_json::Value) -> Option<ImportInferredType> {
+    match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::Bool(_) => Some(ImportInferredType::Boolean),
+        serde_json::Value::Number(number) => {
+            if number.is_i64() || number.is_u64() {
+                Some(ImportInferredType::Integer)
+            } else {
+                Some(ImportInferredType::Decimal)
+            }
+        }
+        serde_json::Value::String(value) => Some(infer_string_type(value)),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => Some(ImportInferredType::Json),
+    }
+}
+
+fn infer_column_type(rows: &[Vec<serde_json::Value>], source_index: usize) -> ImportInferredType {
+    let mut inferred = None;
+    for row in rows {
+        let Some(value_type) = row.get(source_index).and_then(infer_value_type) else {
+            continue;
+        };
+        inferred = Some(merge_inferred_type(inferred, value_type));
+        if inferred == Some(ImportInferredType::Text) {
+            break;
+        }
+    }
+    inferred.unwrap_or(ImportInferredType::Text)
+}
+
+fn text_data_type(db_type: &DatabaseType) -> &'static str {
+    match db_type {
+        DatabaseType::SqlServer => "NVARCHAR(MAX)",
+        DatabaseType::Oracle | DatabaseType::OceanbaseOracle | DatabaseType::Dameng => "CLOB",
+        DatabaseType::ClickHouse => "String",
+        DatabaseType::Hive | DatabaseType::Trino | DatabaseType::PrestoSql | DatabaseType::Databricks => "STRING",
+        _ => "TEXT",
+    }
+}
+
+fn integer_data_type(db_type: &DatabaseType) -> &'static str {
+    match db_type {
+        DatabaseType::Sqlite | DatabaseType::Rqlite | DatabaseType::Turso => "INTEGER",
+        DatabaseType::Oracle | DatabaseType::OceanbaseOracle | DatabaseType::Dameng => "NUMBER(19)",
+        DatabaseType::ClickHouse => "Int64",
+        _ => "BIGINT",
+    }
+}
+
+fn decimal_data_type(db_type: &DatabaseType) -> &'static str {
+    match db_type {
+        DatabaseType::Postgres
+        | DatabaseType::Gaussdb
+        | DatabaseType::OpenGauss
+        | DatabaseType::Redshift
+        | DatabaseType::Kingbase
+        | DatabaseType::Highgo
+        | DatabaseType::Kwdb
+        | DatabaseType::Vastbase => "DOUBLE PRECISION",
+        DatabaseType::Sqlite | DatabaseType::Rqlite | DatabaseType::Turso => "REAL",
+        DatabaseType::Oracle | DatabaseType::OceanbaseOracle | DatabaseType::Dameng => "BINARY_DOUBLE",
+        DatabaseType::ClickHouse => "Float64",
+        _ => "DOUBLE",
+    }
+}
+
+fn boolean_data_type(db_type: &DatabaseType) -> &'static str {
+    match db_type {
+        DatabaseType::Mysql
+        | DatabaseType::Doris
+        | DatabaseType::StarRocks
+        | DatabaseType::Goldendb
+        | DatabaseType::Sundb
+        | DatabaseType::Databend => "TINYINT(1)",
+        DatabaseType::SqlServer => "BIT",
+        DatabaseType::Sqlite | DatabaseType::Rqlite | DatabaseType::Turso => "INTEGER",
+        DatabaseType::Oracle | DatabaseType::OceanbaseOracle | DatabaseType::Dameng => "NUMBER(1)",
+        DatabaseType::ClickHouse => "UInt8",
+        _ => "BOOLEAN",
+    }
+}
+
+fn date_data_type(db_type: &DatabaseType) -> &'static str {
+    match db_type {
+        DatabaseType::Sqlite | DatabaseType::Rqlite | DatabaseType::Turso => "TEXT",
+        DatabaseType::ClickHouse => "Date",
+        _ => "DATE",
+    }
+}
+
+fn timestamp_data_type(db_type: &DatabaseType) -> &'static str {
+    match db_type {
+        DatabaseType::Mysql
+        | DatabaseType::Doris
+        | DatabaseType::StarRocks
+        | DatabaseType::Goldendb
+        | DatabaseType::Sundb
+        | DatabaseType::Databend => "DATETIME",
+        DatabaseType::SqlServer => "DATETIME2",
+        DatabaseType::Sqlite | DatabaseType::Rqlite | DatabaseType::Turso => "TEXT",
+        DatabaseType::ClickHouse => "DateTime64",
+        _ => "TIMESTAMP",
+    }
+}
+
+fn json_data_type(db_type: &DatabaseType) -> &'static str {
+    match db_type {
+        DatabaseType::Postgres
+        | DatabaseType::Gaussdb
+        | DatabaseType::OpenGauss
+        | DatabaseType::Kingbase
+        | DatabaseType::Highgo
+        | DatabaseType::Kwdb
+        | DatabaseType::Vastbase => "JSONB",
+        DatabaseType::Mysql | DatabaseType::Databend => "JSON",
+        _ => text_data_type(db_type),
+    }
+}
+
+fn import_data_type(inferred_type: ImportInferredType, db_type: &DatabaseType) -> String {
+    match inferred_type {
+        ImportInferredType::Boolean => boolean_data_type(db_type),
+        ImportInferredType::Integer => integer_data_type(db_type),
+        ImportInferredType::Decimal => decimal_data_type(db_type),
+        ImportInferredType::Date => date_data_type(db_type),
+        ImportInferredType::Timestamp => timestamp_data_type(db_type),
+        ImportInferredType::Json => json_data_type(db_type),
+        ImportInferredType::Text => text_data_type(db_type),
+    }
+    .to_string()
+}
+
+pub fn build_import_create_table_plan(
+    data: &ParsedImportFile,
+    mappings: &[TableImportColumnMapping],
+    table: &str,
+    schema: &str,
+    db_type: &DatabaseType,
+) -> Result<ImportCreateTablePlan, String> {
+    if table.trim().is_empty() {
+        return Err("Target table name is required".to_string());
+    }
+    let mapped = mapping_indexes(data, mappings)?;
+    let mut columns = Vec::with_capacity(mapped.len());
+    for (source_index, target_column) in mapped {
+        let inferred_type = infer_column_type(&data.rows, source_index);
+        columns
+            .push(ImportCreateTableColumn { name: target_column, data_type: import_data_type(inferred_type, db_type) });
+    }
+    if columns.is_empty() {
+        return Err("No columns mapped for import".to_string());
+    }
+
+    let full_table = qualified_table(table.trim(), schema, db_type);
+    let column_sql = columns
+        .iter()
+        .map(|column| format!("{} {}", quote_identifier(&column.name, db_type), column.data_type))
+        .collect::<Vec<_>>()
+        .join(",\n  ");
+    let engine_clause =
+        if matches!(db_type, DatabaseType::ClickHouse) { " ENGINE = MergeTree() ORDER BY tuple()" } else { "" };
+    Ok(ImportCreateTablePlan { sql: format!("CREATE TABLE {full_table} (\n  {column_sql}\n){engine_clause}"), columns })
+}
+
 fn import_error_message(request: &TableImportRequest, rows_imported: usize, error: impl AsRef<str>) -> String {
     format!("Import into table '{}' failed after {} imported rows: {}", request.table, rows_imported, error.as_ref())
 }
@@ -937,8 +1190,58 @@ where
         ));
     }
 
+    let mut create_table_sample: Option<ParsedImportFile> = None;
+    let mut created_column_types: Option<Vec<(String, String)>> = None;
+    if request.create_table {
+        if matches!(request.mode, TableImportMode::Truncate) {
+            return Err(emit_import_error(
+                &mut progress_callback,
+                request,
+                0,
+                0,
+                "Cannot truncate a table that is being created by the import",
+            ));
+        }
+        let parsed = match parse_import_file_with_options(
+            &request.file_path,
+            Some(source_format),
+            &request.parse_options,
+            CREATE_TABLE_INFERENCE_ROWS,
+        )
+        .await
+        {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                return Err(emit_import_error(&mut progress_callback, request, 0, 0, error));
+            }
+        };
+        let total_rows = parsed.total_rows;
+        let plan = match build_import_create_table_plan(
+            &parsed,
+            &request.mappings,
+            &request.table,
+            &request.schema,
+            db_type,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                return Err(emit_import_error(&mut progress_callback, request, 0, total_rows, error));
+            }
+        };
+        // The table must be created before streaming rows so existing import batching
+        // can reuse the same INSERT path and database-specific value escaping.
+        if let Err(error) = execute_on_pool(state, pool_key, &plan.sql).await {
+            return Err(emit_import_error(&mut progress_callback, request, 0, total_rows, error));
+        }
+        created_column_types =
+            Some(plan.columns.iter().map(|column| (column.name.clone(), column.data_type.clone())).collect());
+        create_table_sample = Some(parsed);
+    }
+
     if source_format.is_delimited() {
-        let parsed =
+        let parsed = if let Some(parsed) = create_table_sample.clone() {
+            parsed
+        } else {
             match parse_import_file_with_options(&request.file_path, Some(source_format), &request.parse_options, 0)
                 .await
             {
@@ -946,7 +1249,8 @@ where
                 Err(error) => {
                     return Err(emit_import_error(&mut progress_callback, request, 0, 0, error));
                 }
-            };
+            }
+        };
         let total_rows = parsed.total_rows;
         if let Err(error) = mapping_indexes_for_columns(&parsed.columns, &request.mappings) {
             return Err(emit_import_error(&mut progress_callback, request, 0, total_rows, error));
@@ -960,7 +1264,7 @@ where
             error: None,
         });
 
-        let target_column_types = get_columns_for_transfer(
+        let mut target_column_types = get_columns_for_transfer(
             state,
             pool_key,
             &request.connection_id,
@@ -973,6 +1277,9 @@ where
         .into_iter()
         .map(|column| (column.name, column.data_type))
         .collect::<Vec<_>>();
+        if target_column_types.is_empty() {
+            target_column_types = created_column_types.clone().unwrap_or_default();
+        }
 
         if matches!(request.mode, TableImportMode::Truncate) {
             let sql = truncate_sql(&request.table, &request.schema, db_type);
@@ -1154,7 +1461,7 @@ where
         error: None,
     });
 
-    let target_column_types = get_columns_for_transfer(
+    let mut target_column_types = get_columns_for_transfer(
         state,
         pool_key,
         &request.connection_id,
@@ -1167,6 +1474,9 @@ where
     .into_iter()
     .map(|column| (column.name, column.data_type))
     .collect::<Vec<_>>();
+    if target_column_types.is_empty() {
+        target_column_types = created_column_types.clone().unwrap_or_default();
+    }
 
     let batches = match build_import_insert_batches(
         &parsed,
@@ -1350,6 +1660,90 @@ mod tests {
         assert_eq!(parsed.columns, vec!["name"]);
         assert_eq!(parsed.rows, vec![vec![serde_json::json!("Ada")]]);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn builds_create_table_plan_from_import_sample() {
+        let data = ParsedImportFile {
+            columns: vec![
+                "id".to_string(),
+                "code".to_string(),
+                "amount".to_string(),
+                "created_at".to_string(),
+                "active".to_string(),
+                "payload".to_string(),
+            ],
+            rows: vec![
+                vec![
+                    serde_json::json!("1"),
+                    serde_json::json!("00123"),
+                    serde_json::json!("12.5"),
+                    serde_json::json!("2026-07-06 12:30:45"),
+                    serde_json::json!("true"),
+                    serde_json::json!({ "source": "csv" }),
+                ],
+                vec![
+                    serde_json::json!("2"),
+                    serde_json::json!("00456"),
+                    serde_json::json!("13.75"),
+                    serde_json::json!("2026-07-07 08:15:00"),
+                    serde_json::json!("false"),
+                    serde_json::json!({ "source": "json" }),
+                ],
+            ],
+            total_rows: 2,
+        };
+        let mappings = data
+            .columns
+            .iter()
+            .map(|column| TableImportColumnMapping { source_column: column.clone(), target_column: column.clone() })
+            .collect::<Vec<_>>();
+
+        let plan =
+            build_import_create_table_plan(&data, &mappings, "orders", "public", &DatabaseType::Postgres).unwrap();
+
+        assert_eq!(
+            plan.sql,
+            "CREATE TABLE \"public\".\"orders\" (\n  \"id\" BIGINT,\n  \"code\" TEXT,\n  \"amount\" DOUBLE PRECISION,\n  \"created_at\" TIMESTAMP,\n  \"active\" TEXT,\n  \"payload\" JSONB\n)"
+        );
+        assert_eq!(
+            plan.columns,
+            vec![
+                ImportCreateTableColumn { name: "id".to_string(), data_type: "BIGINT".to_string() },
+                ImportCreateTableColumn { name: "code".to_string(), data_type: "TEXT".to_string() },
+                ImportCreateTableColumn { name: "amount".to_string(), data_type: "DOUBLE PRECISION".to_string() },
+                ImportCreateTableColumn { name: "created_at".to_string(), data_type: "TIMESTAMP".to_string() },
+                ImportCreateTableColumn { name: "active".to_string(), data_type: "TEXT".to_string() },
+                ImportCreateTableColumn { name: "payload".to_string(), data_type: "JSONB".to_string() },
+            ]
+        );
+    }
+
+    #[test]
+    fn create_table_plan_requires_target_table_name() {
+        let data =
+            ParsedImportFile { columns: vec!["id".to_string()], rows: vec![vec![serde_json::json!(1)]], total_rows: 1 };
+        let mappings =
+            vec![TableImportColumnMapping { source_column: "id".to_string(), target_column: "id".to_string() }];
+
+        let error = build_import_create_table_plan(&data, &mappings, " ", "", &DatabaseType::Mysql).unwrap_err();
+
+        assert_eq!(error, "Target table name is required");
+    }
+
+    #[test]
+    fn create_table_plan_uses_database_specific_text_type() {
+        let data = ParsedImportFile {
+            columns: vec!["notes".to_string()],
+            rows: vec![vec![serde_json::json!("long text")]],
+            total_rows: 1,
+        };
+        let mappings =
+            vec![TableImportColumnMapping { source_column: "notes".to_string(), target_column: "notes".to_string() }];
+
+        let plan = build_import_create_table_plan(&data, &mappings, "events", "dbo", &DatabaseType::SqlServer).unwrap();
+
+        assert_eq!(plan.sql, "CREATE TABLE [dbo].[events] (\n  [notes] NVARCHAR(MAX)\n)");
     }
 
     #[test]

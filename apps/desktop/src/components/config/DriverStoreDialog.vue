@@ -1112,9 +1112,9 @@ watch(driverStoreTab, (tab) => {
                   {{ upgradingAll ? t("driverStore.upgradingProgress", { current: upgradingIndex, total: upgradingTotal }) : t("driverStore.upgradeAll") }}
                 </Button>
               </div>
-              <div v-for="driver in filteredAgentDrivers" :key="driver.db_type" class="flex items-center gap-3 px-4 py-2.5 transition hover:bg-muted/30">
-                <span class="flex h-9 w-9 items-center justify-center rounded-lg bg-muted/60 shrink-0">
-                  <DatabaseIcon :db-type="driver.db_type" class="h-5 w-5" />
+              <div v-for="driver in filteredAgentDrivers" :key="driver.db_type" class="flex items-center gap-3 px-4 py-2 transition hover:bg-muted/30">
+                <span class="flex h-8 w-8 items-center justify-center rounded-lg bg-muted/60 shrink-0">
+                  <DatabaseIcon :db-type="driver.db_type" class="h-4 w-4" />
                 </span>
                 <div class="min-w-0 flex-1">
                   <div class="text-sm font-medium">{{ driver.label }}</div>

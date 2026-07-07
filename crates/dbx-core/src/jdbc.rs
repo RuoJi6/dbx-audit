@@ -363,7 +363,8 @@ fn build_plugin_status(
 }
 
 async fn latest_jdbc_plugin() -> Option<JdbcPluginLatest> {
-    fetch_latest_release().await.ok().and_then(|release| release.jdbc_plugin)
+    // 只需 jdbc_plugin，不关心 release notes；传中文 locale 跳过英文 notes 拉取
+    fetch_latest_release("zh-CN").await.ok().and_then(|release| release.jdbc_plugin)
 }
 
 async fn download_jdbc_plugin_zip_with_progress(progress: &impl Fn(AgentProgressEvent)) -> Result<Vec<u8>, String> {
