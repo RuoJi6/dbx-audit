@@ -52,11 +52,10 @@ import { isSchemaAware } from "@/lib/database/databaseCapabilities";
 import { supportsSchemaDiagram, supportsTableImport, supportsTableStructureEditing, supportsTableTruncate } from "@/lib/database/databaseFeatureSupport";
 import { codeMirrorSqlDialect, connectionUsesDatabaseObjectTreeMode, effectiveDatabaseTypeForConnection, tableStructureDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
 import { buildTableSelectSql } from "@/lib/table/tableSelectSql";
-import { buildDropObjectSql, buildDuplicateTableStructureSql, buildCopyTableDataSql, buildEmptyTableSql, buildTruncateTableSql, type TableAdminSqlOptions } from "@/lib/database/dbAdminSql";
+import { buildDropObjectSql, buildDropTableSql, buildDuplicateTableStructureSql, buildCopyTableDataSql, buildEmptyTableSql, buildTruncateTableSql, supportsDropTableCascade, type TableAdminSqlOptions } from "@/lib/database/dbAdminSql";
 import { useToast } from "@/composables/useToast";
-import { buildExecutableObjectSourceStatements, buildRoutineRenameObjectSourceStatements, objectSourceSaveExecutionMode, supportsSourceBackedRoutineRename } from "@/lib/table/objectSourceEditor";
+import { buildExecutableObjectSourceStatements, buildRoutineRenameObjectSourceStatements, executeObjectSourceSave, supportsSourceBackedRoutineRename } from "@/lib/table/objectSourceEditor";
 import { buildRenameObjectSql, supportsObjectRename } from "@/lib/table/objectRenameSql";
-import { buildViewDdl } from "@/lib/table/viewDdl";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { generateDatabaseExportId } from "@/lib/export/databaseExport";
 import { copyToClipboard, eventTargetAllowsAppClipboardShortcut } from "@/lib/common/clipboard";
@@ -123,6 +122,7 @@ const sourceContent = ref("");
 const sourceError = ref("");
 const sourceRow = ref<ObjectBrowserRow | null>(null);
 const sourceEditing = ref(false);
+const sourceCanEdit = ref(true);
 const effectiveDatabaseType = computed(() => effectiveDatabaseTypeForConnection(props.connection) ?? props.connection.db_type);
 const tableStructureDatabaseType = computed(() => tableStructureDatabaseTypeForConnection(props.connection) ?? props.connection.db_type);
 const sourceEditableText = ref("");
@@ -132,6 +132,8 @@ const sourceSaveError = ref("");
 const error = ref("");
 const showDropConfirm = ref(false);
 const dropTarget = ref<ObjectBrowserRow | null>(null);
+const dropPreviewSql = ref("");
+const dropTableCascade = ref(false);
 const showRenameDialog = ref(false);
 const renameTarget = ref<ObjectBrowserRow | null>(null);
 const renameInput = ref("");
@@ -176,6 +178,7 @@ let stopColumnResize: (() => void) | null = null;
 const { addTask: addExportTask } = useExportTracker();
 
 const needsSchema = computed(() => isSchemaAware(props.connection.db_type) && !connectionUsesDatabaseObjectTreeMode(props.connection));
+const canDropTargetCascade = computed(() => dropTarget.value?.type === "TABLE" && supportsDropTableCascade(effectiveDatabaseType.value));
 const tableCount = computed(() => rows.value.filter((row) => row.type === "TABLE").length);
 const viewCount = computed(() => rows.value.filter((row) => row.type === "VIEW").length);
 const materializedViewCount = computed(() => rows.value.filter((row) => row.type === "MATERIALIZED_VIEW").length);
@@ -423,12 +426,14 @@ async function openSource(row: ObjectBrowserRow) {
   sourceContent.value = "";
   sourceError.value = "";
   sourceEditing.value = false;
+  sourceCanEdit.value = true;
   sourceEditableText.value = "";
   sourceDraft.value = "";
   sourceSaveError.value = "";
   sourceLoading.value = true;
   try {
     const result = await api.getObjectSource(props.connection.id, props.database, row.schema || selectedSchema.value || props.database, row.name, row.type as ObjectSourceKind);
+    sourceCanEdit.value = result.editable !== false && row.type !== "SEQUENCE";
     const editable = await api.buildEditableObjectSource({
       databaseType: effectiveDatabaseType.value,
       objectType: row.type as ObjectSourceKind,
@@ -439,32 +444,14 @@ async function openSource(row: ObjectBrowserRow) {
     sourceEditableText.value = editable;
     sourceContent.value = await formatSqlForDisplay(editable, sourceFormatDialect.value, settingsStore.editorSettings.sqlFormatter);
     sourceDraft.value = editable;
-    sourceEditing.value = row.type !== "SEQUENCE";
+    sourceEditing.value = sourceCanEdit.value;
+    if (!sourceCanEdit.value && row.type !== "SEQUENCE") {
+      toast(t("objects.sourceReadOnly"), 3000);
+    }
   } catch (e: any) {
     sourceError.value = e?.message || String(e);
   } finally {
     sourceLoading.value = false;
-  }
-}
-
-async function openViewDdl(row: ObjectBrowserRow) {
-  if (row.type !== "VIEW" && row.type !== "MATERIALIZED_VIEW") return;
-  try {
-    const schema = row.schema || selectedSchema.value || props.database;
-    const ddl =
-      row.type === "MATERIALIZED_VIEW"
-        ? await api.getTableDdl(props.connection.id, props.database, schema, row.name, "MATERIALIZED_VIEW")
-        : await buildViewDdl({
-            databaseType: effectiveDatabaseType.value,
-            schema,
-            name: row.name,
-            source: (await api.getObjectSource(props.connection.id, props.database, schema, row.name, "VIEW")).source,
-          });
-    const formatted = await formatSqlForDisplay(ddl, sourceFormatDialect.value, settingsStore.editorSettings.sqlFormatter);
-    const tabId = queryStore.createTab(props.connection.id, props.database, `DDL - ${row.name}`);
-    queryStore.updateSql(tabId, formatted);
-  } catch (e: any) {
-    toast(e?.message || String(e), 5000);
   }
 }
 
@@ -506,7 +493,10 @@ async function executeProcedureSql(sql: string) {
 
 function requestDrop(row: ObjectBrowserRow) {
   dropTarget.value = row;
+  dropPreviewSql.value = "";
+  dropTableCascade.value = false;
   showDropConfirm.value = true;
+  void refreshDropPreviewSql();
 }
 
 function requestRename(row: ObjectBrowserRow) {
@@ -593,12 +583,7 @@ async function confirmDrop() {
   if (!dropTarget.value) return;
   const row = dropTarget.value;
   try {
-    const sql = await buildDropObjectSql({
-      databaseType: effectiveDatabaseType.value,
-      objectType: row.type,
-      schema: row.schema || selectedSchema.value,
-      name: row.name,
-    });
+    const sql = dropPreviewSql.value || (await buildDropSqlForRow(row, { cascade: canDropTargetCascade.value && dropTableCascade.value }));
     await api.executeQuery(props.connection.id, props.database, sql);
     const successKey = row.type === "VIEW" ? "contextMenu.dropViewSuccess" : row.type === "PROCEDURE" ? "contextMenu.dropProcedureSuccess" : row.type === "FUNCTION" ? "contextMenu.dropFunctionSuccess" : "contextMenu.dropTableSuccess";
     toast(t(successKey, { name: row.name }));
@@ -609,6 +594,34 @@ async function confirmDrop() {
     toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), 5000);
   }
   dropTarget.value = null;
+  dropPreviewSql.value = "";
+  dropTableCascade.value = false;
+}
+
+async function buildDropSqlForRow(row: ObjectBrowserRow, options?: { cascade?: boolean }): Promise<string> {
+  if (row.type === "TABLE") {
+    return buildDropTableSql(tableAdminSqlOptions(row, { cascade: options?.cascade && supportsDropTableCascade(effectiveDatabaseType.value) }));
+  }
+  return buildDropObjectSql({
+    databaseType: effectiveDatabaseType.value,
+    objectType: row.type,
+    schema: row.schema || selectedSchema.value,
+    name: row.name,
+  });
+}
+
+let dropPreviewRequestId = 0;
+
+async function refreshDropPreviewSql() {
+  const requestId = ++dropPreviewRequestId;
+  const row = dropTarget.value;
+  if (!row) {
+    dropPreviewSql.value = "";
+    return;
+  }
+  dropPreviewSql.value = "";
+  const sql = await buildDropSqlForRow(row, { cascade: canDropTargetCascade.value && dropTableCascade.value }).catch(() => "");
+  if (requestId === dropPreviewRequestId) dropPreviewSql.value = sql;
 }
 
 function dropConfirmTitle(): string {
@@ -786,12 +799,7 @@ async function refreshBatchDropPreviewSql() {
   const statements: string[] = [];
   const sortedRows = await fetchSortedTableRowsForDrop();
   for (const row of sortedRows) {
-    const sql = await buildDropObjectSql({
-      databaseType: effectiveDatabaseType.value,
-      objectType: "TABLE",
-      schema: row.schema || selectedSchema.value,
-      name: row.name,
-    }).catch(() => "");
+    const sql = await buildDropTableSql(tableAdminSqlOptions(row)).catch(() => "");
     if (sql) statements.push(sql);
   }
   batchDropPreviewSql.value = statements.join("\n");
@@ -809,12 +817,7 @@ async function confirmBatchDropTables() {
   if (targets.length === 0) return;
   try {
     for (const row of targets) {
-      const sql = await buildDropObjectSql({
-        databaseType: effectiveDatabaseType.value,
-        objectType: "TABLE",
-        schema: row.schema || selectedSchema.value,
-        name: row.name,
-      });
+      const sql = await buildDropTableSql(tableAdminSqlOptions(row));
       await api.executeQuery(props.connection.id, props.database, sql);
       closeDroppedTableObjectTabsForRow(row);
     }
@@ -1121,12 +1124,14 @@ async function confirmPasteTable() {
   await connectionStore.refreshObjectListTreeNode(props.connection.id, props.database, selectedSchema.value);
 }
 
-function tableAdminSqlOptions(row: ObjectBrowserRow): TableAdminSqlOptions {
-  return {
+function tableAdminSqlOptions(row: ObjectBrowserRow, options?: { cascade?: boolean }): TableAdminSqlOptions {
+  const result: TableAdminSqlOptions = {
     databaseType: effectiveDatabaseType.value,
     schema: row.schema || selectedSchema.value,
     tableName: row.name,
   };
+  if (options?.cascade) result.cascade = true;
+  return result;
 }
 
 async function refreshTruncatePreviewSql(row: ObjectBrowserRow) {
@@ -1198,6 +1203,10 @@ async function copySource() {
 
 function editSource() {
   if (!sourceRow.value || !sourceEditableText.value) return;
+  if (!sourceCanEdit.value) {
+    toast(t("objects.sourceReadOnly"), 3000);
+    return;
+  }
   sourceDraft.value = sourceEditableText.value;
   sourceSaveError.value = "";
   sourceEditing.value = true;
@@ -1210,6 +1219,10 @@ function cancelEditSource() {
 }
 
 async function saveSource() {
+  if (!sourceCanEdit.value) {
+    toast(t("objects.sourceReadOnly"), 3000);
+    return;
+  }
   if (!sourceRow.value || !sourceDraft.value.trim()) return;
   const row = sourceRow.value;
   const schema = row.schema || selectedSchema.value || props.database;
@@ -1223,13 +1236,7 @@ async function saveSource() {
       name: row.name,
       source: sourceDraft.value,
     });
-    for (const sql of statements) {
-      if (objectSourceSaveExecutionMode(effectiveDatabaseType.value) === "single") {
-        await api.executeQuery(props.connection.id, props.database, sql, schema);
-      } else {
-        await api.executeScript(props.connection.id, props.database, sql, schema);
-      }
-    }
+    await executeObjectSourceSave(props.connection.id, props.database, effectiveDatabaseType.value, statements, schema);
     toast(t("objects.sourceSaved"));
     sourceEditing.value = false;
     sourceDraft.value = "";
@@ -1481,7 +1488,14 @@ function getViewMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
     { label: t("contextMenu.viewData"), action: () => openViewData(item), icon: Table2 },
     { label: t("contextMenu.editView"), action: () => openSource(item), icon: PencilLine },
     { label: t("contextMenu.viewSource"), action: () => openSource(item), icon: Code2 },
-    { label: t("contextMenu.viewDdl"), action: () => openViewDdl(item), icon: ScrollText },
+    {
+      label: t("contextMenu.viewDdl"),
+      action: () => {
+        ddlDialogTarget.value = item;
+        showDdlDialog.value = true;
+      },
+      icon: ScrollText,
+    },
     ...(canRename(item) ? [{ label: t("contextMenu.renameObject"), action: () => requestRename(item), icon: Pencil }] : []),
     { label: t("contextMenu.newQuery"), action: () => openNewQuery(item), icon: TerminalSquare },
     ...(canOpenDiagram.value ? [{ label: t("diagram.open"), action: () => openDiagram(item), icon: Network }] : []),
@@ -1784,7 +1798,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
           <Button v-if="!sourceEditing" variant="ghost" size="icon" class="h-5 w-5" :disabled="!sourceContent" @click="copySource">
             <Copy class="h-3 w-3" />
           </Button>
-          <Button v-if="!sourceEditing" variant="ghost" size="icon" class="h-5 w-5" :disabled="!sourceContent" @click="editSource">
+          <Button v-if="!sourceEditing && sourceCanEdit" variant="ghost" size="icon" class="h-5 w-5" :disabled="!sourceContent" @click="editSource">
             <PencilLine class="h-3 w-3" />
           </Button>
           <Button variant="ghost" size="icon" class="h-5 w-5" @click="closeSource">
@@ -1822,7 +1836,17 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
     </div>
   </div>
 
-  <DangerConfirmDialog v-model:open="showDropConfirm" :title="dropConfirmTitle()" :details="dropConfirmMessage()" :confirm-label="t('dangerDialog.deleteConfirm')" @confirm="confirmDrop" />
+  <DangerConfirmDialog v-model:open="showDropConfirm" :title="dropConfirmTitle()" :message="dropConfirmMessage()" :sql="dropPreviewSql" :confirm-label="t('dangerDialog.deleteConfirm')" @confirm="confirmDrop">
+    <template v-if="canDropTargetCascade" #options>
+      <label class="mb-3 flex items-start gap-2 rounded-md border bg-muted/20 px-3 py-2 text-sm">
+        <input v-model="dropTableCascade" type="checkbox" class="mt-0.5 h-3.5 w-3.5 shrink-0 accent-primary" @change="refreshDropPreviewSql()" />
+        <span class="grid gap-0.5">
+          <span class="font-medium text-foreground">{{ t("contextMenu.dropTableCascade") }}</span>
+          <span class="text-xs leading-5 text-muted-foreground">{{ t("contextMenu.dropTableCascadeHint") }}</span>
+        </span>
+      </label>
+    </template>
+  </DangerConfirmDialog>
 
   <DangerConfirmDialog v-model:open="showBatchDropConfirm" :title="t('objects.confirmBatchDropTitle')" :message="t('objects.confirmBatchDropMessage', { count: selectedTableCount })" :sql="batchDropPreviewSql" :confirm-label="t('objects.dropSelected')" @confirm="confirmBatchDropTables" />
 
@@ -1918,7 +1942,17 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
     </DialogContent>
   </Dialog>
 
-  <DdlViewDialog v-if="ddlDialogTarget" :connection-id="props.connection.id" :database="props.database" :schema="ddlDialogTarget.schema || selectedSchema" :table-name="ddlDialogTarget.name" :dialect="sourceDialect" :format-dialect="sourceFormatDialect" v-model:open="showDdlDialog" />
+  <DdlViewDialog
+    v-if="ddlDialogTarget"
+    :connection-id="props.connection.id"
+    :database="props.database"
+    :schema="ddlDialogTarget.schema || selectedSchema"
+    :table-name="ddlDialogTarget.name"
+    :object-type="tableDdlObjectType(ddlDialogTarget.type)"
+    :dialect="sourceDialect"
+    :format-dialect="sourceFormatDialect"
+    v-model:open="showDdlDialog"
+  />
 </template>
 
 <style scoped>

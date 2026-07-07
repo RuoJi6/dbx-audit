@@ -38,7 +38,7 @@ import { connectionRedactedNameLabel } from "@/lib/connection/connectionPresenta
 import { quickConnectionOpenTarget } from "@/lib/connection/connectionOpenTarget";
 import { resolveDefaultDatabase } from "@/lib/database/defaultDatabase";
 import { findTreeNodeById, resolveNewQueryTarget } from "@/lib/sql/newQueryContext";
-import { buildExecutableObjectSourceStatements, objectSourceSaveExecutionMode } from "@/lib/table/objectSourceEditor";
+import { buildExecutableObjectSourceStatements, executeObjectSourceSave } from "@/lib/table/objectSourceEditor";
 import { resolveExecutableSql, resolveExecutableSqlWithBackend, type SqlExecutionSnapshot } from "@/lib/sql/sqlExecutionTarget";
 import { uuid } from "@/lib/common/utils";
 import { isMacOS } from "@/lib/backend/platform";
@@ -90,6 +90,7 @@ import type { AiAction } from "@/lib/ai/ai";
 const AiAssistant = defineAsyncComponent(() => import("@/components/editor/AiAssistant.vue"));
 const QueryHistory = defineAsyncComponent(() => import("@/components/editor/QueryHistory.vue"));
 const SqlLibraryPanel = defineAsyncComponent(() => import("@/components/layout/SqlLibraryPanel.vue"));
+const SqlFilePanel = defineAsyncComponent(() => import("@/components/layout/SqlFilePanel.vue"));
 const DriverStorePage = defineAsyncComponent(() => import("@/components/config/DriverStoreDialog.vue"));
 const EditorSettingsPage = defineAsyncComponent(() => import("@/components/editor/EditorSettingsDialog.vue"));
 const UpdateDialog = defineAsyncComponent(() => import("@/components/layout/UpdateDialog.vue"));
@@ -144,9 +145,10 @@ const agentDriverUpdateCount = ref(0);
 const showHistory = ref(false);
 const showAiPanel = ref(safeLocalStorageGet("dbx-ai-panel-open") === "true");
 const showSqlLibraryPanel = ref(safeLocalStorageGet("dbx-sql-library-open") === "true");
+const showSqlFilePanel = ref(safeLocalStorageGet("dbx-sql-file-panel-open") === "true");
 const sidebarOpen = ref(safeLocalStorageGet("dbx-sidebar-open") !== "false");
 const aiPanelReady = ref(false);
-const { sidebarWidth, aiPanelWidth, historyWidth, sqlLibraryWidth, startSidebarResize, startAiPanelResize, startHistoryResize, startSqlLibraryResize } = usePanelResize();
+const { sidebarWidth, aiPanelWidth, historyWidth, sqlLibraryWidth, sqlFilePanelWidth, startSidebarResize, startAiPanelResize, startHistoryResize, startSqlLibraryResize, startSqlFilePanelResize } = usePanelResize();
 const aiAssistantRef = ref<AiAssistantHandle | null>(null);
 const appSidebarRef = ref<InstanceType<typeof AppSidebar> | null>(null);
 const contentAreaRef = ref<InstanceType<typeof ContentArea> | null>(null);
@@ -527,6 +529,11 @@ function toggleSqlLibrary() {
   safeLocalStorageSet("dbx-sql-library-open", String(showSqlLibraryPanel.value));
 }
 
+function toggleSqlFilePanel() {
+  showSqlFilePanel.value = !showSqlFilePanel.value;
+  safeLocalStorageSet("dbx-sql-file-panel-open", String(showSqlFilePanel.value));
+}
+
 function fixWithAi(errorMessage: string) {
   if (!showAiPanel.value) {
     showAiPanel.value = true;
@@ -817,20 +824,15 @@ async function saveActiveObjectSource(tab: QueryTab): Promise<boolean> {
   if (!connection || !source) return false;
 
   try {
+    const databaseType = effectiveDatabaseTypeForConnection(connection) ?? connection.db_type;
     const statements = await buildExecutableObjectSourceStatements({
-      databaseType: connection.db_type,
+      databaseType,
       objectType: source.objectType,
       schema: source.schema || tab.schema || tab.database,
       name: source.name,
       source: tab.sql,
     });
-    for (const sql of statements) {
-      if (objectSourceSaveExecutionMode(connection.db_type) === "single") {
-        await api.executeQuery(tab.connectionId, tab.database, sql, source.schema || tab.schema);
-      } else {
-        await api.executeScript(tab.connectionId, tab.database, sql, source.schema || tab.schema);
-      }
-    }
+    await executeObjectSourceSave(tab.connectionId, tab.database, databaseType, statements, source.schema || tab.schema);
     queryStore.markTabClean(tab);
     toast(t("objects.sourceSaved"), 2000);
     return true;
@@ -1786,6 +1788,7 @@ onUnmounted(() => {
           :show-ai-panel="showAiPanel"
           :show-history="showHistory"
           :show-sql-library="showSqlLibraryPanel"
+          :show-sql-file-panel="showSqlFilePanel"
           :show-driver-store="showDriverStore"
           :show-audit-panel="activeTab?.mode === 'audit'"
           :show-settings-page="showSettingsPage"
@@ -1800,6 +1803,7 @@ onUnmounted(() => {
           @toggle-ai="toggleAiPanel"
           @toggle-history="showHistory = !showHistory"
           @toggle-sql-library="toggleSqlLibrary"
+          @toggle-sql-file-panel="toggleSqlFilePanel"
           @open-github="openGitHub"
           @open-settings="openSettings()"
           @open-driver-store="openDriverStorePage"
@@ -1996,6 +2000,13 @@ onUnmounted(() => {
             <div class="panel-resize-handle panel-resize-handle--left" @mousedown="startSqlLibraryResize" />
             <div class="h-full min-h-0 overflow-hidden">
               <SqlLibraryPanel @close="toggleSqlLibrary" />
+            </div>
+          </div>
+
+          <div v-if="showSqlFilePanel" :class="isClassicLayout ? 'h-full shrink-0 relative z-30 isolate bg-background' : 'h-full shrink-0 relative z-30 isolate rounded-md border border-border/80 bg-background'" :style="{ width: sqlFilePanelWidth + 'px' }">
+            <div class="panel-resize-handle panel-resize-handle--left" @mousedown="startSqlFilePanelResize" />
+            <div class="h-full min-h-0 overflow-hidden">
+              <SqlFilePanel @close="toggleSqlFilePanel" />
             </div>
           </div>
         </div>

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildExecutionCandidates, executableStatementRanges, fullSqlRange, hasMultipleExecutionTargets, splitSqlStatementRanges, statementRangeAtCursor, supportsExecutionTargetPicker } from "@/lib/sql/sqlStatementRanges";
+import { buildExecutionCandidates, currentExecutableStatementRange, executableStatementRanges, fullSqlRange, hasMultipleExecutionTargets, splitSqlStatementRanges, statementRangeAtCursor, supportsExecutionTargetPicker } from "@/lib/sql/sqlStatementRanges";
 
 function indexOf(sql: string, needle: string, occurrence = 1): number {
   let from = 0;
@@ -65,6 +65,26 @@ END;
 /
 SELECT 1;`;
 
+const mysqlRoutineFixture = `CREATE PROCEDURE p()
+BEGIN
+  SELECT 1;
+  IF 1 = 1 THEN
+    SELECT 'ok';
+  END IF;
+END;
+SELECT 2;`;
+
+const mysqlRoutineWithLoopsFixture = `CREATE PROCEDURE p_loop()
+BEGIN
+  WHILE 1 = 0 DO
+    SELECT 'while; still body';
+  END WHILE;
+  REPEAT
+    SELECT 'repeat; still body';
+  UNTIL 1 = 1 END REPEAT;
+END;
+SELECT 2;`;
+
 describe("splitSqlStatementRanges", () => {
   it("splits multiple top-level statements", () => {
     const sql = "SELECT 1;\nSELECT 2;\nSELECT 3;";
@@ -125,6 +145,29 @@ describe("splitSqlStatementRanges", () => {
   it("skips MySQL delimiter commands and empty custom delimiter statements", () => {
     const sql = "select COUNT(1) FROM your_table;\ndelimiter ;;\nselect COUNT(1) FROM your_table;\n\n;;\ndelimiter ;";
     expect(rangeSqlTexts(splitSqlStatementRanges(sql, "mysql"))).toEqual(["select COUNT(1) FROM your_table", "select COUNT(1) FROM your_table;"]);
+  });
+
+  it("keeps MySQL routine blocks together without delimiter commands", () => {
+    const ranges = splitSqlStatementRanges(mysqlRoutineFixture, "mysql");
+    expect(rangeSqlTexts(ranges)).toEqual([mysqlRoutineFixture.slice(0, mysqlRoutineFixture.indexOf("\nSELECT 2;")).replace(/;$/, "").trim(), "SELECT 2"]);
+    expect(ranges[0].sql).toContain("SELECT 1;");
+    expect(ranges[0].sql).toContain("END IF;");
+    expect(ranges[0].sql).not.toMatch(/END;$/);
+  });
+
+  it("does not merge regular MySQL transaction statements as routine blocks", () => {
+    const sql = "BEGIN; INSERT INTO t VALUES (1); COMMIT;";
+    expect(rangeSqlTexts(splitSqlStatementRanges(sql, "mysql"))).toEqual(["BEGIN", "INSERT INTO t VALUES (1)", "COMMIT"]);
+  });
+
+  it("treats SQL Server GO lines as batch delimiters", () => {
+    const sql = "SELECT 1\nGO\nSELECT 2;\n  GO 2\nSELECT 3";
+    expect(rangeSqlTexts(splitSqlStatementRanges(sql, "sqlserver"))).toEqual(["SELECT 1", "SELECT 2", "SELECT 3"]);
+  });
+
+  it("does not treat GO inside strings or comments as a SQL Server batch delimiter", () => {
+    const sql = "SELECT 'GO'\n-- GO\nSELECT 2\nGO\nSELECT 3";
+    expect(rangeSqlTexts(splitSqlStatementRanges(sql, "sqlserver"))).toEqual(["SELECT 'GO'\n-- GO\nSELECT 2", "SELECT 3"]);
   });
 
   it("keeps Oracle PL/SQL blocks together and treats slash lines as delimiters", () => {
@@ -203,6 +246,21 @@ describe("statementRangeAtCursor", () => {
     const sql = "SELECT 1\nSELECT 2;\nSELECT 3;";
     const range = statementRangeAtCursor(sql, indexOf(sql, "2"));
     expect(range?.sql.trim()).toBe("SELECT 2");
+  });
+
+  it("keeps newline set-operation SELECT operands with the cursor statement", () => {
+    const sql = "select * from tbA\nunion\nselect * from tbB";
+    const expected = "select * from tbA\nunion\nselect * from tbB";
+
+    expect(statementRangeAtCursor(sql, indexOf(sql, "tbA"))?.sql.trim()).toBe(expected);
+    expect(statementRangeAtCursor(sql, indexOf(sql, "tbB"))?.sql.trim()).toBe(expected);
+  });
+
+  it("keeps newline set-operation operands with ALL modifiers together", () => {
+    const sql = "select * from tbA\nunion all\nselect * from tbB\nSELECT * FROM logs;";
+    const range = statementRangeAtCursor(sql, indexOf(sql, "tbA"));
+
+    expect(range?.sql.trim()).toBe("select * from tbA\nunion all\nselect * from tbB");
   });
 
   it("keeps a multi-line select together when continuation lines do not start statements", () => {
@@ -344,6 +402,23 @@ WHERE request_json LIKE '%"paperFlag":null%';`;
     expect(statementRangeAtCursor(sql, indexOf(sql, "delimiter"), "mysql")).toBeNull();
   });
 
+  it("returns the full MySQL routine block for cursors inside nested statements", () => {
+    const range = statementRangeAtCursor(mysqlRoutineFixture, indexOf(mysqlRoutineFixture, "ok"), "mysql");
+    expect(range?.sql.trim()).toBe(mysqlRoutineFixture.slice(0, mysqlRoutineFixture.indexOf("\nSELECT 2;")).replace(/;$/, "").trim());
+  });
+
+  it("returns null on SQL Server GO batch delimiter lines", () => {
+    const sql = "SELECT 1\nGO\nSELECT 2";
+    expect(statementRangeAtCursor(sql, indexOf(sql, "GO"), "sqlserver")).toBeNull();
+  });
+
+  it("returns the current SQL Server batch around GO delimiters", () => {
+    const sql = "SELECT 1\nGO\nSELECT 2\nGO\nSELECT 3";
+    expect(statementRangeAtCursor(sql, indexOf(sql, "1"), "sqlserver")?.sql.trim()).toBe("SELECT 1");
+    expect(statementRangeAtCursor(sql, indexOf(sql, "2"), "sqlserver")?.sql.trim()).toBe("SELECT 2");
+    expect(statementRangeAtCursor(sql, indexOf(sql, "3"), "sqlserver")?.sql.trim()).toBe("SELECT 3");
+  });
+
   it("returns the full Oracle PL/SQL block for cursors inside nested statements", () => {
     const range = statementRangeAtCursor(oraclePlSqlFixture, indexOf(oraclePlSqlFixture, "ORDERS_10K", 2), "oracle");
     expect(range?.sql.trim()).toBe(oraclePlSqlFixture.slice(0, oraclePlSqlFixture.indexOf("\n/")));
@@ -381,6 +456,46 @@ describe("executableStatementRanges", () => {
   it("does not split executable Oracle PL/SQL ranges at inner statement starts", () => {
     expect(rangeSqlTexts(executableStatementRanges(oraclePlSqlFixture, "oracle"))).toEqual([oraclePlSqlFixture.slice(0, oraclePlSqlFixture.indexOf("\n/")), "SELECT 1"]);
   });
+
+  it("does not split executable MySQL routine ranges at inner statements", () => {
+    expect(rangeSqlTexts(executableStatementRanges(mysqlRoutineFixture, "mysql"))).toEqual([mysqlRoutineFixture.slice(0, mysqlRoutineFixture.indexOf("\nSELECT 2;")).replace(/;$/, "").trim(), "SELECT 2"]);
+  });
+
+  it("does not split executable MySQL routine ranges at WHILE and REPEAT endings", () => {
+    expect(rangeSqlTexts(executableStatementRanges(mysqlRoutineWithLoopsFixture, "mysql"))).toEqual([mysqlRoutineWithLoopsFixture.slice(0, mysqlRoutineWithLoopsFixture.indexOf("\nSELECT 2;")).replace(/;$/, "").trim(), "SELECT 2"]);
+  });
+
+  it("returns executable SQL Server batches without GO delimiter lines", () => {
+    expect(rangeSqlTexts(executableStatementRanges("SELECT 1\nGO\nSELECT 2;", "sqlserver"))).toEqual(["SELECT 1", "SELECT 2"]);
+  });
+});
+
+describe("currentExecutableStatementRange", () => {
+  it("uses the current SQL statement range for multi-line DDL", () => {
+    const sql = "ALTER TABLE `yb_course_order`\n  ADD COLUMN `audit_status` tinyint(4) DEFAULT NULL\n    COMMENT '审核状态：0-待审核，1-已通过，2-已拒绝',\n  ADD COLUMN `close_reason` varchar(30) DEFAULT NULL\n    COMMENT '关闭原因：timeout-超时关闭，cancel-取消关闭，refund-退款关闭';\nSELECT 1;";
+
+    expect(currentExecutableStatementRange(sql, indexOf(sql, "close_reason"), "mysql")?.sql.trim()).toBe(sql.slice(0, sql.indexOf(";\nSELECT")));
+  });
+
+  it("returns null on blank and pure comment lines", () => {
+    const sql = "SELECT 1;\n-- comment\n\nSELECT 2;";
+
+    expect(currentExecutableStatementRange(sql, indexOf(sql, "comment"), "mysql")).toBeNull();
+    expect(currentExecutableStatementRange(sql, sql.indexOf("\n\n") + 1, "mysql")).toBeNull();
+  });
+
+  it("uses the current Redis command line", () => {
+    const sql = "GET user:1\n  DEL user:2\n# comment";
+
+    expect(currentExecutableStatementRange(sql, indexOf(sql, "DEL"), "redis")?.sql).toBe("DEL user:2");
+    expect(currentExecutableStatementRange(sql, indexOf(sql, "comment"), "redis")).toBeNull();
+  });
+
+  it("does not expose current statement framing for MongoDB", () => {
+    const sql = "db.users.find({})";
+
+    expect(currentExecutableStatementRange(sql, indexOf(sql, "users"), "mongodb")).toBeNull();
+  });
 });
 
 describe("fullSqlRange", () => {
@@ -414,6 +529,13 @@ describe("buildExecutionCandidates", () => {
     const candidates = buildExecutionCandidates(sql, indexOf(sql, "users"));
     expect(candidates).toHaveLength(1);
     expect(candidates[0].kind).toBe("all");
+  });
+
+  it("uses the whole set-operation statement for cursor execution candidates", () => {
+    const sql = "select * from tbA\nunion\nselect * from tbB\nSELECT * FROM logs;";
+    const candidates = buildExecutionCandidates(sql, indexOf(sql, "tbA"));
+
+    expect(candidateSummaries(candidates)).toEqual(["cursor:select * from tbA\nunion\nselect * from tbB", "all:select * from tbA\nunion\nselect * from tbB\nSELECT * FROM logs;"]);
   });
 
   it("uses the current command line for Redis cursor candidates", () => {
@@ -473,6 +595,12 @@ describe("buildExecutionCandidates", () => {
     const candidates = buildExecutionCandidates(sql, indexOf(sql, "COUNT", 2), "mysql");
     expect(candidateSummaries(candidates)).toEqual(["cursor:select COUNT(1) FROM your_table;", "all:select COUNT(1) FROM your_table;\ndelimiter ;;\nselect COUNT(1) FROM your_table;\n\n;;\ndelimiter ;"]);
   });
+
+  it("uses the current SQL Server batch for cursor candidates", () => {
+    const sql = "SELECT 1\nGO\nSELECT 2;";
+    const candidates = buildExecutionCandidates(sql, indexOf(sql, "2"), "sqlserver");
+    expect(candidateSummaries(candidates)).toEqual(["cursor:SELECT 2", "all:SELECT 1\nGO\nSELECT 2;"]);
+  });
 });
 
 describe("hasMultipleExecutionTargets", () => {
@@ -496,6 +624,14 @@ describe("hasMultipleExecutionTargets", () => {
   it("counts MySQL delimiter scripts by executable statements", () => {
     const sql = "select COUNT(1) FROM your_table;\ndelimiter ;;\nselect COUNT(1) FROM your_table;\n\n;;\ndelimiter ;";
     expect(hasMultipleExecutionTargets(sql, "mysql")).toBe(true);
+  });
+
+  it("counts MySQL routine blocks without delimiter by executable statements", () => {
+    expect(hasMultipleExecutionTargets(mysqlRoutineFixture, "mysql")).toBe(true);
+  });
+
+  it("counts SQL Server GO batches as multiple execution targets", () => {
+    expect(hasMultipleExecutionTargets("SELECT 1\nGO\nSELECT 2", "sqlserver")).toBe(true);
   });
 
   it("does not show multiple targets for MySQL DESC UPDATE joins", () => {

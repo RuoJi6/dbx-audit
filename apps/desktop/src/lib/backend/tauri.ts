@@ -702,6 +702,17 @@ export async function writeExternalSqlFile(path: string, content: string): Promi
   return invoke("write_external_sql_file", { path, content });
 }
 
+export interface SqlFileEntry {
+  name: string;
+  path: string;
+  is_dir: boolean;
+  children: SqlFileEntry[];
+}
+
+export async function listSqlFilesInFolder(folderPath: string): Promise<SqlFileEntry[]> {
+  return invoke("list_sql_files_in_folder", { folderPath });
+}
+
 // --- AI Conversations ---
 
 export interface AiChatMessage {
@@ -1439,8 +1450,8 @@ export async function installMcpServer(): Promise<string> {
   return invoke("install_mcp_server");
 }
 
-export async function checkForUpdates(): Promise<UpdateInfo> {
-  return invoke("check_for_updates");
+export async function checkForUpdates(locale?: string): Promise<UpdateInfo> {
+  return invoke("check_for_updates", { locale });
 }
 
 export async function getSystemProxyUrl(): Promise<string | null> {
@@ -1806,12 +1817,12 @@ export async function documentFindDocuments(connectionId: string, database: stri
   return invoke("document_find_documents", { connectionId, database, collection, skip, limit, filter, projection, sort, executionId });
 }
 
-export async function documentListGridFsFiles(connectionId: string, database: string, bucket: string): Promise<MongoGridFsFileInfo[]> {
-  return invoke("document_list_gridfs_files", { connectionId, database, bucket });
+export async function documentListGridFsFiles(connectionId: string, database: string, bucket: string, filter?: string, sort?: string): Promise<MongoGridFsFileInfo[]> {
+  return invoke("document_list_gridfs_files", { connectionId, database, bucket, filter, sort });
 }
 
-export async function documentListGridFsBuckets(connectionId: string, database: string): Promise<MongoGridFsBucketInfo[]> {
-  return invoke("document_list_gridfs_buckets", { connectionId, database });
+export async function documentListGridFsBuckets(connectionId: string, database: string, filter?: string, sort?: string): Promise<MongoGridFsBucketInfo[]> {
+  return invoke("document_list_gridfs_buckets", { connectionId, database, filter, sort });
 }
 
 export async function documentCreateGridFsBucket(connectionId: string, database: string, bucket: string): Promise<void> {
@@ -2133,6 +2144,7 @@ export interface TableImportRequest {
   parseOptions?: TableImportParseOptions | null;
   mappings: TableImportColumnMapping[];
   mode: TableImportMode;
+  createTable?: boolean;
   batchSize: number;
 }
 

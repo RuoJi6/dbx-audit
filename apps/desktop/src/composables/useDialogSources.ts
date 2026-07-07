@@ -142,7 +142,7 @@ export function useDialogSources() {
           tableImportPrefillConnectionId.value = v.connectionId;
           tableImportPrefillDatabase.value = v.database;
           tableImportPrefillSchema.value = v.schema ?? "";
-          tableImportPrefillTable.value = v.tableName;
+          tableImportPrefillTable.value = v.tableName ?? "";
           showTableImportDialog.value = true;
           connectionStore.tableImportSource = null;
         }
