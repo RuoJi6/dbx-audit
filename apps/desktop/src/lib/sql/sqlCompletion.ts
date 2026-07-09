@@ -1,3 +1,4 @@
+import { Cassandra, MariaSQL, MSSQL, MySQL, PLSQL, PostgreSQL, SQLite, StandardSQL } from "@codemirror/lang-sql";
 import type { DatabaseType, SqlSnippet } from "@/types/database";
 import { buildMongoCompletionItemsFromContext, type MongoCompletionItem } from "@/lib/mongo/mongoCompletion";
 
@@ -662,66 +663,77 @@ export const DEFAULT_SQL_SNIPPETS: SqlSnippet[] = [
     label: "select *",
     prefix: "sel",
     body: "SELECT *\nFROM table\nLIMIT 100;",
+    enabled: true,
   },
   {
     id: "builtin-ins",
     label: "insert into",
     prefix: "ins",
     body: "INSERT INTO table (columns)\nVALUES (values);",
+    enabled: true,
   },
   {
     id: "builtin-upd",
     label: "update set",
     prefix: "upd",
     body: "UPDATE table\nSET column = value\nWHERE condition;",
+    enabled: true,
   },
   {
     id: "builtin-cte",
     label: "common table expression",
     prefix: "cte",
     body: "WITH name AS (\n  SELECT columns\n  FROM table\n)\nSELECT *\nFROM name;",
+    enabled: true,
   },
   {
     id: "builtin-join",
     label: "join",
     prefix: "join",
     body: "JOIN table ON left_column = right_column",
+    enabled: true,
   },
   {
     id: "builtin-case",
     label: "case when",
     prefix: "case",
     body: "CASE\n  WHEN condition THEN value\n  ELSE default\nEND",
+    enabled: true,
   },
   {
     id: "builtin-ct",
     label: "create table",
     prefix: "ct",
     body: "CREATE TABLE table (\n  column type\n);",
+    enabled: true,
   },
   {
     id: "builtin-ex",
     label: "exists",
     prefix: "ex",
     body: "EXISTS (\n  SELECT 1\n  FROM table\n  WHERE condition\n)",
+    enabled: true,
   },
   {
     id: "builtin-nex",
     label: "not exists",
     prefix: "nex",
     body: "NOT EXISTS (\n  SELECT 1\n  FROM table\n  WHERE condition\n)",
+    enabled: true,
   },
   {
     id: "builtin-at",
     label: "alter table add column",
     prefix: "at",
     body: "ALTER TABLE table\nADD COLUMN column type;",
+    enabled: true,
   },
   {
     id: "builtin-ci",
     label: "create index",
     prefix: "ci",
     body: "CREATE INDEX idx_name\nON table (column);",
+    enabled: true,
   },
 ];
 
@@ -1052,6 +1064,15 @@ const SQL_ALIAS_RESERVED_WORDS = new Set([
   "where",
   "with",
 ]);
+
+const SQL_ALIAS_KEYWORD_WORDS = new Set(sqlAliasKeywordWords(SQL_KEYWORDS.join(" "), StandardSQL.spec.keywords, MySQL.spec.keywords, MariaSQL.spec.keywords, PostgreSQL.spec.keywords, MSSQL.spec.keywords, SQLite.spec.keywords, PLSQL.spec.keywords, Cassandra.spec.keywords));
+
+function sqlAliasKeywordWords(...sources: Array<string | undefined>): string[] {
+  return sources
+    .flatMap((source) => (source ?? "").split(/\s+/))
+    .filter((keyword) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(keyword))
+    .map((keyword) => keyword.toLowerCase());
+}
 
 export interface SqlCompletionTable {
   name: string;
@@ -1649,7 +1670,7 @@ export function getSqlCompletionContext(sql: string, cursor: number): SqlComplet
   const suggestRoutines = inCallRoutineContext || oracleTableFunctionContext || inPotentialPackageMemberContext || (!preferColumnsOverGlobalRoutines && !exclusiveTableSuggestions && !exclusiveColumnSuggestions && !insertInfo && prefix.length >= 2);
 
   const statementKind = detectStatementKind(beforeCursor || fullStatement);
-  const preferredKeywords = preferredKeywordsForCompletion(beforeCursor, beforeToken, selectListColumnContext, exclusiveTableSuggestions, updateInfo, deleteInfo);
+  const preferredKeywords = qualifier ? [] : preferredKeywordsForCompletion(beforeCursor, beforeToken, selectListColumnContext, exclusiveTableSuggestions, updateInfo, deleteInfo);
   const contextKind = detectCompletionContextKind({
     qualifier,
     exclusiveTableSuggestions,
@@ -3034,7 +3055,7 @@ function generateTableCompletionAlias(tableName: string, existing = new Set<stri
   const candidates = buildAliasCandidates(tableName);
 
   for (const candidate of candidates.filter(Boolean)) {
-    if (SQL_ALIAS_RESERVED_WORDS.has(candidate.toLowerCase())) continue;
+    if (isUnsafeSqlAlias(candidate.toLowerCase())) continue;
     if (!existing.has(candidate.toLowerCase())) return candidate;
     for (let index = 2; index < 100; index++) {
       const numbered = `${candidate}${index}`;
@@ -3070,7 +3091,11 @@ function buildAliasCandidates(tableName: string): string[] {
 
 function aliasConflicts(candidate: string, existing: Set<string>): boolean {
   const lower = candidate.toLowerCase();
-  return existing.has(lower) || SQL_ALIAS_RESERVED_WORDS.has(lower);
+  return existing.has(lower) || isUnsafeSqlAlias(lower);
+}
+
+function isUnsafeSqlAlias(candidate: string): boolean {
+  return SQL_ALIAS_RESERVED_WORDS.has(candidate) || SQL_ALIAS_KEYWORD_WORDS.has(candidate);
 }
 
 function isFollowedByJoin(beforeToken: string): boolean {
@@ -3081,7 +3106,26 @@ function isFollowedByJoin(beforeToken: string): boolean {
 
 function isInTableListContext(beforeToken: string): boolean {
   if (isInOrderOrGroupByContext(beforeToken)) return false;
-  return /,\s*$/.test(beforeToken) && /\b(?:from|join|update|into)\b/i.test(beforeToken);
+  const cleaned = stripSqlLiterals(beforeToken).trimEnd();
+  if (!/,\s*$/.test(cleaned)) return false;
+
+  // Only commas in the active top-level table segment should continue table completion.
+  const lastTableIntro = Math.max(lastTopLevelKeywordIndex(cleaned, "from"), lastTopLevelKeywordIndex(cleaned, "join"), lastTopLevelKeywordIndex(cleaned, "update"), lastTopLevelKeywordIndex(cleaned, "into"));
+  if (lastTableIntro < 0) return false;
+
+  const lastBoundary = Math.max(
+    lastTopLevelKeywordIndex(cleaned, "where"),
+    lastTopLevelKeywordIndex(cleaned, "set"),
+    lastTopLevelKeywordIndex(cleaned, "group"),
+    lastTopLevelKeywordIndex(cleaned, "order"),
+    lastTopLevelKeywordIndex(cleaned, "having"),
+    lastTopLevelKeywordIndex(cleaned, "limit"),
+    lastTopLevelKeywordIndex(cleaned, "offset"),
+    lastTopLevelKeywordIndex(cleaned, "union"),
+    lastTopLevelKeywordIndex(cleaned, "intersect"),
+    lastTopLevelKeywordIndex(cleaned, "except"),
+  );
+  return lastBoundary < lastTableIntro;
 }
 
 function collectCompletionColumns(columnsByTable: Map<string, SqlCompletionColumn[]>): Array<SqlCompletionColumn & { key: string }> {
@@ -3587,6 +3631,7 @@ function buildSnippetItems(prefix: string, snippets: SqlSnippet[], keywordCase?:
   if (!prefix) return [];
   return snippets
     .filter((snippet) => {
+      if (snippet.enabled === false) return false;
       const matchesSnippetPrefix = matchesPrefix(snippet.prefix, prefix);
       const matchesSnippetLabel = prefix.length > snippet.prefix.length && matchesPrefix(snippet.label, prefix);
       return matchesSnippetPrefix || matchesSnippetLabel;

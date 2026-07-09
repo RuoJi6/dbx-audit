@@ -15,7 +15,7 @@ import { connectionPasteTargetGroupId, selectedConnectionClipboardNodes, selecte
 import { isEditableSidebarTypeSearchTarget, sidebarTypeSearchNextQuery } from "@/lib/sidebar/sidebarTypeSearch";
 import { usesTreeSchemaMode } from "@/lib/database/databaseFeatureSupport";
 import { connectionUsesDatabaseObjectTreeMode, effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
-import { activeTabSidebarTarget, findSidebarNodeForActiveTab, findSidebarNodeForTarget, findNodePathForTarget, scrollTopForSidebarNode, shouldScrollActiveSidebarSelection, type ActiveTabSidebarTarget } from "@/lib/sidebar/sidebarActiveTabTarget";
+import { activeTabSidebarTarget, findSidebarNodeForActiveTab, findSidebarNodeForTarget, findNodePathForTarget, scrollTopForSidebarNode, shouldScrollActiveSidebarSelection, type ActiveTabSidebarTarget, type SidebarNodeScrollAlign } from "@/lib/sidebar/sidebarActiveTabTarget";
 import { findLoadedTableTargetForCandidate, queryContextTargetFromCandidate, queryCursorTableCandidate, type QueryCursorTableCandidate } from "@/lib/sql/queryCursorTableTarget";
 import { SIDEBAR_TREE_ROW_HEIGHT, SIDEBAR_TREE_PRERENDER_COUNT, SIDEBAR_TREE_SCROLL_BUFFER, flattenTree, shouldVirtualizeFlatTree, type FlatTreeNode } from "@/composables/useFlatTree";
 import { sidebarTreeContextKey } from "@/lib/sidebar/sidebarTreeContext";
@@ -153,11 +153,19 @@ const SEARCH_SCOPE_TO_NODE_TYPES: Record<SearchScope, TreeNodeType[]> = {
   view: ["view"],
 };
 
-// Database-level container types. When browsing a large number of children
-// under one of these (e.g. hundreds of tables) and scrolling down, the row is
-// kept pinned at the top of the tree so the active database stays visible and
-// can be collapsed with one click. Mirrors the `database` search scope above.
+// Sticky-row container types. When browsing a large number of children (e.g.
+// hundreds of tables) under one of these and scrolling down, the row is kept
+// pinned at the top so the active container stays identifiable and can be
+// collapsed with one click.
+//
+// Database-level containers are always preferred. Schema is only a fallback,
+// used when the upward path has NO database-level ancestor at all: Dameng /
+// Oracle / oceanbase-oracle expose `connection -> schema -> tables` (no database
+// node, via connectionUsesVisibleSchemaFilter). For Postgres/SQLServer, whose
+// tree is `connection -> database -> schema -> tables`, the sticky walk prefers
+// the database node, so schema never shadows it.
 const DATABASE_LEVEL_TYPES = new Set<TreeNodeType>(SEARCH_SCOPE_TO_NODE_TYPES.database);
+const SCHEMA_LEVEL_TYPES = new Set<TreeNodeType>(["schema"]);
 
 const searchScopeOptions = computed(() => {
   return [
@@ -373,16 +381,29 @@ const stickyNode = computed<FlatTreeNode | null>(() => {
   if (len === 0) return null;
 
   const topIndex = Math.min(Math.floor(stickyScrollTop.value / SIDEBAR_TREE_ROW_HEIGHT), len - 1);
-  // Walk UP from the topmost visible row to the nearest database-level ancestor.
-  // Show the overlay as soon as that database row starts crossing the top edge,
-  // instead of waiting for it to fully scroll out by one row.
+  // flatNodes is a DFS preorder spanning ALL connections, so walking up from a
+  // leaf visits `... -> schema -> database -> connection -> <other connection>`.
+  // Stop at the connection boundary so the sticky row never leaks across into a
+  // different connection's subtree (e.g. MySQL's last database sticking while
+  // scrolling Dameng). Within one connection: track both candidates and prefer
+  // database-level; only fall back to schema when the whole path has no
+  // database-level container (Dameng/Oracle-style trees).
+  let schemaCandidate: FlatTreeNode | null = null;
+  let schemaCandidateTop = 0;
   for (let i = topIndex; i >= 0; i--) {
     const item = nodes[i];
-    if (!DATABASE_LEVEL_TYPES.has(item.type)) continue;
-    const rowTop = i * SIDEBAR_TREE_ROW_HEIGHT;
-    return stickyScrollTop.value > rowTop ? item : null;
+    if (item.type === "connection" || item.type === "connection-group") break;
+    if (DATABASE_LEVEL_TYPES.has(item.type)) {
+      const rowTop = i * SIDEBAR_TREE_ROW_HEIGHT;
+      return stickyScrollTop.value > rowTop ? item : null;
+    }
+    if (item.type === "schema" && !schemaCandidate) {
+      schemaCandidate = item;
+      schemaCandidateTop = i * SIDEBAR_TREE_ROW_HEIGHT;
+    }
   }
-  return null;
+  if (!schemaCandidate) return null;
+  return stickyScrollTop.value > schemaCandidateTop ? schemaCandidate : null;
 });
 
 const stickyHeaderStyle = computed<CSSProperties>(() => {
@@ -391,7 +412,20 @@ const stickyHeaderStyle = computed<CSSProperties>(() => {
   const nodes = flatNodes.value;
   const currentIndex = nodes.findIndex((item) => item.id === node.id);
   if (currentIndex < 0) return {};
-  const nextDatabaseIndex = nodes.findIndex((item, index) => index > currentIndex && DATABASE_LEVEL_TYPES.has(item.type));
+  // Look forward for the next sibling container at the SAME level as the sticky
+  // node so the push-up only fires when a peer scrolls in (database-to-database,
+  // or schema-to-schema for Dameng/Oracle), never schema-into-database. Stop at
+  // the connection boundary so we never reach into the next connection's rows.
+  const nextTypes = SCHEMA_LEVEL_TYPES.has(node.type) ? SCHEMA_LEVEL_TYPES : DATABASE_LEVEL_TYPES;
+  let nextDatabaseIndex = -1;
+  for (let i = currentIndex + 1; i < nodes.length; i++) {
+    const item = nodes[i];
+    if (item.type === "connection" || item.type === "connection-group") break;
+    if (nextTypes.has(item.type)) {
+      nextDatabaseIndex = i;
+      break;
+    }
+  }
   if (nextDatabaseIndex < 0) return {};
   const distanceToNext = nextDatabaseIndex * SIDEBAR_TREE_ROW_HEIGHT - stickyScrollTop.value;
   if (distanceToNext >= SIDEBAR_TREE_ROW_HEIGHT) return {};
@@ -500,13 +534,33 @@ const pendingRenameGroupId = ref<string | null>(null);
 const highlightedNodeId = ref<string | null>(null);
 let highlightTimer: number | undefined;
 
+// 等待虚拟列表渲染后再高亮。
+function waitForSidebarRenderFrame(): Promise<void> {
+  return new Promise((resolve) => {
+    window.requestAnimationFrame(() => resolve());
+  });
+}
+
+// 重新触发定位高亮，支持连续定位同一节点。
+async function flashSidebarNode(nodeId: string) {
+  window.clearTimeout(highlightTimer);
+  highlightedNodeId.value = null;
+  await nextTick();
+  await waitForSidebarRenderFrame();
+
+  highlightedNodeId.value = nodeId;
+  highlightTimer = window.setTimeout(() => {
+    if (highlightedNodeId.value === nodeId) highlightedNodeId.value = null;
+  }, 1800);
+}
+
 function topOcclusionHeightForSidebarNode(nodeId: string): number {
   const sticky = stickyNode.value;
   if (!useVirtualTree.value || !sticky || sticky.id === nodeId) return 0;
   return SIDEBAR_TREE_ROW_HEIGHT;
 }
 
-async function scrollToSidebarNode(nodeId: string) {
+async function scrollToSidebarNode(nodeId: string, options?: { align?: SidebarNodeScrollAlign }) {
   await nextTick();
 
   const index = flatNodes.value.findIndex((item) => item.id === nodeId);
@@ -518,6 +572,7 @@ async function scrollToSidebarNode(nodeId: string) {
     currentScrollTop: scroller.scrollTop,
     viewportHeight: scroller.clientHeight,
     topOcclusionHeight: topOcclusionHeightForSidebarNode(nodeId),
+    ...(options?.align ? { align: options.align } : {}),
   });
   if (nextScrollTop !== scroller.scrollTop) {
     scroller.scrollTop = nextScrollTop;
@@ -627,13 +682,8 @@ async function locateActiveTabInSidebar() {
   store.treeSelectionAnchorId = match.id;
   await nextTick();
 
-  window.clearTimeout(highlightTimer);
-  highlightedNodeId.value = match.id;
-  highlightTimer = window.setTimeout(() => {
-    highlightedNodeId.value = null;
-  }, 1800);
-
-  await scrollToSidebarNode(match.id);
+  await scrollToSidebarNode(match.id, { align: "smart" });
+  await flashSidebarNode(match.id);
 }
 
 function tableTargetFromCandidate(candidate: QueryCursorTableCandidate): ActiveTabSidebarTarget {

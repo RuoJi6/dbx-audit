@@ -4,7 +4,9 @@ use tauri::{AppHandle, Emitter, State};
 use crate::commands::connection::{ensure_connection_writable, AppState};
 
 // Re-export types and functions used by other modules
-pub use dbx_core::transfer::{get_db_type, TransferProgress, TransferRequest, TransferStatus};
+pub use dbx_core::transfer::{
+    get_db_type, TransferOwnershipPreview, TransferProgress, TransferRequest, TransferStatus,
+};
 
 fn emit_progress(app: &AppHandle, progress: TransferProgress) {
     let _ = app.emit("transfer-progress", progress);
@@ -269,6 +271,31 @@ pub async fn start_transfer(
     });
 
     Ok(())
+}
+
+#[tauri::command]
+pub async fn preview_transfer_ownership(
+    state: State<'_, Arc<AppState>>,
+    request: TransferRequest,
+) -> Result<TransferOwnershipPreview, String> {
+    let state = state.inner().clone();
+    let source_db_type = get_db_type(&state, &request.source_connection_id).await?;
+    let target_db_type = get_db_type(&state, &request.target_connection_id).await?;
+    dbx_core::transfer::validate_transfer_target_table_names(&request)?;
+    let source_pool_key =
+        state.get_or_create_pool(&request.source_connection_id, Some(&request.source_database)).await?;
+    let target_pool_key =
+        state.get_or_create_pool(&request.target_connection_id, Some(&request.target_database)).await?;
+
+    dbx_core::transfer::preview_transfer_ownership(
+        &state,
+        &request,
+        &source_db_type,
+        &target_db_type,
+        &source_pool_key,
+        &target_pool_key,
+    )
+    .await
 }
 
 #[tauri::command]

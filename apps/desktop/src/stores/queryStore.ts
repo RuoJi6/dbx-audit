@@ -46,6 +46,7 @@ import { useConnectionStore } from "@/stores/connectionStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useSavedSqlStore } from "@/stores/savedSqlStore";
 import { createSavedSqlEditorPosition, initSavedSqlEditorPositions, restoreSavedSqlEditorPosition, saveSavedSqlEditorPosition } from "@/lib/app/savedSqlEditorPosition";
+import { ensureSqlExtension } from "@/lib/savedSql/savedSqlFileName";
 import { safeLocalStorageGet, safeLocalStorageRemove } from "@/lib/backend/safeStorage";
 import type { SavedSqlFile } from "@/types/database";
 
@@ -800,6 +801,31 @@ export const useQueryStore = defineStore("query", () => {
     return id;
   }
 
+  function openDamengJobAdmin(connectionId: string) {
+    const existing = tabs.value.find((tab) => tab.mode === "dameng-jobs" && tab.connectionId === connectionId);
+    if (existing) {
+      activeTabId.value = existing.id;
+      return existing.id;
+    }
+
+    const conn = useConnectionStore().getConfig(connectionId);
+    const id = uuid();
+    const tab: QueryTab = {
+      id,
+      title: t("damengJobAdmin.title"),
+      connectionId,
+      database: conn?.database || "",
+      sql: "",
+      isExecuting: false,
+      isCancelling: false,
+      isExplaining: false,
+      mode: "dameng-jobs",
+    };
+    tabs.value.push(tab);
+    activeTabId.value = id;
+    return id;
+  }
+
   function openMongoBucket(connectionId: string, database: string, bucketName: string) {
     const title = `${database}.${bucketName}`;
     const existing = tabs.value.find((tab) => tab.mode === "mongo-bucket" && tab.connectionId === connectionId && tab.database === database && tab.mongoBucket?.bucketName === bucketName);
@@ -1491,8 +1517,20 @@ export const useQueryStore = defineStore("query", () => {
     if (!trimmed) return false;
     const tab = tabs.value.find((t) => t.id === id);
     if (!tab || tab.mode !== "query") return false;
-    tab.title = trimmed;
+    const normalizedTitle = tab.savedSqlId ? ensureSqlExtension(trimmed) : trimmed;
+    const previousTitle = tab.title;
+    tab.title = normalizedTitle;
     tab.customTitle = true;
+    if (tab.savedSqlId) {
+      const savedSqlStore = useSavedSqlStore();
+      const existing = savedSqlStore.getFile(tab.savedSqlId);
+      if (existing && existing.name !== normalizedTitle) {
+        void savedSqlStore.renameFile(tab.savedSqlId, normalizedTitle).catch((error) => {
+          console.warn("[DBX][saved-sql:rename:error]", error);
+          tab.title = previousTitle;
+        });
+      }
+    }
     return true;
   }
 
@@ -2865,6 +2903,7 @@ export const useQueryStore = defineStore("query", () => {
             schema: tableMeta.schema,
             tableName: tableMeta.tableName,
             tableType: tableMeta.tableType,
+            catalog: tableMeta.catalog,
             columns: tableMeta.columns.map((column) => column.name),
             primaryKeys,
             whereInput: tab.whereInput,
@@ -3070,6 +3109,7 @@ export const useQueryStore = defineStore("query", () => {
     openMongoBucket,
     openUserAdmin,
     openAuditTab,
+    openDamengJobAdmin,
     openMqAdmin,
     openNacosAdmin,
     openTableStructure,

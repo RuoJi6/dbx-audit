@@ -5,6 +5,7 @@ use std::io::Write;
 use tokio::sync::RwLock;
 
 use crate::models::connection::DatabaseType;
+use crate::object_source_sql::build_export_object_source_sql;
 use crate::sql_dialect::{qualified_table_name, quote_table_identifier, uses_single_row_insert_statements};
 use crate::transfer::{
     format_ch_array_sql_literal, format_pg_array_sql_literal, is_identity_column_extra, quote_identifier,
@@ -179,6 +180,9 @@ fn format_export_sql_literal_typed(
     database_type: Option<DatabaseType>,
     column_type: Option<&str>,
 ) -> String {
+    if is_postgres_json_export_column(database_type, column_type) {
+        return format_postgres_json_export_literal(value);
+    }
     if matches!(database_type, Some(DatabaseType::Mysql)) && column_type.is_some_and(is_mysql_bit_type) {
         return format_mysql_bit_literal(value);
     }
@@ -203,6 +207,16 @@ fn format_export_sql_literal_typed(
         return literal;
     }
     format_export_sql_literal_for_database(value, database_type)
+}
+
+fn format_postgres_json_export_literal(value: &Value) -> String {
+    if value.is_null() {
+        return "NULL".to_string();
+    }
+    let text = value.as_str().map_or_else(|| value.to_string(), ToString::to_string);
+    // PostgreSQL standard strings keep backslashes literal; JSON text needs its
+    // own escape sequences, so only SQL-escape the surrounding string delimiter.
+    postgres_string_literal(&text)
 }
 
 fn quote_export_sql_string(text: &str) -> String {
@@ -563,6 +577,18 @@ fn is_postgres_tsvector_export_column(database_type: Option<DatabaseType>, colum
             .map(|column_type| {
                 let normalized = column_type.trim().trim_matches('"').to_ascii_lowercase();
                 normalized == "tsvector" || normalized.ends_with(".tsvector")
+            })
+            .unwrap_or(false)
+}
+
+fn is_postgres_json_export_column(database_type: Option<DatabaseType>, column_type: Option<&str>) -> bool {
+    database_type == Some(DatabaseType::Postgres)
+        && column_type
+            .map(|column_type| {
+                let normalized = column_type.trim().trim_matches('"').to_ascii_lowercase();
+                matches!(normalized.as_str(), "json" | "jsonb")
+                    || normalized.ends_with(".json")
+                    || normalized.ends_with(".jsonb")
             })
             .unwrap_or(false)
 }
@@ -1199,8 +1225,10 @@ pub async fn export_database_sql_core(
             .await
             {
                 Ok(obj_source) => {
-                    if !obj_source.source.is_empty() {
-                        writeln!(file, "{};\n", obj_source.source).map_err(|e| format!("Failed to write file: {e}"))?;
+                    let source =
+                        build_export_object_source_sql(db_type, crate::db::ObjectSourceKind::View, &obj_source.source);
+                    if !source.is_empty() {
+                        writeln!(file, "{source}\n").map_err(|e| format!("Failed to write file: {e}"))?;
                     }
                 }
                 Err(e) => {
@@ -1240,8 +1268,13 @@ pub async fn export_database_sql_core(
             .await
             {
                 Ok(obj_source) => {
-                    if !obj_source.source.is_empty() {
-                        writeln!(file, "{};\n", obj_source.source).map_err(|e| format!("Failed to write file: {e}"))?;
+                    let source = build_export_object_source_sql(
+                        db_type,
+                        crate::db::ObjectSourceKind::Procedure,
+                        &obj_source.source,
+                    );
+                    if !source.is_empty() {
+                        writeln!(file, "{source}\n").map_err(|e| format!("Failed to write file: {e}"))?;
                     }
                 }
                 Err(e) => {
@@ -1281,8 +1314,13 @@ pub async fn export_database_sql_core(
             .await
             {
                 Ok(obj_source) => {
-                    if !obj_source.source.is_empty() {
-                        writeln!(file, "{};\n", obj_source.source).map_err(|e| format!("Failed to write file: {e}"))?;
+                    let source = build_export_object_source_sql(
+                        db_type,
+                        crate::db::ObjectSourceKind::Function,
+                        &obj_source.source,
+                    );
+                    if !source.is_empty() {
+                        writeln!(file, "{source}\n").map_err(|e| format!("Failed to write file: {e}"))?;
                     }
                 }
                 Err(e) => {
@@ -1448,6 +1486,29 @@ mod tests {
         .unwrap();
 
         assert_eq!(statements, vec!["INSERT INTO \"public\".\"notes\" (\"body\") VALUES ('line1\nline2\tend');"]);
+    }
+
+    #[test]
+    fn postgres_jsonb_export_preserves_json_escape_sequences() {
+        let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
+            database_type: Some(DatabaseType::Postgres),
+            schema: Some("public".to_string()),
+            table_name: Some("events".to_string()),
+            qualified_table_name: None,
+            columns: vec!["payload".to_string()],
+            column_types: vec![Some("jsonb".to_string())],
+            column_extras: Vec::new(),
+            rows: vec![vec![json!(r#"{"text":"say \"hi\"","path":"C:\\tmp","quote":"O'Hara"}"#)]],
+            batch_size: Some(10),
+        })
+        .unwrap();
+
+        assert_eq!(
+            statements,
+            vec![
+                r#"INSERT INTO "public"."events" ("payload") VALUES ('{"text":"say \"hi\"","path":"C:\\tmp","quote":"O''Hara"}');"#
+            ]
+        );
     }
 
     #[test]
