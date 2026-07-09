@@ -5,6 +5,7 @@ import type {
   DatabaseInfo,
   SchemaInfo,
   LinkedServerInfo,
+  CatalogInfo,
   TableInfo,
   ObjectInfo,
   CompletionAssistantRequest,
@@ -718,6 +719,7 @@ export async function listSqlFilesInFolder(folderPath: string): Promise<SqlFileE
 export interface AiChatMessage {
   role: string;
   content: string;
+  mentions?: unknown[];
   reasoning?: string;
   kind?: "contextSummary";
 }
@@ -772,6 +774,14 @@ export async function listDatabases(connectionId: string): Promise<DatabaseInfo[
   return invoke("list_databases", { connectionId });
 }
 
+export async function listDorisCatalogs(connectionId: string): Promise<CatalogInfo[]> {
+  return invoke("list_doris_catalogs", { connectionId });
+}
+
+export async function listDorisCatalogDatabases(connectionId: string, catalog: string): Promise<DatabaseInfo[]> {
+  return invoke("list_doris_catalog_databases", { connectionId, catalog });
+}
+
 export async function listSqlServerLinkedServers(connectionId: string): Promise<LinkedServerInfo[]> {
   return invoke("list_sqlserver_linked_servers", { connectionId });
 }
@@ -800,16 +810,16 @@ export async function deleteSchemaCachePrefix(prefix: string): Promise<void> {
   return invoke("delete_schema_cache_prefix", { prefix });
 }
 
-export async function listTables(connectionId: string, database: string, schema: string, filter?: string, limit?: number, offset?: number, objectTypes?: SidebarObjectKind[]): Promise<TableInfo[]> {
-  return invoke("list_tables", { connectionId, database, schema, filter, limit, offset, objectTypes });
+export async function listTables(connectionId: string, database: string, schema: string, filter?: string, limit?: number, offset?: number, objectTypes?: SidebarObjectKind[], catalog?: string): Promise<TableInfo[]> {
+  return invoke("list_tables", { connectionId, database, schema, filter, limit, offset, objectTypes, catalog });
 }
 
-export async function getTableComment(connectionId: string, database: string, schema: string, table: string): Promise<string | null> {
-  return invoke("get_table_comment", { connectionId, database, schema, table });
+export async function getTableComment(connectionId: string, database: string, schema: string, table: string, catalog?: string): Promise<string | null> {
+  return invoke("get_table_comment", { connectionId, database, schema, table, catalog });
 }
 
-export async function listObjects(connectionId: string, database: string, schema: string, objectTypes?: SidebarObjectKind[], filter?: string, limit?: number, offset?: number): Promise<ObjectInfo[]> {
-  return invoke("list_objects", { connectionId, database, schema, objectTypes, filter, limit, offset });
+export async function listObjects(connectionId: string, database: string, schema: string, objectTypes?: SidebarObjectKind[], filter?: string, limit?: number, offset?: number, catalog?: string): Promise<ObjectInfo[]> {
+  return invoke("list_objects", { connectionId, database, schema, objectTypes, filter, limit, offset, catalog });
 }
 
 export async function listObjectStatistics(connectionId: string, database: string, schema: string): Promise<ObjectStatistics[]> {
@@ -836,8 +846,8 @@ export async function listSchemaInfos(connectionId: string, database: string): P
   return invoke("list_schema_infos", { connectionId, database });
 }
 
-export async function getColumns(connectionId: string, database: string, schema: string, table: string): Promise<ColumnInfo[]> {
-  return invoke("get_columns", { connectionId, database, schema, table });
+export async function getColumns(connectionId: string, database: string, schema: string, table: string, catalog?: string): Promise<ColumnInfo[]> {
+  return invoke("get_columns", { connectionId, database, schema, table, catalog });
 }
 
 export async function listDataTypes(connectionId: string, database: string): Promise<string[]> {
@@ -1143,20 +1153,20 @@ export async function buildDataCompareSyncPlan(options: DataCompareSyncPlanOptio
   return invoke("build_data_compare_sync_plan", { options });
 }
 
-export async function listIndexes(connectionId: string, database: string, schema: string, table: string): Promise<IndexInfo[]> {
-  return invoke("list_indexes", { connectionId, database, schema, table });
+export async function listIndexes(connectionId: string, database: string, schema: string, table: string, catalog?: string): Promise<IndexInfo[]> {
+  return invoke("list_indexes", { connectionId, database, schema, table, catalog });
 }
 
-export async function listForeignKeys(connectionId: string, database: string, schema: string, table: string): Promise<ForeignKeyInfo[]> {
-  return invoke("list_foreign_keys", { connectionId, database, schema, table });
+export async function listForeignKeys(connectionId: string, database: string, schema: string, table: string, catalog?: string): Promise<ForeignKeyInfo[]> {
+  return invoke("list_foreign_keys", { connectionId, database, schema, table, catalog });
 }
 
-export async function listTriggers(connectionId: string, database: string, schema: string, table: string): Promise<TriggerInfo[]> {
-  return invoke("list_triggers", { connectionId, database, schema, table });
+export async function listTriggers(connectionId: string, database: string, schema: string, table: string, catalog?: string): Promise<TriggerInfo[]> {
+  return invoke("list_triggers", { connectionId, database, schema, table, catalog });
 }
 
-export async function getTableDdl(connectionId: string, database: string, schema: string, table: string, objectType?: ObjectSourceKind): Promise<string> {
-  return invoke("get_table_ddl", { connectionId, database, schema, table, objectType });
+export async function getTableDdl(connectionId: string, database: string, schema: string, table: string, objectType?: ObjectSourceKind, catalog?: string): Promise<string> {
+  return invoke("get_table_ddl", { connectionId, database, schema, table, objectType, catalog });
 }
 
 export async function prepareSchemaDiff(options: SchemaDiffPreparationOptions): Promise<SchemaDiffPreparation> {
@@ -1285,6 +1295,10 @@ export async function listInstalledAgents(): Promise<AgentDriverInfo[]> {
 
 export async function getDriverStoreUsage(): Promise<DriverStoreUsage> {
   return invoke("get_driver_store_usage");
+}
+
+export async function clearDriverDownloadCache(): Promise<void> {
+  return invoke("clear_driver_download_cache");
 }
 
 export async function getDriverRuntimeSummary(): Promise<DriverRuntimeSummary> {
@@ -1482,16 +1496,61 @@ export interface RedisDatabaseInfo {
   keys: number;
 }
 
+export type RedisBlobEncoding = "utf8" | "binary";
+
+export interface RedisBlob {
+  raw_base64: string;
+  encoding: RedisBlobEncoding;
+}
+
+export interface RedisListItem {
+  index: number;
+  value: RedisBlob;
+}
+
+export interface RedisSetItem {
+  member: RedisBlob;
+}
+
+export interface RedisHashItem {
+  field: RedisBlob;
+  value: RedisBlob;
+}
+
+export interface RedisZsetItem {
+  score: string;
+  member: RedisBlob;
+}
+
+export interface RedisStreamField {
+  field: string;
+  value: string;
+}
+
+export interface RedisStreamEntry {
+  id: string;
+  fields: RedisStreamField[];
+}
+
+export type RedisValueData =
+  | { kind: "string"; content: RedisBlob }
+  | { kind: "json"; value: unknown }
+  | { kind: "list"; items: RedisListItem[]; total: number; scan_cursor?: number }
+  | { kind: "set"; items: RedisSetItem[]; total: number; scan_cursor?: number }
+  | { kind: "hash"; items: RedisHashItem[]; total: number; scan_cursor?: number }
+  | { kind: "zset"; items: RedisZsetItem[]; total: number; scan_cursor?: number }
+  | { kind: "stream"; entries: RedisStreamEntry[] }
+  | { kind: "unknown" };
+
 export interface RedisValue {
   key_display: string;
   key_raw: string;
-  key_type: string;
   ttl: number;
-  value_is_binary: boolean;
-  value: any;
-  total?: number;
-  scan_cursor?: number;
+  redis_type: string;
+  data: RedisValueData;
 }
+
+export type RedisCollectionPage = { kind: "list"; items: RedisListItem[]; scan_cursor?: number } | { kind: "set"; items: RedisSetItem[]; scan_cursor?: number } | { kind: "hash"; items: RedisHashItem[]; scan_cursor?: number } | { kind: "zset"; items: RedisZsetItem[]; scan_cursor?: number };
 
 export interface RedisScanResult {
   cursor: number;
@@ -1613,7 +1672,7 @@ export async function redisExecuteCommand(connectionId: string, db: number, comm
   return invoke("redis_execute_command", { connectionId, db, command, skipSafetyCheck: skipSafetyCheck ?? false });
 }
 
-export async function redisLoadMore(connectionId: string, db: number, keyRaw: string, keyType: string, cursor: number, count: number, filter?: string): Promise<RedisValue> {
+export async function redisLoadMore(connectionId: string, db: number, keyRaw: string, keyType: string, cursor: number, count: number, filter?: string): Promise<RedisCollectionPage> {
   return invoke("redis_load_more", { connectionId, db, keyRaw, keyType, cursor, count, filter });
 }
 
@@ -2019,6 +2078,7 @@ export async function listenSqlFileProgress(handler: (progress: SqlFileProgress)
 // --- Data Transfer ---
 export type TransferMode = "append" | "overwrite" | "upsert";
 export type TransferTableNameCase = "preserve" | "lower" | "upper";
+export type TransferOwnershipPolicy = "preserve" | "skip" | "reassignMissing";
 
 export interface TransferRequest {
   transferId: string;
@@ -2032,7 +2092,13 @@ export interface TransferRequest {
   createTable: boolean;
   mode: TransferMode;
   targetTableNameCase: TransferTableNameCase;
+  ownershipPolicy?: TransferOwnershipPolicy;
   batchSize: number;
+}
+
+export interface TransferOwnershipPreview {
+  missingOwners: string[];
+  targetOwner: string;
 }
 
 export interface TransferProgress {
@@ -2073,6 +2139,10 @@ export async function cancelTransfer(transferId: string): Promise<void> {
   return invoke("cancel_transfer", { transferId });
 }
 
+export async function previewTransferOwnership(request: TransferRequest): Promise<TransferOwnershipPreview> {
+  return invoke("preview_transfer_ownership", { request });
+}
+
 export interface SortTablesByFkOptions {
   connectionId: string;
   database: string;
@@ -2100,6 +2170,7 @@ export type TableImportJsonShape = "auto" | "objects" | "arrays";
 export interface TableImportColumnMapping {
   sourceColumn: string;
   targetColumn: string;
+  targetDataType?: string | null;
 }
 
 export interface TableImportParseOptions {

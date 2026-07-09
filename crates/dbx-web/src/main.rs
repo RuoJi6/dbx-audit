@@ -252,6 +252,7 @@ async fn main() {
         .route("/agents/installed-local", get(routes::agents::list_installed_agents_local))
         .route("/agents/installed", get(routes::agents::list_installed_agents))
         .route("/agents/storage-usage", get(routes::agents::get_driver_store_usage))
+        .route("/agents/download-cache", delete(routes::agents::clear_driver_download_cache))
         .route("/agents/runtime", get(routes::agents::get_driver_runtime_summary))
         .route("/agents/runtime/stop", post(routes::agents::stop_driver_runtime))
         .route("/agents/runtime/restart", post(routes::agents::restart_driver_runtime))
@@ -270,6 +271,8 @@ async fn main() {
         .route("/agents/progress/{operationId}", get(routes::agents::agent_progress))
         // Schema
         .route("/schema/databases", get(routes::schema::list_databases))
+        .route("/schema/doris/catalogs", get(routes::schema::list_doris_catalogs))
+        .route("/schema/doris/catalog-databases", get(routes::schema::list_doris_catalog_databases))
         .route("/schema/sqlserver/linked-servers", get(routes::schema::list_sqlserver_linked_servers))
         .route("/schema/sqlserver/linked-server-catalogs", get(routes::schema::list_sqlserver_linked_server_catalogs))
         .route("/schema/sqlserver/linked-server-schemas", get(routes::schema::list_sqlserver_linked_server_schemas))
@@ -515,6 +518,7 @@ async fn main() {
         .route("/audit/task-store", get(routes::audit::load_task_store).post(routes::audit::save_task_store))
         // Transfer
         .route("/transfer/start", post(routes::transfer::start_transfer))
+        .route("/transfer/ownership-preview", post(routes::transfer::preview_transfer_ownership))
         .route("/transfer/progress/{transferId}", get(routes::transfer::transfer_progress))
         .route("/transfer/cancel", post(routes::transfer::cancel_transfer))
         .route("/transfer/sort-tables-by-fk", post(routes::transfer::sort_tables_by_fk_dependency))

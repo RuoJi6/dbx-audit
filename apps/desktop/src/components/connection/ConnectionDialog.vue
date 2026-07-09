@@ -48,6 +48,7 @@ import { isSchemaAware } from "@/lib/database/databaseFeatureSupport";
 import VisibleSchemasDialog from "@/components/sidebar/VisibleSchemasDialog.vue";
 import { oceanbaseModeConnectionPatch, oceanbaseSubModeFromConfig } from "@/lib/database/oceanbaseConnectionMode";
 import { translateBackendError } from "@/i18n/backend-errors";
+import { applyHiveKerberosSubmitConfig, hiveKerberosFormConfig, type HiveKerberosAuthMode } from "@/lib/database/hiveKerberosOptions";
 
 type DbOption = { value: string; label: string };
 type DbCategory = { key: string; title: string; options: DbOption[] };
@@ -151,6 +152,7 @@ const defaultForm = (): ConnectionForm => ({
   driver_profile: "mysql",
   driver_label: "MySQL",
   url_params: "",
+  agent_java_options: [],
   host: "127.0.0.1",
   port: 3306,
   username: "root",
@@ -378,6 +380,12 @@ const dremioConnectionUrls = ref<Record<DremioConnectionMode, string>>({
   "arrow-flight-sql": DREMIO_ARROW_FLIGHT_SQL_JDBC_URL,
   legacy: DREMIO_LEGACY_JDBC_URL,
 });
+const hiveAuthMode = ref<HiveKerberosAuthMode>("none");
+const hivePrincipal = ref("");
+const hiveKrb5ConfPath = ref("");
+const hiveJaasConfigPath = ref("");
+const hiveUseSubjectCredsOnlyFalse = ref(false);
+const hiveExtraJavaOptions = ref("");
 const dialogStep = ref<DialogStep>("select");
 const dbPickerView = ref<DbPickerView>("icon");
 const dbSearchQuery = ref("");
@@ -537,10 +545,10 @@ const driverProfiles: Record<
   chromadb: { type: "chromadb", port: 8000, user: "", label: "ChromaDB", icon: "chromadb" },
   mariadb: { type: "mysql", port: 3306, user: "root", label: "MariaDB", icon: "mariadb" },
   tidb: { type: "mysql", port: 4000, user: "root", label: "TiDB", icon: "tidb" },
-  oceanbase: { type: "mysql", port: 2881, user: "root", label: "OceanBase", icon: "oceanbase" },
+  oceanbase: { type: "mysql", port: 2883, user: "root", label: "OceanBase", icon: "oceanbase" },
   "oceanbase-oracle": {
     type: "oceanbase-oracle",
-    port: 2881,
+    port: 2883,
     user: "SYS",
     label: "OceanBase Oracle Mode",
     icon: "oceanbase",
@@ -612,6 +620,7 @@ const driverProfiles: Record<
   trino: { type: "trino", port: 8080, user: "", label: "Trino", icon: "trino" },
   prestosql: { type: "prestosql", port: 8080, user: "", label: "PrestoSQL", icon: "presto" },
   hive: { type: "hive", port: 10000, user: "", label: "Apache Hive", icon: "hive" },
+  spark: { type: "spark", port: 10015, user: "", label: "Apache Spark", icon: "spark-logo.png" },
   db2: { type: "db2", port: 50000, user: "db2inst1", label: "IBM DB2", icon: "db2" },
   informix: { type: "informix", port: 9088, user: "informix", label: "Informix", icon: "informix" },
   dremio: { type: "jdbc", port: 31010, user: "", label: "Dremio", icon: "dremio" },
@@ -772,6 +781,16 @@ function hydrateInfluxDbFields(value: unknown) {
     return;
   }
   resetInfluxDbFields(value as Partial<InfluxDbExternalConfig>);
+}
+
+function resetHiveKerberosFields(config?: Pick<ConnectionConfig, "url_params" | "agent_java_options">) {
+  const kerberos = hiveKerberosFormConfig(config?.url_params, config?.agent_java_options);
+  hiveAuthMode.value = kerberos.authMode;
+  hivePrincipal.value = kerberos.principal;
+  hiveKrb5ConfPath.value = kerberos.krb5ConfPath;
+  hiveJaasConfigPath.value = kerberos.jaasConfigPath;
+  hiveUseSubjectCredsOnlyFalse.value = kerberos.useSubjectCredsOnlyFalse;
+  hiveExtraJavaOptions.value = kerberos.extraJavaOptions;
 }
 
 function buildInfluxDbExternalConfig(): InfluxDbExternalConfig {
@@ -1022,8 +1041,10 @@ function isSqlServerLegacyUnencryptedMode(params: string | undefined): boolean {
   if (!normalized) return false;
   const parsed = new URLSearchParams(normalized);
   for (const [key, value] of parsed.entries()) {
-    if (key.trim().toLowerCase() === "sqlserverencryption") {
-      return ["disabled", "disable", "false", "0", "off"].includes(value.trim().toLowerCase());
+    const normalizedKey = key.trim().toLowerCase();
+    if (normalizedKey === "sqlserverencryption" || normalizedKey === "encrypt") {
+      // Accept JDBC-style `encrypt=false` from imported SQL Server URLs as the same opt-in.
+      if (["disabled", "disable", "false", "0", "off", "no"].includes(value.trim().toLowerCase())) return true;
     }
   }
   return false;
@@ -1031,7 +1052,13 @@ function isSqlServerLegacyUnencryptedMode(params: string | undefined): boolean {
 
 function setSqlServerLegacyUnencryptedMode(params: string | undefined, enabled: boolean): string {
   const normalized = (params || "").trim().replace(/^\?/, "").replace(/;/g, "&");
-  return setUrlParam(normalized, "sqlserverEncryption", enabled ? "disabled" : "");
+  const parsed = new URLSearchParams(normalized);
+  for (const key of Array.from(parsed.keys())) {
+    const normalizedKey = key.trim().toLowerCase();
+    if (normalizedKey === "sqlserverencryption" || normalizedKey === "encrypt") parsed.delete(key);
+  }
+  if (enabled) parsed.set("sqlserverEncryption", "disabled");
+  return parsed.toString();
 }
 
 function isSqlServerTlsHandshakeFailure(message: string): boolean {
@@ -1193,6 +1220,7 @@ function applyProfile(val: string, preserveConnectionFields = false) {
     form.value.port = profile.port;
     form.value.username = profile.user;
     form.value.url_params = profile.urlParams || "";
+    form.value.agent_java_options = [];
     if (profile.host) {
       form.value.host = profile.host;
     }
@@ -1249,6 +1277,7 @@ function applyProfile(val: string, preserveConnectionFields = false) {
       form.value.password = "";
       form.value.connection_string = undefined;
     }
+    resetHiveKerberosFields(profile.type === "hive" ? form.value : undefined);
   }
 }
 
@@ -1285,6 +1314,7 @@ watch(
         driver_profile: oceanbasePatch?.driver_profile || profile,
         driver_label: config.driver_label || oceanbasePatch?.driver_label || driverProfiles[profile]?.label || config.db_type,
         url_params: config.url_params || "",
+        agent_java_options: config.agent_java_options || [],
         host: config.db_type === "h2" && h2FilePathFromJdbcUrl(config.connection_string) ? h2FilePathFromJdbcUrl(config.connection_string) : config.host,
         port: profile === "tdengine" && (config.port === 0 || config.port === 6030) ? 6041 : config.port,
         username: config.username,
@@ -1337,6 +1367,7 @@ watch(
       } else {
         resetInfluxDbFields();
       }
+      resetHiveKerberosFields(config.db_type === "hive" ? config : undefined);
       h2ConnectionMode.value = h2ConnectionModeForConfig(config);
       customColorInput.value = config.color || "";
       selectedTransportLayerId.value = form.value.transport_layers?.[0]?.id || null;
@@ -1364,6 +1395,7 @@ watch(
       resetMqFields();
       resetNacosFields();
       resetInfluxDbFields();
+      resetHiveKerberosFields();
       oceanbaseSubMode.value = "mysql";
       h2ConnectionMode.value = "file";
       dremioConnectionMode.value = "legacy";
@@ -1391,6 +1423,7 @@ const databaseLabel = computed(() => {
 });
 
 const databasePlaceholder = computed(() => {
+  if (form.value.db_type === "kingbase") return t("connection.databasePlaceholderRequired");
   const fallback = defaultDatabaseForProfile();
   if (!fallback) return t("connection.databasePlaceholder");
   return t("connection.databasePlaceholderWithDefault", { database: fallback });
@@ -1429,7 +1462,7 @@ function defaultDatabaseForProfile() {
   if (selectedType.value === "cockroachdb") return "defaultdb";
   if (form.value.db_type === "highgo") return "highgo";
   if (form.value.db_type === "yashandb") return "yasdb";
-  if (form.value.db_type === "postgres" || form.value.db_type === "kingbase" || form.value.db_type === "vastbase") return "postgres";
+  if (form.value.db_type === "postgres" || form.value.db_type === "vastbase") return "postgres";
   if (form.value.db_type === "sqlserver") return "master";
   if (form.value.db_type === "oracle") return "ORCL";
   if (form.value.db_type === "h2" && h2ConnectionMode.value === "tcp") return "test";
@@ -1524,6 +1557,7 @@ const iconTypeMap: Record<string, string> = {
   trino: "trino",
   prestosql: "prestosql",
   hive: "hive",
+  spark: "spark-logo.png",
   db2: "db2",
   informix: "informix",
   dremio: "dremio",
@@ -1593,6 +1627,7 @@ const dbOptions: DbOption[] = [
   { value: "trino", label: "Trino" },
   { value: "prestosql", label: "PrestoSQL" },
   { value: "hive", label: "Hive" },
+  { value: "spark", label: "Apache Spark" },
   { value: "db2", label: "DB2" },
   { value: "informix", label: "Informix" },
   { value: "neo4j", label: "Neo4j" },
@@ -1909,8 +1944,9 @@ async function testConnection() {
   const runId = ++testRunId;
   isTesting.value = true;
   testResult.value = null;
-  const config = connectionConfigForSubmit(editingId.value || draftTestConnectionId.value);
+  let config: ConnectionConfig | null = null;
   try {
+    config = connectionConfigForSubmit(editingId.value || draftTestConnectionId.value);
     await ensureRequiredAgentDriverInstalled(config);
     const msg = await testConnectionWithTimeout(config, runId);
     if (runId !== testRunId) return;
@@ -1921,10 +1957,11 @@ async function testConnection() {
     clearEditedConnectionErrorAfterSuccessfulTest();
   } catch (e: any) {
     if (runId !== testRunId) return;
-    const message = connectionErrorWithDriverUpdateHint(config, mongodbAuthFailureHint(String(e)));
-    const fallbackMessage = await tryNacosDockerConsoleFallback(config, message, runId);
+    const rawMessage = mongodbAuthFailureHint(errorMessage(e));
+    const message = config ? connectionErrorWithDriverUpdateHint(config, rawMessage) : rawMessage;
+    const fallbackMessage = config ? await tryNacosDockerConsoleFallback(config, message, runId) : null;
     if (runId !== testRunId) return;
-    const shouldShowSqlServerLegacyMode = !fallbackMessage && config.db_type === "sqlserver" && !isSqlServerLegacyUnencryptedMode(config.url_params) && isSqlServerTlsHandshakeFailure(message);
+    const shouldShowSqlServerLegacyMode = !fallbackMessage && config?.db_type === "sqlserver" && !isSqlServerLegacyUnencryptedMode(config.url_params) && isSqlServerTlsHandshakeFailure(message);
     if (shouldShowSqlServerLegacyMode) {
       configTab.value = "advanced";
     }
@@ -2088,6 +2125,12 @@ function connectionConfigForSubmit(id: string): ConnectionConfig {
   if (!config.name?.trim()) {
     config.name = generateConnectionName();
   }
+  if (config.db_type === "kingbase") {
+    config.database = config.database?.trim() || undefined;
+    if (!config.database) {
+      throw new Error(t("connection.kingbaseDatabaseRequired"));
+    }
+  }
   config.transport_layers = (config.transport_layers || []).map(normalizeTransportLayer);
   config.transport_layers = config.transport_layers.map((layer) => {
     if (layer.type !== "ssh") return layer;
@@ -2107,6 +2150,24 @@ function connectionConfigForSubmit(id: string): ConnectionConfig {
   config.keepalive_interval_secs = Number.isFinite(keepaliveInterval) && keepaliveInterval >= 0 ? keepaliveInterval : 30;
   if (config.db_type === "manticoresearch") {
     config.url_params = "";
+  }
+  if (config.db_type === "hive") {
+    if (hiveAuthMode.value === "kerberos" && !hivePrincipal.value.trim()) {
+      throw new Error(t("connection.hiveKerberosPrincipalRequired"));
+    }
+    const hiveKerberos = applyHiveKerberosSubmitConfig({
+      authMode: hiveAuthMode.value,
+      principal: hivePrincipal.value,
+      krb5ConfPath: hiveKrb5ConfPath.value,
+      jaasConfigPath: hiveJaasConfigPath.value,
+      useSubjectCredsOnlyFalse: hiveUseSubjectCredsOnlyFalse.value,
+      extraJavaOptions: hiveExtraJavaOptions.value,
+      urlParams: config.url_params,
+    });
+    config.url_params = hiveKerberos.urlParams;
+    config.agent_java_options = hiveKerberos.agentJavaOptions;
+  } else {
+    config.agent_java_options = undefined;
   }
   if (config.db_type === "informix" && config.informix_server) {
     // Strip INFORMIXSERVER from url_params to avoid duplicate when dedicated field is used
@@ -2319,6 +2380,7 @@ function connectionConfigForSubmit(id: string): ConnectionConfig {
     config.visible_databases = Array.isArray(config.visible_databases) && config.visible_databases.length > 0 ? config.visible_databases : undefined;
   }
   if (config.visible_schemas && Object.keys(config.visible_schemas).length === 0) config.visible_schemas = undefined;
+  if (config.agent_java_options && config.agent_java_options.length === 0) config.agent_java_options = undefined;
   return config as ConnectionConfig;
 }
 
@@ -2553,12 +2615,12 @@ async function preloadVisibleDatabaseNames() {
   if (visibleDatabaseNames.value.length > 0) return;
   isLoadingVisibleDatabases.value = true;
   const draftId = buildDraftVisibleDatabasesConnectionId(uuid());
-  const draftConfig = {
-    ...connectionConfigForSubmit(draftId),
-    id: draftId,
-    one_time: true,
-  };
   try {
+    const draftConfig = {
+      ...connectionConfigForSubmit(draftId),
+      id: draftId,
+      one_time: true,
+    };
     await api.connectDb(draftConfig);
     visibleDatabaseNames.value = await loadVisibleDatabaseNames(draftId, draftConfig);
   } catch {
@@ -2577,13 +2639,13 @@ async function openVisibleDatabasesPicker() {
   visibleDatabaseError.value = "";
   visibleDatabaseSearchText.value = "";
   const draftId = buildDraftVisibleDatabasesConnectionId(uuid());
-  const draftConfig = {
-    ...connectionConfigForSubmit(draftId),
-    id: draftId,
-    one_time: true,
-  };
 
   try {
+    const draftConfig = {
+      ...connectionConfigForSubmit(draftId),
+      id: draftId,
+      one_time: true,
+    };
     await api.connectDb(draftConfig);
     const names = await loadVisibleDatabaseNames(draftId, draftConfig);
     visibleDatabaseNames.value = names;
@@ -2595,8 +2657,9 @@ async function openVisibleDatabasesPicker() {
   } catch (e: any) {
     visibleDatabaseNames.value = [];
     visibleDatabaseSelection.value = new Set();
-    visibleDatabaseError.value = mongodbAuthFailureHint(String(e?.message || e));
+    visibleDatabaseError.value = mongodbAuthFailureHint(errorMessage(e));
     testResult.value = { ok: false, message: visibleDatabaseError.value };
+    showVisibleDatabasesDialog.value = true;
   } finally {
     await api.disconnectDb(draftId).catch(() => undefined);
     isLoadingVisibleDatabases.value = false;
@@ -3213,6 +3276,24 @@ async function browseEtcdTlsFile(target: "ca" | "cert" | "key") {
         form.value.client_cert_path = selected;
       } else {
         form.value.client_key_path = selected;
+      }
+    }
+  }
+}
+
+async function browseHiveKerberosFile(target: "krb5" | "jaas") {
+  if (isTauriRuntime()) {
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const selected = await open({
+      title: target === "krb5" ? t("connection.hiveKrb5ConfBrowse") : t("connection.hiveJaasConfigBrowse"),
+      multiple: false,
+      filters: [{ name: "Config", extensions: ["conf", "ini", "properties", "*"] }],
+    });
+    if (selected && typeof selected === "string") {
+      if (target === "krb5") {
+        hiveKrb5ConfPath.value = selected;
+      } else {
+        hiveJaasConfigPath.value = selected;
       }
     }
   }
@@ -4366,6 +4447,76 @@ function openExternalUrl(url: string) {
                     <Input v-model="form.database" class="col-span-3" :placeholder="databasePlaceholder" />
                   </div>
 
+                  <template v-if="form.db_type === 'hive'">
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label :class="connectionLabelClass">{{ t("connection.hiveAuthMode") }}</Label>
+                      <div class="col-span-3 grid h-8 grid-cols-2 overflow-hidden rounded-md border border-input bg-muted/30 p-0.5">
+                        <button type="button" class="h-7 rounded-sm px-3 text-sm transition-colors" :class="hiveAuthMode === 'none' ? 'bg-background text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'" :aria-pressed="hiveAuthMode === 'none'" @click="hiveAuthMode = 'none'">
+                          {{ t("connection.hiveAuthNone") }}
+                        </button>
+                        <button
+                          type="button"
+                          class="h-7 rounded-sm px-3 text-sm transition-colors"
+                          :class="hiveAuthMode === 'kerberos' ? 'bg-background text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'"
+                          :aria-pressed="hiveAuthMode === 'kerberos'"
+                          @click="hiveAuthMode = 'kerberos'"
+                        >
+                          Kerberos
+                        </button>
+                      </div>
+                    </div>
+
+                    <template v-if="hiveAuthMode === 'kerberos'">
+                      <div class="grid grid-cols-4 items-center gap-4">
+                        <Label :class="connectionLabelSmallClass">{{ t("connection.hivePrincipal") }}</Label>
+                        <Input v-model="hivePrincipal" class="col-span-3" placeholder="hive/_HOST@EXAMPLE.COM" />
+                      </div>
+                      <div class="grid grid-cols-4 items-center gap-4">
+                        <Label :class="connectionLabelSmallClass">krb5.conf</Label>
+                        <div class="col-span-3 flex items-center gap-1">
+                          <Input v-model="hiveKrb5ConfPath" class="flex-1" placeholder="/etc/krb5.conf" />
+                          <Tooltip v-if="isDesktop">
+                            <TooltipTrigger as-child>
+                              <Button variant="outline" size="icon" class="h-9 w-9 shrink-0" @click="browseHiveKerberosFile('krb5')">
+                                <FolderOpen class="h-4 w-4" />
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>{{ t("connection.hiveKrb5ConfBrowse") }}</TooltipContent>
+                          </Tooltip>
+                        </div>
+                      </div>
+                      <div class="grid grid-cols-4 items-center gap-4">
+                        <Label :class="connectionLabelSmallClass">JAAS</Label>
+                        <div class="col-span-3 flex items-center gap-1">
+                          <Input v-model="hiveJaasConfigPath" class="flex-1" placeholder="/etc/hive-jaas.conf" />
+                          <Tooltip v-if="isDesktop">
+                            <TooltipTrigger as-child>
+                              <Button variant="outline" size="icon" class="h-9 w-9 shrink-0" @click="browseHiveKerberosFile('jaas')">
+                                <FolderOpen class="h-4 w-4" />
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>{{ t("connection.hiveJaasConfigBrowse") }}</TooltipContent>
+                          </Tooltip>
+                        </div>
+                      </div>
+                      <div class="grid grid-cols-4 items-center gap-4">
+                        <Label :class="connectionLabelSmallClass">{{ t("connection.hiveTicketCache") }}</Label>
+                        <label class="col-span-3 flex items-center gap-2 cursor-pointer">
+                          <input type="checkbox" v-model="hiveUseSubjectCredsOnlyFalse" class="mr-0" />
+                          <span class="text-xs text-muted-foreground">{{ t("connection.hiveTicketCacheFallback") }}</span>
+                        </label>
+                      </div>
+                      <div class="grid grid-cols-4 items-start gap-4">
+                        <Label :class="connectionLabelTopClass">{{ t("connection.hiveJvmOptions") }}</Label>
+                        <textarea
+                          v-model="hiveExtraJavaOptions"
+                          class="col-span-3 min-h-16 rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                          :placeholder="t('connection.hiveJvmOptionsPlaceholder')"
+                        />
+                      </div>
+                    </template>
+                  </template>
+
                   <div v-if="form.db_type === 'oracle'" class="grid grid-cols-4 items-center gap-4">
                     <Label :class="connectionLabelSmallClass">{{ t("connection.mode") }}</Label>
                     <div class="col-span-3 grid h-8 grid-cols-2 overflow-hidden rounded-md border border-input bg-muted/30 p-0.5">
@@ -4422,7 +4573,11 @@ function openExternalUrl(url: string) {
                                 ? 'OAuthType=0;OAuthServiceAcctEmail=svc@project.iam.gserviceaccount.com;OAuthPvtKeyPath=/path/key.json'
                                 : form.db_type === 'informix'
                                   ? 'CLIENT_LOCALE=en_US.utf8;DB_LOCALE=en_US.utf8'
-                                  : 'sslmode=disable'
+                                  : form.db_type === 'spark'
+                                    ? 'catalog=paimon_catalog'
+                                    : form.db_type === 'cassandra'
+                                      ? 'localdatacenter=dc1'
+                                      : 'sslmode=disable'
                       "
                     />
                   </div>

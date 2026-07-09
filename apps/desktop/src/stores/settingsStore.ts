@@ -430,6 +430,7 @@ export interface ToolbarItems {
   dataCompare: boolean;
   checkUpdates: boolean;
   sqlLibrary: boolean;
+  sqlFileTree: boolean;
   history: boolean;
   ai: boolean;
   theme: boolean;
@@ -444,6 +445,7 @@ export const DEFAULT_TOOLBAR_ITEMS: ToolbarItems = {
   dataCompare: true,
   checkUpdates: true,
   sqlLibrary: true,
+  sqlFileTree: true,
   history: true,
   ai: true,
   theme: true,
@@ -476,9 +478,9 @@ export const EDITOR_THEMES: { value: EditorTheme; label: string; dark: boolean }
 const EDITOR_THEME_VALUES = new Set<EditorTheme>(EDITOR_THEMES.map((theme) => theme.value));
 
 export const FONT_FAMILIES: { value: string; label: string }[] = [
+  { value: "'Fira Code', 'Cascadia Code', 'Cascadia Mono', 'JetBrains Mono', monospace", label: "Fira Code" },
   { value: "'JetBrains Mono', 'Fira Code', monospace", label: "JetBrains Mono" },
-  { value: "'Fira Code', monospace", label: "Fira Code" },
-  { value: "'Cascadia Code', monospace", label: "Cascadia Code" },
+  { value: "'Cascadia Code', 'Cascadia Mono', monospace", label: "Cascadia Code" },
   { value: "'Source Code Pro', monospace", label: "Source Code Pro" },
   { value: "'SF Mono', 'Menlo', monospace", label: "SF Mono / Menlo" },
   { value: "'Consolas', 'Courier New', monospace", label: "Consolas" },
@@ -486,7 +488,7 @@ export const FONT_FAMILIES: { value: string; label: string }[] = [
 ];
 
 export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
-  fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
+  fontFamily: "'Fira Code', 'Cascadia Code', 'Cascadia Mono', 'JetBrains Mono', monospace",
   fontSize: 13,
   uiFontFamily: DEFAULT_UI_FONT_FAMILY,
   uiScale: 1,
@@ -658,7 +660,8 @@ function normalizeSqlSnippets(value: unknown, existing?: SqlSnippet[]): SqlSnipp
     }
     if (seenPrefixes.has(item.prefix)) continue;
     seenPrefixes.add(item.prefix);
-    valid.push({ id: item.id, label: item.label, prefix: item.prefix, body: item.body });
+    // Older settings do not have this field; only an explicit false disables a snippet.
+    valid.push({ id: item.id, label: item.label, prefix: item.prefix, body: item.body, enabled: item.enabled !== false });
   }
   if (valid.length === 0) return existing ?? DEFAULT_SQL_SNIPPETS;
   return valid;
@@ -675,6 +678,7 @@ function normalizeToolbarItems(items: Partial<ToolbarItems> | undefined): Toolba
     dataCompare: items.dataCompare ?? defaults.dataCompare,
     checkUpdates: items.checkUpdates ?? defaults.checkUpdates,
     sqlLibrary: items.sqlLibrary ?? defaults.sqlLibrary,
+    sqlFileTree: items.sqlFileTree ?? defaults.sqlFileTree,
     history: items.history ?? defaults.history,
     ai: items.ai ?? defaults.ai,
     theme: items.theme ?? defaults.theme,

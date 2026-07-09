@@ -4,6 +4,7 @@ import * as api from "@/lib/backend/api";
 export type GridCellValue = string | number | boolean | null | unknown[] | { [key: string]: unknown };
 
 export interface DataGridTableMeta {
+  catalog?: string;
   schema?: string;
   tableName: string;
   primaryKeys: string[];
@@ -38,6 +39,8 @@ export interface DataGridCopyUpdateStatementOptions {
   rows: GridCellValue[][];
 }
 
+export type DataGridCopyInsertMode = "merged" | "row-by-row";
+
 export interface DataGridCopyInsertStatementOptions {
   databaseType?: DatabaseType;
   tableMeta?: DataGridTableMeta;
@@ -45,6 +48,7 @@ export interface DataGridCopyInsertStatementOptions {
   sourceColumns?: Array<string | undefined>;
   rows: GridCellValue[][];
   excludePrimaryKeys?: boolean;
+  insertMode?: DataGridCopyInsertMode;
 }
 
 export type DataGridContextFilterMode = "equals" | "not-equals" | "is-null" | "is-not-null" | "like" | "not-like" | "less-than" | "greater-than";
@@ -73,6 +77,7 @@ export interface DataGridColumnValuesFilterConditionOptions {
 
 export interface DataGridColumnDistinctValuesSqlOptions {
   databaseType?: DatabaseType;
+  catalog?: string;
   schema?: string;
   tableName: string;
   columnName: string;
@@ -85,6 +90,7 @@ export interface DataGridColumnDistinctValuesSqlOptions {
 
 export interface DataGridCountSqlOptions {
   databaseType?: DatabaseType;
+  catalog?: string;
   schema?: string;
   tableName: string;
   whereInput?: string;

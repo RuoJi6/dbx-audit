@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use base64::Engine;
 use chrono::{Local, Utc};
 use futures::stream::{self, StreamExt};
 use tauri::State;
@@ -18,6 +19,7 @@ use dbx_core::audit::{
     AuditExportResult, AuditFinding, AuditJobState, AuditJobStatus, AuditLogEntry, AuditSample, AuditScanRequest,
     AuditTableEvidence, AuditTableField, ParsedFscanTargets,
 };
+use dbx_core::db::redis_driver::{RedisBlob, RedisBlobEncoding, RedisValueData};
 use dbx_core::models::connection::{ConnectionConfig, DatabaseType};
 use dbx_core::query::QueryExecutionOptions;
 use dbx_core::types::ColumnInfo;
@@ -1317,7 +1319,7 @@ fn redis_key_findings(
         }
     }
     if request.mode.includes_content() {
-        let value_text = value.map(|value| redis_value_text(&value.value)).unwrap_or_default();
+        let value_text = value.map(|value| redis_value_text(&value.data)).unwrap_or_default();
         for matched in engine.scan_content(&value_text, request.level) {
             let sample = if request.mask { mask_sensitive_value(&matched.value) } else { matched.value };
             findings.push(redis_finding(
@@ -1380,12 +1382,59 @@ fn redis_finding(
     }
 }
 
-fn redis_value_text(value: &Value) -> String {
+fn redis_value_text(value: &RedisValueData) -> String {
     match value {
-        Value::Null => String::new(),
-        Value::String(value) => value.clone(),
-        other => other.to_string(),
+        RedisValueData::String { content } => redis_blob_display_text(content),
+        RedisValueData::Json { value } => serde_json::to_string(value).unwrap_or_else(|_| value.to_string()),
+        RedisValueData::List { items, .. } => {
+            items.iter().map(|item| redis_blob_display_text(&item.value)).collect::<Vec<_>>().join(" ")
+        }
+        RedisValueData::Set { items, .. } => {
+            items.iter().map(|item| redis_blob_display_text(&item.member)).collect::<Vec<_>>().join(" ")
+        }
+        RedisValueData::Hash { items, .. } => items
+            .iter()
+            .flat_map(|item| [redis_blob_display_text(&item.field), redis_blob_display_text(&item.value)])
+            .collect::<Vec<_>>()
+            .join(" "),
+        RedisValueData::Zset { items, .. } => items
+            .iter()
+            .flat_map(|item| [item.score.clone(), redis_blob_display_text(&item.member)])
+            .collect::<Vec<_>>()
+            .join(" "),
+        RedisValueData::Stream { entries } => entries
+            .iter()
+            .flat_map(|entry| entry.fields.iter().flat_map(|field| [field.field.clone(), field.value.clone()]))
+            .collect::<Vec<_>>()
+            .join(" "),
+        RedisValueData::Unknown => String::new(),
     }
+}
+
+fn redis_blob_display_text(blob: &RedisBlob) -> String {
+    let bytes = base64::engine::general_purpose::STANDARD.decode(&blob.raw_base64).unwrap_or_default();
+    if matches!(blob.encoding, RedisBlobEncoding::Utf8) {
+        if let Ok(text) = std::str::from_utf8(&bytes) {
+            return text.to_string();
+        }
+    }
+    redis_bytes_to_display(&bytes)
+}
+
+fn redis_bytes_to_display(bytes: &[u8]) -> String {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return text.replace('\\', "\\\\");
+    }
+
+    let mut output = String::new();
+    for &byte in bytes {
+        match byte {
+            b'\\' => output.push_str("\\\\"),
+            0x20..=0x7e => output.push(byte as char),
+            _ => output.push_str(&format!("\\x{byte:02x}")),
+        }
+    }
+    output
 }
 
 async fn apply_connection_meta(state: &AppState, connection_id: &str, findings: &mut [AuditFinding]) {

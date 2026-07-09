@@ -70,6 +70,8 @@
     "find_documents",
     "find_documents_extended_json",
     "server_version",
+    "create_index",
+    "drop_indexes",
     "insert_document",
     "update_document",
     "update_documents",

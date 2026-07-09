@@ -65,6 +65,12 @@ END;
 /
 SELECT 1;`;
 
+const oracleIssue2405PlSql = `DECLARE
+   PRE_TRD_DATE   INTEGER ;
+BEGIN
+   SELECT 1 + 2 INTO PRE_TRD_DATE FROM DUAL;
+END;`;
+
 const mysqlRoutineFixture = `CREATE PROCEDURE p()
 BEGIN
   SELECT 1;
@@ -84,6 +90,12 @@ BEGIN
   UNTIL 1 = 1 END REPEAT;
 END;
 SELECT 2;`;
+
+const sapHanaDoBlockFixture = `DO
+BEGIN
+  SELECT 1 AS "Result" FROM DUMMY;
+END;
+SELECT 2 FROM DUMMY;`;
 
 describe("splitSqlStatementRanges", () => {
   it("splits multiple top-level statements", () => {
@@ -176,6 +188,18 @@ describe("splitSqlStatementRanges", () => {
     expect(ranges[0].sql).toContain("v_order_count NUMBER;");
     expect(ranges[0].sql).toContain("END;");
     expect(ranges[0].sql).not.toContain("\n/");
+  });
+
+  it("keeps issue #2405 Oracle PL/SQL block together without a slash delimiter", () => {
+    expect(rangeSqlTexts(splitSqlStatementRanges(oracleIssue2405PlSql, "oracle"))).toEqual([oracleIssue2405PlSql]);
+  });
+
+  it("keeps SAP HANA DO blocks together", () => {
+    const ranges = splitSqlStatementRanges(sapHanaDoBlockFixture, "saphana");
+
+    expect(rangeSqlTexts(ranges)).toEqual([sapHanaDoBlockFixture.slice(0, sapHanaDoBlockFixture.indexOf("\nSELECT 2")), "SELECT 2 FROM DUMMY"]);
+    expect(ranges[0].sql).toContain('SELECT 1 AS "Result" FROM DUMMY;');
+    expect(ranges[0].sql).toContain("END;");
   });
 });
 
@@ -288,6 +312,48 @@ describe("statementRangeAtCursor", () => {
     expect(statementRangeAtCursor(sql, indexOf(sql, "ALTER"), "mysql")?.sql.trim()).toBe(sql.slice(0, -1));
     expect(statementRangeAtCursor(sql, indexOf(sql, "close_reason"), "mysql")?.sql.trim()).toBe(sql.slice(0, -1));
     expect(rangeSqlTexts(executableStatementRanges(sql, "mysql"))).toEqual([sql.slice(0, -1)]);
+  });
+
+  it("keeps MySQL CREATE TABLE options with table comments", () => {
+    const sql = `CREATE TABLE test_1 (
+  id bigint NOT NULL AUTO_INCREMENT COMMENT '主键id',
+  deleted tinyint NOT NULL DEFAULT 0 COMMENT '删除标志(0:有效 1：无效)',
+  locked tinyint NOT NULL DEFAULT 0 COMMENT '是否锁定(0.否,1.是)',
+  version int NOT NULL DEFAULT 0 COMMENT '版本号',
+  creatorId bigint DEFAULT NULL COMMENT '创建人ID',
+  createBy varchar(100) DEFAULT NULL COMMENT '创建人名称',
+  createdTime timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  updaterId bigint DEFAULT NULL COMMENT '修改人ID',
+  updatedBy varchar(100) DEFAULT NULL COMMENT '修改人名称',
+  updatedTime timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '最后更新时间',
+  PRIMARY KEY (id)
+)
+ENGINE = INNODB,
+CHARACTER SET utf8mb4,
+COLLATE utf8mb4_general_ci,
+COMMENT = '测试';`;
+
+    expect(statementRangeAtCursor(sql, indexOf(sql, "CREATE"), "mysql")?.sql.trim()).toBe(sql.slice(0, -1));
+    expect(statementRangeAtCursor(sql, indexOf(sql, "COMMENT ="), "mysql")?.sql.trim()).toBe(sql.slice(0, -1));
+    expect(rangeSqlTexts(executableStatementRanges(sql, "mysql"))).toEqual([sql.slice(0, -1)]);
+    expect(statementRangeAtCursor(sql, indexOf(sql, "COMMENT ="))?.sql.trim()).toBe(sql.slice(0, -1));
+    expect(rangeSqlTexts(executableStatementRanges(sql))).toEqual([sql.slice(0, -1)]);
+  });
+
+  it("keeps MySQL CREATE TABLE comments without equals as table options", () => {
+    const sql = "CREATE TABLE test_2 (\n  id bigint NOT NULL\n)\nCOMMENT '测试';";
+
+    expect(statementRangeAtCursor(sql, indexOf(sql, "COMMENT"), "mysql")?.sql.trim()).toBe(sql.slice(0, -1));
+    expect(rangeSqlTexts(executableStatementRanges(sql, "mysql"))).toEqual([sql.slice(0, -1)]);
+    expect(statementRangeAtCursor(sql, indexOf(sql, "COMMENT"))?.sql.trim()).toBe(sql.slice(0, -1));
+    expect(rangeSqlTexts(executableStatementRanges(sql))).toEqual([sql.slice(0, -1)]);
+  });
+
+  it("does not merge standard COMMENT ON statements into preceding CREATE TABLE statements", () => {
+    const sql = "CREATE TABLE users (id int)\nCOMMENT ON TABLE users IS 'Users';";
+
+    expect(rangeSqlTexts(executableStatementRanges(sql, "postgres"))).toEqual(["CREATE TABLE users (id int)", "COMMENT ON TABLE users IS 'Users'"]);
+    expect(rangeSqlTexts(executableStatementRanges(sql))).toEqual(["CREATE TABLE users (id int)", "COMMENT ON TABLE users IS 'Users'"]);
   });
 
   it("keeps MySQL ALTER TABLE drop column clauses with the statement", () => {
@@ -423,6 +489,18 @@ WHERE request_json LIKE '%"paperFlag":null%';`;
     const range = statementRangeAtCursor(oraclePlSqlFixture, indexOf(oraclePlSqlFixture, "ORDERS_10K", 2), "oracle");
     expect(range?.sql.trim()).toBe(oraclePlSqlFixture.slice(0, oraclePlSqlFixture.indexOf("\n/")));
   });
+
+  it("returns the full issue #2405 Oracle PL/SQL block for cursors inside the block", () => {
+    for (const cursor of [indexOf(oracleIssue2405PlSql, "PRE_TRD_DATE"), indexOf(oracleIssue2405PlSql, "SELECT 1 + 2"), indexOf(oracleIssue2405PlSql, "END;")]) {
+      expect(statementRangeAtCursor(oracleIssue2405PlSql, cursor, "oracle")?.sql.trim()).toBe(oracleIssue2405PlSql);
+    }
+  });
+
+  it("returns the full SAP HANA DO block for cursors inside nested statements", () => {
+    const range = statementRangeAtCursor(sapHanaDoBlockFixture, indexOf(sapHanaDoBlockFixture, "Result"), "saphana");
+
+    expect(range?.sql.trim()).toBe(sapHanaDoBlockFixture.slice(0, sapHanaDoBlockFixture.indexOf("\nSELECT 2")));
+  });
 });
 
 describe("executableStatementRanges", () => {
@@ -457,12 +535,20 @@ describe("executableStatementRanges", () => {
     expect(rangeSqlTexts(executableStatementRanges(oraclePlSqlFixture, "oracle"))).toEqual([oraclePlSqlFixture.slice(0, oraclePlSqlFixture.indexOf("\n/")), "SELECT 1"]);
   });
 
+  it("returns the issue #2405 Oracle PL/SQL block as one executable range", () => {
+    expect(rangeSqlTexts(executableStatementRanges(oracleIssue2405PlSql, "oracle"))).toEqual([oracleIssue2405PlSql]);
+  });
+
   it("does not split executable MySQL routine ranges at inner statements", () => {
     expect(rangeSqlTexts(executableStatementRanges(mysqlRoutineFixture, "mysql"))).toEqual([mysqlRoutineFixture.slice(0, mysqlRoutineFixture.indexOf("\nSELECT 2;")).replace(/;$/, "").trim(), "SELECT 2"]);
   });
 
   it("does not split executable MySQL routine ranges at WHILE and REPEAT endings", () => {
     expect(rangeSqlTexts(executableStatementRanges(mysqlRoutineWithLoopsFixture, "mysql"))).toEqual([mysqlRoutineWithLoopsFixture.slice(0, mysqlRoutineWithLoopsFixture.indexOf("\nSELECT 2;")).replace(/;$/, "").trim(), "SELECT 2"]);
+  });
+
+  it("does not split executable SAP HANA DO ranges at inner statements", () => {
+    expect(rangeSqlTexts(executableStatementRanges(sapHanaDoBlockFixture, "saphana"))).toEqual([sapHanaDoBlockFixture.slice(0, sapHanaDoBlockFixture.indexOf("\nSELECT 2")), "SELECT 2 FROM DUMMY"]);
   });
 
   it("returns executable SQL Server batches without GO delimiter lines", () => {

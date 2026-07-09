@@ -50,6 +50,7 @@ import {
   Clipboard,
   Check,
   UsersRound,
+  CalendarClock,
   Lock,
   HardDriveDownload,
   FilePlus,
@@ -119,6 +120,7 @@ import {
   buildEmptyTableSql,
   buildTruncateTableSql,
   supportsDropTableCascade,
+  supportsTruncateTableCascade,
   supportsSchemaComment,
   type DropTableChildObjectSqlOptions,
   type DropObjectSqlOptions,
@@ -335,6 +337,8 @@ function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
       return { icon: TableProperties, colorClass: "text-primary" };
     case "user-admin":
       return { icon: UsersRound, colorClass: "text-primary" };
+    case "dameng-job-admin":
+      return { icon: CalendarClock, colorClass: "text-primary" };
     case "index":
       return { icon: Key, colorClass: "text-amber-400" };
     case "fkey":
@@ -409,7 +413,7 @@ function isGroupLabel(node: TreeNode): boolean {
 function displayLabel(node: TreeNode): string {
   if (node.type === "load-more") return t(node.label);
   if (node.type === "object-browser") return t(node.label, { count: node.objectCount ?? 0 });
-  if (node.type === "user-admin") return t(node.label);
+  if (node.type === "user-admin" || node.type === "dameng-job-admin") return t(node.label);
   if (node.type === "linked-server-root") return t(node.label);
   if (node.label === "tree.defaultDatabase") return t(node.label);
   return isGroupLabel(node) ? t(node.label) : node.label;
@@ -615,6 +619,9 @@ async function toggle() {
     } else if (node.type === "user-admin" && node.connectionId) {
       await connectionStore.ensureConnected(node.connectionId);
       queryStore.openUserAdmin(node.connectionId);
+    } else if (node.type === "dameng-job-admin" && node.connectionId) {
+      await connectionStore.ensureConnected(node.connectionId);
+      queryStore.openDamengJobAdmin(node.connectionId);
     } else if (node.type === "mongo-db" && node.connectionId && node.database) {
       await connectionStore.loadMongoCollections(node.connectionId, node.database);
     } else if (node.type === "vector-database" && node.connectionId && node.database) {
@@ -643,15 +650,21 @@ async function toggle() {
         })
         .catch(() => {});
     } else if (node.type === "database" && node.connectionId && hasTreeNodeDatabaseContext(node)) {
-      const config = connectionStore.getConfig(node.connectionId);
-      const effectiveDbType = effectiveDatabaseTypeForConnection(config);
-      if (config?.db_type === "sqlserver") {
-        await connectionStore.loadSqlServerDatabaseObjects(node.connectionId, node.database);
-      } else if (usesTreeSchemaMode(effectiveDbType) && !connectionUsesDatabaseObjectTreeMode(config)) {
-        await connectionStore.loadSchemas(node.connectionId, node.database);
+      if (node.catalog && node.catalog !== "internal") {
+        await connectionStore.loadDorisCatalogTables(node);
       } else {
-        await connectionStore.loadTables(node.connectionId, node.database);
+        const config = connectionStore.getConfig(node.connectionId);
+        const effectiveDbType = effectiveDatabaseTypeForConnection(config);
+        if (config?.db_type === "sqlserver") {
+          await connectionStore.loadSqlServerDatabaseObjects(node.connectionId, node.database);
+        } else if (usesTreeSchemaMode(effectiveDbType) && !connectionUsesDatabaseObjectTreeMode(config)) {
+          await connectionStore.loadSchemas(node.connectionId, node.database);
+        } else {
+          await connectionStore.loadTables(node.connectionId, node.database);
+        }
       }
+    } else if (node.type === "doris-catalog" && node.connectionId) {
+      await connectionStore.loadDorisCatalogDatabases(node);
     } else if (node.type === "schema" && node.connectionId && hasTreeNodeDatabaseContext(node) && node.schema) {
       await connectionStore.loadTables(node.connectionId, node.database, node.schema);
     } else if (node.type === "linked-server-root" && node.connectionId) {
@@ -663,15 +676,15 @@ async function toggle() {
     } else if (node.type === "linked-server-schema" && node.connectionId && hasTreeNodeDatabaseContext(node) && node.schema) {
       await connectionStore.loadTables(node.connectionId, node.database, node.schema);
     } else if ((node.type === "table" || node.type === "view" || node.type === "materialized_view") && node.connectionId && hasTreeNodeDatabaseContext(node)) {
-      await connectionStore.loadTableGroups(node.connectionId, node.database, node.label, node.schema, node.id);
+      await connectionStore.loadTableGroups(node.connectionId, node.database, node.label, node.schema, node.id, node.catalog);
     } else if (node.type === "group-columns" && node.connectionId && hasTreeNodeDatabaseContext(node) && node.tableName) {
-      await connectionStore.loadColumns(node.connectionId, node.database, node.tableName, node.schema, node.id);
+      await connectionStore.loadColumns(node.connectionId, node.database, node.tableName, node.schema, node.id, node.catalog);
     } else if (node.type === "group-indexes" && node.connectionId && hasTreeNodeDatabaseContext(node) && node.tableName) {
-      await connectionStore.loadIndexes(node.connectionId, node.database, node.tableName, node.schema, node.id);
+      await connectionStore.loadIndexes(node.connectionId, node.database, node.tableName, node.schema, node.id, node.catalog);
     } else if (node.type === "group-fkeys" && node.connectionId && hasTreeNodeDatabaseContext(node) && node.tableName) {
-      await connectionStore.loadForeignKeys(node.connectionId, node.database, node.tableName, node.schema, node.id);
+      await connectionStore.loadForeignKeys(node.connectionId, node.database, node.tableName, node.schema, node.id, node.catalog);
     } else if (node.type === "group-triggers" && node.connectionId && hasTreeNodeDatabaseContext(node) && node.tableName) {
-      await connectionStore.loadTriggers(node.connectionId, node.database, node.tableName, node.schema, node.id);
+      await connectionStore.loadTriggers(node.connectionId, node.database, node.tableName, node.schema, node.id, node.catalog);
     } else if (databaseObjectGroup) {
       await connectionStore.loadObjectGroupChildren(node);
     }
@@ -799,19 +812,24 @@ function selectTreeNodeRange(node: TreeNode) {
   connectionStore.selectedTreeNodeId = node.id;
 }
 
-const selectedConnectionIds = computed(() => {
+function selectedConnectionIdsForAction(): string[] {
   const connectionIds = new Set(connectionStore.connections.map((connection) => connection.id));
   return connectionStore.selectedTreeNodeIds.filter((id) => connectionIds.has(id));
-});
+}
 
-const isConnectionSelectionChecked = computed(() => connectionStore.connectionMultiSelectActive && props.node.type === "connection" && !!props.node.connectionId && selectedConnectionIds.value.includes(props.node.connectionId));
+const isConnectionSelectionChecked = computed(() => {
+  if (!connectionStore.connectionMultiSelectActive || props.node.type !== "connection" || !props.node.connectionId) return false;
+  return connectionStore.selectedTreeNodeIds.includes(props.node.connectionId);
+});
 
 function toggleConnectionMultiSelection(event: MouseEvent) {
   event.preventDefault();
   event.stopPropagation();
   if (props.node.type !== "connection" || !props.node.connectionId) return;
 
-  const next = new Set(connectionStore.connectionMultiSelectActive ? selectedConnectionIds.value : []);
+  // Keep connection-id normalization off the row render path; this handler only
+  // runs when the checkbox is clicked, while the checked state updates often.
+  const next = new Set(connectionStore.connectionMultiSelectActive ? selectedConnectionIdsForAction() : []);
   if (next.has(props.node.connectionId)) next.delete(props.node.connectionId);
   else next.add(props.node.connectionId);
 
@@ -1119,6 +1137,18 @@ async function openUserAdmin() {
   }
 }
 
+async function openDamengJobAdmin() {
+  const node = props.node;
+  if (!node.connectionId) return;
+  try {
+    await connectionStore.ensureConnected(node.connectionId);
+    connectionStore.activeConnectionId = node.connectionId;
+    queryStore.openDamengJobAdmin(node.connectionId);
+  } catch (e: any) {
+    toast(t("connection.connectFailed", { message: translateBackendError(t, e?.message || String(e)) }), 5000);
+  }
+}
+
 async function openData() {
   const node = props.node;
   if (!(node.type === "table" || node.type === "view" || node.type === "materialized_view") || !hasNodeDatabaseContext(node)) return;
@@ -1152,7 +1182,8 @@ async function openData() {
   const querySchema = config ? connectionObjectTreeQuerySchema(config, node.database, tableSchema) : (tableSchema ?? "");
   const effectiveDbType = effectiveDatabaseTypeForConnection(config);
   const metadataDatabaseType = effectiveDbType || config?.db_type || "";
-  const isSameDataTableTab = (tab: (typeof queryStore.tabs)[number]) => tab.mode === "data" && tab.connectionId === node.connectionId && tab.database === node.database && (tab.schema || "") === (tableSchema || "") && (tab.tableMeta?.tableName || tab.title) === node.label;
+  const isSameDataTableTab = (tab: (typeof queryStore.tabs)[number]) =>
+    tab.mode === "data" && tab.connectionId === node.connectionId && tab.database === node.database && (tab.tableMeta?.catalog || "") === (node.catalog || "") && (tab.schema || "") === (tableSchema || "") && (tab.tableMeta?.tableName || tab.title) === node.label;
   const existingSameTableTab = queryStore.tabs.find(isSameDataTableTab);
   const resetReusedDataTabState = (tab: (typeof queryStore.tabs)[number]) => {
     tab.title = node.label;
@@ -1226,15 +1257,20 @@ async function openData() {
         tableType,
         databaseType: metadataDatabaseType,
         driverProfile: config.driver_profile || config.db_type,
+        catalog: node.catalog,
       })
     : undefined;
-  const tabCachedTableMeta = existingTableMeta?.tableName === node.label && existingTableMeta.schema === tableSchema && existingTableMeta.tableType === tableType && existingTableMeta.columns.length > 0 && existingTableMetaAgeMs < DATA_TAB_METADATA_TTL_MS ? existingTableMeta : undefined;
+  const tabCachedTableMeta =
+    existingTableMeta?.tableName === node.label && (existingTableMeta.catalog || "") === (node.catalog || "") && existingTableMeta.schema === tableSchema && existingTableMeta.tableType === tableType && existingTableMeta.columns.length > 0 && existingTableMetaAgeMs < DATA_TAB_METADATA_TTL_MS
+      ? existingTableMeta
+      : undefined;
   const cachedTableMeta = sharedCachedTableMeta ? tableMetadataToDataTabMeta(sharedCachedTableMeta.metadata, tableSchema) : tabCachedTableMeta;
   const cachedTableMetaAgeMs = sharedCachedTableMeta?.ageMs ?? existingTableMetaAgeMs;
   const cachedTableMetaSource = sharedCachedTableMeta ? "shared" : tabCachedTableMeta ? "tab" : undefined;
   queryStore.setTableMeta(
     tabId,
     cachedTableMeta ?? {
+      catalog: node.catalog,
       schema: tableSchema,
       tableName: node.label,
       tableType,
@@ -1282,6 +1318,7 @@ async function openData() {
           tableType,
           databaseType: metadataDatabaseType,
           driverProfile: config.driver_profile || config.db_type,
+          catalog: node.catalog,
           traceLogger: (event) => console.debug("[DBX][openData:metadata:trace]", { sourceTraceId: traceId, ...event }),
         });
         if (!isCurrentDataTab()) {
@@ -1338,6 +1375,7 @@ async function openData() {
       schema: tableSchema,
       tableName: node.label,
       tableType,
+      catalog: node.catalog,
       columns: columns.map((column) => column.name),
       primaryKeys,
       limit,
@@ -1704,6 +1742,7 @@ async function duplicateConnection() {
 const showDropTableConfirm = ref(false);
 const showDropTableChildObjectConfirm = ref(false);
 const showBatchDropConfirm = ref(false);
+const showBatchTruncateConfirm = ref(false);
 const showStructurePreviewDialog = ref(false);
 const showStructureDocCopyDialog = ref(false);
 const structurePreviewSql = ref("");
@@ -1721,11 +1760,15 @@ const renameObjectError = ref("");
 const renameObjectPreviewSql = ref("");
 const dropTablePreviewSql = ref("");
 const dropTableCascade = ref(false);
+const batchDropCascade = ref(false);
 const emptyTablePreviewSql = ref("");
 const truncateTablePreviewSql = ref("");
+const truncateTableCascade = ref(false);
 const dropObjectPreviewSql = ref("");
 const dropTableChildObjectPreviewSql = ref("");
 const batchDropPreviewSql = ref("");
+const batchTruncatePreviewSql = ref("");
+const batchTruncateCascade = ref(false);
 const dropDatabasePreviewSql = ref("");
 const dropSchemaPreviewSql = ref("");
 const showDuplicateDialog = ref(false);
@@ -2019,6 +2062,16 @@ function selectedBatchDropTargets(): TreeNode[] {
   return selected;
 }
 
+function selectedBatchTableTargets(): TreeNode[] {
+  const targets = selectedBatchDropTargets();
+  return targets.length > 1 && targets.every((node) => node.type === "table") ? targets : [];
+}
+
+function selectedBatchTruncateTargets(): TreeNode[] {
+  const targets = selectedBatchTableTargets();
+  return targets.every((node) => supportsTableTruncate(databaseTypeForNode(node))) ? targets : [];
+}
+
 function selectedBatchMongoIndexTargets(): TreeNode[] {
   const targets = selectedBatchDropTargets();
   return targets.length > 1 && targets.every((node) => canDropMongoIndexNode(node)) ? targets : [];
@@ -2056,12 +2109,25 @@ function batchDropConfirmMessage(): string {
   return t("contextMenu.confirmBatchDropMessage", { count: targets.length });
 }
 
-async function dropSqlForTreeNode(node: TreeNode): Promise<string | null> {
+function batchTruncateMenuLabel(): string {
+  return t("contextMenu.batchTruncate", { count: selectedBatchTruncateTargets().length });
+}
+
+function batchTruncateConfirmTitle(): string {
+  return t("contextMenu.confirmBatchTruncateTitle", { count: selectedBatchTruncateTargets().length });
+}
+
+function batchTruncateConfirmMessage(): string {
+  return t("contextMenu.confirmBatchTruncateMessage", { count: selectedBatchTruncateTargets().length });
+}
+
+async function dropSqlForTreeNode(node: TreeNode, options?: { cascade?: boolean }): Promise<string | null> {
   if (node.type === "table" && node.connectionId && node.database) {
     return buildDropTableSql({
       databaseType: databaseTypeForNode(node),
       schema: node.schema,
       tableName: node.label,
+      cascade: options?.cascade && supportsDropTableCascade(databaseTypeForNode(node)),
     });
   }
   const objectOptions = dropObjectSqlOptionsForNode(node);
@@ -2074,6 +2140,16 @@ async function dropSqlForTreeNode(node: TreeNode): Promise<string | null> {
   return null;
 }
 
+async function truncateSqlForTreeNode(node: TreeNode, options?: { cascade?: boolean }): Promise<string | null> {
+  if (node.type !== "table" || !node.connectionId || !node.database || !supportsTableTruncate(databaseTypeForNode(node))) return null;
+  return buildTruncateTableSql({
+    databaseType: databaseTypeForNode(node),
+    schema: node.schema,
+    tableName: node.label,
+    cascade: options?.cascade && supportsTruncateTableCascade(databaseTypeForNode(node)),
+  });
+}
+
 async function refreshBatchDropPreviewSql() {
   const targets = selectedBatchDropTargets();
   const mongoIndexTargets = selectedBatchMongoIndexTargets();
@@ -2082,17 +2158,37 @@ async function refreshBatchDropPreviewSql() {
     return;
   }
   const statements: string[] = [];
+  const useCascade = canBatchDropCascade.value && batchDropCascade.value;
   for (const target of targets) {
-    const sql = await dropSqlForTreeNode(target);
+    const sql = await dropSqlForTreeNode(target, { cascade: useCascade });
     if (sql) statements.push(sql);
   }
   batchDropPreviewSql.value = statements.join("\n");
 }
 
+async function refreshBatchTruncatePreviewSql() {
+  const targets = selectedBatchTruncateTargets();
+  const statements: string[] = [];
+  const useCascade = canBatchTruncateCascade.value && batchTruncateCascade.value;
+  for (const target of targets) {
+    const sql = await truncateSqlForTreeNode(target, { cascade: useCascade });
+    if (sql) statements.push(sql);
+  }
+  batchTruncatePreviewSql.value = statements.join("\n");
+}
+
 function requestBatchDrop() {
   if (!selectedBatchDropTargets().length) return;
+  batchDropCascade.value = false;
   void refreshBatchDropPreviewSql();
   showBatchDropConfirm.value = true;
+}
+
+function requestBatchTruncate() {
+  if (!selectedBatchTruncateTargets().length) return;
+  batchTruncateCascade.value = false;
+  void refreshBatchTruncatePreviewSql();
+  showBatchTruncateConfirm.value = true;
 }
 
 function requestDropSelectedNodes(): boolean {
@@ -2287,10 +2383,11 @@ async function confirmBatchDrop() {
       showBatchDropConfirm.value = false;
       return;
     }
+    const useCascade = canBatchDropCascade.value && batchDropCascade.value;
     for (const target of targets) {
       if (!target.connectionId || !target.database) continue;
       await connectionStore.ensureConnected(target.connectionId);
-      const sql = await dropSqlForTreeNode(target);
+      const sql = await dropSqlForTreeNode(target, { cascade: useCascade });
       if (!sql) continue;
       await api.executeQuery(target.connectionId, target.database, sql, target.schema);
       closeDroppedTableObjectTabsForNode(target);
@@ -2298,6 +2395,25 @@ async function confirmBatchDrop() {
     }
     toast(t("contextMenu.batchDropSuccess", { count: targets.length }), 3000);
     showBatchDropConfirm.value = false;
+  } catch (e: any) {
+    toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), 5000);
+  }
+}
+
+async function confirmBatchTruncate() {
+  const targets = selectedBatchTruncateTargets();
+  if (!targets.length) return;
+  try {
+    const useCascade = canBatchTruncateCascade.value && batchTruncateCascade.value;
+    for (const target of targets) {
+      if (!target.connectionId || !target.database) continue;
+      await connectionStore.ensureConnected(target.connectionId);
+      const sql = await truncateSqlForTreeNode(target, { cascade: useCascade });
+      if (!sql) continue;
+      await api.executeQuery(target.connectionId, target.database, sql, target.schema);
+    }
+    toast(t("contextMenu.batchTruncateSuccess", { count: targets.length }), 3000);
+    showBatchTruncateConfirm.value = false;
   } catch (e: any) {
     toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), 5000);
   }
@@ -2333,6 +2449,11 @@ const canEditNacosNamespace = computed(() => {
 const isDuckDbConnection = computed(() => {
   const config = props.node.connectionId ? connectionStore.getConfig(props.node.connectionId) : undefined;
   return props.node.type === "connection" && connectionNamespaceCreationTarget(config) === "attach";
+});
+
+const isConnectionSchemaCreation = computed(() => {
+  const config = props.node.connectionId ? connectionStore.getConfig(props.node.connectionId) : undefined;
+  return props.node.type === "connection" && connectionNamespaceCreationTarget(config) === "schema";
 });
 
 const canSetCreateDatabaseCharset = computed(() => {
@@ -2410,6 +2531,15 @@ const canEditSchemaComment = computed(() => {
 });
 
 const canDropTableCascade = computed(() => props.node.type === "table" && supportsDropTableCascade(currentDatabaseType()));
+const canTruncateTableCascade = computed(() => props.node.type === "table" && supportsTruncateTableCascade(currentDatabaseType()));
+const canBatchDropCascade = computed(() => {
+  const targets = selectedBatchTableTargets();
+  return targets.length > 1 && targets.every((node) => supportsDropTableCascade(databaseTypeForNode(node)));
+});
+const canBatchTruncateCascade = computed(() => {
+  const targets = selectedBatchTruncateTargets();
+  return targets.length > 1 && targets.every((node) => supportsTruncateTableCascade(databaseTypeForNode(node)));
+});
 
 function tableAdminSqlOptions(options?: { cascade?: boolean }): TableAdminSqlOptions {
   const result: TableAdminSqlOptions = {
@@ -2425,6 +2555,10 @@ function dropTableSqlOptions(): TableAdminSqlOptions {
   return tableAdminSqlOptions({ cascade: canDropTableCascade.value && dropTableCascade.value });
 }
 
+function truncateTableSqlOptions(): TableAdminSqlOptions {
+  return tableAdminSqlOptions({ cascade: canTruncateTableCascade.value && truncateTableCascade.value });
+}
+
 async function refreshDropTablePreviewSql() {
   dropTablePreviewSql.value = "";
   dropTablePreviewSql.value = await buildDropTableSql(dropTableSqlOptions()).catch(() => "");
@@ -2437,7 +2571,7 @@ async function refreshEmptyTablePreviewSql() {
 
 async function refreshTruncateTablePreviewSql() {
   truncateTablePreviewSql.value = "";
-  truncateTablePreviewSql.value = await buildTruncateTableSql(tableAdminSqlOptions()).catch(() => "");
+  truncateTablePreviewSql.value = await buildTruncateTableSql(truncateTableSqlOptions()).catch(() => "");
 }
 
 function dropTable() {
@@ -2485,6 +2619,7 @@ async function confirmEmptyTable() {
 }
 
 function truncateTable() {
+  truncateTableCascade.value = false;
   void refreshTruncateTablePreviewSql();
   showTruncateTableConfirm.value = true;
 }
@@ -2494,7 +2629,7 @@ async function confirmTruncateTable() {
   if (!node.connectionId || !node.database) return;
   try {
     await connectionStore.ensureConnected(node.connectionId);
-    const sql = truncateTablePreviewSql.value || (await buildTruncateTableSql(tableAdminSqlOptions()));
+    const sql = truncateTablePreviewSql.value || (await buildTruncateTableSql(truncateTableSqlOptions()));
     await api.executeQuery(node.connectionId, node.database, sql, node.schema);
     toast(t("contextMenu.truncateTableSuccess", { name: node.label }), 3000);
   } catch (e: any) {
@@ -2733,6 +2868,20 @@ function openCreateDatabaseDialog() {
   }
 }
 
+function openConnectionNamespaceCreation() {
+  if (isConnectionSchemaCreation.value) {
+    openCreateSchemaDialog();
+    return;
+  }
+  void openCreateDatabase();
+}
+
+function connectionNamespaceCreationLabel() {
+  if (isDuckDbConnection.value) return t("contextMenu.createDuckDbFile");
+  if (isConnectionSchemaCreation.value) return t("contextMenu.createSchema");
+  return t("contextMenu.createDatabase");
+}
+
 function updateCreateDatabaseCharset(value: string) {
   const previousCharset = createDatabaseCharset.value;
   createDatabaseCharset.value = value;
@@ -2759,7 +2908,11 @@ async function loadCreateDatabaseCharsetMetadata(target: "create" | "edit" = "cr
     createDatabaseCollationsByCharset.value = metadata.collationsByCharset;
     const selectedCharset = target === "create" ? createDatabaseCharset.value : editDatabaseCharset.value;
     if (!createDatabaseCharsetOptions.value.includes(selectedCharset) && createDatabaseCharsetOptions.value.length) {
-      target === "create" ? updateCreateDatabaseCharset(createDatabaseCharsetOptions.value[0]) : updateEditDatabaseCharset(createDatabaseCharsetOptions.value[0]);
+      if (target === "create") {
+        updateCreateDatabaseCharset(createDatabaseCharsetOptions.value[0]);
+      } else {
+        updateEditDatabaseCharset(createDatabaseCharsetOptions.value[0]);
+      }
     } else {
       if (target === "create") {
         createDatabaseCollation.value = nextCreateDatabaseCollation(createDatabaseCharset.value, createDatabaseCharset.value, createDatabaseCollation.value, createDatabaseCollationsByCharset.value);
@@ -2868,6 +3021,7 @@ async function createDuckDbAttachedDatabaseFile() {
         attached_databases: [...(config.attached_databases ?? []), { name, path }],
       });
     }
+    await connectionStore.ensureVisibleDatabase(node.connectionId, name);
     await connectionStore.loadDatabases(node.connectionId, { force: true });
     connectionStore.selectedTreeNodeId = `${node.connectionId}:${name}`;
     toast(t("contextMenu.createDuckDbFileSuccess", { name }), 3000);
@@ -2887,6 +3041,7 @@ async function confirmCreateDatabase() {
     if (config?.db_type === "mongodb") {
       await api.mongoCreateDatabase(node.connectionId, name);
       toast(t("contextMenu.createDatabaseSuccess", { name }), 3000);
+      await connectionStore.ensureVisibleDatabase(node.connectionId, name);
       await connectionStore.loadMongoDatabases(node.connectionId);
       return;
     }
@@ -2900,6 +3055,7 @@ async function confirmCreateDatabase() {
     });
     await api.executeQuery(node.connectionId, "", sql);
     toast(t("contextMenu.createDatabaseSuccess", { name }), 3000);
+    await connectionStore.ensureVisibleDatabase(node.connectionId, name);
     await connectionStore.loadDatabases(node.connectionId, { force: true });
   } catch (e: any) {
     toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), 5000);
@@ -3051,21 +3207,25 @@ function openCreateSchemaDialog() {
 async function confirmCreateSchema() {
   const node = props.node;
   const name = createSchemaName.value.trim();
-  if (!name || !node.connectionId || !node.database) return;
+  const config = node.connectionId ? connectionStore.getConfig(node.connectionId) : undefined;
+  const isConnectionLevelSchemaCreation = node.type === "connection" && connectionNamespaceCreationTarget(config) === "schema";
+  const targetDatabase = isConnectionLevelSchemaCreation ? "" : node.database;
+  if (!name || !node.connectionId || (!targetDatabase && !isConnectionLevelSchemaCreation)) return;
   showCreateSchemaDialog.value = false;
   try {
     await connectionStore.ensureConnected(node.connectionId);
     const sql = await buildCreateSchemaSql({
-      databaseType: currentDatabaseType(),
+      databaseType: effectiveDatabaseTypeForConnection(config),
       name,
     });
-    await api.executeQuery(node.connectionId, node.database, sql);
+    await api.executeQuery(node.connectionId, targetDatabase || "", sql);
     toast(t("contextMenu.createSchemaSuccess", { name }), 3000);
-    const config = connectionStore.getConfig(node.connectionId);
-    if (config?.db_type === "sqlserver") {
-      await connectionStore.loadSqlServerDatabaseObjects(node.connectionId, node.database, { force: true });
+    if (isConnectionLevelSchemaCreation) {
+      await connectionStore.loadDatabases(node.connectionId, { force: true });
+    } else if (config?.db_type === "sqlserver") {
+      await connectionStore.loadSqlServerDatabaseObjects(node.connectionId, targetDatabase || "", { force: true });
     } else {
-      await connectionStore.loadSchemas(node.connectionId, node.database, { force: true });
+      await connectionStore.loadSchemas(node.connectionId, targetDatabase || "", { force: true });
     }
   } catch (e: any) {
     toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), 5000);
@@ -3907,6 +4067,8 @@ const connectionColor = computed(() => {
 const isActiveConnectionScope = computed(() => !!props.node.connectionId && connectionStore.activeConnectionId === props.node.connectionId);
 const isSelected = computed(() => connectionStore.selectedTreeNodeId === props.node.id);
 const isMultiSelected = computed(() => connectionStore.selectedTreeNodeIds.includes(props.node.id));
+const isTreeRowSelected = computed(() => isSelected.value || isMultiSelected.value);
+const usesSelectionSetHighlight = computed(() => connectionStore.connectionMultiSelectActive || connectionStore.selectedTreeNodeIds.length > 1);
 const rowStyle = computed(() => {
   const color = connectionColor.value;
   const backgroundColor = hexToRgba(color, isActiveConnectionScope.value ? 0.14 : 0.08);
@@ -4105,7 +4267,9 @@ const isDragging = computed(() => dragState.active && dragState.draggedId === pr
 const TABLE_REFERENCE_DRAG_THRESHOLD = 5;
 const TABLE_REFERENCE_DRAGGING_CLASS = "dbx-table-reference-dragging";
 const canDragTableReference = computed(() => {
-  if (props.dragDisabled || !props.node.connectionId || props.node.database == null) return false;
+  if (props.dragDisabled || !props.node.connectionId) return false;
+  if (props.node.type === "database") return typeof props.node.database === "string" && props.node.database.trim().length > 0;
+  if (props.node.database == null) return false;
   if (props.node.type === "table" || props.node.type === "view" || props.node.type === "materialized_view") return true;
   return props.node.type === "column" && !!props.node.tableName;
 });
@@ -4120,6 +4284,14 @@ let suppressNextTableReferenceClick = false;
 
 function tableReferenceDragPayload(): QueryEditorTableReferencePayload | null {
   if (!canDragTableReference.value) return null;
+  if (props.node.type === "database") {
+    return createTableReferencePayload({
+      connectionId: props.node.connectionId,
+      database: props.node.database,
+      referenceType: "database",
+      databaseType: currentDatabaseType(),
+    });
+  }
   if (props.node.type === "column") {
     const columnName = columnNameForDrag(props.node);
     if (!props.node.tableName || !columnName) return null;
@@ -4241,7 +4413,7 @@ const shortcutDelete = "Delete";
 function exportDataSubmenu(): ContextMenuItem {
   return {
     label: t("contextMenu.exportData"),
-    icon: Download,
+    icon: Upload,
     children: [
       { label: "CSV", action: () => exportData("csv") },
       { label: "JSON", action: () => exportData("json") },
@@ -4328,8 +4500,11 @@ function treeItemMenuItems(): ContextMenuItem[] {
   const node = props.node;
   const items: ContextMenuItem[] = [];
   const batchDropCount = selectedBatchDropTargets().length;
+  const batchTruncateCount = selectedBatchTruncateTargets().length;
   const deleteMenuLabel = (singleLabel: string) => (batchDropCount > 1 ? batchDropMenuLabel() : singleLabel);
   const deleteMenuAction = (singleAction: () => void) => (batchDropCount > 1 ? requestBatchDrop : singleAction);
+  const truncateMenuLabel = (singleLabel: string) => (batchTruncateCount > 1 ? batchTruncateMenuLabel() : singleLabel);
+  const truncateMenuAction = (singleAction: () => void) => (batchTruncateCount > 1 ? requestBatchTruncate : singleAction);
 
   // 1. Pin toggle
   if (canPin.value) {
@@ -4359,6 +4534,9 @@ function treeItemMenuItems(): ContextMenuItem[] {
     if (supportsDatabaseUserAdmin(currentDatabaseType())) {
       items.push({ label: t("contextMenu.userAdmin"), action: openUserAdmin, icon: UsersRound });
     }
+    if (currentDatabaseType() === "dameng") {
+      items.push({ label: t("contextMenu.damengJobAdmin"), action: openDamengJobAdmin, icon: CalendarClock });
+    }
     if (canCopyFinalProxyPort.value) {
       items.push({ label: t("contextMenu.copyFinalProxyPort"), action: copyFinalProxyPort, icon: Network });
     }
@@ -4370,8 +4548,8 @@ function treeItemMenuItems(): ContextMenuItem[] {
     }
     if (canCreateDatabase.value) {
       items.push({
-        label: isDuckDbConnection.value ? t("contextMenu.createDuckDbFile") : t("contextMenu.createDatabase"),
-        action: openCreateDatabase,
+        label: connectionNamespaceCreationLabel(),
+        action: openConnectionNamespaceCreation,
         icon: Plus,
       });
     }
@@ -4505,7 +4683,7 @@ function treeItemMenuItems(): ContextMenuItem[] {
       items.push({ label: t("contextMenu.createTable"), action: createTable, icon: Plus });
     }
     if (canOpenTableImport.value) {
-      items.push({ label: t("contextMenu.importData"), action: openTableImport, icon: Upload });
+      items.push({ label: t("contextMenu.importData"), action: openTableImport, icon: Download });
     }
     if (canCreateSchema.value) {
       items.push({ label: t("contextMenu.createSchema"), action: openCreateSchemaDialog, icon: Plus });
@@ -4539,7 +4717,7 @@ function treeItemMenuItems(): ContextMenuItem[] {
     items.push({ label: t("transfer.dataTransfer"), action: openTransfer, icon: ArrowRightLeft });
     items.push({ label: t("diff.title"), action: openSchemaDiff, icon: ArrowRightLeft });
     items.push({ label: t("dataCompare.title"), action: openDataCompare, icon: ArrowRightLeft });
-    items.push({ label: t("contextMenu.exportDatabase"), action: openDatabaseExport, icon: Download });
+    items.push({ label: t("contextMenu.exportDatabase"), action: openDatabaseExport, icon: Upload });
     const destructiveActions: ContextMenuItem[] = [];
     if (canDropDatabase.value) {
       destructiveActions.push({
@@ -4577,6 +4755,11 @@ function treeItemMenuItems(): ContextMenuItem[] {
 
   if (node.type === "user-admin") {
     items.push({ label: t("contextMenu.openUserAdmin"), action: openUserAdmin, icon: UsersRound });
+    return items;
+  }
+
+  if (node.type === "dameng-job-admin") {
+    items.push({ label: t("contextMenu.openDamengJobAdmin"), action: openDamengJobAdmin, icon: CalendarClock });
     return items;
   }
 
@@ -4723,14 +4906,14 @@ function treeItemMenuItems(): ContextMenuItem[] {
       items.push({ label: t("diagram.open"), action: openDiagram, icon: Network });
     }
     if (canOpenTableImport.value) {
-      items.push({ label: t("contextMenu.importData"), action: openTableImport, icon: Upload });
+      items.push({ label: t("contextMenu.importData"), action: openTableImport, icon: Download });
     }
     if (isTableNotView.value) {
       items.push({ label: t("dataCompare.title"), action: openDataCompare, icon: ArrowRightLeft });
     }
     items.push({ label: "", separator: true });
     items.push(exportDataSubmenu());
-    items.push({ label: t("contextMenu.exportDatabase"), action: openDatabaseExport, icon: Download });
+    items.push({ label: t("contextMenu.exportDatabase"), action: openDatabaseExport, icon: Upload });
     items.push({ label: t("contextMenu.exportStructure"), action: exportStructure, icon: FileCode });
     items.push(copyStructureAsSubmenu());
     if (isTableNotView.value) {
@@ -4739,8 +4922,8 @@ function treeItemMenuItems(): ContextMenuItem[] {
       items.push({ label: t("contextMenu.copyTable"), action: copyTableToClipboard, icon: Copy });
       if (supportsTruncate.value) {
         destructiveActions.push({
-          label: t("contextMenu.truncateTable"),
-          action: truncateTable,
+          label: truncateMenuLabel(t("contextMenu.truncateTable")),
+          action: truncateMenuAction(truncateTable),
           icon: Scissors,
           variant: "destructive" as const,
         });
@@ -4953,7 +5136,7 @@ function treeItemMenuItems(): ContextMenuItem[] {
 
   <CustomContextMenu v-else :items="treeItemMenuItems()" v-slot="contextMenuSlot">
     <div @contextmenu="onTreeItemContextMenu($event, contextMenuSlot.onContextMenu)">
-      <LightTooltip :text="displayLabel(node)" :disabled="isTooltipDisabled()" side="right" :side-offset="8" :delay="0" :close-delay="0">
+      <LightTooltip :text="displayLabel(node)" :disabled="isTooltipDisabled()" side="right" :side-offset="8" :delay="0" :close-delay="0" :surface="detailTooltip ? 'popover' : 'foreground'">
         <div
           ref="rowRef"
           class="group flex items-center gap-1.5 py-1 px-2 cursor-pointer relative outline-none"
@@ -4967,9 +5150,9 @@ function treeItemMenuItems(): ContextMenuItem[] {
               'tree-item-connection-tint': connectionColor,
               'hover:bg-accent': node.type !== 'connection',
               'hover:bg-secondary/60': node.type === 'connection',
-              rounded: !isSelected && !isMultiSelected,
-              'tree-item-active rounded-none': connectionColor && (isSelected || isMultiSelected),
-              'tree-item-active rounded-md': !connectionColor && (isSelected || isMultiSelected),
+              rounded: !isTreeRowSelected,
+              'tree-item-active': isTreeRowSelected,
+              'tree-item-active--selection-set': usesSelectionSetHighlight && isTreeRowSelected,
               'tree-item-highlight': highlighted,
             },
           ]"
@@ -5160,7 +5343,7 @@ function treeItemMenuItems(): ContextMenuItem[] {
           {{ t("contextMenu.copyStructure") }}
         </Button>
         <Button :disabled="isLoadingStructurePreview || !structurePreviewSql" @click="saveStructurePreview">
-          <Download class="h-4 w-4" />
+          <Upload class="h-4 w-4" />
           {{ t("contextMenu.saveStructure") }}
         </Button>
       </DialogFooter>
@@ -5207,13 +5390,45 @@ function treeItemMenuItems(): ContextMenuItem[] {
     :sql="truncateTablePreviewSql"
     :confirm-label="t('contextMenu.truncateTable')"
     @confirm="confirmTruncateTable"
-  />
+  >
+    <template v-if="canTruncateTableCascade" #options>
+      <label class="mb-3 flex items-start gap-2 rounded-md border bg-muted/20 px-3 py-2 text-sm">
+        <input v-model="truncateTableCascade" type="checkbox" class="mt-0.5 h-3.5 w-3.5 shrink-0 accent-primary" @change="refreshTruncateTablePreviewSql()" />
+        <span class="grid gap-0.5">
+          <span class="font-medium text-foreground">{{ t("contextMenu.truncateTableCascade") }}</span>
+          <span class="text-xs leading-5 text-muted-foreground">{{ t("contextMenu.truncateTableCascadeHint") }}</span>
+        </span>
+      </label>
+    </template>
+  </DangerConfirmDialog>
 
   <DangerConfirmDialog v-model:open="showDropObjectConfirm" :title="dropObjectConfirmTitle()" :message="dropObjectConfirmMessage()" :sql="dropObjectPreviewSql" :confirm-label="dropObjectMenuLabel()" @confirm="confirmDropObject" />
 
   <DangerConfirmDialog v-model:open="showDropTableChildObjectConfirm" :title="dropTableChildObjectConfirmTitle()" :message="dropTableChildObjectConfirmMessage()" :sql="dropTableChildObjectPreviewSql" :confirm-label="dropTableChildObjectMenuLabel()" @confirm="confirmDropTableChildObject" />
 
-  <DangerConfirmDialog v-model:open="showBatchDropConfirm" :title="batchDropConfirmTitle()" :message="batchDropConfirmMessage()" :sql="batchDropPreviewSql" :confirm-label="batchDropMenuLabel()" @confirm="confirmBatchDrop" />
+  <DangerConfirmDialog v-model:open="showBatchDropConfirm" :title="batchDropConfirmTitle()" :message="batchDropConfirmMessage()" :sql="batchDropPreviewSql" :confirm-label="batchDropMenuLabel()" @confirm="confirmBatchDrop">
+    <template v-if="canBatchDropCascade" #options>
+      <label class="mb-3 flex items-start gap-2 rounded-md border bg-muted/20 px-3 py-2 text-sm">
+        <input v-model="batchDropCascade" type="checkbox" class="mt-0.5 h-3.5 w-3.5 shrink-0 accent-primary" @change="refreshBatchDropPreviewSql()" />
+        <span class="grid gap-0.5">
+          <span class="font-medium text-foreground">{{ t("contextMenu.dropTableCascade") }}</span>
+          <span class="text-xs leading-5 text-muted-foreground">{{ t("contextMenu.dropTableCascadeHint") }}</span>
+        </span>
+      </label>
+    </template>
+  </DangerConfirmDialog>
+
+  <DangerConfirmDialog v-model:open="showBatchTruncateConfirm" :title="batchTruncateConfirmTitle()" :message="batchTruncateConfirmMessage()" :sql="batchTruncatePreviewSql" :confirm-label="batchTruncateMenuLabel()" @confirm="confirmBatchTruncate">
+    <template v-if="canBatchTruncateCascade" #options>
+      <label class="mb-3 flex items-start gap-2 rounded-md border bg-muted/20 px-3 py-2 text-sm">
+        <input v-model="batchTruncateCascade" type="checkbox" class="mt-0.5 h-3.5 w-3.5 shrink-0 accent-primary" @change="refreshBatchTruncatePreviewSql()" />
+        <span class="grid gap-0.5">
+          <span class="font-medium text-foreground">{{ t("contextMenu.truncateTableCascade") }}</span>
+          <span class="text-xs leading-5 text-muted-foreground">{{ t("contextMenu.truncateTableCascadeHint") }}</span>
+        </span>
+      </label>
+    </template>
+  </DangerConfirmDialog>
 
   <ProcedureExecutionDialog
     v-if="node.type === 'procedure' && node.connectionId && node.database"
@@ -5629,6 +5844,10 @@ function treeItemMenuItems(): ContextMenuItem[] {
   background-color: var(--tree-connection-active-focus-bg, var(--tree-connection-active-bg));
 }
 
+.tree-item-connection-tint.tree-item-active--selection-set:focus::before {
+  background-color: var(--tree-connection-active-bg, var(--tree-connection-row-bg));
+}
+
 .tree-table-search-control {
   position: relative;
   isolation: isolate;
@@ -5663,6 +5882,16 @@ function treeItemMenuItems(): ContextMenuItem[] {
 }
 :root.dark .tree-item-active:focus {
   background-color: var(--tree-connection-active-focus-bg, rgb(33 60 89)) !important;
+}
+
+/* Multi-selection treats every selected row as equal; keep focus neutral. */
+.tree-item-active--selection-set:focus {
+  background-color: var(--tree-connection-active-bg, rgb(235 235 235)) !important;
+  box-shadow: inset 0 0 0 1px hsl(var(--foreground) / 0.14);
+}
+:root.dark .tree-item-active--selection-set:focus {
+  background-color: var(--tree-connection-active-bg, rgb(36 36 36)) !important;
+  box-shadow: inset 0 0 0 1px hsl(var(--foreground) / 0.18);
 }
 
 /* Locate highlight: instant amber, then fade on removal */
