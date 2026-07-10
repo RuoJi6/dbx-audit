@@ -184,11 +184,37 @@ test("parseMongoWriteCommand parses dropIndex and dropIndexes variants", () => {
   });
 });
 
+test("parseMongoWriteCommand parses collection drop commands", () => {
+  assert.deepEqual(parseMongoWriteCommand("db.users.drop()"), {
+    kind: "dropCollection",
+    collection: "users",
+  });
+  assert.deepEqual(parseMongoWriteCommand('db.getCollection("audit.logs").drop();'), {
+    kind: "dropCollection",
+    collection: "audit.logs",
+  });
+  assert.deepEqual(parseMongoCommand("db.users.drop()")?.command, {
+    kind: "dropCollection",
+    collection: "users",
+  });
+});
+
+test("parseMongoWriteCommand rejects collection drop arguments", () => {
+  assert.equal(parseMongoWriteCommand("db.users.drop({ writeConcern: 1 })"), null);
+});
+
 test("parseMongoWriteCommand rejects invalid dropIndex/dropIndexes variants", () => {
   assert.equal(parseMongoWriteCommand("db.users.dropIndex()"), null);
   assert.equal(parseMongoWriteCommand('db.users.dropIndex("*")'), null);
   assert.equal(parseMongoWriteCommand('db.users.dropIndex(["a_1"])'), null);
   assert.equal(parseMongoWriteCommand('db.users.dropIndexes([{"a":1}])'), null);
+});
+
+test("evaluateMongoWriteSafety blocks collection drop unless dangerous writes are enabled", () => {
+  const dropCollection = parseMongoWriteCommand("db.users.drop()");
+  assert.ok(dropCollection);
+  assert.match(evaluateMongoWriteSafety(dropCollection, { allowWrites: true }).reason || "", /DBX_MCP_ALLOW_DANGEROUS_SQL=1/);
+  assert.equal(evaluateMongoWriteSafety(dropCollection, { allowWrites: true, allowDangerous: true }).allowed, true);
 });
 
 test("evaluateMongoWriteSafety blocks dangerous dropIndexes shapes unless enabled", () => {

@@ -75,6 +75,7 @@ export const installJdbcPluginLocal = forward("installJdbcPluginLocal");
 export const uninstallJdbcPlugin = forward("uninstallJdbcPlugin");
 export const listInstalledAgentsLocal = forward("listInstalledAgentsLocal");
 export const listInstalledAgents = forward("listInstalledAgents");
+export const isAgentInstalled = forward("isAgentInstalled");
 export const getDriverStoreUsage = forward("getDriverStoreUsage");
 export const clearDriverDownloadCache = forward("clearDriverDownloadCache");
 export const getDriverRuntimeSummary = forward("getDriverRuntimeSummary");
@@ -449,6 +450,7 @@ export const checkForUpdates = forward("checkForUpdates");
 export const getSystemProxyUrl = forward("getSystemProxyUrl");
 export const downloadAndInstallUpdate = forward("downloadAndInstallUpdate");
 export const getAppVersion = forward("getAppVersion");
+export const getAppSupportInfo = forward("getAppSupportInfo");
 
 // Layout
 export const saveSidebarLayout = forward("saveSidebarLayout");
@@ -459,6 +461,7 @@ export const loadSidebarLayout = forward("loadSidebarLayout");
 // ---------------------------------------------------------------------------
 
 export type {
+  AppSupportInfo,
   AiMessage,
   AiCompletionRequest,
   AiTaskContract,

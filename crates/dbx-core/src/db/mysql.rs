@@ -540,7 +540,18 @@ async fn connect_with_ca_cert_pool_limit_idle_setup_database_with_mode(
         extra_setup_queries,
         setup_mode,
     )?;
-    let result = verify_pool_connection(&pool, timeout).await;
+    let result = verify_pool_connection_with_setup_fallback(
+        pool,
+        timeout,
+        url,
+        ca_cert_path,
+        max_connections,
+        idle_timeout_secs,
+        setup_database,
+        extra_setup_queries,
+        setup_mode,
+    )
+    .await;
 
     if let Err(ref e) = result {
         if mysql_error_should_retry_without_ssl(e) {
@@ -555,15 +566,23 @@ async fn connect_with_ca_cert_pool_limit_idle_setup_database_with_mode(
                     extra_setup_queries,
                     setup_mode,
                 )?;
-                return match verify_pool_connection(&fallback_pool, timeout).await {
-                    Ok(()) => Ok(fallback_pool),
-                    Err(e) => Err(e),
-                };
+                return verify_pool_connection_with_setup_fallback(
+                    fallback_pool,
+                    timeout,
+                    &fallback_url,
+                    None,
+                    max_connections,
+                    idle_timeout_secs,
+                    setup_database,
+                    extra_setup_queries,
+                    setup_mode,
+                )
+                .await;
             }
         }
     }
 
-    result.map(|_| pool)
+    result
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -582,6 +601,48 @@ impl MySqlSetupMode {
     fn set_group_concat_max_len(self) -> bool {
         self == Self::Standard
     }
+}
+
+async fn verify_pool_connection_with_setup_fallback(
+    pool: MySqlPool,
+    timeout: Duration,
+    url: &str,
+    ca_cert_path: Option<&str>,
+    max_connections: usize,
+    idle_timeout_secs: Option<u64>,
+    setup_database: Option<&str>,
+    extra_setup_queries: &[String],
+    setup_mode: MySqlSetupMode,
+) -> Result<MySqlPool, String> {
+    match verify_pool_connection(&pool, timeout).await {
+        Ok(()) => Ok(pool),
+        Err(err) => {
+            let Some(fallback_mode) = mysql_setup_mode_retry_without_group_concat(setup_mode, &err) else {
+                return Err(err);
+            };
+            log::info!(
+                "MySQL server rejected optional group_concat_max_len setup; retrying without that session setting"
+            );
+            let fallback_pool = create_pool(
+                url,
+                ca_cert_path,
+                max_connections,
+                idle_timeout_secs,
+                setup_database,
+                extra_setup_queries,
+                fallback_mode,
+            )?;
+            verify_pool_connection(&fallback_pool, timeout).await.map(|_| fallback_pool)
+        }
+    }
+}
+
+fn mysql_setup_mode_retry_without_group_concat(setup_mode: MySqlSetupMode, error: &str) -> Option<MySqlSetupMode> {
+    // group_concat_max_len improves real MySQL metadata reads, but some MySQL-compatible proxies reject the variable.
+    if setup_mode.set_group_concat_max_len() && mysql_error_should_retry_without_group_concat_max_len(error) {
+        return Some(MySqlSetupMode::Compatible);
+    }
+    None
 }
 
 fn create_pool(
@@ -1007,6 +1068,9 @@ fn mysql_error_should_retry_without_ssl(error: &str) -> bool {
         || error.contains("handshake")
         || error.contains("tls connection")
         || error.contains("server closed session")
+        // Some older MySQL proxies report a failed preferred-TLS probe as a
+        // protocol packet error instead of a TLS handshake error.
+        || error.contains("packet out of order")
         // Some MySQL-compatible servers report a preferred-TLS attempt as a
         // normal server error instead of a TLS handshake error.
         || (error.contains("client asked for ssl") && error.contains("server does not have this capability"))
@@ -1021,6 +1085,11 @@ fn mysql_error_should_retry_with_text_protocol(error: &str) -> bool {
         || lower.contains("buf doesn't have enough data")
         || lower.contains("prepared statement protocol")
         || lower.contains("this command is not supported in the prepared statement protocol yet")
+}
+
+fn mysql_error_should_retry_without_group_concat_max_len(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("group_concat_max_len") && (lower.contains("1193") || lower.contains("unknown system variable"))
 }
 
 fn ssl_fallback_url(url: &str) -> Option<String> {
@@ -1437,23 +1506,21 @@ pub async fn list_tables_filtered(
         })
         .collect();
 
-    if tables.is_empty() && should_fallback_empty_list_tables(filter, limit, offset, object_types) {
+    if tables.is_empty() && should_fallback_empty_list_tables(filter) {
         log::debug!("Falling back to SHOW TABLES for database `{database}` after information_schema.TABLES returned no named tables");
-        return list_tables_show(pool, database).await;
+        return list_tables_show(pool, database)
+            .await
+            .map(|tables| filter_list_tables_fallback(tables, filter, limit, offset, object_types));
     }
 
     Ok(tables)
 }
 
-fn should_fallback_empty_list_tables(
-    filter: Option<&str>,
-    limit: Option<usize>,
-    offset: Option<usize>,
-    object_types: Option<&[String]>,
-) -> bool {
-    let has_filter = filter.is_some_and(|filter| !filter.trim().is_empty());
-    let has_object_types = object_types.is_some_and(|object_types| !object_types.is_empty());
-    !has_filter && limit.is_none() && offset.unwrap_or(0) == 0 && !has_object_types
+fn should_fallback_empty_list_tables(filter: Option<&str>) -> bool {
+    // MySQL proxies such as MyCat can return an empty information_schema.TABLES
+    // even when SHOW TABLES exposes objects. Avoid the fallback for active
+    // searches so normal MySQL "no match" queries do not rescan large schemas.
+    !filter.is_some_and(|filter| !filter.trim().is_empty())
 }
 
 fn filter_list_tables_fallback(
@@ -1952,8 +2019,22 @@ pub async fn list_objects(pool: &MySqlPool, database: &str) -> Result<Vec<Object
     let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
 
     let tables_sql = list_tables_objects_sql(database);
-    let result = conn.query_iter(&tables_sql).await.map_err(|e| e.to_string())?;
+    let result = match conn.query_iter(&tables_sql).await {
+        Ok(result) => result,
+        Err(err) => {
+            log::debug!(
+                "Falling back to SHOW TABLES for object browser database `{database}` after information_schema.TABLES failed: {err}"
+            );
+            return list_table_objects_show(pool, database).await;
+        }
+    };
     let table_rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
+    if table_rows.is_empty() {
+        log::debug!(
+            "Falling back to SHOW TABLES for object browser database `{database}` after information_schema.TABLES returned no named tables"
+        );
+        return list_table_objects_show(pool, database).await;
+    }
     let mut objects: Vec<ObjectInfo> = table_rows.iter().map(|row| row_to_object(row, database)).collect();
 
     // Routines are queried separately: some MySQL-compatible servers (sharding proxies,
@@ -3760,12 +3841,11 @@ mod tests {
     }
 
     #[test]
-    fn mysql_empty_list_tables_fallback_only_for_unfiltered_query() {
-        assert!(should_fallback_empty_list_tables(None, None, None, None));
-        assert!(!should_fallback_empty_list_tables(Some("missing"), None, None, None));
-        assert!(!should_fallback_empty_list_tables(None, Some(1000), None, None));
-        assert!(!should_fallback_empty_list_tables(None, None, Some(1000), None));
-        assert!(!should_fallback_empty_list_tables(None, None, None, Some(&["VIEW".to_string()])));
+    fn mysql_empty_list_tables_fallback_allows_sidebar_paging_and_type_filters() {
+        assert!(should_fallback_empty_list_tables(None));
+        assert!(should_fallback_empty_list_tables(Some("")));
+        assert!(should_fallback_empty_list_tables(Some("  ")));
+        assert!(!should_fallback_empty_list_tables(Some("missing")));
     }
 
     #[test]
@@ -4130,6 +4210,13 @@ UNIQUE KEY(`tenant_id`, `name``part`)
     }
 
     #[test]
+    fn mysql_packet_out_of_order_can_retry_without_ssl() {
+        let error = "MySQL connection failed: Input/output error: Input/output error: packet out of order";
+
+        assert!(mysql_error_should_retry_without_ssl(error));
+    }
+
+    #[test]
     fn mysql_tcp_keepalive_uses_milliseconds_not_seconds() {
         assert_eq!(MYSQL_TCP_KEEPALIVE_MS, 30_000);
         assert!(MYSQL_TCP_KEEPALIVE_MS >= 1_000);
@@ -4241,6 +4328,31 @@ UNIQUE KEY(`tenant_id`, `name``part`)
         let error = "Server error: ERROR HY000 (1615): Prepared statement needs to be re-prepared";
 
         assert!(mysql_error_should_retry_with_text_protocol(error));
+    }
+
+    #[test]
+    fn mysql_group_concat_setup_error_retries_without_session_variable() {
+        let error = "MySQL connection failed: Server error: `ERROR HY000 (1193): Unknown system variable,stmt:SET @@group_concat_max_len = 1048576'";
+
+        assert!(mysql_error_should_retry_without_group_concat_max_len(error));
+        assert_eq!(
+            mysql_setup_mode_retry_without_group_concat(MySqlSetupMode::Standard, error),
+            Some(MySqlSetupMode::Compatible)
+        );
+    }
+
+    #[test]
+    fn mysql_group_concat_setup_retry_is_narrow() {
+        assert!(!mysql_error_should_retry_without_group_concat_max_len(
+            "MySQL connection failed: Server error: `ERROR HY000 (1193): Unknown system variable,stmt:SET @@sql_mode = ANSI'"
+        ));
+        assert_eq!(
+            mysql_setup_mode_retry_without_group_concat(
+                MySqlSetupMode::Compatible,
+                "Server error: ERROR HY000 (1193): Unknown system variable,stmt:SET @@group_concat_max_len = 1048576"
+            ),
+            None
+        );
     }
 
     #[test]

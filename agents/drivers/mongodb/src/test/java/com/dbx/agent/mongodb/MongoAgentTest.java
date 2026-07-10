@@ -177,6 +177,19 @@ class MongoAgentTest {
     }
 
     @Test
+    void dropCollectionMethodIsRecognizedOverJsonRpc() {
+        String response = MongoAgent.handleRequest(
+            "{\"jsonrpc\":\"2.0\",\"id\":14,\"method\":\"drop_collection\","
+                + "\"params\":{\"database\":\"app\",\"collection\":\"orders\"}}");
+
+        JsonObject json = JsonParser.parseString(response).getAsJsonObject();
+        assertEquals(14, json.get("id").getAsInt());
+        assertEquals("Not connected", json.getAsJsonObject("error").get("message").getAsString());
+        assertFalse(json.getAsJsonObject("error").get("message").getAsString().contains("Unknown method"));
+        assertTrue(AgentProtocol.MONGO_LEGACY_METHODS.contains(AgentProtocol.MONGO_METHOD_DROP_COLLECTION));
+    }
+
+    @Test
     void updateDocumentsMethodIsRecognizedOverJsonRpc() {
         String response = MongoAgent.handleRequest(
             "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"update_documents\","

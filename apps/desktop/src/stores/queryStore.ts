@@ -2,11 +2,11 @@ import { defineStore } from "pinia";
 import { uuid } from "@/lib/common/utils";
 import { markRaw, ref, watch, computed } from "vue";
 import { useI18n } from "vue-i18n";
-import type { DatabaseType, QueryResult, QueryTab, TableInfoTab, TableStructureEditorTarget } from "@/types/database";
+import type { DatabaseType, ObjectBrowserViewport, QueryResult, QueryTab, TableInfoTab, TableStructureEditorTarget } from "@/types/database";
 import { orderPinnedFirst } from "@/lib/app/pinnedItems";
 import { canCancelQueryExecution } from "@/lib/sql/queryExecutionState";
 import { buildExplainSql, parseExplainResult, parseDamengExplainText } from "@/lib/diagram/explainPlan";
-import { allEditableColumnsWriteable, allPrimaryKeysPresent, analyzeEditableQuery, sourceColumnsForResult, type EditableQueryInfo } from "@/lib/sql/sqlAnalysis";
+import { allEditableColumnsWriteable, allPrimaryKeysPresent, analyzeEditableQuery, sourceColumnsForResult, type EditableQueryInfo, type EditableQuerySource } from "@/lib/sql/sqlAnalysis";
 import { ACTIVE_TAB_STORAGE_KEY, OPEN_TABS_STORAGE_KEY, restoreOpenTabsPayload, restoreOpenTabsState, serializeOpenTabs } from "@/lib/app/openTabsPersistence";
 import {
   evaluateMongoAggregateSafety,
@@ -116,6 +116,9 @@ function markQueryResultRunsRowsRaw(resultRuns: NonNullable<QueryTab["resultRuns
 function queryResultSourceLabel(sql: string, database: string | undefined): string | undefined {
   const analysis = analyzeEditableQuery(sql);
   if (!analysis) return undefined;
+  // A joined result may still expose writable target-table columns, but its tab
+  // label must not imply that the whole result came from a single table.
+  if (analysis.multiSource || (analysis.sources?.length ?? 0) > 1) return undefined;
   const qualifier = analysis.schema || database?.trim();
   return qualifier ? `${qualifier}.${analysis.tableName}` : analysis.tableName;
 }
@@ -179,10 +182,84 @@ function normalizeOracleLikeQueryAnalysis(dbType: string, analysis: EditableQuer
     ...analysis,
     schema,
     tableName,
+    sources: analysis.sources?.map((source) => ({
+      ...source,
+      schema: normalizeOracleLikeMetadataIdentifier(dbType, source.schema, source.schemaQuoted),
+      tableName: normalizeOracleLikeMetadataIdentifier(dbType, source.tableName, source.tableNameQuoted)!,
+    })),
     columns: analysis.columns.map((column) => ({
       ...column,
       sourceName: normalizeOracleLikeMetadataIdentifier(dbType, column.sourceName, column.sourceNameQuoted),
     })),
+  };
+}
+
+function editableQuerySources(analysis: EditableQueryInfo): EditableQuerySource[] {
+  return analysis.sources?.length
+    ? analysis.sources
+    : [
+        {
+          key: `${analysis.tableAlias ?? analysis.tableName}:0`,
+          catalog: analysis.catalog,
+          catalogQuoted: analysis.catalogQuoted,
+          schema: analysis.schema,
+          schemaQuoted: analysis.schemaQuoted,
+          tableName: analysis.tableName,
+          tableNameQuoted: analysis.tableNameQuoted,
+          alias: analysis.tableAlias,
+        },
+      ];
+}
+
+function cloneAnalysisForSource(analysis: EditableQueryInfo, source: EditableQuerySource): EditableQueryInfo {
+  return {
+    ...analysis,
+    catalog: source.catalog,
+    catalogQuoted: source.catalogQuoted,
+    schema: source.schema,
+    schemaQuoted: source.schemaQuoted,
+    tableName: source.tableName,
+    tableNameQuoted: source.tableNameQuoted,
+    tableAlias: source.alias,
+    editableSourceKey: source.key,
+    allowInsertDelete: analysis.sources?.length ? false : analysis.allowInsertDelete,
+  };
+}
+
+function sourceMatchesColumn(columnName: string, tableColumns: readonly { name: string }[]): boolean {
+  const normalizedColumn = columnName.toLowerCase();
+  return tableColumns.some((column) => column.name.toLowerCase() === normalizedColumn);
+}
+
+function bindUnqualifiedColumnsForSource(analysis: EditableQueryInfo, source: EditableQuerySource, tableColumns: readonly { name: string }[], allSourceColumns: Array<{ source: EditableQuerySource; columns: readonly { name: string }[] }> = [{ source, columns: tableColumns }]): EditableQueryInfo {
+  return {
+    ...analysis,
+    columns: analysis.columns.map((column) => {
+      if (!column.sourceName || column.sourceKey || column.sourceQualifier) return column;
+      if (!sourceMatchesColumn(column.sourceName, tableColumns)) return column;
+      const matchingSources = allSourceColumns.filter((entry) => sourceMatchesColumn(column.sourceName!, entry.columns));
+      if (matchingSources.length !== 1 || matchingSources[0]?.source.key !== source.key) return column;
+      return { ...column, sourceKey: source.key };
+    }),
+  };
+}
+
+function expandStarProjectionColumnsForSource(analysis: EditableQueryInfo, source: EditableQuerySource, tableColumns: readonly { name: string }[]): EditableQueryInfo {
+  if (analysis.selectStar || !analysis.columns.some((column) => column.star)) return analysis;
+  return {
+    ...analysis,
+    columns: analysis.columns.flatMap((column) => {
+      if (!column.star) return [column];
+      if (column.sourceKey && column.sourceKey !== source.key) return [column];
+      return tableColumns.map((tableColumn) => ({
+        sourceName: tableColumn.name,
+        sourceNameQuoted: false,
+        ...(column.sourceQualifier ? { sourceQualifier: column.sourceQualifier } : {}),
+        sourceKey: source.key,
+        resultName: tableColumn.name,
+        expression: column.sourceQualifier ? `${column.sourceQualifier}.${tableColumn.name}` : tableColumn.name,
+      }));
+    }),
   };
 }
 
@@ -245,6 +322,9 @@ export const useQueryStore = defineStore("query", () => {
   const closeConfirmContext = ref<CloseConfirmContext>("tab");
   const tableStructureRefreshVersions = ref<Record<string, number>>({});
   const savedSqlEditorPositionTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  let resultCacheTrimScheduled = false;
+  let resultCacheTrimRunning = false;
+  let resultCacheTrimRequested = false;
 
   function tableStructureKey(connectionId: string, database: string, schema: string | undefined, tableName: string): string {
     return [connectionId, database, schema || "", tableName].map((part) => part.toLowerCase()).join("\u0000");
@@ -604,6 +684,12 @@ export const useQueryStore = defineStore("query", () => {
     if (saved?.tabs && Array.isArray(saved.tabs)) {
       const restored = restoreSavedTabsFromPayload(saved);
       applyRestoredOpenTabs(restored);
+      if (useSettingsStore().editorSettings.openTabsRestoreMode === "none") {
+        // Restore is explicitly disabled, so stale saved payloads should not
+        // reappear if the user later changes the setting.
+        clearLegacySavedTabs();
+        await saveTabs(tabs.value, activeTabId.value).catch(() => undefined);
+      }
       isOpenTabsLoaded.value = true;
       return;
     }
@@ -1342,7 +1428,7 @@ export const useQueryStore = defineStore("query", () => {
       objectBrowser: original.objectBrowser ? { ...original.objectBrowser } : undefined,
       objectSource: original.objectSource ? { ...original.objectSource } : undefined,
       tableMeta: original.tableMeta ? { ...original.tableMeta, columns: [...original.tableMeta.columns], primaryKeys: [...original.tableMeta.primaryKeys] } : undefined,
-      queryAnalysis: original.queryAnalysis ? { ...original.queryAnalysis, columns: original.queryAnalysis.columns.map((c) => ({ ...c })) } : undefined,
+      queryAnalysis: original.queryAnalysis ? { ...original.queryAnalysis, sources: original.queryAnalysis.sources?.map((source) => ({ ...source })), columns: original.queryAnalysis.columns.map((c) => ({ ...c })) } : undefined,
       querySourceColumns: original.querySourceColumns ? [...original.querySourceColumns] : undefined,
       queryEditabilityReason: original.queryEditabilityReason,
       resultEvicted: undefined,
@@ -1501,6 +1587,7 @@ export const useQueryStore = defineStore("query", () => {
   function updateEditorViewport(id: string, viewport: { scrollTop: number; scrollLeft: number }) {
     const tab = tabs.value.find((t) => t.id === id);
     if (!tab) return;
+    if (tab.editorViewport?.scrollTop === viewport.scrollTop && tab.editorViewport?.scrollLeft === viewport.scrollLeft) return;
     tab.editorViewport = viewport;
     queueSavedSqlEditorPositionPersist(tab);
   }
@@ -1510,6 +1597,14 @@ export const useQueryStore = defineStore("query", () => {
     if (!tab) return;
     tab.editorSelection = selection;
     queueSavedSqlEditorPositionPersist(tab);
+  }
+
+  function updateObjectBrowserViewport(id: string, viewport: ObjectBrowserViewport) {
+    const tab = tabs.value.find((t) => t.id === id);
+    if (!tab || tab.mode !== "objects") return;
+    const previous = tab.objectBrowser?.viewport;
+    if (previous?.scrollTop === viewport.scrollTop && previous.viewMode === viewport.viewMode) return;
+    tab.objectBrowser = { ...tab.objectBrowser, viewport };
   }
 
   function renameTab(id: string, title: string) {
@@ -1654,7 +1749,7 @@ export const useQueryStore = defineStore("query", () => {
     if (!tab || tab.schema === schema) return;
     rollbackTabTransaction(tab);
     tab.schema = schema;
-    if (tab.mode === "objects") tab.objectBrowser = { ...tab.objectBrowser, schema };
+    if (tab.mode === "objects") tab.objectBrowser = { ...tab.objectBrowser, schema, viewport: undefined };
   }
 
   function updateConnection(id: string, connectionId: string, database = "") {
@@ -1831,88 +1926,168 @@ export const useQueryStore = defineStore("query", () => {
       };
     }
 
-    // Resolve schema per database type
     const connStore = useConnectionStore();
     const conn = connStore.getConfig(tab.connectionId);
     const dbType = conn?.db_type || "";
-    let schema = analysis.schema || tab.schema;
-    if (!schema) {
-      if (dbType === "postgres" || dbType === "kwdb") schema = "public";
-      else schema = "";
-    }
-    const resolvedSchema = metadataSchemaForConnection(conn, tab.database, schema || undefined);
-    const metadataSchema = normalizeOracleLikeMetadataIdentifier(dbType, resolvedSchema || undefined, analysis.schema ? analysis.schemaQuoted : false) || "";
-    const metadataTableName = normalizeOracleLikeMetadataIdentifier(dbType, analysis.tableName, analysis.tableNameQuoted)!;
-    const metadataAnalysis = normalizeOracleLikeQueryAnalysis(dbType, analysis, metadataSchema || undefined, metadataTableName);
-
+    const sources = editableQuerySources(analysis);
+    type LoadedEditableSource = {
+      source: EditableQuerySource;
+      analysis: EditableQueryInfo;
+      tableMeta: NonNullable<QueryTab["tableMeta"]>;
+    };
+    const loadedSources: LoadedEditableSource[] = [];
     try {
-      console.info("[DBX][executeTabSql:metadata:table:start]", {
-        traceId,
-        schema: metadataSchema,
-        table: metadataTableName,
-        elapsed: elapsed?.(),
-      });
-      const loadedMetadata = await loadTableMetadata({
-        connectionId: tab.connectionId,
-        database: tab.database,
-        schema: metadataSchema,
-        tableName: metadataTableName,
-        tableType: tab.tableMeta?.tableType,
-        databaseType: dbType,
-        driverProfile: conn?.driver_profile || conn?.db_type,
-        traceLogger: (event) => console.debug("[DBX][executeTabSql:metadata:table-trace]", { sourceTraceId: traceId, ...event }),
-      });
-      const columns = loadedMetadata.metadata.columns;
-      const primaryKeys = loadedMetadata.metadata.primaryKeys;
-      console.info("[DBX][executeTabSql:metadata:table:done]", {
-        traceId,
-        columnCount: columns.length,
-        primaryKeyCount: primaryKeys.length,
-        cacheStatus: loadedMetadata.cacheStatus,
-        ageMs: Math.round(loadedMetadata.ageMs),
-        elapsed: elapsed?.(),
-      });
-      const tableType = loadedMetadata.metadata.tableType;
-      const tableMeta = {
-        schema: metadataSchema || undefined,
-        tableName: metadataTableName,
-        tableType,
-        columns,
-        primaryKeys,
+      for (const source of sources) {
+        let schema = source.schema || tab.schema;
+        if (!schema) {
+          if (dbType === "postgres" || dbType === "kwdb") schema = "public";
+          else schema = "";
+        }
+        const resolvedSchema = metadataSchemaForConnection(conn, tab.database, schema || undefined);
+        const metadataSchema = normalizeOracleLikeMetadataIdentifier(dbType, resolvedSchema || undefined, source.schema ? source.schemaQuoted : false) || "";
+        const metadataTableName = normalizeOracleLikeMetadataIdentifier(dbType, source.tableName, source.tableNameQuoted)!;
+        const metadataCatalog = normalizeOracleLikeMetadataIdentifier(dbType, source.catalog, source.catalogQuoted);
+        const metadataSource: EditableQuerySource = {
+          ...source,
+          catalog: metadataCatalog,
+          schema: metadataSchema || undefined,
+          tableName: metadataTableName,
+        };
+        console.info("[DBX][executeTabSql:metadata:table:start]", {
+          traceId,
+          schema: metadataSchema,
+          table: metadataTableName,
+          alias: source.alias,
+          elapsed: elapsed?.(),
+        });
+        const loadedMetadata = await loadTableMetadata({
+          connectionId: tab.connectionId,
+          database: tab.database,
+          schema: metadataSchema,
+          tableName: metadataTableName,
+          tableType: tab.tableMeta?.tableType,
+          databaseType: dbType,
+          driverProfile: conn?.driver_profile || conn?.db_type,
+          catalog: metadataCatalog,
+          traceLogger: (event) => console.debug("[DBX][executeTabSql:metadata:table-trace]", { sourceTraceId: traceId, ...event }),
+        });
+        const columns = loadedMetadata.metadata.columns;
+        const primaryKeys = loadedMetadata.metadata.primaryKeys;
+        console.info("[DBX][executeTabSql:metadata:table:done]", {
+          traceId,
+          columnCount: columns.length,
+          primaryKeyCount: primaryKeys.length,
+          cacheStatus: loadedMetadata.cacheStatus,
+          ageMs: Math.round(loadedMetadata.ageMs),
+          elapsed: elapsed?.(),
+        });
+        const tableType = loadedMetadata.metadata.tableType;
+        const tableMeta = {
+          catalog: metadataCatalog,
+          schema: metadataSchema || undefined,
+          tableName: metadataTableName,
+          tableType,
+          columns,
+          primaryKeys,
+        };
+        loadedSources.push({
+          source: metadataSource,
+          analysis: normalizeOracleLikeQueryAnalysis(dbType, cloneAnalysisForSource(analysis, metadataSource), metadataSchema || undefined, metadataTableName),
+          tableMeta,
+        });
+      }
+
+      const allSourceColumns = loadedSources.map((source) => ({ source: source.source, columns: source.tableMeta.columns }));
+      // Match DBeaver's safety model: a joined result is writable only when one
+      // source table has a complete row identifier and at least one writable column.
+      const candidates = loadedSources
+        .map((loaded) => {
+          const metadataAnalysis = expandStarProjectionColumnsForSource(bindUnqualifiedColumnsForSource(loaded.analysis, loaded.source, loaded.tableMeta.columns, allSourceColumns), loaded.source, loaded.tableMeta.columns);
+          const primaryKeys = loaded.tableMeta.primaryKeys;
+          const sourceColumns = sourceColumnsForResult(metadataAnalysis, tab.result!.columns, loaded.source.key);
+          const primaryKeysPresent = allPrimaryKeysPresent(primaryKeys, tab.result!.columns, metadataAnalysis, loaded.source.key);
+          const keylessAllowed = sources.length === 1 && canUseKeylessRowPredicate(dbType as DatabaseType, primaryKeys);
+          const primaryKeySet = new Set(primaryKeys.map((key) => key.toLowerCase()));
+          const editableSourceColumnCount = (sourceColumns ?? []).filter((column) => column && !primaryKeySet.has(column.toLowerCase())).length;
+          return {
+            ...loaded,
+            analysis: metadataAnalysis,
+            sourceColumns,
+            primaryKeysPresent,
+            keylessAllowed,
+            editableSourceColumnCount,
+          };
+        })
+        .filter((loaded) => (loaded.primaryKeysPresent || loaded.keylessAllowed) && !!loaded.sourceColumns && loaded.editableSourceColumnCount > 0);
+
+      if (loadedSources.length === 1) {
+        const loaded = loadedSources[0]!;
+        const metadataAnalysis = expandStarProjectionColumnsForSource(bindUnqualifiedColumnsForSource(loaded.analysis, loaded.source, loaded.tableMeta.columns, allSourceColumns), loaded.source, loaded.tableMeta.columns);
+        const primaryKeys = loaded.tableMeta.primaryKeys;
+        if (primaryKeys.length === 0 && !canUseKeylessRowPredicate(dbType as DatabaseType, primaryKeys)) {
+          return {
+            queryAnalysis: undefined,
+            querySourceColumns: undefined,
+            queryEditabilityReason: "no-primary-key",
+            tableMeta: loaded.tableMeta,
+          };
+        }
+
+        if (!allPrimaryKeysPresent(primaryKeys, tab.result.columns, metadataAnalysis, loaded.source.key)) {
+          return {
+            queryAnalysis: undefined,
+            querySourceColumns: undefined,
+            queryEditabilityReason: "primary-key-not-returned",
+            tableMeta: loaded.tableMeta,
+          };
+        }
+
+        if (!allEditableColumnsWriteable(metadataAnalysis, tab.result.columns)) {
+          return {
+            queryAnalysis: undefined,
+            querySourceColumns: undefined,
+            queryEditabilityReason: "aliased-columns",
+            tableMeta: loaded.tableMeta,
+          };
+        }
+
+        return {
+          queryAnalysis: metadataAnalysis,
+          querySourceColumns: sourceColumnsForResult(metadataAnalysis, tab.result.columns, loaded.source.key),
+          queryEditabilityReason: undefined,
+          tableMeta: loaded.tableMeta,
+        };
+      }
+
+      if (candidates.length === 0) {
+        return {
+          queryAnalysis: undefined,
+          querySourceColumns: undefined,
+          queryEditabilityReason: loadedSources.some((loaded) => loaded.tableMeta.primaryKeys.length > 0) ? "primary-key-not-returned" : "no-primary-key",
+          tableMeta: undefined,
+        };
+      }
+
+      if (candidates.length > 1) {
+        return {
+          queryAnalysis: undefined,
+          querySourceColumns: undefined,
+          queryEditabilityReason: "complex-source",
+          tableMeta: undefined,
+        };
+      }
+
+      const target = candidates[0]!;
+      const queryAnalysis = {
+        ...target.analysis,
+        allowInsertDelete: false,
+        multiSource: true,
       };
-
-      if (primaryKeys.length === 0 && !canUseKeylessRowPredicate(dbType as DatabaseType, primaryKeys)) {
-        return {
-          queryAnalysis: undefined,
-          querySourceColumns: undefined,
-          queryEditabilityReason: "no-primary-key",
-          tableMeta,
-        };
-      }
-
-      if (!allPrimaryKeysPresent(primaryKeys, tab.result.columns, metadataAnalysis)) {
-        return {
-          queryAnalysis: undefined,
-          querySourceColumns: undefined,
-          queryEditabilityReason: "primary-key-not-returned",
-          tableMeta,
-        };
-      }
-
-      if (!allEditableColumnsWriteable(metadataAnalysis, tab.result.columns)) {
-        return {
-          queryAnalysis: undefined,
-          querySourceColumns: undefined,
-          queryEditabilityReason: "aliased-columns",
-          tableMeta,
-        };
-      }
-
       return {
-        queryAnalysis: metadataAnalysis,
-        querySourceColumns: sourceColumnsForResult(metadataAnalysis, tab.result.columns),
+        queryAnalysis,
+        querySourceColumns: target.sourceColumns,
         queryEditabilityReason: undefined,
-        tableMeta,
+        tableMeta: target.tableMeta,
       };
     } catch (err) {
       console.error("[DBX] ERROR fetching columns for query metadata:", err);
@@ -2269,7 +2444,8 @@ export const useQueryStore = defineStore("query", () => {
               case "delete":
               case "createIndex":
               case "dropIndex":
-              case "dropIndexes": {
+              case "dropIndexes":
+              case "dropCollection": {
                 if (options?.mongoSafety) {
                   const safety = evaluateMongoWriteSafety(mongoCommand, options.mongoSafety);
                   if (!safety.allowed) throw new Error(safety.reason);
@@ -2293,6 +2469,9 @@ export const useQueryStore = defineStore("query", () => {
                 } else if (mongoCommand.kind === "dropIndex" || mongoCommand.kind === "dropIndexes") {
                   const result = await api.mongoDropIndexes(tab.connectionId, currentDatabase, mongoCommand.collection, mongoCommand.kind === "dropIndex" ? mongoCommand.index : mongoCommand.indexes, mongoCommand.kind === "dropIndex");
                   allResults.push(markQueryResultRowsRaw(annotateQueryResultSource(mongoDroppedIndexesToQueryResult(result.dropped_names, performance.now() - commandStartedAt), sourceStatement)));
+                } else if (mongoCommand.kind === "dropCollection") {
+                  await api.mongoDropCollection(tab.connectionId, currentDatabase, mongoCommand.collection);
+                  allResults.push(markQueryResultRowsRaw(annotateQueryResultSource(mongoWriteToQueryResult(1, performance.now() - commandStartedAt), sourceStatement)));
                 } else {
                   const result = await api.mongoDeleteDocuments(tab.connectionId, currentDatabase, mongoCommand.collection, mongoCommand.filter, mongoCommand.many);
                   allResults.push(markQueryResultRowsRaw(annotateQueryResultSource(mongoWriteToQueryResult(result.affected_rows, performance.now() - commandStartedAt), sourceStatement)));
@@ -2547,7 +2726,7 @@ export const useQueryStore = defineStore("query", () => {
         });
       }
     }
-    await trimResultCache();
+    scheduleResultCacheTrim();
   }
 
   async function explainTabSql(id: string, sql: string, databaseType?: DatabaseType, explainMode?: string) {
@@ -2740,6 +2919,39 @@ export const useQueryStore = defineStore("query", () => {
     if (inactive.length > MAX_CACHED_RESULTS) {
       const toEvict = inactive.slice(0, inactive.length - MAX_CACHED_RESULTS);
       await Promise.all(toEvict.map((t) => evictCachedResult(t)));
+    }
+  }
+
+  function scheduleResultCacheTrim() {
+    resultCacheTrimRequested = true;
+    if (resultCacheTrimScheduled || resultCacheTrimRunning) return;
+    resultCacheTrimScheduled = true;
+
+    const run = () => {
+      resultCacheTrimScheduled = false;
+      void runRequestedResultCacheTrim();
+    };
+
+    // Eviction serializes large result payloads; schedule it after the result
+    // assignment so the grid can paint before cache maintenance starts.
+    if (typeof window !== "undefined" && "requestIdleCallback" in window) {
+      window.requestIdleCallback(run, { timeout: 1500 });
+    } else {
+      setTimeout(run, 0);
+    }
+  }
+
+  async function runRequestedResultCacheTrim() {
+    if (resultCacheTrimRunning) return;
+    resultCacheTrimRunning = true;
+    try {
+      while (resultCacheTrimRequested) {
+        resultCacheTrimRequested = false;
+        await trimResultCache();
+      }
+    } finally {
+      resultCacheTrimRunning = false;
+      if (resultCacheTrimRequested) scheduleResultCacheTrim();
     }
   }
 
@@ -3100,6 +3312,7 @@ export const useQueryStore = defineStore("query", () => {
     updateSql,
     updateEditorViewport,
     updateEditorSelection,
+    updateObjectBrowserViewport,
     setAutoCommit,
     commitTransaction,
     rollbackTransaction,

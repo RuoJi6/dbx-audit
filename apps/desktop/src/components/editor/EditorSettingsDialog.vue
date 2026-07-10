@@ -57,6 +57,7 @@ import {
   installMcpServer,
   forgetWebdavSyncSecretsPassphrase,
   forgetWebdavSavedPassword,
+  getAppSupportInfo,
   listSystemFonts,
   saveWebdavSyncSecretsPreference,
   saveWebdavSavedPassword,
@@ -65,6 +66,7 @@ import {
   webdavSyncSecretsStatus,
   webdavSyncTest,
   webdavSyncUpload,
+  type AppSupportInfo,
   type AiModelInfo,
   type McpServerStatus,
   type WebDavConfig,
@@ -96,6 +98,7 @@ import { LOCALE_OPTIONS } from "@/lib/app/localeOptions";
 import { DEFAULT_WEB_DAV_AUTO_UPLOAD_INTERVAL_MINUTES, DEFAULT_WEB_DAV_REMOTE_PATH, normalizedWebDavAutoUploadInterval, writeWebDavAutoUploadFields } from "@/lib/webdav/webdavAutoUploadConfig";
 import { apiUrl } from "@/lib/common/webPath";
 import { DEFAULT_UI_FONT_FAMILY, SYSTEM_UI_FONT_FAMILY } from "@/lib/app/appFonts";
+import { buildAppSupportInfoRows, formatAppSupportInfoForClipboard, type AppSupportInfoLabels } from "@/lib/app/supportInfo";
 
 const { t } = useI18n();
 const { toast } = useToast();
@@ -244,6 +247,7 @@ const editShowCurrentStatementFrame = ref(settingsStore.editorSettings.showCurre
 const editAutoAliasTables = ref(settingsStore.editorSettings.autoAliasTables);
 const editWordWrap = ref(settingsStore.editorSettings.wordWrap);
 const editVimModeEnabled = ref(settingsStore.editorSettings.vimModeEnabled);
+const editAutoCloseBrackets = ref(settingsStore.editorSettings.autoCloseBrackets);
 const editSqlSemanticDiagnosticsMode = ref<SqlSemanticDiagnosticsMode>(settingsStore.editorSettings.sqlSemanticDiagnosticsMode);
 const editSqlSemanticDiagnosticsEnabled = ref(settingsStore.editorSettings.sqlSemanticDiagnosticsEnabled);
 const editConfirmDangerousSqlExecution = ref(settingsStore.editorSettings.confirmDangerousSqlExecution);
@@ -567,6 +571,7 @@ watch(
       editAutoAliasTables.value = settingsStore.editorSettings.autoAliasTables;
       editWordWrap.value = settingsStore.editorSettings.wordWrap;
       editVimModeEnabled.value = settingsStore.editorSettings.vimModeEnabled;
+      editAutoCloseBrackets.value = settingsStore.editorSettings.autoCloseBrackets;
       editSqlSemanticDiagnosticsMode.value = settingsStore.editorSettings.sqlSemanticDiagnosticsMode;
       editSqlSemanticDiagnosticsEnabled.value = settingsStore.editorSettings.sqlSemanticDiagnosticsEnabled;
       editConfirmDangerousSqlExecution.value = settingsStore.editorSettings.confirmDangerousSqlExecution;
@@ -672,6 +677,7 @@ function hasChanges(): boolean {
     editAutoAliasTables.value !== settingsStore.editorSettings.autoAliasTables ||
     editWordWrap.value !== settingsStore.editorSettings.wordWrap ||
     editVimModeEnabled.value !== settingsStore.editorSettings.vimModeEnabled ||
+    editAutoCloseBrackets.value !== settingsStore.editorSettings.autoCloseBrackets ||
     editSqlSemanticDiagnosticsMode.value !== settingsStore.editorSettings.sqlSemanticDiagnosticsMode ||
     editSqlSemanticDiagnosticsEnabled.value !== settingsStore.editorSettings.sqlSemanticDiagnosticsEnabled ||
     editConfirmDangerousSqlExecution.value !== settingsStore.editorSettings.confirmDangerousSqlExecution ||
@@ -733,6 +739,7 @@ async function persistSettings() {
     autoAliasTables: editAutoAliasTables.value,
     wordWrap: editWordWrap.value,
     vimModeEnabled: editVimModeEnabled.value,
+    autoCloseBrackets: editAutoCloseBrackets.value,
     sqlSemanticDiagnosticsMode: editSqlSemanticDiagnosticsMode.value,
     confirmDangerousSqlExecution: editConfirmDangerousSqlExecution.value,
     confirmUnsavedSqlClose: editConfirmUnsavedSqlClose.value,
@@ -817,6 +824,7 @@ function resetDefaultsForTab(tab: SettingsCategory) {
     editAutoAliasTables.value = DEFAULT_EDITOR_SETTINGS.autoAliasTables;
     editWordWrap.value = DEFAULT_EDITOR_SETTINGS.wordWrap;
     editVimModeEnabled.value = DEFAULT_EDITOR_SETTINGS.vimModeEnabled;
+    editAutoCloseBrackets.value = DEFAULT_EDITOR_SETTINGS.autoCloseBrackets;
     editSqlSemanticDiagnosticsMode.value = DEFAULT_EDITOR_SETTINGS.sqlSemanticDiagnosticsMode;
     editSqlSemanticDiagnosticsEnabled.value = DEFAULT_EDITOR_SETTINGS.sqlSemanticDiagnosticsEnabled;
     editConfirmDangerousSqlExecution.value = DEFAULT_EDITOR_SETTINGS.confirmDangerousSqlExecution;
@@ -888,6 +896,7 @@ function resetAllDefaults() {
   editAutoAliasTables.value = DEFAULT_EDITOR_SETTINGS.autoAliasTables;
   editWordWrap.value = DEFAULT_EDITOR_SETTINGS.wordWrap;
   editVimModeEnabled.value = DEFAULT_EDITOR_SETTINGS.vimModeEnabled;
+  editAutoCloseBrackets.value = DEFAULT_EDITOR_SETTINGS.autoCloseBrackets;
   editSqlSemanticDiagnosticsMode.value = DEFAULT_EDITOR_SETTINGS.sqlSemanticDiagnosticsMode;
   editSqlSemanticDiagnosticsEnabled.value = DEFAULT_EDITOR_SETTINGS.sqlSemanticDiagnosticsEnabled;
   editConfirmDangerousSqlExecution.value = DEFAULT_EDITOR_SETTINGS.confirmDangerousSqlExecution;
@@ -1195,6 +1204,20 @@ function setSidebarActivation(value: "single" | "double") {
 const activeSettingsTab = ref("appearance");
 const isWeb = !isTauriRuntime();
 const displayedAppVersion = computed(() => (props.appVersion ? `v${props.appVersion}` : ""));
+const appSupportInfo = ref<AppSupportInfo | null>(null);
+const appSupportInfoLoading = ref(false);
+const appSupportInfoError = ref("");
+const appSupportInfoCopied = ref(false);
+const appSupportInfoLabels = computed<AppSupportInfoLabels>(() => ({
+  appVersion: t("settings.supportInfoAppVersion"),
+  runtime: t("settings.supportInfoRuntime"),
+  runtimeDesktop: t("settings.supportInfoRuntimeDesktop"),
+  runtimeWeb: t("settings.supportInfoRuntimeWeb"),
+  operatingSystem: t("settings.supportInfoOperatingSystem"),
+  architecture: t("settings.supportInfoArchitecture"),
+  unknown: t("settings.supportInfoUnknown"),
+}));
+const appSupportInfoRows = computed(() => (appSupportInfo.value ? buildAppSupportInfoRows(appSupportInfo.value, appSupportInfoLabels.value) : []));
 type SettingsCategory = "editor" | "formatter" | "appearance" | "navigation" | "data" | "shortcuts" | "snippets" | "sync" | "ai" | "mcp" | "security" | "about";
 const settingsCategoryNav = computed<{ value: SettingsCategory; label: string }[]>(() => [
   { value: "appearance", label: t("settings.appearanceTab") },
@@ -1234,6 +1257,44 @@ async function copyDebugLogs() {
   window.setTimeout(() => {
     debugLogCopied.value = false;
   }, 1500);
+}
+
+function fallbackAppSupportInfo(): AppSupportInfo {
+  return {
+    appVersion: props.appVersion || "",
+    runtime: isWeb ? "web" : "desktop",
+    osName: "",
+    osVersion: null,
+    arch: "",
+  };
+}
+
+async function refreshAppSupportInfo() {
+  if (appSupportInfoLoading.value) return;
+  appSupportInfoLoading.value = true;
+  appSupportInfoError.value = "";
+  try {
+    appSupportInfo.value = await getAppSupportInfo();
+  } catch (e: any) {
+    appSupportInfo.value = appSupportInfo.value || fallbackAppSupportInfo();
+    appSupportInfoError.value = e?.message || String(e);
+  } finally {
+    appSupportInfoLoading.value = false;
+  }
+}
+
+async function copyAppSupportInfo() {
+  if (!appSupportInfo.value) await refreshAppSupportInfo();
+  if (!appSupportInfo.value) return;
+  try {
+    await copyToClipboard(formatAppSupportInfoForClipboard(appSupportInfo.value, appSupportInfoLabels.value));
+    appSupportInfoCopied.value = true;
+    window.setTimeout(() => {
+      appSupportInfoCopied.value = false;
+    }, 1500);
+  } catch (e: any) {
+    toast(t("grid.copyFailed", { message: e?.message || String(e) }), 5000);
+  }
 }
 
 function clearDebugLogs() {
@@ -1572,6 +1633,7 @@ watch(
       syncAiEditState();
       if (!isWeb && activeSettingsTab.value === "mcp") void refreshMcpStatus();
       if (!isWeb && activeSettingsTab.value === "ai" && aiIsCodexCli.value) void ensureCodexMcpStatus();
+      if (activeSettingsTab.value === "about") void refreshAppSupportInfo();
       await scrollToInitialSettingsSection();
     }
   },
@@ -1608,6 +1670,7 @@ watch([webdavAutoUploadEnabled, webdavAutoUploadIntervalMinutes], () => {
 watch(activeSettingsTab, (tab) => {
   if (tab === "mcp" && !mcpStatus.value && !mcpStatusLoading.value) void refreshMcpStatus();
   if (tab === "ai" && aiIsCodexCli.value) void ensureCodexMcpStatus();
+  if (tab === "about" && !appSupportInfo.value) void refreshAppSupportInfo();
   if (tab === "appearance") {
     checkLayoutDescTruncation();
     checkIconThemeDescTruncation();
@@ -2531,6 +2594,14 @@ onUnmounted(cleanupPreviewEditor);
                     <p class="text-xs text-muted-foreground">{{ t("settings.vimModeDescription") }}</p>
                   </div>
                   <Switch id="editor-vim-mode" v-model="editVimModeEnabled" class="mt-0.5" />
+                </div>
+
+                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                  <div class="space-y-1">
+                    <Label for="editor-auto-close-brackets">{{ t("settings.autoCloseBrackets") }}</Label>
+                    <p class="text-xs text-muted-foreground">{{ t("settings.autoCloseBracketsDescription") }}</p>
+                  </div>
+                  <Switch id="editor-auto-close-brackets" v-model="editAutoCloseBrackets" class="mt-0.5" />
                 </div>
 
                 <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
@@ -4142,6 +4213,29 @@ onUnmounted(cleanupPreviewEditor);
                     {{ displayedAppVersion }}
                   </div>
                 </div>
+              </div>
+
+              <div class="rounded-lg border p-4">
+                <div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                  <div class="min-w-0 space-y-1">
+                    <Label>{{ t("settings.supportInfoTitle") }}</Label>
+                    <p class="text-sm text-muted-foreground">{{ t("settings.supportInfoDescription") }}</p>
+                  </div>
+                  <Button type="button" variant="outline" size="sm" class="shrink-0" :disabled="appSupportInfoLoading && !appSupportInfo" @click="copyAppSupportInfo">
+                    <Loader2 v-if="appSupportInfoLoading && !appSupportInfo" class="mr-1 h-3.5 w-3.5 animate-spin" />
+                    <CheckCircle2 v-else-if="appSupportInfoCopied" class="mr-1 h-3.5 w-3.5" />
+                    <Copy v-else class="mr-1 h-3.5 w-3.5" />
+                    {{ appSupportInfoCopied ? t("settings.supportInfoCopied") : t("settings.supportInfoCopy") }}
+                  </Button>
+                </div>
+                <div v-if="appSupportInfoRows.length" class="mt-4 grid gap-3 sm:grid-cols-2">
+                  <div v-for="row in appSupportInfoRows" :key="row.key" class="min-w-0 rounded-md bg-muted/30 px-3 py-2">
+                    <div class="text-xs font-medium text-muted-foreground">{{ row.label }}</div>
+                    <div class="mt-1 min-w-0 select-text break-words font-mono text-xs text-foreground">{{ row.value }}</div>
+                  </div>
+                </div>
+                <p v-else class="mt-4 text-sm text-muted-foreground">{{ t("settings.supportInfoLoading") }}</p>
+                <p v-if="appSupportInfoError" class="mt-3 text-xs text-destructive">{{ t("settings.supportInfoLoadFailed", { message: appSupportInfoError }) }}</p>
               </div>
 
               <div class="rounded-lg border p-4">

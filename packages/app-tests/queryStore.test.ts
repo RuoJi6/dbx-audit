@@ -1229,6 +1229,293 @@ test("normalizes unquoted Oracle query identifiers before loading editable metad
   }
 });
 
+test("binds joined query edits to the single safe source table", async () => {
+  const restoreStorage = installMemoryStorage();
+  setActivePinia(createPinia());
+  const connectionStore = useConnectionStore();
+  const store = useQueryStore();
+  const originalFetch = globalThis.fetch;
+  const columnRequests: Array<{ schema: string | null; table: string | null }> = [];
+
+  connectionStore.addEphemeralConnection(conn("pg-join-1"));
+
+  globalThis.fetch = withConnectionHealthMock(async (input, init) => {
+    const url = String(input);
+    if (url === "/api/query/execute-multi") {
+      return new Response(
+        JSON.stringify([
+          {
+            columns: ["user_id", "name", "total"],
+            rows: [[1, "Ada", 42]],
+            affected_rows: 0,
+            execution_time_ms: 1,
+          },
+        ]),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (url === "/api/query/analyze-editability") {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      assert.equal(body.sql, "select u.id as user_id, u.name, o.total from users u join orders o on o.user_id = u.id");
+      return new Response(
+        JSON.stringify({
+          editable: true,
+          analysis: {
+            schema: undefined,
+            schemaQuoted: false,
+            tableName: "users",
+            tableNameQuoted: false,
+            tableAlias: "u",
+            selectStar: false,
+            multiSource: true,
+            allowInsertDelete: false,
+            sources: [
+              { key: "u:0", tableName: "users", tableNameQuoted: false, schemaQuoted: false, alias: "u" },
+              { key: "o:1", tableName: "orders", tableNameQuoted: false, schemaQuoted: false, alias: "o" },
+            ],
+            columns: [
+              { sourceName: "id", sourceNameQuoted: false, sourceQualifier: "u", sourceKey: "u:0", resultName: "user_id", expression: "u.id" },
+              { sourceName: "name", sourceNameQuoted: false, sourceQualifier: "u", sourceKey: "u:0", resultName: "name", expression: "u.name" },
+              { sourceName: "total", sourceNameQuoted: false, sourceQualifier: "o", sourceKey: "o:1", resultName: "total", expression: "o.total" },
+            ],
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (url.startsWith("/api/schema/columns?")) {
+      const params = new URL(url, "http://localhost").searchParams;
+      const table = params.get("table");
+      columnRequests.push({ schema: params.get("schema"), table });
+      const columns =
+        table === "users"
+          ? [
+              { name: "id", data_type: "integer", is_nullable: false, column_default: null, is_primary_key: true, extra: null, comment: null },
+              { name: "name", data_type: "text", is_nullable: true, column_default: null, is_primary_key: false, extra: null, comment: null },
+            ]
+          : [
+              { name: "id", data_type: "integer", is_nullable: false, column_default: null, is_primary_key: true, extra: null, comment: null },
+              { name: "user_id", data_type: "integer", is_nullable: false, column_default: null, is_primary_key: false, extra: null, comment: null },
+              { name: "total", data_type: "numeric", is_nullable: true, column_default: null, is_primary_key: false, extra: null, comment: null },
+            ];
+      return new Response(JSON.stringify(columns), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    if (url === "/api/query/prepare-pagination-plan") {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      return new Response(JSON.stringify({ sqlToExecute: body.options.sql, useAgentResultSession: false }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return new Response("unexpected request", { status: 500 });
+  });
+
+  try {
+    const sql = "select u.id as user_id, u.name, o.total from users u join orders o on o.user_id = u.id";
+    const tabId = store.createTab("pg-join-1", "appdb", "Query 1", "query");
+    await store.executeTabSql(tabId, sql);
+
+    const tab = store.tabs.find((item) => item.id === tabId);
+    await waitFor(() => columnRequests.length === 2 && tab?.tableMeta?.tableName === "users");
+    assert.deepEqual(columnRequests, [
+      { schema: "public", table: "users" },
+      { schema: "public", table: "orders" },
+    ]);
+    assert.equal(tab?.queryEditabilityReason, undefined);
+    assert.equal(tab?.queryAnalysis?.multiSource, true);
+    assert.equal(tab?.queryAnalysis?.allowInsertDelete, false);
+    assert.equal(tab?.tableMeta?.tableName, "users");
+    assert.deepEqual(tab?.querySourceColumns, ["id", "name", undefined]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreStorage();
+  }
+});
+
+test("expands single-table alias star projections for editable query metadata", async () => {
+  const restoreStorage = installMemoryStorage();
+  setActivePinia(createPinia());
+  const connectionStore = useConnectionStore();
+  const store = useQueryStore();
+  const originalFetch = globalThis.fetch;
+  const columnRequests: Array<{ schema: string | null; table: string | null }> = [];
+
+  connectionStore.addEphemeralConnection(conn("pg-star-1"));
+
+  globalThis.fetch = withConnectionHealthMock(async (input, init) => {
+    const url = String(input);
+    if (url === "/api/query/execute-multi") {
+      return new Response(
+        JSON.stringify([
+          {
+            columns: ["create_date", "id", "container_main_id"],
+            rows: [["2026-07-09 13:59:35", "20750975119640248", null]],
+            affected_rows: 0,
+            execution_time_ms: 1,
+          },
+        ]),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (url === "/api/query/analyze-editability") {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      assert.equal(body.sql, "select t.create_date, t.* from tt_kd_material_container_sap t where t.order_no = 'KD2607071336' order by t.create_date desc");
+      return new Response(
+        JSON.stringify({
+          editable: true,
+          analysis: {
+            schema: undefined,
+            schemaQuoted: false,
+            tableName: "tt_kd_material_container_sap",
+            tableNameQuoted: false,
+            tableAlias: "t",
+            selectStar: false,
+            columns: [
+              { sourceName: "create_date", sourceNameQuoted: false, sourceQualifier: "t", sourceKey: "t:0", resultName: "create_date", expression: "t.create_date" },
+              { star: true, sourceQualifier: "t", sourceKey: "t:0", resultName: "*", expression: "t.*" },
+            ],
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (url.startsWith("/api/schema/columns?")) {
+      const params = new URL(url, "http://localhost").searchParams;
+      columnRequests.push({ schema: params.get("schema"), table: params.get("table") });
+      return new Response(
+        JSON.stringify([
+          { name: "create_date", data_type: "timestamp", is_nullable: true, column_default: null, is_primary_key: false, extra: null, comment: null },
+          { name: "id", data_type: "varchar", is_nullable: false, column_default: null, is_primary_key: true, extra: null, comment: null },
+          { name: "container_main_id", data_type: "varchar", is_nullable: true, column_default: null, is_primary_key: false, extra: null, comment: null },
+        ]),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (url === "/api/query/prepare-pagination-plan") {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      return new Response(JSON.stringify({ sqlToExecute: body.options.sql, useAgentResultSession: false }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return new Response("unexpected request", { status: 500 });
+  });
+
+  try {
+    const sql = "select t.create_date, t.* from tt_kd_material_container_sap t where t.order_no = 'KD2607071336' order by t.create_date desc";
+    const tabId = store.createTab("pg-star-1", "appdb", "Query 1", "query");
+    await store.executeTabSql(tabId, sql);
+
+    const tab = store.tabs.find((item) => item.id === tabId);
+    await waitFor(() => columnRequests.length === 1 && tab?.tableMeta?.tableName === "tt_kd_material_container_sap");
+    assert.deepEqual(columnRequests, [{ schema: "public", table: "tt_kd_material_container_sap" }]);
+    assert.equal(tab?.queryEditabilityReason, undefined);
+    assert.equal(tab?.queryAnalysis?.selectStar, false);
+    assert.equal(tab?.tableMeta?.tableName, "tt_kd_material_container_sap");
+    assert.deepEqual(tab?.querySourceColumns, ["create_date", "id", "container_main_id"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreStorage();
+  }
+});
+
+test("keeps joined query read-only when multiple source tables are writable candidates", async () => {
+  const restoreStorage = installMemoryStorage();
+  setActivePinia(createPinia());
+  const connectionStore = useConnectionStore();
+  const store = useQueryStore();
+  const originalFetch = globalThis.fetch;
+  const columnRequests: Array<{ schema: string | null; table: string | null }> = [];
+
+  connectionStore.addEphemeralConnection(conn("pg-join-ambiguous"));
+
+  globalThis.fetch = withConnectionHealthMock(async (input, init) => {
+    const url = String(input);
+    if (url === "/api/query/execute-multi") {
+      return new Response(
+        JSON.stringify([
+          {
+            columns: ["user_id", "name", "order_id", "total"],
+            rows: [[1, "Ada", 10, 42]],
+            affected_rows: 0,
+            execution_time_ms: 1,
+          },
+        ]),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (url === "/api/query/analyze-editability") {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      assert.equal(body.sql, "select u.id as user_id, u.name, o.id as order_id, o.total from users u join orders o on o.user_id = u.id");
+      return new Response(
+        JSON.stringify({
+          editable: true,
+          analysis: {
+            schema: undefined,
+            schemaQuoted: false,
+            tableName: "users",
+            tableNameQuoted: false,
+            tableAlias: "u",
+            selectStar: false,
+            multiSource: true,
+            allowInsertDelete: false,
+            sources: [
+              { key: "u:0", tableName: "users", tableNameQuoted: false, schemaQuoted: false, alias: "u" },
+              { key: "o:1", tableName: "orders", tableNameQuoted: false, schemaQuoted: false, alias: "o" },
+            ],
+            columns: [
+              { sourceName: "id", sourceNameQuoted: false, sourceQualifier: "u", sourceKey: "u:0", resultName: "user_id", expression: "u.id" },
+              { sourceName: "name", sourceNameQuoted: false, sourceQualifier: "u", sourceKey: "u:0", resultName: "name", expression: "u.name" },
+              { sourceName: "id", sourceNameQuoted: false, sourceQualifier: "o", sourceKey: "o:1", resultName: "order_id", expression: "o.id" },
+              { sourceName: "total", sourceNameQuoted: false, sourceQualifier: "o", sourceKey: "o:1", resultName: "total", expression: "o.total" },
+            ],
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (url.startsWith("/api/schema/columns?")) {
+      const params = new URL(url, "http://localhost").searchParams;
+      const table = params.get("table");
+      columnRequests.push({ schema: params.get("schema"), table });
+      const columns =
+        table === "users"
+          ? [
+              { name: "id", data_type: "integer", is_nullable: false, column_default: null, is_primary_key: true, extra: null, comment: null },
+              { name: "name", data_type: "text", is_nullable: true, column_default: null, is_primary_key: false, extra: null, comment: null },
+            ]
+          : [
+              { name: "id", data_type: "integer", is_nullable: false, column_default: null, is_primary_key: true, extra: null, comment: null },
+              { name: "total", data_type: "numeric", is_nullable: true, column_default: null, is_primary_key: false, extra: null, comment: null },
+            ];
+      return new Response(JSON.stringify(columns), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    if (url === "/api/query/prepare-pagination-plan") {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      return new Response(JSON.stringify({ sqlToExecute: body.options.sql, useAgentResultSession: false }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return new Response("unexpected request", { status: 500 });
+  });
+
+  try {
+    const sql = "select u.id as user_id, u.name, o.id as order_id, o.total from users u join orders o on o.user_id = u.id";
+    const tabId = store.createTab("pg-join-ambiguous", "appdb", "Query 1", "query");
+    await store.executeTabSql(tabId, sql);
+
+    const tab = store.tabs.find((item) => item.id === tabId);
+    await waitFor(() => columnRequests.length === 2 && tab?.queryEditabilityReason === "complex-source");
+    assert.equal(tab?.queryAnalysis, undefined);
+    assert.equal(tab?.tableMeta, undefined);
+    assert.equal(tab?.querySourceColumns, undefined);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreStorage();
+  }
+});
+
 test("uses dbo as SQL Server metadata schema when query omits schema", async () => {
   const restoreStorage = installMemoryStorage();
   setActivePinia(createPinia());
@@ -1399,6 +1686,7 @@ test("evicting cached tab results releases multi-result payloads and sessions", 
       await store.executeTabSql(tabId, `select ${i + 1}; select ${i + 1} as detail`);
     }
 
+    await waitFor(() => store.tabs.find((tab) => tab.id === tabIds[0])?.resultEvicted === true);
     const evicted = store.tabs.find((tab) => tab.id === tabIds[0]);
     assert.equal(executeCount, 7);
     assert.equal(evicted?.result, undefined);
@@ -1474,6 +1762,7 @@ test("result cache eviction keeps recently accessed inactive tabs", async () => 
     tabIds.push(tabId);
     await store.executeTabSql(tabId, "select 7");
 
+    await waitFor(() => store.tabs.find((tab) => tab.id === tabIds[1])?.resultEvicted === true);
     const recentlyViewed = store.tabs.find((tab) => tab.id === tabIds[0]);
     const leastRecentlyUsed = store.tabs.find((tab) => tab.id === tabIds[1]);
     assert.ok(recentlyViewed?.result);

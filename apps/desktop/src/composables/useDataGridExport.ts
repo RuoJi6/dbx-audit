@@ -237,6 +237,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
       tableName: tableMeta.value?.tableName ?? null,
       copyInsertTargetLabel: copyInsertTargetLabel?.value ?? null,
       columns: columns.value,
+      columnTypes: columnTypes.value ?? null,
       sourceColumns: sourceColumns.value ?? null,
       excludePrimaryKeys,
       insertMode,
@@ -311,6 +312,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
               databaseType: databaseType.value,
               tableMeta: tableMeta.value,
               columns: columns.value,
+              columnTypes: columnTypes.value,
               sourceColumns: sourceColumns.value,
               rows: rows.map((item) => item.data),
               excludePrimaryKeys,
@@ -449,6 +451,13 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
     const rows = displayItems.value.filter((item) => selectedRowIds.value.has(item.id) && !item.isDraft).map((item) => item.data);
     if (rows.length === 0) return;
     await copyText(formatSelectionAsTsv({ columns: columns.value, rows }));
+  }
+
+  async function copySelectedRowsTsvWithHeaders() {
+    if (!hasRowSelection.value || selectedRowIds.value.size === 0) return;
+    const rows = displayItems.value.filter((item) => selectedRowIds.value.has(item.id) && !item.isDraft).map((item) => item.data);
+    if (rows.length === 0) return;
+    await copyText(formatSelectionAsTsv({ columns: columns.value, rows }, true));
   }
 
   async function copyColumnNames() {
@@ -1075,9 +1084,10 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
   } {
     const exportColumns = tableMeta.value ? effectiveColumns(sourceColumns.value, result.columns) : result.columns;
     const columnIndexes = exportColumns.map((column, index) => ({ column, index })).filter((item): item is { column: string; index: number } => !!item.column);
+    const exportColumnTypes = columnTypes.value?.length === result.columns.length ? columnTypes.value : undefined;
     return {
       columns: columnIndexes.map((item) => item.column),
-      columnTypes: tableMeta.value ? columnIndexes.map((item) => columnTypes.value?.[item.index]) : undefined,
+      columnTypes: exportColumnTypes ? columnIndexes.map((item) => exportColumnTypes[item.index]) : undefined,
       rows: result.rows.map((row) => columnIndexes.map((item) => row[item.index] ?? null)),
     };
   }
@@ -1109,6 +1119,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
     copySelectionJson,
     copySelectionSqlInList,
     copySelectedRowsTsv,
+    copySelectedRowsTsvWithHeaders,
     copyColumnNames,
     exportCsv,
     exportCurrentPageCsv,

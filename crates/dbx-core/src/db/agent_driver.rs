@@ -3,7 +3,7 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -14,7 +14,8 @@ pub const AGENT_PROTOCOL_VERSION: u32 = 1;
 const RPC_TIMEOUT_SECS: u64 = 30;
 const STARTUP_TIMEOUT_SECS: u64 = 15;
 const STDERR_TAIL_LINES: usize = 20;
-const AGENT_EXIT_DIAGNOSTIC_WAIT_MS: u64 = 200;
+const AGENT_EXIT_DIAGNOSTIC_WAIT_MS: u64 = 1_000;
+const AGENT_EXIT_DIAGNOSTIC_POLL_MS: u64 = 10;
 const AGENT_JAVA_OPTS_ENV: &str = "DBX_AGENT_JAVA_OPTS";
 const AGENT_JAVA_TOO_OLD_MESSAGE: &str =
     "Agent requires Java 21, but DBX started it with an older Java runtime. Use DBX managed JRE 21 or select a Java 21 executable in Driver Manager.";
@@ -256,6 +257,7 @@ pub enum MongoAgentMethod {
     ServerVersion,
     CreateIndex,
     DropIndexes,
+    DropCollection,
     InsertDocument,
     UpdateDocument,
     UpdateDocuments,
@@ -264,7 +266,7 @@ pub enum MongoAgentMethod {
 }
 
 impl MongoAgentMethod {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::ListDatabases,
         Self::ListCollections,
         Self::FindDocuments,
@@ -272,6 +274,7 @@ impl MongoAgentMethod {
         Self::ServerVersion,
         Self::CreateIndex,
         Self::DropIndexes,
+        Self::DropCollection,
         Self::InsertDocument,
         Self::UpdateDocument,
         Self::UpdateDocuments,
@@ -288,6 +291,7 @@ impl MongoAgentMethod {
             Self::ServerVersion => "server_version",
             Self::CreateIndex => "create_index",
             Self::DropIndexes => "drop_indexes",
+            Self::DropCollection => "drop_collection",
             Self::InsertDocument => "insert_document",
             Self::UpdateDocument => "update_document",
             Self::UpdateDocuments => "update_documents",
@@ -1024,6 +1028,13 @@ impl AgentDriverClient {
         self.call_mongo_method(MongoAgentMethod::DropIndexes, params).await
     }
 
+    pub async fn mongo_drop_collection<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        params: Value,
+    ) -> Result<T, String> {
+        self.call_mongo_method(MongoAgentMethod::DropCollection, params).await
+    }
+
     pub async fn mongo_insert_document<T: DeserializeOwned + Send + 'static>(
         &mut self,
         params: Value,
@@ -1368,12 +1379,16 @@ fn child_exit_status(child: &mut Child) -> Option<String> {
 }
 
 fn child_exit_status_after_short_wait(child: &mut Child) -> Option<String> {
-    let status = child_exit_status(child);
-    if status.is_some() {
-        return status;
+    let deadline = Instant::now() + Duration::from_millis(AGENT_EXIT_DIAGNOSTIC_WAIT_MS);
+    loop {
+        if let Some(status) = child_exit_status(child) {
+            return Some(status);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(AGENT_EXIT_DIAGNOSTIC_POLL_MS));
     }
-    std::thread::sleep(Duration::from_millis(AGENT_EXIT_DIAGNOSTIC_WAIT_MS));
-    child_exit_status(child)
 }
 
 fn stderr_tail_snapshot(stderr_tail: &Arc<Mutex<StderrTail>>) -> StderrTail {
@@ -1419,11 +1434,9 @@ fn format_agent_startup_error(base: &str, child: &mut Child, stderr_tail: &Arc<M
 
 impl AgentDriverClient {
     fn format_agent_process_error(&mut self, base: &str) -> String {
-        format_agent_process_error(
-            base,
-            child_exit_status_after_short_wait(&mut self.child),
-            &stderr_tail_snapshot(&self.stderr_tail),
-        )
+        // Runtime RPC errors are common SQL/driver paths. Do not wait for the
+        // child to exit unless startup diagnostics already expect the process to die.
+        format_agent_process_error(base, child_exit_status(&mut self.child), &stderr_tail_snapshot(&self.stderr_tail))
     }
 }
 
@@ -1613,6 +1626,33 @@ mod tests {
     }
 
     #[test]
+    fn runtime_agent_process_error_does_not_wait_for_live_child() {
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 2")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("child should start");
+        let mut client = AgentDriverClient {
+            child,
+            stdin: None,
+            stdout: None,
+            stderr_tail: Arc::new(Mutex::new(StderrTail::default())),
+            handshake: None,
+            next_id: 0,
+        };
+
+        let started_at = std::time::Instant::now();
+        let message = client.format_agent_process_error("Agent RPC error (-1): syntax error");
+
+        assert!(started_at.elapsed() < std::time::Duration::from_millis(500));
+        assert!(message.contains("Agent RPC error (-1): syntax error"));
+        assert!(!message.contains("agent process exited"));
+    }
+
+    #[test]
     fn stderr_tail_keeps_recent_lines_only() {
         let mut stderr_tail = StderrTail::with_capacity(3);
         stderr_tail.push_line("line 1".to_string());
@@ -1698,6 +1738,7 @@ mod tests {
         assert_eq!(MongoAgentMethod::ServerVersion.as_str(), "server_version");
         assert_eq!(MongoAgentMethod::CreateIndex.as_str(), "create_index");
         assert_eq!(MongoAgentMethod::DropIndexes.as_str(), "drop_indexes");
+        assert_eq!(MongoAgentMethod::DropCollection.as_str(), "drop_collection");
         assert_eq!(MongoAgentMethod::InsertDocument.as_str(), "insert_document");
         assert_eq!(MongoAgentMethod::UpdateDocument.as_str(), "update_document");
         assert_eq!(MongoAgentMethod::UpdateDocuments.as_str(), "update_documents");
@@ -1744,6 +1785,7 @@ mod tests {
         let _mongo_server_version = AgentDriverClient::mongo_server_version::<serde_json::Value>;
         let _mongo_create_index = AgentDriverClient::mongo_create_index::<serde_json::Value>;
         let _mongo_drop_indexes = AgentDriverClient::mongo_drop_indexes::<serde_json::Value>;
+        let _mongo_drop_collection = AgentDriverClient::mongo_drop_collection::<serde_json::Value>;
         let _mongo_insert_document = AgentDriverClient::mongo_insert_document::<serde_json::Value>;
         let _mongo_update_document = AgentDriverClient::mongo_update_document::<serde_json::Value>;
         let _mongo_update_documents = AgentDriverClient::mongo_update_documents::<serde_json::Value>;

@@ -31,6 +31,7 @@ import { collapseExpandedTreeNodes } from "@/lib/sidebar/sidebarTreeCollapse";
 import { findDatabaseTreeNode } from "@/lib/sidebar/treeRefreshTarget";
 import { shouldMarkDisconnected } from "@/lib/connection/connectionHealth";
 import { connectionAttemptOriginalErrorMessage, connectionAttemptTimeoutMessage, connectionAttemptTimeoutMs } from "@/lib/connection/connectionAttemptTimeout";
+import { requiresSqlServerLegacyCompatibilityComponent, SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY } from "@/lib/connection/sqlServerLegacyCompatibility";
 import { connectionUsesVisibleSchemaFilter, filterDatabaseNamesForConnection, filterSchemaNamesForConnection, filterVisibleDatabaseNames, normalizeVisibleDatabaseSelection } from "@/lib/database/visibleDatabases";
 import {
   buildObjectGroupPlaceholderNodes,
@@ -1625,6 +1626,12 @@ export const useConnectionStore = defineStore("connection", () => {
     rebuildTreeNodes();
   }
 
+  async function ensureSqlServerLegacyCompatibilityComponentInstalled(config: ConnectionConfig) {
+    if (!requiresSqlServerLegacyCompatibilityComponent(config)) return;
+    if (await api.isAgentInstalled(SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY)) return;
+    await api.installAgent(SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY);
+  }
+
   async function setDefaultDatabase(connectionId: string, database: string) {
     const config = getConfig(connectionId);
     if (!config || config.database === database) return;
@@ -1771,6 +1778,7 @@ export const useConnectionStore = defineStore("connection", () => {
     const localAttempt = beginLocalConnectionAttempt(config.id);
     try {
       await beforeConnectHandler?.(config);
+      await ensureSqlServerLegacyCompatibilityComponentInstalled(config);
       ensureLocalConnectionAttemptActive(config.id, localAttempt);
       const id = await withConnectionAttemptTimeout(api.connectDb(config, localAttempt), config);
       await ensureLocalConnectionAttemptActiveAfterConnectResult(config.id, localAttempt, id);
@@ -4926,9 +4934,10 @@ export const useConnectionStore = defineStore("connection", () => {
         const saved = await api.loadConnections();
         connections.value = saved.map(normalizeConnection);
         const savedLayout = await api.loadSidebarLayout();
+        const currentLayout = sidebarLayout.value.groups.length || sidebarLayout.value.order.length ? sidebarLayout.value : null;
         sidebarLayout.value = reconcileLayout(
           connections.value.map((c) => c.id),
-          savedLayout,
+          savedLayout ?? currentLayout,
         );
         rebuildTreeNodes();
       })().finally(() => {

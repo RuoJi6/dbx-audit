@@ -160,6 +160,12 @@ pub fn build_executable_object_source_statements(input: EditableObjectSourceSqlI
         return Ok(executable_informix_view_statements(input.schema.as_deref(), &input.name, source));
     }
 
+    if is_mysql_like(input.database_type)
+        && matches!(input.object_type, ObjectSourceKind::Function | ObjectSourceKind::Procedure)
+    {
+        return Ok(executable_mysql_routine_statements(&input, source));
+    }
+
     let create_statement = ensure_semicolon(source);
     let cleanup = build_routine_rename_cleanup(&input, source);
     Ok(if let Some(cleanup) = cleanup { vec![create_statement, cleanup] } else { vec![create_statement] })
@@ -195,6 +201,11 @@ pub fn build_editable_object_source(input: EditableObjectSourceSqlInput) -> Stri
     }
     if input.database_type == DatabaseType::Informix && input.object_type == ObjectSourceKind::View {
         return editable_informix_view_ddl(input.schema.as_deref(), &input.name, &source);
+    }
+    if is_mysql_like(input.database_type)
+        && matches!(input.object_type, ObjectSourceKind::Function | ObjectSourceKind::Procedure)
+    {
+        return ensure_semicolon(source.trim());
     }
     match build_executable_object_source_statements(input) {
         Ok(statements) => statements.into_iter().next().unwrap_or_default(),
@@ -458,6 +469,35 @@ fn create_informix_view(name: &str, create_tail: &str) -> String {
 
 fn drop_informix_view_if_exists(name: &str) -> String {
     format!("DROP VIEW IF EXISTS {};", name.trim())
+}
+
+fn executable_mysql_routine_statements(input: &EditableObjectSourceSqlInput, source: &str) -> Vec<String> {
+    if !mysql_source_starts_with_create_routine(source) {
+        return vec![ensure_semicolon(source)];
+    }
+
+    let declaration = mysql_routine_declaration(source).filter(|declaration| declaration.kind == input.object_type);
+    let create_name = declaration.as_ref().map(|declaration| declaration.name.as_str()).unwrap_or(&input.name);
+    let mut statements = Vec::with_capacity(3);
+
+    // MySQL has no cross-version CREATE OR REPLACE for stored routines; DBeaver also
+    // replaces them by dropping the target routine before executing the CREATE body.
+    statements.push(mysql_drop_routine_if_exists(input.object_type.clone(), input.schema.as_deref(), create_name));
+    statements.push(ensure_semicolon(source));
+
+    if declaration.as_ref().is_some_and(|declaration| routine_name_changed(&declaration.name, &input.name)) {
+        statements.push(mysql_drop_routine_if_exists(input.object_type.clone(), input.schema.as_deref(), &input.name));
+    }
+
+    statements
+}
+
+fn mysql_drop_routine_if_exists(object_type: ObjectSourceKind, schema: Option<&str>, name: &str) -> String {
+    format!("DROP {} IF EXISTS {};", object_type_keyword(&object_type), mysql_qualified_name(schema, name))
+}
+
+fn mysql_source_starts_with_create_routine(source: &str) -> bool {
+    Regex::new(r"(?is)^\s*CREATE\s+(?:DEFINER\s*=.+?\s+)?(?:FUNCTION|PROCEDURE)\b").unwrap().is_match(source)
 }
 
 fn informix_validation_view_name(target_name: &str) -> String {
@@ -732,7 +772,7 @@ fn replace_sql_routine_declaration_name(source: &str, schema: Option<&str>, new_
 
 fn mysql_routine_declaration(source: &str) -> Option<RoutineDeclaration> {
     let re = Regex::new(
-        r"(?is)^\s*CREATE\s+(?:DEFINER\s*=\s*(?:`(?:``|[^`])+`|'(?:''|[^'])+'|[^\s]+)\s*@\s*(?:`(?:``|[^`])+`|'(?:''|[^'])+'|[^\s]+)\s+)?(FUNCTION|PROCEDURE)\s+((?:`(?:``|[^`])+`|[A-Za-z_][\w$]*)(?:\s*\.\s*(?:`(?:``|[^`])+`|[A-Za-z_][\w$]*))?)",
+        r"(?is)^\s*CREATE\s+(?:DEFINER\s*=\s*(?:(?:`(?:``|[^`])+`|'(?:''|[^'])+'|[^\s]+)\s*@\s*(?:`(?:``|[^`])+`|'(?:''|[^'])+'|[^\s]+)|CURRENT_USER(?:\(\))?)\s+)?(FUNCTION|PROCEDURE)\s+(?:IF\s+NOT\s+EXISTS\s+)?((?:`(?:``|[^`])+`|[A-Za-z_][\w$]*)(?:\s*\.\s*(?:`(?:``|[^`])+`|[A-Za-z_][\w$]*))?)",
     )
     .unwrap();
     let captures = re.captures(source)?;
@@ -744,7 +784,7 @@ fn mysql_routine_declaration(source: &str) -> Option<RoutineDeclaration> {
 
 fn replace_mysql_routine_declaration_name(source: &str, new_name: &str) -> Option<String> {
     let re = Regex::new(
-        r"(?is)^(\s*CREATE\s+(?:DEFINER\s*=\s*(?:`(?:``|[^`])+`|'(?:''|[^'])+'|[^\s]+)\s*@\s*(?:`(?:``|[^`])+`|'(?:''|[^'])+'|[^\s]+)\s+)?(?:FUNCTION|PROCEDURE)\s+)((?:`(?:``|[^`])+`|[A-Za-z_][\w$]*)(?:\s*\.\s*(?:`(?:``|[^`])+`|[A-Za-z_][\w$]*))?)",
+        r"(?is)^(\s*CREATE\s+(?:DEFINER\s*=\s*(?:(?:`(?:``|[^`])+`|'(?:''|[^'])+'|[^\s]+)\s*@\s*(?:`(?:``|[^`])+`|'(?:''|[^'])+'|[^\s]+)|CURRENT_USER(?:\(\))?)\s+)?(?:FUNCTION|PROCEDURE)\s+(?:IF\s+NOT\s+EXISTS\s+)?)((?:`(?:``|[^`])+`|[A-Za-z_][\w$]*)(?:\s*\.\s*(?:`(?:``|[^`])+`|[A-Za-z_][\w$]*))?)",
     )
     .unwrap();
     let captures = re.captures(source)?;
@@ -1243,10 +1283,78 @@ mod tests {
         assert_eq!(
             statements,
             vec![
+                "DROP PROCEDURE IF EXISTS `app`.`refresh_cache_v2`;",
                 "CREATE DEFINER=`root`@`%` PROCEDURE `refresh_cache_v2`(IN mode_name varchar(20)) BEGIN SELECT 1; END;",
                 "DROP PROCEDURE IF EXISTS `app`.`refresh_cache`;",
             ]
         );
+    }
+
+    #[test]
+    fn mysql_procedure_save_replaces_existing_routine() {
+        let statements = build_executable_object_source_statements(EditableObjectSourceSqlInput {
+            database_type: DatabaseType::Mysql,
+            object_type: ObjectSourceKind::Procedure,
+            schema: Some("app".to_string()),
+            name: "refresh_cache".to_string(),
+            source: "CREATE DEFINER=`root`@`%` PROCEDURE `refresh_cache`() BEGIN SELECT 1; END".to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(
+            statements,
+            vec![
+                "DROP PROCEDURE IF EXISTS `app`.`refresh_cache`;",
+                "CREATE DEFINER=`root`@`%` PROCEDURE `refresh_cache`() BEGIN SELECT 1; END;",
+            ]
+        );
+    }
+
+    #[test]
+    fn mysql_function_save_replaces_existing_routine() {
+        let statements = build_executable_object_source_statements(EditableObjectSourceSqlInput {
+            database_type: DatabaseType::Mysql,
+            object_type: ObjectSourceKind::Function,
+            schema: Some("app".to_string()),
+            name: "active_count".to_string(),
+            source: "CREATE DEFINER=CURRENT_USER FUNCTION `active_count`() RETURNS INT RETURN 1".to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(
+            statements,
+            vec![
+                "DROP FUNCTION IF EXISTS `app`.`active_count`;",
+                "CREATE DEFINER=CURRENT_USER FUNCTION `active_count`() RETURNS INT RETURN 1;",
+            ]
+        );
+    }
+
+    #[test]
+    fn mysql_alter_routine_source_saves_without_dropping() {
+        let statements = build_executable_object_source_statements(EditableObjectSourceSqlInput {
+            database_type: DatabaseType::Mysql,
+            object_type: ObjectSourceKind::Procedure,
+            schema: Some("app".to_string()),
+            name: "refresh_cache".to_string(),
+            source: "ALTER PROCEDURE `refresh_cache` COMMENT 'refreshes cache'".to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(statements, vec!["ALTER PROCEDURE `refresh_cache` COMMENT 'refreshes cache';"]);
+    }
+
+    #[test]
+    fn mysql_routine_source_opened_for_editing_keeps_create_statement() {
+        let sql = build_editable_object_source(EditableObjectSourceSqlInput {
+            database_type: DatabaseType::Mysql,
+            object_type: ObjectSourceKind::Procedure,
+            schema: Some("app".to_string()),
+            name: "refresh_cache".to_string(),
+            source: "CREATE PROCEDURE `refresh_cache`() BEGIN SELECT 1; END".to_string(),
+        });
+
+        assert_eq!(sql, "CREATE PROCEDURE `refresh_cache`() BEGIN SELECT 1; END;");
     }
 
     #[test]

@@ -1,6 +1,22 @@
 import type { ConnectionConfig } from "./connections.js";
 import type { TableInfo, ColumnInfo, QueryOptions, QueryResult } from "./database.js";
-import { collectionListToTableInfos, evaluateMongoAggregateSafety, evaluateMongoWriteSafety, inferMongoColumns, mongoCollectionStatsToQueryResult, mongoDocumentsToQueryResult, parseMongoAggregateCommand, parseMongoCollectionStatsCommand, parseMongoCountDocumentsCommand, parseMongoFindCommand, parseMongoGetIndexesCommand, parseMongoVersionCommand, parseMongoWriteCommand, type CollectionInfo, type MongoWriteCommand } from "./database.js";
+import {
+  collectionListToTableInfos,
+  evaluateMongoAggregateSafety,
+  evaluateMongoWriteSafety,
+  inferMongoColumns,
+  mongoCollectionStatsToQueryResult,
+  mongoDocumentsToQueryResult,
+  parseMongoAggregateCommand,
+  parseMongoCollectionStatsCommand,
+  parseMongoCountDocumentsCommand,
+  parseMongoFindCommand,
+  parseMongoGetIndexesCommand,
+  parseMongoVersionCommand,
+  parseMongoWriteCommand,
+  type CollectionInfo,
+  type MongoWriteCommand,
+} from "./database.js";
 import type { RedisCommandOptions, RedisCommandResult } from "./redis-command.js";
 import { sqlSafetyFromEnv } from "./sql-safety.js";
 
@@ -288,7 +304,7 @@ export async function executeQuery(config: ConnectionConfig, sql: string, option
       return { columns: [], rows: [], row_count: result.affectedRows };
     }
     throw new Error(
-      "Use MongoDB shell-style commands, for example: db.projects.find({}).limit(100), db.version(), db.projects.countDocuments({}), db.projects.count({}), db.projects.getIndexes(), db.projects.dataSize(), db.projects.storageSize(1024), db.projects.totalIndexSize(), db.projects.stats(), db.projects.createIndex({...}), db.projects.dropIndex(\"name\"), db.projects.dropIndexes(), db.projects.insertOne({...}), db.projects.updateOne({...}, {$set: {...}}), or db.projects.deleteOne({...})",
+      'Use MongoDB shell-style commands, for example: db.projects.find({}).limit(100), db.version(), db.projects.countDocuments({}), db.projects.count({}), db.projects.getIndexes(), db.projects.dataSize(), db.projects.storageSize(1024), db.projects.totalIndexSize(), db.projects.stats(), db.projects.createIndex({...}), db.projects.dropIndex("name"), db.projects.dropIndexes(), db.projects.drop(), db.projects.insertOne({...}), db.projects.updateOne({...}, {$set: {...}}), or db.projects.deleteOne({...})',
     );
   }
   const res = await apiFetch("/api/query/execute", {
@@ -328,10 +344,7 @@ export async function executeRedisCommand(config: ConnectionConfig, db: number, 
   return (await res.json()) as RedisCommandResult;
 }
 
-async function executeMongoWrite(
-  config: ConnectionConfig,
-  command: MongoWriteCommand,
-): Promise<{ affectedRows: number; indexName?: string; droppedNames?: string[] }> {
+async function executeMongoWrite(config: ConnectionConfig, command: MongoWriteCommand): Promise<{ affectedRows: number; indexName?: string; droppedNames?: string[] }> {
   if (command.kind === "insert") {
     const res = await apiFetch("/api/mongo/insert-documents", {
       method: "POST",
@@ -387,6 +400,17 @@ async function executeMongoWrite(
     });
     const result = (await res.json()) as { dropped_names: string[]; affected_rows: number };
     return { affectedRows: result.affected_rows, droppedNames: result.dropped_names };
+  }
+  if (command.kind === "dropCollection") {
+    await apiFetch("/api/mongo/drop-collection", {
+      method: "POST",
+      body: JSON.stringify({
+        connectionId: config.id,
+        database: config.database || "",
+        collection: command.collection,
+      }),
+    });
+    return { affectedRows: 1 };
   }
   const res = await apiFetch("/api/mongo/delete-documents", {
     method: "POST",

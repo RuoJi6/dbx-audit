@@ -773,6 +773,11 @@ function selectedTreeNodesInVisibleOrder(): TreeNode[] {
 }
 
 function selectSingleTreeNode(node: TreeNode) {
+  // Re-clicking the selected row should not replace the selection array and
+  // force visible tree rows to recompute.
+  if (!connectionStore.connectionMultiSelectActive && connectionStore.selectedTreeNodeId === node.id && connectionStore.treeSelectionAnchorId === node.id && connectionStore.selectedTreeNodeIds.length === 1 && connectionStore.selectedTreeNodeIds[0] === node.id) {
+    return;
+  }
   connectionStore.connectionMultiSelectActive = false;
   connectionStore.selectedTreeNodeId = node.id;
   connectionStore.selectedTreeNodeIds = [node.id];
@@ -5134,7 +5139,7 @@ function treeItemMenuItems(): ContextMenuItem[] {
     </div>
   </div>
 
-  <CustomContextMenu v-else :items="treeItemMenuItems()" v-slot="contextMenuSlot">
+  <CustomContextMenu v-else :items="treeItemMenuItems" v-slot="contextMenuSlot">
     <div @contextmenu="onTreeItemContextMenu($event, contextMenuSlot.onContextMenu)">
       <LightTooltip :text="displayLabel(node)" :disabled="isTooltipDisabled()" side="right" :side-offset="8" :delay="0" :close-delay="0" :surface="detailTooltip ? 'popover' : 'foreground'">
         <div
