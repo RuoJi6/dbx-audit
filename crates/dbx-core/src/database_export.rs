@@ -183,6 +183,9 @@ fn format_export_sql_literal_typed(
     if is_postgres_json_export_column(database_type, column_type) {
         return format_postgres_json_export_literal(value);
     }
+    if is_postgres_vector_export_column(database_type, column_type) {
+        return format_postgres_vector_export_literal(value);
+    }
     if matches!(database_type, Some(DatabaseType::Mysql)) && column_type.is_some_and(is_mysql_bit_type) {
         return format_mysql_bit_literal(value);
     }
@@ -203,6 +206,9 @@ fn format_export_sql_literal_typed(
             return format_ch_array_sql_literal(arr);
         }
     }
+    if let Some(literal) = format_oracle_export_date_literal(value, database_type, column_type) {
+        return literal;
+    }
     if let Some(literal) = format_export_temporal_literal(value, database_type, column_type) {
         return literal;
     }
@@ -217,6 +223,35 @@ fn format_postgres_json_export_literal(value: &Value) -> String {
     // PostgreSQL standard strings keep backslashes literal; JSON text needs its
     // own escape sequences, so only SQL-escape the surrounding string delimiter.
     postgres_string_literal(&text)
+}
+
+fn format_postgres_vector_export_literal(value: &Value) -> String {
+    if value.is_null() {
+        return "NULL".to_string();
+    }
+    let text = match value {
+        // pgvector vector/halfvec are scalar extension types whose importable
+        // literal grammar uses square brackets, unlike PostgreSQL arrays.
+        Value::Array(arr) => format_postgres_vector_export_text(arr),
+        Value::String(text) => text.to_string(),
+        _ => value.to_string(),
+    };
+    postgres_string_literal(&text)
+}
+
+fn format_postgres_vector_export_text(arr: &[Value]) -> String {
+    let elements = arr.iter().map(format_postgres_vector_export_element).collect::<Vec<_>>();
+    format!("[{}]", elements.join(","))
+}
+
+fn format_postgres_vector_export_element(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.trim().to_string(),
+        Value::Number(number) => number.to_string(),
+        Value::Bool(value) => value.to_string(),
+        Value::Null => "NULL".to_string(),
+        _ => value.to_string(),
+    }
 }
 
 fn quote_export_sql_string(text: &str) -> String {
@@ -261,6 +296,43 @@ fn is_mysql_compatible_export_literal_target(database_type: Option<DatabaseType>
         database_type,
         Some(DatabaseType::Mysql | DatabaseType::Doris | DatabaseType::StarRocks | DatabaseType::Goldendb)
     )
+}
+
+fn format_oracle_export_date_literal(
+    value: &Value,
+    database_type: Option<DatabaseType>,
+    column_type: Option<&str>,
+) -> Option<String> {
+    if !matches!(database_type, Some(DatabaseType::Oracle | DatabaseType::OceanbaseOracle)) {
+        return None;
+    }
+    if export_temporal_column_kind(database_type, column_type?)? != ExportTemporalKind::DateTime {
+        return None;
+    }
+    let lower = column_type?.trim().trim_matches('"').to_ascii_lowercase();
+    let base = lower.split(['(', ' ', '\t', '\n']).next().unwrap_or("");
+    if base != "date" {
+        return None;
+    }
+    let parts = parse_export_date_parts(value.as_str()?)?;
+    Some(format_oracle_export_date_parts_literal(&parts))
+}
+
+fn format_oracle_export_date_parts_literal(parts: &ExportRfc3339Parts) -> String {
+    if export_temporal_parts_are_midnight(parts) {
+        format!("DATE '{}'", parts.date)
+    } else {
+        format!("TO_DATE('{} {}', 'YYYY-MM-DD HH24:MI:SS')", parts.date, parts.time)
+    }
+}
+
+fn export_temporal_parts_are_midnight(parts: &ExportRfc3339Parts) -> bool {
+    parts.time == "00:00:00"
+        && parts
+            .fraction
+            .as_deref()
+            .map(|fraction| fraction.trim_start_matches('.').chars().all(|ch| ch == '0'))
+            .unwrap_or(true)
 }
 
 fn format_export_temporal_literal(
@@ -329,6 +401,53 @@ struct ExportRfc3339Parts {
     time: String,
     fraction: Option<String>,
     zone: String,
+}
+
+fn parse_export_date_parts(text: &str) -> Option<ExportRfc3339Parts> {
+    parse_export_rfc3339_parts(text).or_else(|| parse_export_local_temporal_parts(text))
+}
+
+fn parse_export_local_temporal_parts(text: &str) -> Option<ExportRfc3339Parts> {
+    let bytes = text.as_bytes();
+    if bytes.len() < 10 || bytes.get(4) != Some(&b'-') || bytes.get(7) != Some(&b'-') {
+        return None;
+    }
+    let date = &text[0..10];
+    if !date.as_bytes().iter().enumerate().all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit()) {
+        return None;
+    }
+    if bytes.len() == 10 {
+        return Some(ExportRfc3339Parts {
+            date: date.to_string(),
+            time: "00:00:00".to_string(),
+            fraction: None,
+            zone: String::new(),
+        });
+    }
+    let separator = *bytes.get(10)?;
+    if separator != b'T' && separator != b' ' {
+        return None;
+    }
+    if bytes.len() < 19 || bytes.get(13) != Some(&b':') || bytes.get(16) != Some(&b':') {
+        return None;
+    }
+    let time = &text[11..19];
+    if !time.as_bytes().iter().enumerate().all(|(index, byte)| matches!(index, 2 | 5) || byte.is_ascii_digit()) {
+        return None;
+    }
+    let rest = &text[19..];
+    let fraction = if let Some(rest) = rest.strip_prefix('.') {
+        let digit_count = rest.chars().take_while(|ch| ch.is_ascii_digit()).count();
+        if digit_count == 0 || digit_count > 9 || digit_count != rest.len() {
+            return None;
+        }
+        Some(format!(".{}", &rest[..digit_count]))
+    } else if rest.is_empty() {
+        None
+    } else {
+        return None;
+    };
+    Some(ExportRfc3339Parts { date: date.to_string(), time: time.to_string(), fraction, zone: String::new() })
 }
 
 fn parse_export_rfc3339_parts(text: &str) -> Option<ExportRfc3339Parts> {
@@ -589,6 +708,17 @@ fn is_postgres_json_export_column(database_type: Option<DatabaseType>, column_ty
                 matches!(normalized.as_str(), "json" | "jsonb")
                     || normalized.ends_with(".json")
                     || normalized.ends_with(".jsonb")
+            })
+            .unwrap_or(false)
+}
+
+fn is_postgres_vector_export_column(database_type: Option<DatabaseType>, column_type: Option<&str>) -> bool {
+    database_type == Some(DatabaseType::Postgres)
+        && column_type
+            .map(|column_type| {
+                let normalized = column_type.trim().trim_matches('"').to_ascii_lowercase();
+                let base = normalized.split(['(', ' ', '\t', '\n']).next().unwrap_or("").trim_matches('"');
+                matches!(base, "vector" | "halfvec") || base.ends_with(".vector") || base.ends_with(".halfvec")
             })
             .unwrap_or(false)
 }
@@ -1512,6 +1642,39 @@ mod tests {
     }
 
     #[test]
+    fn postgres_vector_export_preserves_pgvector_bracket_literals() {
+        let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
+            database_type: Some(DatabaseType::Postgres),
+            schema: Some("public".to_string()),
+            table_name: Some("items".to_string()),
+            qualified_table_name: None,
+            columns: vec![
+                "id".to_string(),
+                "embedding".to_string(),
+                "qualified_embedding".to_string(),
+                "labels".to_string(),
+            ],
+            column_types: vec![
+                Some("integer".to_string()),
+                Some("vector(2)".to_string()),
+                Some("public.vector".to_string()),
+                Some("text[]".to_string()),
+            ],
+            column_extras: Vec::new(),
+            rows: vec![vec![json!(1), json!([1.2, 3.4]), json!(["5", "6"]), json!(["x", "y"])]],
+            batch_size: Some(10),
+        })
+        .unwrap();
+
+        assert_eq!(
+            statements,
+            vec![
+                r#"INSERT INTO "public"."items" ("id", "embedding", "qualified_embedding", "labels") VALUES (1, '[1.2,3.4]', '[5,6]', '{"x","y"}');"#
+            ]
+        );
+    }
+
+    #[test]
     fn builds_batched_insert_statements_for_export() {
         let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
             database_type: Some(DatabaseType::Mysql),
@@ -1555,6 +1718,33 @@ mod tests {
             vec![
                 "INSERT INTO \"APP\".\"USERS\" (\"ID\", \"NAME\") VALUES (1, 'Ada');",
                 "INSERT INTO \"APP\".\"USERS\" (\"ID\", \"NAME\") VALUES (2, 'Linus');",
+            ]
+        );
+    }
+
+    #[test]
+    fn oracle_date_columns_export_as_date_literals() {
+        let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
+            database_type: Some(DatabaseType::Oracle),
+            schema: Some("APP".to_string()),
+            table_name: Some("EVENTS".to_string()),
+            qualified_table_name: None,
+            columns: vec!["ID".to_string(), "CREATED_ON".to_string(), "RAW_TEXT".to_string()],
+            column_types: vec![Some("NUMBER".to_string()), Some("DATE".to_string()), Some("VARCHAR2(64)".to_string())],
+            column_extras: Vec::new(),
+            rows: vec![
+                vec![json!(1), json!("2022-08-25T09:58:43Z"), json!("2022-08-25T09:58:43Z")],
+                vec![json!(2), json!("2022-08-25T00:00:00Z"), json!("2022-08-25T00:00:00Z")],
+            ],
+            batch_size: Some(100),
+        })
+        .unwrap();
+
+        assert_eq!(
+            statements,
+            vec![
+                "INSERT INTO \"APP\".\"EVENTS\" (\"ID\", \"CREATED_ON\", \"RAW_TEXT\") VALUES (1, TO_DATE('2022-08-25 09:58:43', 'YYYY-MM-DD HH24:MI:SS'), '2022-08-25T09:58:43Z');",
+                "INSERT INTO \"APP\".\"EVENTS\" (\"ID\", \"CREATED_ON\", \"RAW_TEXT\") VALUES (2, DATE '2022-08-25', '2022-08-25T00:00:00Z');",
             ]
         );
     }

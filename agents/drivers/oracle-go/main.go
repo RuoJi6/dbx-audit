@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
 	"os"
 	"regexp"
@@ -173,6 +174,7 @@ type queryOptions struct {
 
 type queryResult struct {
 	Columns         []string `json:"columns"`
+	ColumnTypes     []string `json:"column_types"`
 	Rows            [][]any  `json:"rows"`
 	AffectedRows    int64    `json:"affected_rows"`
 	ExecutionTimeMS int64    `json:"execution_time_ms"`
@@ -185,6 +187,9 @@ func (r queryResult) MarshalJSON() ([]byte, error) {
 	if value.Columns == nil {
 		value.Columns = []string{}
 	}
+	if value.ColumnTypes == nil {
+		value.ColumnTypes = []string{}
+	}
 	if value.Rows == nil {
 		value.Rows = [][]any{}
 	}
@@ -193,6 +198,7 @@ func (r queryResult) MarshalJSON() ([]byte, error) {
 
 type queryPageResult struct {
 	Columns         []string `json:"columns"`
+	ColumnTypes     []string `json:"column_types"`
 	Rows            [][]any  `json:"rows"`
 	AffectedRows    int64    `json:"affected_rows"`
 	ExecutionTimeMS int64    `json:"execution_time_ms"`
@@ -207,6 +213,9 @@ func (r queryPageResult) MarshalJSON() ([]byte, error) {
 	if value.Columns == nil {
 		value.Columns = []string{}
 	}
+	if value.ColumnTypes == nil {
+		value.ColumnTypes = []string{}
+	}
 	if value.Rows == nil {
 		value.Rows = [][]any{}
 	}
@@ -214,10 +223,11 @@ func (r queryPageResult) MarshalJSON() ([]byte, error) {
 }
 
 type querySession struct {
-	rows      *sql.Rows
-	columns   []string
-	pending   []any
-	remaining int
+	rows        *sql.Rows
+	columns     []string
+	columnTypes []string
+	pending     []any
+	remaining   int
 }
 
 type oracleColumnMeta struct {
@@ -610,6 +620,7 @@ func buildDSN(params connectParams) string {
 	if strings.HasPrefix(strings.ToLower(connectionString), "oracle://") {
 		return connectionString
 	}
+	username := oracleAuthUsername(params.Username)
 	options := parseURLParams(params.URLParams)
 	if params.SysDBA {
 		options["AUTH TYPE"] = "SYSDBA"
@@ -617,7 +628,7 @@ func buildDSN(params connectParams) string {
 
 	if jdbc := parseOracleJDBCURL(connectionString); jdbc.Kind != "" {
 		if jdbc.Descriptor != "" {
-			return go_ora.BuildJDBC(params.Username, params.Password, jdbc.Descriptor, options)
+			return buildGoOraJDBC(username, params.Password, jdbc.Descriptor, options)
 		}
 		host := jdbc.Host
 		port := jdbc.Port
@@ -626,9 +637,9 @@ func buildDSN(params connectParams) string {
 		}
 		if jdbc.Kind == "sid" {
 			options["SID"] = jdbc.Database
-			return go_ora.BuildUrl(host, port, "", params.Username, params.Password, options)
+			return buildGoOraURL(host, port, "", username, params.Password, options)
 		}
-		return go_ora.BuildUrl(host, port, jdbc.Database, params.Username, params.Password, options)
+		return buildGoOraURL(host, port, jdbc.Database, username, params.Password, options)
 	}
 
 	service := strings.TrimSpace(params.Database)
@@ -639,7 +650,78 @@ func buildDSN(params connectParams) string {
 	if port == 0 {
 		port = 1521
 	}
-	return go_ora.BuildUrl(params.Host, port, service, params.Username, params.Password, options)
+	return buildGoOraURL(params.Host, port, service, username, params.Password, options)
+}
+
+func oracleAuthUsername(username string) string {
+	if username == "" || isQuotedOracleUsername(username) || !oracleUsernameRequiresQuoting(username) {
+		return username
+	}
+	// Oracle logon accepts quoted identifiers for users that cannot be
+	// represented as regular identifiers, such as bastion usernames with ':'.
+	return `"` + strings.ReplaceAll(username, `"`, `""`) + `"`
+}
+
+func isQuotedOracleUsername(username string) bool {
+	return len(username) >= 2 && strings.HasPrefix(username, `"`) && strings.HasSuffix(username, `"`)
+}
+
+func oracleUsernameRequiresQuoting(username string) bool {
+	for index, ch := range username {
+		if index == 0 {
+			if !isAsciiLetter(ch) {
+				return true
+			}
+			continue
+		}
+		if !isAsciiLetter(ch) && !isAsciiDigit(ch) && ch != '_' && ch != '$' && ch != '#' {
+			return true
+		}
+	}
+	return false
+}
+
+func isAsciiLetter(ch rune) bool {
+	return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z')
+}
+
+func isAsciiDigit(ch rune) bool {
+	return ch >= '0' && ch <= '9'
+}
+
+func buildGoOraJDBC(user, password, connStr string, options map[string]string) string {
+	if options == nil {
+		options = make(map[string]string)
+	}
+	options["connStr"] = connStr
+	return buildGoOraURL("", 0, "", user, password, options)
+}
+
+func buildGoOraURL(server string, port int, service, user, password string, options map[string]string) string {
+	// go-ora v2.9.0 uses path escaping for user/password, leaving ':' unescaped.
+	// Userinfo escaping keeps usernames such as "9008888:reader" intact.
+	ret := fmt.Sprintf(
+		"oracle://%s@%s/%s",
+		url.UserPassword(user, password).String(),
+		net.JoinHostPort(server, strconv.Itoa(port)),
+		url.PathEscape(service),
+	)
+	if options != nil {
+		ret += "?"
+		for key, val := range options {
+			val = strings.TrimSpace(val)
+			for _, temp := range strings.Split(val, ",") {
+				temp = strings.TrimSpace(temp)
+				if strings.ToUpper(key) == "SERVER" {
+					ret += fmt.Sprintf("%s=%s&", key, temp)
+				} else {
+					ret += fmt.Sprintf("%s=%s&", key, url.QueryEscape(temp))
+				}
+			}
+		}
+		ret = strings.TrimRight(ret, "&")
+	}
+	return ret
 }
 
 type jdbcURLInfo struct {
@@ -1545,6 +1627,7 @@ func (s *server) executeQueryPage(opts queryOptions, pageSize int) (queryPageRes
 		result, err := s.executeQuery(opts)
 		return queryPageResult{
 			Columns:         result.Columns,
+			ColumnTypes:     result.ColumnTypes,
 			Rows:            result.Rows,
 			AffectedRows:    result.AffectedRows,
 			ExecutionTimeMS: result.ExecutionTimeMS,
@@ -1562,11 +1645,12 @@ func (s *server) executeQueryPage(opts queryOptions, pageSize int) (queryPageRes
 		rows.Close()
 		return queryPageResult{}, err
 	}
+	columnTypes := columnTypeNames(rows)
 	maxRows := opts.MaxRows
 	if maxRows <= 0 {
 		maxRows = defaultMaxRows
 	}
-	session := &querySession{rows: rows, columns: columns, remaining: maxRows}
+	session := &querySession{rows: rows, columns: columns, columnTypes: columnTypes, remaining: maxRows}
 	result, err := readQuerySessionPage(session, pageSize)
 	result.ExecutionTimeMS = time.Since(start).Milliseconds()
 	if err != nil {
@@ -1585,7 +1669,7 @@ func (s *server) executeQueryPage(opts queryOptions, pageSize int) (queryPageRes
 func (s *server) fetchQueryPage(sessionID string, pageSize int) (queryPageResult, error) {
 	session := s.sessions[sessionID]
 	if session == nil {
-		return queryPageResult{Columns: []string{}, Rows: [][]any{}, SessionID: nil, HasMore: false}, nil
+		return queryPageResult{Columns: []string{}, ColumnTypes: []string{}, Rows: [][]any{}, SessionID: nil, HasMore: false}, nil
 	}
 	result, err := readQuerySessionPage(session, pageSize)
 	if err != nil {
@@ -1627,11 +1711,12 @@ func (s *server) startTableRead(opts queryOptions, pageSize int) (queryPageResul
 		rows.Close()
 		return queryPageResult{}, err
 	}
+	columnTypes := columnTypeNames(rows)
 	maxRows := opts.MaxRows
 	if maxRows <= 0 {
 		maxRows = defaultMaxRows
 	}
-	session := &querySession{rows: rows, columns: columns, remaining: maxRows}
+	session := &querySession{rows: rows, columns: columns, columnTypes: columnTypes, remaining: maxRows}
 	result, err := readQuerySessionPage(session, pageSize)
 	result.ExecutionTimeMS = time.Since(start).Milliseconds()
 	if err != nil {
@@ -1650,7 +1735,7 @@ func (s *server) startTableRead(opts queryOptions, pageSize int) (queryPageResul
 func (s *server) fetchTableReadPage(sessionID string, pageSize int) (queryPageResult, error) {
 	session := s.tableReadSessions[sessionID]
 	if session == nil {
-		return queryPageResult{Columns: []string{}, Rows: [][]any{}, SessionID: nil, HasMore: false}, nil
+		return queryPageResult{Columns: []string{}, ColumnTypes: []string{}, Rows: [][]any{}, SessionID: nil, HasMore: false}, nil
 	}
 	result, err := readQuerySessionPage(session, pageSize)
 	if err != nil {
@@ -1705,7 +1790,7 @@ func readQuerySessionPage(session *querySession, pageSize int) (queryPageResult,
 	if pageSize <= 0 {
 		pageSize = defaultMaxRows
 	}
-	result := queryPageResult{Columns: session.columns, Rows: [][]any{}, SessionID: nil, HasMore: false}
+	result := queryPageResult{Columns: session.columns, ColumnTypes: session.columnTypes, Rows: [][]any{}, SessionID: nil, HasMore: false}
 	for len(result.Rows) < pageSize && session.remaining > 0 {
 		if session.pending != nil {
 			result.Rows = append(result.Rows, session.pending)
@@ -1716,7 +1801,7 @@ func readQuerySessionPage(session *querySession, pageSize int) (queryPageResult,
 		if !session.rows.Next() {
 			return result, session.rows.Err()
 		}
-		row, err := scanRow(session.rows, len(session.columns))
+		row, err := scanRow(session.rows, len(session.columns), session.columnTypes)
 		if err != nil {
 			return queryPageResult{}, err
 		}
@@ -1728,7 +1813,7 @@ func readQuerySessionPage(session *querySession, pageSize int) (queryPageResult,
 		return result, nil
 	}
 	if session.rows.Next() {
-		row, err := scanRow(session.rows, len(session.columns))
+		row, err := scanRow(session.rows, len(session.columns), session.columnTypes)
 		if err != nil {
 			return queryPageResult{}, err
 		}
@@ -1765,7 +1850,7 @@ func (s *server) executeQuery(opts queryOptions) (queryResult, error) {
 		return queryResult{}, err
 	}
 	affected, _ := execResult.RowsAffected()
-	return queryResult{Columns: []string{}, Rows: [][]any{}, AffectedRows: affected, ExecutionTimeMS: time.Since(start).Milliseconds()}, nil
+	return queryResult{Columns: []string{}, ColumnTypes: []string{}, Rows: [][]any{}, AffectedRows: affected, ExecutionTimeMS: time.Since(start).Milliseconds()}, nil
 }
 
 func (s *server) executeSelect(sqlText string, maxRows int) (queryResult, error) {
@@ -1778,13 +1863,14 @@ func (s *server) executeSelect(sqlText string, maxRows int) (queryResult, error)
 	if err != nil {
 		return queryResult{}, err
 	}
-	result := queryResult{Columns: columns, Rows: [][]any{}}
+	columnTypes := columnTypeNames(rows)
+	result := queryResult{Columns: columns, ColumnTypes: columnTypes, Rows: [][]any{}}
 	for rows.Next() {
 		if len(result.Rows) >= maxRows {
 			result.Truncated = true
 			break
 		}
-		values, err := scanRow(rows, len(columns))
+		values, err := scanRow(rows, len(columns), columnTypes)
 		if err != nil {
 			return queryResult{}, err
 		}
@@ -1793,7 +1879,7 @@ func (s *server) executeSelect(sqlText string, maxRows int) (queryResult, error)
 	return result, rows.Err()
 }
 
-func scanRow(rows *sql.Rows, columnCount int) ([]any, error) {
+func scanRow(rows *sql.Rows, columnCount int, columnTypes []string) ([]any, error) {
 	values := make([]any, columnCount)
 	scanTargets := make([]any, columnCount)
 	for i := range values {
@@ -1803,9 +1889,28 @@ func scanRow(rows *sql.Rows, columnCount int) ([]any, error) {
 		return nil, err
 	}
 	for i, value := range values {
-		values[i] = normalizeValue(value)
+		values[i] = normalizeValue(value, columnTypeAt(columnTypes, i))
 	}
 	return values, nil
+}
+
+func columnTypeAt(columnTypes []string, index int) string {
+	if index < 0 || index >= len(columnTypes) {
+		return ""
+	}
+	return columnTypes[index]
+}
+
+func columnTypeNames(rows *sql.Rows) []string {
+	types, err := rows.ColumnTypes()
+	if err != nil {
+		return []string{}
+	}
+	result := make([]string, 0, len(types))
+	for _, columnType := range types {
+		result = append(result, columnType.DatabaseTypeName())
+	}
+	return result
 }
 
 func (s *server) queryRowsWithXMLTypeRewriteIfNeeded(sqlText string) (*sql.Rows, error) {
@@ -2605,11 +2710,15 @@ func quoteIdentifier(value string) string {
 	return `"` + strings.ReplaceAll(value, `"`, `""`) + `"`
 }
 
-func normalizeValue(value any) any {
+func normalizeValue(value any, columnTypeName string) any {
 	switch v := value.(type) {
 	case nil:
 		return nil
 	case []byte:
+		// Oracle RAW-like columns are binary data; decoding them as text produces mojibake.
+		if isOracleBinaryColumnType(columnTypeName) {
+			return bytesToHex(v)
+		}
 		return string(v)
 	case time.Time:
 		return v.Format(time.RFC3339Nano)
@@ -2620,6 +2729,28 @@ func normalizeValue(value any) any {
 	default:
 		return fmt.Sprint(v)
 	}
+}
+
+func isOracleBinaryColumnType(columnTypeName string) bool {
+	normalized := strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(columnTypeName), " ", ""))
+	switch normalized {
+	case "RAW", "VARRAW", "LONGRAW", "LONGVARRAW", "BLOB", "BFILE", "OCIBLOBLOCATOR", "OCIFILELOCATOR":
+		return true
+	default:
+		return false
+	}
+}
+
+func bytesToHex(bytes []byte) string {
+	const digits = "0123456789abcdef"
+	result := make([]byte, 2+len(bytes)*2)
+	result[0] = '0'
+	result[1] = 'x'
+	for i, b := range bytes {
+		result[2+i*2] = digits[b>>4]
+		result[3+i*2] = digits[b&0x0f]
+	}
+	return string(result)
 }
 
 func emptyIfNil[T any](values []T) []T {

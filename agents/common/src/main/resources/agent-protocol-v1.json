@@ -72,6 +72,7 @@
     "server_version",
     "create_index",
     "drop_indexes",
+    "drop_collection",
     "insert_document",
     "update_document",
     "update_documents",

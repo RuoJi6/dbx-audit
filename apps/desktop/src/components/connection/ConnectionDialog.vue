@@ -40,7 +40,9 @@ import { SQLITE_DATABASE_FILE_EXTENSIONS } from "@/lib/database/databaseFileDete
 import { connectionAttemptOriginalErrorMessage, connectionAttemptTimeoutMessage, connectionAttemptTimeoutMs } from "@/lib/connection/connectionAttemptTimeout";
 import { appendConnectionErrorHints } from "@/lib/connection/connectionErrorHints";
 import { normalizeKafkaBootstrapServers } from "@/lib/connection/kafkaBootstrapServers";
+import { detectMqUiAuthKind, isMqAuthKindAllowedForSystem, type MqUiAuthKind } from "@/lib/connection/mqAuth";
 import { driverInstallProgressPercent, type DriverInstallProgress } from "@/lib/connection/driverInstallProgressUi";
+import { isSqlServerLegacyCompatibilityMode, requiresSqlServerLegacyCompatibilityComponent, setSqlServerLegacyCompatibilityMode, SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY } from "@/lib/connection/sqlServerLegacyCompatibility";
 import { ArrowLeft, ArrowDown, ArrowUp, CheckSquare, ChevronRight, CircleHelp, Copy, ExternalLink, FilePlus2, FolderOpen, GripVertical, Grid3X3, KeyRound, Link2, List, ListFilter, Loader2, Pencil, Pipette, Plus, Search, ShieldCheck, Square, Trash2 } from "@lucide/vue";
 import { buildDraftVisibleDatabasesConnectionId, connectionCanChooseVisibleDatabases, initialVisibleDatabaseSelection, visibleDatabaseSelectionIsStale } from "@/lib/connection/connectionVisibleDatabases";
 import { canSaveVisibleDatabaseSelection, connectionUsesVisibleSchemaFilter, filterDatabaseNamesForVisiblePicker, isSystemDatabaseName, normalizeVisibleDatabaseSelection, buildDraftVisibleSchemasConnectionId, normalizeVisibleSchemaSelection } from "@/lib/database/visibleDatabases";
@@ -390,14 +392,17 @@ const dialogStep = ref<DialogStep>("select");
 const dbPickerView = ref<DbPickerView>("icon");
 const dbSearchQuery = ref("");
 const configTab = ref<ConfigTab>("connection");
-type MqAuthKind = MqAuth["kind"];
 const MQ_KAFKA_SECURITY_PROTOCOL_AUTO = "__auto";
 const mqAdminUrl = ref("http://127.0.0.1:8080");
 const mqSystemKind = ref<MqSystemKind>("pulsar");
 const mqKafkaBootstrapServers = ref("127.0.0.1:9092");
 const mqKafkaSecurityProtocol = ref(MQ_KAFKA_SECURITY_PROTOCOL_AUTO);
 const mqKafkaSaslMechanism = ref("PLAIN");
-const mqAuthKind = ref<MqAuthKind>("none");
+const mqKafkaKerberosPrincipal = ref("");
+const mqKafkaKerberosKeytabPath = ref("");
+const mqKafkaKerberosServiceName = ref("kafka");
+const mqKafkaKrb5ConfPath = ref("");
+const mqAuthKind = ref<MqUiAuthKind>("none");
 const mqToken = ref("");
 const mqBasicUsername = ref("");
 const mqBasicPassword = ref("");
@@ -693,18 +698,50 @@ function mqExtraString(extra: Record<string, unknown>, key: string): string {
   return typeof value === "string" ? value : "";
 }
 
+function mqExtraProperties(extra: Record<string, unknown>): Record<string, unknown> {
+  const value = extra.properties;
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
+
+function mqExtraPropertyString(extra: Record<string, unknown>, key: string): string {
+  const value = mqExtraProperties(extra)[key];
+  return typeof value === "string" ? value : "";
+}
+
+function jaasStringValue(value: string): string {
+  return value.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
+}
+
+function parseJaasStringProperty(value: string, key: string): string {
+  const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = value.match(new RegExp(`${escapedKey}\\s*=\\s*"((?:\\\\.|[^"\\\\])*)"`, "i"));
+  if (!match) return "";
+  return match[1].replace(/\\(["\\])/g, "$1");
+}
+
 function resetMqFields(config?: Partial<MqAdminConfig>) {
   const systemKind = config?.systemKind === "kafka" ? "kafka" : "pulsar";
   const extra = mqExtraRecord(config);
+  const properties = mqExtraProperties(extra);
+  const jaasConfig = mqExtraPropertyString(extra, "sasl.jaas.config");
   mqSystemKind.value = systemKind;
   mqAdminUrl.value = config?.adminUrl?.trim() || (systemKind === "kafka" ? "" : "http://127.0.0.1:8080");
   mqKafkaBootstrapServers.value = mqExtraString(extra, "bootstrapServers") || "127.0.0.1:9092";
   mqKafkaSecurityProtocol.value = mqExtraString(extra, "securityProtocol") || MQ_KAFKA_SECURITY_PROTOCOL_AUTO;
   mqKafkaSaslMechanism.value = mqExtraString(extra, "saslMechanism") || "PLAIN";
+  mqKafkaKerberosPrincipal.value = parseJaasStringProperty(jaasConfig, "principal");
+  mqKafkaKerberosKeytabPath.value = parseJaasStringProperty(jaasConfig, "keyTab");
+  mqKafkaKerberosServiceName.value = typeof properties["sasl.kerberos.service.name"] === "string" ? properties["sasl.kerberos.service.name"] : "kafka";
+  mqKafkaKrb5ConfPath.value = typeof properties["java.security.krb5.conf"] === "string" ? properties["java.security.krb5.conf"] : "";
   mqTlsSkipVerify.value = !!config?.tlsSkipVerify;
   mqPinnedVersion.value = pinnedVersionToSelection(config?.pinnedVersion);
   const auth = (config?.auth || { kind: "none" }) as MqAuth;
-  mqAuthKind.value = systemKind === "kafka" && auth.kind !== "basic" ? "none" : auth.kind || "none";
+  mqAuthKind.value = detectMqUiAuthKind({
+    systemKind,
+    authKind: auth.kind,
+    saslMechanism: mqKafkaSaslMechanism.value,
+    jaasConfig,
+  });
   mqToken.value = auth.token || "";
   mqBasicUsername.value = auth.username || "";
   mqBasicPassword.value = auth.password || "";
@@ -741,10 +778,16 @@ function hydrateMqFields(value: unknown) {
 watch(mqSystemKind, (kind) => {
   if (kind === "kafka") {
     if (!mqKafkaBootstrapServers.value.trim()) mqKafkaBootstrapServers.value = "127.0.0.1:9092";
-    if (!["none", "basic"].includes(mqAuthKind.value)) mqAuthKind.value = "none";
+    if (!isMqAuthKindAllowedForSystem(kind, mqAuthKind.value)) mqAuthKind.value = "none";
     return;
   }
   if (!mqAdminUrl.value.trim()) mqAdminUrl.value = "http://127.0.0.1:8080";
+});
+
+watch(mqAuthKind, (kind) => {
+  if (mqSystemKind.value === "kafka" && kind === "basic" && mqKafkaSaslMechanism.value.toUpperCase() === "GSSAPI") {
+    mqKafkaSaslMechanism.value = "PLAIN";
+  }
 });
 
 function resetNacosFields(config?: Partial<NacosAdminConfig>) {
@@ -845,6 +888,12 @@ function buildMqAuth(): MqAuth {
   }
 }
 
+function buildKafkaKerberosJaasConfig(): string {
+  const principal = requireMqField(mqKafkaKerberosPrincipal.value, t("connection.kafkaKerberosPrincipalRequired"));
+  const keytab = requireMqField(mqKafkaKerberosKeytabPath.value, t("connection.kafkaKerberosKeytabRequired"));
+  return `com.sun.security.auth.module.Krb5LoginModule required useKeyTab=true storeKey=true keyTab="${jaasStringValue(keytab)}" principal="${jaasStringValue(principal)}";`;
+}
+
 function buildMqTokenSigning() {
   if (mqTokenSigningMode.value === "none") return undefined;
   return {
@@ -857,11 +906,21 @@ function buildMqAdminConfig(): MqAdminConfig {
   const systemKind = mqSystemKind.value;
   if (systemKind === "kafka") {
     const bootstrapServers = normalizeKafkaBootstrapServers(mqKafkaBootstrapServers.value);
-    const extra: Record<string, string> = { bootstrapServers };
+    const extra: Record<string, unknown> = { bootstrapServers };
     const securityProtocol = mqKafkaSecurityProtocol.value === MQ_KAFKA_SECURITY_PROTOCOL_AUTO ? "" : mqKafkaSecurityProtocol.value.trim();
-    const saslMechanism = mqKafkaSaslMechanism.value.trim();
+    const saslMechanism = mqAuthKind.value === "kerberos" ? "GSSAPI" : mqKafkaSaslMechanism.value.trim();
+    const properties: Record<string, string> = {};
     if (securityProtocol) extra.securityProtocol = securityProtocol;
     if (mqAuthKind.value === "basic" && saslMechanism) extra.saslMechanism = saslMechanism;
+    if (mqAuthKind.value === "kerberos") {
+      extra.saslMechanism = "GSSAPI";
+      properties["sasl.jaas.config"] = buildKafkaKerberosJaasConfig();
+      properties["sasl.kerberos.service.name"] = mqKafkaKerberosServiceName.value.trim() || "kafka";
+      if (mqKafkaKrb5ConfPath.value.trim()) {
+        properties["java.security.krb5.conf"] = mqKafkaKrb5ConfPath.value.trim();
+      }
+    }
+    if (Object.keys(properties).length) extra.properties = properties;
     return {
       systemKind: mqSystemKind.value,
       adminUrl: "",
@@ -1012,6 +1071,10 @@ function formatInstallSize(bytes: number): string {
 }
 
 async function ensureRequiredAgentDriverInstalled(config: ConnectionConfig): Promise<void> {
+  if (requiresSqlServerLegacyCompatibilityComponent(config)) {
+    await installSqlServerLegacyCompatibilityComponentIfNeeded();
+  }
+
   const driverKey = agentDriverInstallKey(config.db_type, config.driver_profile);
   if (!driverKey) return;
 
@@ -1036,29 +1099,42 @@ async function ensureRequiredAgentDriverInstalled(config: ConnectionConfig): Pro
   }
 }
 
-function isSqlServerLegacyUnencryptedMode(params: string | undefined): boolean {
-  const normalized = (params || "").trim().replace(/^\?/, "").replace(/;/g, "&");
-  if (!normalized) return false;
-  const parsed = new URLSearchParams(normalized);
-  for (const [key, value] of parsed.entries()) {
-    const normalizedKey = key.trim().toLowerCase();
-    if (normalizedKey === "sqlserverencryption" || normalizedKey === "encrypt") {
-      // Accept JDBC-style `encrypt=false` from imported SQL Server URLs as the same opt-in.
-      if (["disabled", "disable", "false", "0", "off", "no"].includes(value.trim().toLowerCase())) return true;
-    }
+async function installSqlServerLegacyCompatibilityComponentIfNeeded(): Promise<boolean> {
+  if (await api.isAgentInstalled(SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY)) return true;
+
+  const label = t("connection.sqlServerLegacyCompatibilityComponent");
+  testResult.value = { ok: true, message: t("connection.sqlServerLegacyCompatibilityComponentInstalling") };
+  beginAgentDriverInstall(SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY, label);
+  try {
+    await api.installAgent(SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY);
+    await refreshLocalAgentDrivers();
+    finishAgentDriverInstall();
+  } catch (error) {
+    testResult.value = { ok: false, message: errorMessage(error) };
+    failAgentDriverInstall(error);
+    throw error;
   }
-  return false;
+  return true;
 }
 
-function setSqlServerLegacyUnencryptedMode(params: string | undefined, enabled: boolean): string {
-  const normalized = (params || "").trim().replace(/^\?/, "").replace(/;/g, "&");
-  const parsed = new URLSearchParams(normalized);
-  for (const key of Array.from(parsed.keys())) {
-    const normalizedKey = key.trim().toLowerCase();
-    if (normalizedKey === "sqlserverencryption" || normalizedKey === "encrypt") parsed.delete(key);
+async function onSqlServerLegacyCompatibilityModeChange(event: Event) {
+  if (form.value.db_type !== "sqlserver") return;
+  const input = event.target instanceof HTMLInputElement ? event.target : null;
+  const enabled = input?.checked === true;
+  if (!enabled) {
+    form.value.url_params = setSqlServerLegacyCompatibilityMode(form.value.url_params, false);
+    return;
   }
-  if (enabled) parsed.set("sqlserverEncryption", "disabled");
-  return parsed.toString();
+
+  if (input) input.checked = false;
+  try {
+    await installSqlServerLegacyCompatibilityComponentIfNeeded();
+    form.value.url_params = setSqlServerLegacyCompatibilityMode(form.value.url_params, true);
+    testResult.value = { ok: true, message: t("connection.sqlServerLegacyCompatibilityModeEnabled") };
+  } catch {
+    form.value.url_params = setSqlServerLegacyCompatibilityMode(form.value.url_params, false);
+    if (input) input.checked = false;
+  }
 }
 
 function isSqlServerTlsHandshakeFailure(message: string): boolean {
@@ -1859,13 +1935,7 @@ const agentInstallProgressLabel = computed(() => {
   return `${label} ${formatInstallSize(progress.downloaded ?? 0)} / ${formatInstallSize(progress.total)} (${agentInstallPercent.value ?? 0}%)`;
 });
 const canCloseAgentInstallDialog = computed(() => !agentInstallRunning.value || !!agentInstallError.value);
-const sqlServerLegacyUnencryptedModeEnabled = computed({
-  get: () => form.value.db_type === "sqlserver" && isSqlServerLegacyUnencryptedMode(form.value.url_params),
-  set: (enabled: boolean) => {
-    if (form.value.db_type !== "sqlserver") return;
-    form.value.url_params = setSqlServerLegacyUnencryptedMode(form.value.url_params, enabled);
-  },
-});
+const sqlServerLegacyCompatibilityModeEnabled = computed(() => form.value.db_type === "sqlserver" && isSqlServerLegacyCompatibilityMode(form.value.url_params));
 const shouldUseWideConnectionDialog = computed(() => dialogStep.value === "config" && (canChooseVisibleDatabases.value || (canChooseVisibleSchemas.value && !visibleFilterUsesSchemas.value)));
 const connectionDialogContentClass = computed(() => {
   if (dialogStep.value === "select") return "sm:max-w-[760px]";
@@ -1961,7 +2031,7 @@ async function testConnection() {
     const message = config ? connectionErrorWithDriverUpdateHint(config, rawMessage) : rawMessage;
     const fallbackMessage = config ? await tryNacosDockerConsoleFallback(config, message, runId) : null;
     if (runId !== testRunId) return;
-    const shouldShowSqlServerLegacyMode = !fallbackMessage && config?.db_type === "sqlserver" && !isSqlServerLegacyUnencryptedMode(config.url_params) && isSqlServerTlsHandshakeFailure(message);
+    const shouldShowSqlServerLegacyMode = !fallbackMessage && config?.db_type === "sqlserver" && !isSqlServerLegacyCompatibilityMode(config.url_params) && isSqlServerTlsHandshakeFailure(message);
     if (shouldShowSqlServerLegacyMode) {
       configTab.value = "advanced";
     }
@@ -3908,6 +3978,7 @@ function openExternalUrl(url: string) {
                       <Button size="sm" :variant="mqAuthKind === 'none' ? 'default' : 'outline'" @click="mqAuthKind = 'none'">None</Button>
                       <Button v-if="mqSystemKind !== 'kafka'" size="sm" :variant="mqAuthKind === 'token' ? 'default' : 'outline'" @click="mqAuthKind = 'token'">Token</Button>
                       <Button size="sm" :variant="mqAuthKind === 'basic' ? 'default' : 'outline'" @click="mqAuthKind = 'basic'">Basic</Button>
+                      <Button v-if="mqSystemKind === 'kafka'" size="sm" :variant="mqAuthKind === 'kerberos' ? 'default' : 'outline'" @click="mqAuthKind = 'kerberos'">Kerberos</Button>
                       <Button v-if="mqSystemKind !== 'kafka'" size="sm" :variant="mqAuthKind === 'apiKey' ? 'default' : 'outline'" @click="mqAuthKind = 'apiKey'">API Key</Button>
                       <Button v-if="mqSystemKind !== 'kafka'" size="sm" :variant="mqAuthKind === 'oauth2' ? 'default' : 'outline'" @click="mqAuthKind = 'oauth2'">OAuth2</Button>
                     </div>
@@ -3939,6 +4010,31 @@ function openExternalUrl(url: string) {
                           </SelectItem>
                         </SelectContent>
                       </Select>
+                    </div>
+                  </template>
+                  <template v-else-if="mqSystemKind === 'kafka' && mqAuthKind === 'kerberos'">
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label :class="connectionLabelClass">{{ t("connection.kafkaKerberosPrincipal") }}</Label>
+                      <Input v-model="mqKafkaKerberosPrincipal" class="col-span-3" placeholder="user@EXAMPLE.COM" />
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label :class="connectionLabelClass">{{ t("connection.kafkaKerberosKeytab") }}</Label>
+                      <Input v-model="mqKafkaKerberosKeytabPath" class="col-span-3" :placeholder="t('connection.kafkaKerberosKeytabPlaceholder')" />
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label :class="connectionLabelClass">{{ t("connection.kafkaKerberosServiceName") }}</Label>
+                      <Input v-model="mqKafkaKerberosServiceName" class="col-span-3" placeholder="kafka" />
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label :class="connectionLabelClass">{{ t("connection.kafkaKerberosKrb5Conf") }}</Label>
+                      <Input v-model="mqKafkaKrb5ConfPath" class="col-span-3" :placeholder="t('connection.kafkaKerberosKrb5ConfPlaceholder')" />
+                    </div>
+                    <div class="grid grid-cols-4 items-start gap-4">
+                      <div></div>
+                      <div class="col-span-3 space-y-1 text-xs leading-5 text-muted-foreground">
+                        <p>{{ t("connection.kafkaKerberosPathHint") }}</p>
+                        <p>{{ t("connection.kafkaKerberosAuthHint") }}</p>
+                      </div>
                     </div>
                   </template>
                   <template v-else-if="mqAuthKind === 'apiKey'">
@@ -4943,14 +5039,14 @@ function openExternalUrl(url: string) {
                   </label>
                 </div>
                 <div v-show="form.db_type === 'sqlserver'" class="grid grid-cols-4 items-start gap-4">
-                  <Label :class="connectionLabelSmallClass">{{ t("connection.sqlServerLegacyUnencryptedMode") }}</Label>
+                  <Label :class="connectionLabelSmallClass">{{ t("connection.sqlServerLegacyCompatibilityMode") }}</Label>
                   <div class="col-span-3 flex flex-col gap-1">
                     <label class="flex h-5 cursor-pointer items-center gap-2">
-                      <input type="checkbox" v-model="sqlServerLegacyUnencryptedModeEnabled" class="mr-0" />
-                      <span class="text-xs text-foreground">{{ t("connection.sqlServerLegacyUnencryptedModeEnable") }}</span>
+                      <input type="checkbox" :checked="sqlServerLegacyCompatibilityModeEnabled" :disabled="agentInstallRunning" class="mr-0" @change="onSqlServerLegacyCompatibilityModeChange" />
+                      <span class="text-xs text-foreground">{{ t("connection.sqlServerLegacyCompatibilityModeEnable") }}</span>
                     </label>
                     <p class="m-0 whitespace-pre-line text-xs leading-5 text-muted-foreground">
-                      {{ t("connection.sqlServerLegacyUnencryptedModeHint") }}
+                      {{ t("connection.sqlServerLegacyCompatibilityModeHint") }}
                     </p>
                   </div>
                 </div>

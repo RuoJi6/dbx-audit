@@ -25,7 +25,7 @@ pub(super) fn column_definition(dialect: StructureDialect, column: &EditableStru
             parts.push("ON UPDATE CURRENT_TIMESTAMP".to_string());
         }
     }
-    if dialect == StructureDialect::Mysql && !clean(&column.comment).is_empty() {
+    if matches!(dialect, StructureDialect::Mysql | StructureDialect::Doris) && !clean(&column.comment).is_empty() {
         parts.push(format!("COMMENT {}", quote_string(&clean(&column.comment))));
     }
     parts.join(" ")

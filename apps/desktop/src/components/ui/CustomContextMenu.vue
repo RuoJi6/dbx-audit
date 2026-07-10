@@ -17,8 +17,10 @@ export interface ContextMenuItem {
   children?: ContextMenuItem[];
 }
 
+type ContextMenuItemsSource = ContextMenuItem[] | (() => ContextMenuItem[]);
+
 const props = defineProps<{
-  items: ContextMenuItem[];
+  items: ContextMenuItemsSource;
 }>();
 
 defineEmits<{
@@ -51,6 +53,7 @@ const show = ref(false);
 const x = ref(0);
 const y = ref(0);
 const menuRef = ref<HTMLElement>();
+const activeItems = ref<ContextMenuItem[]>([]);
 
 // Submenu state
 const activeSubIndex = ref<number | null>(null);
@@ -63,6 +66,7 @@ let subAnchorRect: { left: number; right: number; top: number; bottom: number } 
 function close() {
   activeSubIndex.value = null;
   subAnchorRect = null;
+  activeItems.value = [];
   show.value = false;
 }
 
@@ -122,7 +126,10 @@ function handleSubItemClick(item: ContextMenuItem) {
 }
 
 function onContextMenu(event: MouseEvent) {
-  if (props.items.length === 0) return;
+  // Some callers build large context menus; resolve them only for actual opens.
+  const items = typeof props.items === "function" ? props.items() : props.items;
+  if (items.length === 0) return;
+  activeItems.value = items;
   event.preventDefault();
   event.stopPropagation();
   x.value = event.clientX;
@@ -143,7 +150,7 @@ function onContextMenu(event: MouseEvent) {
 function onItemMouseEnter(index: number, event: MouseEvent) {
   lastMouseX = event.clientX;
   lastMouseY = event.clientY;
-  const item = props.items[index];
+  const item = activeItems.value[index];
   if (!item?.children?.length || item.disabled) {
     // Moving to an item without children — close submenu immediately, no delay needed
     activeSubIndex.value = null;
@@ -259,7 +266,7 @@ onBeforeUnmount(() => {
   <!-- Main menu -->
   <Teleport to="body">
     <div v-if="show" ref="menuRef" :style="{ position: 'fixed', left: x + 'px', top: y + 'px', zIndex: 9999 }" class="bg-popover text-popover-foreground min-w-40 w-max max-w-[calc(100vw-16px)] rounded-[6px] p-1 overflow-y-auto ring-1 ring-foreground/10 shadow-lg">
-      <template v-for="(item, index) in items" :key="index">
+      <template v-for="(item, index) in activeItems" :key="index">
         <template v-if="item.visible !== false">
           <div v-if="item.separator" class="-mx-1 my-1 flex items-center px-1">
             <div class="h-px flex-1 bg-border/70" />
@@ -281,14 +288,14 @@ onBeforeUnmount(() => {
   <!-- Submenu -->
   <Teleport to="body">
     <div
-      v-if="show && activeSubIndex !== null && items[activeSubIndex]?.children?.length"
+      v-if="show && activeSubIndex !== null && activeItems[activeSubIndex]?.children?.length"
       ref="subRef"
       :style="{ position: 'fixed', left: subX + 'px', top: subY + 'px', zIndex: 10000, maxHeight: 'min(420px, calc(100vh - 16px))' }"
       class="bg-popover text-popover-foreground min-w-56 w-max max-w-[calc(100vw-16px)] rounded-[6px] p-1 overflow-y-auto ring-1 ring-foreground/10 shadow-lg"
       @mouseenter="onSubMouseEnter"
       @mouseleave="onSubMouseLeave"
     >
-      <template v-for="(child, ci) in items[activeSubIndex]!.children!" :key="ci">
+      <template v-for="(child, ci) in activeItems[activeSubIndex]!.children!" :key="ci">
         <template v-if="child.visible !== false">
           <div v-if="child.separator" class="-mx-1 my-1 flex items-center px-1">
             <div class="h-px flex-1 bg-border/70" />

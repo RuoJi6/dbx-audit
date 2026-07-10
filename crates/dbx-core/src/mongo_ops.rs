@@ -48,7 +48,16 @@ pub async fn mongo_drop_collection_core(
     let connections = state.connections.read().await;
     match connections.get(connection_id).ok_or("Not found")? {
         PoolKind::MongoDb(client) => mongo_driver::drop_collection(client, database, collection).await,
-        PoolKind::Agent(_) => Err("MongoDB legacy agent does not support drop collection".to_string()),
+        PoolKind::Agent(client) => {
+            let mut client = client.lock().await;
+            let _: serde_json::Value = client
+                .mongo_drop_collection(serde_json::json!({
+                    "database": database,
+                    "collection": collection,
+                }))
+                .await?;
+            Ok(())
+        }
         _ => Err("Not a MongoDB connection".to_string()),
     }
 }

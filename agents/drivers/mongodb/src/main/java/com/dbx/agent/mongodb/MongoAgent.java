@@ -504,6 +504,14 @@ public final class MongoAgent {
         return result;
     }
 
+    private static Object dropCollection(JsonObject params) {
+        MongoClient c = requireClient();
+        String database = params.get("database").getAsString();
+        String collection = params.get("collection").getAsString();
+        c.getDatabase(database).getCollection(collection).drop();
+        return Collections.singletonMap("ok", true);
+    }
+
     private static Object parseDropIndexesValue(String indexesJson, boolean single) {
         if (indexesJson == null || indexesJson.isBlank()) {
             if (single) {
@@ -808,6 +816,7 @@ public final class MongoAgent {
             case AgentProtocol.MONGO_METHOD_SERVER_VERSION -> serverVersion(params);
             case AgentProtocol.MONGO_METHOD_CREATE_INDEX -> createIndex(params);
             case AgentProtocol.MONGO_METHOD_DROP_INDEXES -> dropIndexes(params);
+            case AgentProtocol.MONGO_METHOD_DROP_COLLECTION -> dropCollection(params);
             case AgentProtocol.MONGO_METHOD_INSERT_DOCUMENT -> insertDocument(params);
             case AgentProtocol.MONGO_METHOD_UPDATE_DOCUMENT -> updateDocument(params);
             case AgentProtocol.MONGO_METHOD_UPDATE_DOCUMENTS -> updateDocuments(params);

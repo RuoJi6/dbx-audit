@@ -165,6 +165,13 @@ test("defaults Vim mode to off and preserves saved booleans", () => {
   assert.equal(normalizeEditorSettings({ vimModeEnabled: "yes" as any }).vimModeEnabled, false);
 });
 
+test("defaults auto-close brackets to on and preserves saved booleans", () => {
+  assert.equal(DEFAULT_EDITOR_SETTINGS.autoCloseBrackets, true);
+  assert.equal(normalizeEditorSettings({}).autoCloseBrackets, true);
+  assert.equal(normalizeEditorSettings({ autoCloseBrackets: false }).autoCloseBrackets, false);
+  assert.equal(normalizeEditorSettings({ autoCloseBrackets: "nope" as any }).autoCloseBrackets, true);
+});
+
 test("defaults update notifications to enabled", () => {
   assert.equal(DEFAULT_EDITOR_SETTINGS.updateNotificationsEnabled, true);
   assert.equal(normalizeEditorSettings({}).updateNotificationsEnabled, true);
