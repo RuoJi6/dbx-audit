@@ -411,7 +411,13 @@ fn finding_detail_row(finding: &AuditFinding) -> Vec<XlsxCellData> {
 }
 
 fn sheet(name: &str, cells: Vec<Vec<XlsxCellData>>) -> XlsxWorksheetData {
-    XlsxWorksheetData { sheet_name: Some(name.to_string()), cells, columns: Vec::new(), rows: Vec::new() }
+    XlsxWorksheetData {
+        sheet_name: Some(name.to_string()),
+        cells,
+        columns: Vec::new(),
+        column_types: Vec::new(),
+        rows: Vec::new(),
+    }
 }
 
 fn row<const N: usize>(values: [&str; N]) -> Vec<XlsxCellData> {

@@ -10,6 +10,14 @@ test("reports no diagnostics for read-only valid commands", () => {
   assert.deepEqual(messages("GET foo"), []);
   assert.deepEqual(messages("HGETALL k"), []);
   assert.deepEqual(messages("SCAN 0"), []);
+  assert.deepEqual(messages("ZRANDMEMBER leaderboard 2 WITHSCORES"), []);
+});
+
+test("recognizes set store commands as writes", () => {
+  const diags = buildRedisSyntaxDiagnostics("SDIFFSTORE destination source-a source-b");
+  assert.equal(diags.length, 1);
+  assert.equal(diags[0].severity, "warning");
+  assert.doesNotMatch(diags[0].message, /Unknown command/);
 });
 
 test("flags unknown command name", () => {

@@ -31,5 +31,6 @@ pub mod table_export;
 pub mod table_import;
 pub mod text_export;
 pub mod transfer;
+pub mod tunnel_profiles;
 pub mod update;
 pub mod zookeeper;

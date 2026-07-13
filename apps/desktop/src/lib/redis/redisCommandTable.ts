@@ -217,6 +217,7 @@ const RAW_COMMANDS: Record<string, Spec> = {
   ZMSCORE: [-3, "zset"],
   ZPOPMAX: [-2, "zset", "confirm"],
   ZPOPMIN: [-2, "zset", "confirm"],
+  ZRANDMEMBER: [-2, "zset"],
   ZRANGE: [-4, "zset"],
   ZRANGEBYLEX: [-4, "zset"],
   ZRANGEBYSCORE: [-4, "zset"],

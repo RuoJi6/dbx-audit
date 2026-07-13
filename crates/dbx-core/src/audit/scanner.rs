@@ -343,6 +343,8 @@ mod tests {
             numeric_scale: None,
             character_maximum_length: None,
             enum_values: None,
+            character_set: None,
+            collation: None,
         }
     }
 
