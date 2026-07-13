@@ -9,6 +9,8 @@ pub struct XlsxWorksheetData {
     #[serde(default)]
     pub cells: Vec<Vec<XlsxCellData>>,
     pub columns: Vec<String>,
+    #[serde(default)]
+    pub column_types: Vec<String>,
     pub rows: Vec<Vec<Value>>,
 }
 
@@ -25,6 +27,7 @@ pub struct XlsxCellData {
 pub struct StreamingXlsxWriter<W: Write + Seek> {
     zip: zip::ZipWriter<W>,
     columns: Vec<String>,
+    column_types: Vec<String>,
     next_row_number: usize,
 }
 
@@ -53,11 +56,14 @@ pub(crate) fn header_row_xml(columns: &[String]) -> String {
     )
 }
 
-pub(crate) fn data_row_xml(row_number: usize, columns: &[String], row: &[Value]) -> String {
+/// Build a single `<row>` XML fragment for a data row.
+pub(crate) fn data_row_xml(row_number: usize, columns: &[String], column_types: &[String], row: &[Value]) -> String {
     let cells = columns
         .iter()
         .enumerate()
-        .map(|(col_index, _)| cell_xml(row.get(col_index), row_number - 1, col_index, None))
+        .map(|(col_index, _)| {
+            typed_cell_xml(row.get(col_index), column_types.get(col_index), row_number - 1, col_index, None)
+        })
         .collect::<String>();
     format!("<row r=\"{row_number}\">{cells}</row>")
 }
@@ -78,6 +84,7 @@ pub(crate) fn start_streaming_xlsx_workbook<W: Write + Seek>(
     writer: W,
     sheet_name: Option<&str>,
     columns: &[String],
+    column_types: &[String],
 ) -> Result<StreamingXlsxWriter<W>, String> {
     let sheet_name = normalize_sheet_name(sheet_name);
     let widths = estimate_header_widths(columns);
@@ -109,13 +116,13 @@ pub(crate) fn start_streaming_xlsx_workbook<W: Write + Seek>(
     zip.write_all(sheet_header.as_bytes()).map_err(|err| err.to_string())?;
     zip.write_all(header_row_xml(columns).as_bytes()).map_err(|err| err.to_string())?;
 
-    Ok(StreamingXlsxWriter { zip, columns: columns.to_vec(), next_row_number: 2 })
+    Ok(StreamingXlsxWriter { zip, columns: columns.to_vec(), column_types: column_types.to_vec(), next_row_number: 2 })
 }
 
 impl<W: Write + Seek> StreamingXlsxWriter<W> {
     pub fn write_row(&mut self, row: &[Value]) -> Result<(), String> {
         self.zip
-            .write_all(data_row_xml(self.next_row_number, &self.columns, row).as_bytes())
+            .write_all(data_row_xml(self.next_row_number, &self.columns, &self.column_types, row).as_bytes())
             .map_err(|err| err.to_string())?;
         self.next_row_number += 1;
         Ok(())
@@ -254,6 +261,79 @@ fn cell_xml(value: Option<&Value>, row_index: usize, col_index: usize, style: Op
     }
 }
 
+fn is_numeric_column_type(column_type: Option<&String>) -> bool {
+    let normalized = column_type.map(|value| value.trim().to_ascii_lowercase()).unwrap_or_default();
+    let base = normalized.split(['(', ' ', '[']).next().unwrap_or_default();
+    matches!(
+        base,
+        "bit"
+            | "tinyint"
+            | "smallint"
+            | "mediumint"
+            | "int"
+            | "integer"
+            | "bigint"
+            | "int2"
+            | "int4"
+            | "int8"
+            | "uint8"
+            | "uint16"
+            | "uint32"
+            | "uint64"
+            | "uint128"
+            | "uint256"
+            | "float"
+            | "float4"
+            | "float8"
+            | "float32"
+            | "float64"
+            | "real"
+            | "double"
+            | "decimal"
+            | "numeric"
+            | "number"
+            | "money"
+            | "smallmoney"
+    )
+}
+
+fn safe_excel_number(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.parse::<f64>().ok().is_none_or(|number| !number.is_finite()) {
+        return None;
+    }
+    // Excel stores numbers with at most 15 significant decimal digits. Keep
+    // higher-precision database values as text rather than silently rounding.
+    let significant_digits = trimmed
+        .split(['e', 'E'])
+        .next()
+        .unwrap_or(trimmed)
+        .chars()
+        .filter(|ch| ch.is_ascii_digit())
+        .skip_while(|ch| *ch == '0')
+        .count();
+    (significant_digits <= 15).then_some(trimmed)
+}
+
+fn typed_cell_xml(
+    value: Option<&Value>,
+    column_type: Option<&String>,
+    row_index: usize,
+    col_index: usize,
+    style: Option<usize>,
+) -> String {
+    if is_numeric_column_type(column_type) {
+        if let Some(Value::String(value)) = value {
+            if let Some(number) = safe_excel_number(value) {
+                let reference = cell_ref(row_index, col_index);
+                let style_attr = style.map_or(String::new(), |style| format!(" s=\"{style}\""));
+                return format!("<c r=\"{reference}\"{style_attr}><v>{number}</v></c>");
+            }
+        }
+    }
+    cell_xml(value, row_index, col_index, style)
+}
+
 fn worksheet_xml(data: &XlsxWorksheetData) -> String {
     if !data.cells.is_empty() {
         return worksheet_cells_xml(&data.cells);
@@ -289,7 +369,9 @@ fn worksheet_xml(data: &XlsxWorksheetData) -> String {
                 .columns
                 .iter()
                 .enumerate()
-                .map(|(col_index, _)| cell_xml(row.get(col_index), excel_row - 1, col_index, None))
+                .map(|(col_index, _)| {
+                    typed_cell_xml(row.get(col_index), data.column_types.get(col_index), excel_row - 1, col_index, None)
+                })
                 .collect::<String>();
             format!("<row r=\"{excel_row}\">{cells}</row>")
         })
@@ -481,6 +563,7 @@ pub fn build_xlsx_workbook_multi(sheets: &[XlsxWorksheetData]) -> Result<Vec<u8>
             sheet_name: Some("Sheet1".to_string()),
             cells: Vec::new(),
             columns: vec!["Result".to_string()],
+            column_types: Vec::new(),
             rows: vec![vec![Value::String("No data".to_string())]],
         }]
     } else {
@@ -550,6 +633,7 @@ mod tests {
             sheet_name: Some("Users".to_string()),
             cells: Vec::new(),
             columns: vec!["id".to_string(), "name".to_string(), "active".to_string()],
+            column_types: vec![],
             rows: vec![vec![json!(1), json!("Ada & Bob"), json!(true)], vec![json!(2), json!(null), json!(false)]],
         })
         .expect("build workbook");
@@ -569,11 +653,45 @@ mod tests {
     }
 
     #[test]
+    fn writes_safe_numeric_strings_as_numbers_for_numeric_columns() {
+        let workbook = build_xlsx_workbook(&XlsxWorksheetData {
+            sheet_name: Some("Amounts".to_string()),
+            cells: Vec::new(),
+            columns: vec!["quantity".to_string(), "amount".to_string(), "code".to_string()],
+            column_types: vec!["decimal(10,5)".to_string(), "numeric".to_string(), "varchar".to_string()],
+            rows: vec![vec![json!("1.00000"), json!("2800.000000"), json!("00123")]],
+        })
+        .expect("build workbook");
+
+        let sheet = read_zip_entry(&workbook, "xl/worksheets/sheet1.xml");
+        assert!(sheet.contains("<c r=\"A2\"><v>1.00000</v></c>"));
+        assert!(sheet.contains("<c r=\"B2\"><v>2800.000000</v></c>"));
+        assert!(sheet.contains("<c r=\"C2\" t=\"inlineStr\"><is><t>00123</t></is></c>"));
+    }
+
+    #[test]
+    fn preserves_high_precision_numeric_strings_as_text() {
+        let workbook = build_xlsx_workbook(&XlsxWorksheetData {
+            sheet_name: Some("Precision".to_string()),
+            cells: Vec::new(),
+            columns: vec!["large_id".to_string(), "precise_amount".to_string()],
+            column_types: vec!["bigint".to_string(), "decimal(30,10)".to_string()],
+            rows: vec![vec![json!("9223372036854775807"), json!("123456789012345.6789000000")]],
+        })
+        .expect("build workbook");
+
+        let sheet = read_zip_entry(&workbook, "xl/worksheets/sheet1.xml");
+        assert!(sheet.contains("t=\"inlineStr\"") && sheet.contains("9223372036854775807"));
+        assert!(sheet.contains("123456789012345.6789000000"));
+    }
+
+    #[test]
     fn sanitizes_invalid_sheet_name() {
         let workbook = build_xlsx_workbook(&XlsxWorksheetData {
             sheet_name: Some("bad/name:with*chars?and-a-very-long-tail".to_string()),
             cells: Vec::new(),
             columns: vec!["value".to_string()],
+            column_types: vec![],
             rows: vec![vec![json!("ok")]],
         })
         .expect("build workbook");
@@ -589,12 +707,14 @@ mod tests {
                 sheet_name: Some("Result 1".to_string()),
                 cells: Vec::new(),
                 columns: vec!["id".to_string()],
+                column_types: vec![],
                 rows: vec![vec![json!(1)]],
             },
             XlsxWorksheetData {
                 sheet_name: Some("Result 2".to_string()),
                 cells: Vec::new(),
                 columns: vec!["name".to_string()],
+                column_types: vec![],
                 rows: vec![vec![json!("Ada")]],
             },
         ])
@@ -617,7 +737,7 @@ mod tests {
         {
             let file = fs::File::create(&path).expect("create temp xlsx");
             let mut writer =
-                start_streaming_xlsx_workbook(file, Some("Streamed"), &["id".to_string(), "name".to_string()])
+                start_streaming_xlsx_workbook(file, Some("Streamed"), &["id".to_string(), "name".to_string()], &[])
                     .expect("start workbook");
             writer.write_row(&[json!(1), json!("Ada")]).expect("write row");
             writer.write_row(&[json!(2), json!("Bob")]).expect("write row");
