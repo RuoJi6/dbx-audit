@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { afterEach, test } from "vitest";
 
-import { loadConnections, resetWebAuthForTests } from "../src/web-backend.js";
+import { executeQuery, loadConnections, resetWebAuthForTests } from "../src/web-backend.js";
 
 const originalFetch = globalThis.fetch;
 const originalWebUrl = process.env.DBX_WEB_URL;
@@ -122,4 +122,62 @@ test("web backend still allows DBX Web instances with password auth disabled", a
   }) as typeof fetch;
 
   assert.deepEqual(await loadConnections(), []);
+});
+
+test("web backend routes MongoDB count commands through count-documents", async () => {
+  process.env.DBX_WEB_URL = "http://127.0.0.1:4224";
+  delete process.env.DBX_WEB_PASSWORD;
+  const calls: Array<{ url: string; init?: RequestInit }> = [];
+  globalThis.fetch = (async (input, init) => {
+    const url = String(input);
+    calls.push({ url, init });
+    if (url.endsWith("/api/auth/check")) {
+      return jsonResponse({ authenticated: true, required: false, setup_required: false });
+    }
+    if (url.endsWith("/api/connection/connect")) {
+      return jsonResponse({ ok: true });
+    }
+    if (url.endsWith("/api/mongo/count-documents")) {
+      assert.equal(init?.method, "POST");
+      assert.deepEqual(JSON.parse(String(init?.body)), {
+        connectionId: "mongo-web",
+        database: "app",
+        collection: "projects",
+        filter: '{"active":true}',
+        mode: "accurate",
+      });
+      return jsonResponse(42);
+    }
+    throw new Error(`unexpected request: ${url}`);
+  }) as typeof fetch;
+
+  const result = await executeQuery(
+    {
+      id: "mongo-web",
+      name: "mongo-web",
+      db_type: "mongodb",
+      host: "127.0.0.1",
+      port: 27017,
+      username: "",
+      password: "",
+      database: "app",
+      ssh_enabled: false,
+      ssl: false,
+    },
+    'db.projects.countDocuments({"active":true})',
+  );
+
+  assert.deepEqual(result, {
+    columns: ["count"],
+    rows: [{ count: 42 }],
+    row_count: 1,
+  });
+  assert.deepEqual(
+    calls.map((call) => call.url),
+    [
+      "http://127.0.0.1:4224/api/auth/check",
+      "http://127.0.0.1:4224/api/connection/connect",
+      "http://127.0.0.1:4224/api/mongo/count-documents",
+    ],
+  );
 });

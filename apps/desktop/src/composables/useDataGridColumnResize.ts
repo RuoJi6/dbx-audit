@@ -113,6 +113,7 @@ export function useDataGridColumnResize(options: UseDataGridColumnResizeOptions)
       valueTextLimit: DATA_GRID_AUTO_FIT_VALUE_TEXT_LIMIT,
       density: density.value,
       compactColumnHeaderActions: compactColumnHeaderActions.value,
+      includeValues: true,
     });
   }
 

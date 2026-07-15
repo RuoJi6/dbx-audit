@@ -20,6 +20,12 @@ describe("dataGridTranspose density widths", () => {
     expect(transposeFieldWidth([], { density: "compact" })).toBe(minTransposeFieldWidth("compact"));
   });
 
+  it("keeps compact record width independent of field order", () => {
+    const longValue = "x".repeat(100);
+
+    expect(calculateTransposeRecordWidth([longValue, "a"], "compact")).toBe(calculateTransposeRecordWidth(["a", longValue], "compact"));
+  });
+
   it("recalculates automatic widths while preserving manual pixel overrides", () => {
     const records = [["x".repeat(40)], ["y".repeat(20)]];
     const standardWidths = transposeRecordWidthsForDensity({ records, density: "standard" });

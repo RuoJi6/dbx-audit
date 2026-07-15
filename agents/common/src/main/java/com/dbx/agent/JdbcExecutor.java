@@ -24,8 +24,13 @@ public final class JdbcExecutor {
 
     private final ConcurrentHashMap<String, QuerySession> sessions = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, QuerySession> tableReadSessions = new ConcurrentHashMap<>();
+    private final java.util.Set<Statement> activeStatements = ConcurrentHashMap.newKeySet();
 
-    private JdbcExecutor() {
+    public JdbcExecutor() {
+    }
+
+    public static JdbcExecutor current() {
+        return AgentExecutionContext.jdbcExecutor();
     }
 
     public QueryResult execute(Connection conn, String sql, String schema, Function<String, String> setSchemaSql) {
@@ -72,6 +77,8 @@ public final class JdbcExecutor {
             applySchema(conn, schema, setSchemaSql);
 
             try (Statement stmt = conn.createStatement()) {
+                activeStatements.add(stmt);
+                try {
                 int effectiveMaxRows = Math.max(maxRows, 1);
                 stmt.setMaxRows(effectiveMaxRows + 1);
                 applyQueryTimeout(stmt, timeoutSecs);
@@ -96,6 +103,9 @@ public final class JdbcExecutor {
                     elapsed,
                     false
                 );
+                } finally {
+                    activeStatements.remove(stmt);
+                }
             }
         });
     }
@@ -199,6 +209,7 @@ public final class JdbcExecutor {
             applySchema(conn, schema, setSchemaSql);
 
             Statement stmt = conn.createStatement();
+            activeStatements.add(stmt);
             try {
                 applyQueryTimeout(stmt, options.getTimeoutSecs());
                 if (options.getFetchSize() != null && options.getFetchSize() > 0) {
@@ -210,6 +221,7 @@ public final class JdbcExecutor {
                 long elapsed = System.currentTimeMillis() - start;
                 if (!hasResultSet) {
                     int updateCount = stmt.getUpdateCount();
+                    activeStatements.remove(stmt);
                     stmt.close();
                     return new QueryPageResult(
                         Collections.emptyList(),
@@ -249,6 +261,7 @@ public final class JdbcExecutor {
                 targetSessions.put(sessionId, session);
                 return readSessionPage(targetSessions, session, options.getPageSize(), elapsed);
             } catch (Exception e) {
+                activeStatements.remove(stmt);
                 try {
                     stmt.close();
                 } catch (Exception ignored) {
@@ -282,6 +295,20 @@ public final class JdbcExecutor {
 
     public void closeAllTableReadSessions() {
         closeAllSessions(tableReadSessions);
+    }
+
+    public void cancelActiveStatements() {
+        for (Statement statement : activeStatements) {
+            try {
+                statement.cancel();
+            } catch (SQLException ignored) {
+            }
+        }
+        // Paged result sets can remain idle between fetch requests, so no
+        // Statement is executing when cancellation arrives. Close those
+        // session-owned cursors as part of the same cancellation boundary.
+        closeAllQuerySessions();
+        closeAllTableReadSessions();
     }
 
     public int expireIdleQuerySessions() {
@@ -504,6 +531,7 @@ public final class JdbcExecutor {
             return false;
         }
         synchronized (session) {
+            activeStatements.remove(session.statement);
             try {
                 session.resultSet.close();
             } catch (Exception ignored) {

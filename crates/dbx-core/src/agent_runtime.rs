@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use crate::agent_manager::{AgentManager, DEFAULT_JRE_KEY};
 use crate::database_capabilities;
-use crate::db::agent_driver::{AgentDriverClient, AgentMethod};
+use crate::db::agent_driver::{AgentDriverClient, AgentMethod, AgentRuntimeClient};
 use crate::models::connection::DatabaseType;
 
 pub fn db_type_to_agent_key(db_type: &DatabaseType, driver_profile: Option<&str>) -> Option<&'static str> {
@@ -16,10 +16,21 @@ pub fn is_agent_type(db_type: &DatabaseType) -> bool {
 
 pub async fn stop_daemons(manager: &AgentManager) {
     manager.daemons.lock().await.clear();
+    let runtimes = std::mem::take(&mut *manager.connection_runtimes.lock().await);
+    for runtime in runtimes.into_values().filter_map(|cell| cell.get().cloned()) {
+        runtime.kill();
+    }
 }
 
 pub async fn stop_daemon_by_key(manager: &AgentManager, agent_key: &str) {
     manager.daemons.lock().await.remove(agent_key);
+    let mut runtimes = manager.connection_runtimes.lock().await;
+    let matching = runtimes.keys().filter(|key| key.starts_with(&format!("{agent_key}|"))).cloned().collect::<Vec<_>>();
+    for key in matching {
+        if let Some(runtime) = runtimes.remove(&key).and_then(|cell| cell.get().cloned()) {
+            runtime.kill();
+        }
+    }
 }
 
 pub async fn restart_daemon_by_key(manager: &AgentManager, agent_key: &str) -> Result<(), String> {
@@ -38,6 +49,54 @@ pub async fn spawn_connection_client(
     let keys = runtime_agent_key_candidates(db_type, driver_profile)
         .ok_or_else(|| format!("{:?} is not an agent-driven database type", db_type))?;
     spawn_first_available_client(manager, &keys, extra_java_args).await
+}
+
+pub async fn spawn_shared_connection_client(
+    manager: &AgentManager,
+    db_type: &DatabaseType,
+    driver_profile: Option<&str>,
+    extra_java_args: &[String],
+    agent_session_id: String,
+    connect_params: serde_json::Value,
+    connect_timeout: Duration,
+) -> Result<AgentDriverClient, String> {
+    let keys = runtime_agent_key_candidates(db_type, driver_profile)
+        .ok_or_else(|| format!("{:?} is not an agent-driven database type", db_type))?;
+    let key = first_installed_agent_key(manager, &keys).unwrap_or(keys[0]);
+    let state = manager.load_state();
+    let jre_key = state.installed_drivers.get(key).map(|driver| driver.jre.as_str()).unwrap_or(DEFAULT_JRE_KEY);
+    let launch = manager.resolve_agent_launch_spec_with_extra_args(&state, key, jre_key, extra_java_args)?;
+    let runtime_key = shared_runtime_key(key, &launch);
+
+    let runtime_cell = {
+        let mut runtimes = manager.connection_runtimes.lock().await;
+        if runtimes.get(&runtime_key).and_then(|cell| cell.get()).is_some_and(|runtime| runtime.is_failed()) {
+            runtimes.remove(&runtime_key);
+        }
+        runtimes.entry(runtime_key).or_insert_with(|| std::sync::Arc::new(tokio::sync::OnceCell::new())).clone()
+    };
+    let runtime =
+        runtime_cell.get_or_try_init(|| AgentRuntimeClient::spawn(launch, manager.agent_app_version())).await?.clone();
+    let mut session_params = connect_params;
+    session_params
+        .as_object_mut()
+        .ok_or_else(|| "Agent connect parameters must be an object".to_string())?
+        .insert("agentSessionId".to_string(), serde_json::Value::String(agent_session_id.clone()));
+    runtime
+        .call::<serde_json::Value>(AgentMethod::OpenSession.as_str(), session_params, Some(connect_timeout), None)
+        .await?;
+    runtime.increment_session_count();
+    Ok(AgentDriverClient::shared_session(runtime, agent_session_id))
+}
+
+fn shared_runtime_key(agent_key: &str, launch: &crate::db::agent_driver::AgentLaunchSpec) -> String {
+    format!(
+        "{}|{}|{}|{}",
+        agent_key,
+        launch.program.display(),
+        launch.args.join("\u{1f}"),
+        launch.working_dir.as_ref().map(|path| path.display().to_string()).unwrap_or_default()
+    )
 }
 
 pub async fn call_daemon<T: DeserializeOwned + Send + 'static>(
@@ -167,6 +226,7 @@ async fn spawn_client_for_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn prestosql_does_not_use_agent_driver() {
@@ -176,5 +236,18 @@ mod tests {
     #[test]
     fn trino_uses_only_trino_agent_driver() {
         assert_eq!(runtime_agent_key_candidates(&DatabaseType::Trino, None).unwrap(), vec!["trino"]);
+    }
+
+    #[test]
+    fn shared_runtime_key_includes_launch_fingerprint() {
+        let base = crate::db::agent_driver::AgentLaunchSpec::new(PathBuf::from("oracle-agent"))
+            .with_args(["--mode", "stdio"])
+            .with_working_dir(PathBuf::from("/tmp/oracle"));
+        let different_args = crate::db::agent_driver::AgentLaunchSpec::new(PathBuf::from("oracle-agent"))
+            .with_args(["--mode", "debug"])
+            .with_working_dir(PathBuf::from("/tmp/oracle"));
+
+        assert_eq!(shared_runtime_key("oracle", &base), shared_runtime_key("oracle", &base));
+        assert_ne!(shared_runtime_key("oracle", &base), shared_runtime_key("oracle", &different_args));
     }
 }

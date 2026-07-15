@@ -71,6 +71,7 @@ describe("queryStore table data refresh", () => {
 
     const publicTabId = store.createTab("pg-1", "app", "users", "data", "public");
     store.setTableMeta(publicTabId, {
+      database: "analytics",
       schema: "public",
       tableName: "users",
       tableType: "TABLE",
@@ -105,6 +106,8 @@ describe("queryStore table data refresh", () => {
     expect(refreshed).toBe(1);
     expect(mocks.buildTableSelectSql).toHaveBeenCalledWith({
       databaseType: "postgres",
+      identifierQuote: undefined,
+      database: "analytics",
       schema: "public",
       tableName: "users",
       tableType: "TABLE",

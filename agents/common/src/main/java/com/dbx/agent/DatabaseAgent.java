@@ -13,6 +13,10 @@ public interface DatabaseAgent {
 
     boolean testConnection(ConnectParams params);
 
+    default String getIdentifierQuote() {
+        return "";
+    }
+
     List<DatabaseInfo> listDatabases();
 
     List<String> listSchemas();
@@ -78,7 +82,51 @@ public interface DatabaseAgent {
             foreignKeys = Collections.emptyList();
         }
 
-        return buildTableDdl(schema, table, getColumns(schema, table), indexes, foreignKeys);
+        String tableComment = null;
+        try {
+            tableComment = getTableComment(schema, table);
+        } catch (RuntimeException e) {
+            // Table comment is optional; DDL generation should still succeed without it.
+        }
+
+        return DdlBuilder.buildTableDdl(schema, table, getColumns(schema, table), indexes, foreignKeys, Collections.emptyList(), false, false, tableComment);
+    }
+
+    /**
+     * Returns the comment/description for a table, or null if not available.
+     * Default implementation looks up the comment from listTables results.
+     * Subclasses can override for more efficient queries.
+     */
+    default String getTableComment(String schema, String table) {
+        try {
+            String caseInsensitiveComment = null;
+            int caseInsensitiveMatches = 0;
+            for (TableInfo info : listTables(schema)) {
+                if (!info.getName().equalsIgnoreCase(table)) {
+                    continue;
+                }
+                if (info.getName().equals(table)) {
+                    return nonBlankComment(info.getComment());
+                }
+                caseInsensitiveMatches++;
+                caseInsensitiveComment = nonBlankComment(info.getComment());
+            }
+            // Case-insensitive databases may normalize metadata names, but quoted
+            // mixed-case objects must never borrow a sibling table's comment.
+            if (caseInsensitiveMatches == 1) {
+                return caseInsensitiveComment;
+            }
+        } catch (RuntimeException e) {
+            // Ignore; table comment is optional.
+        }
+        return null;
+    }
+
+    static String nonBlankComment(String comment) {
+        if (comment != null && !comment.trim().isEmpty()) {
+            return comment;
+        }
+        return null;
     }
 
     List<IndexInfo> listIndexes(String schema, String table);
@@ -102,22 +150,22 @@ public interface DatabaseAgent {
         if (conn == null) {
             throw new IllegalStateException("Not connected");
         }
-        return JdbcExecutor.INSTANCE.executePage(
+        return AgentExecutionContext.jdbcExecutor().executePage(
             conn,
             sql,
             schema,
             this::setSchemaSQL,
             options,
-            JdbcExecutor.INSTANCE::defaultResultValue
+            AgentExecutionContext.jdbcExecutor()::defaultResultValue
         );
     }
 
     default QueryPageResult fetchQueryPage(String sessionId, int pageSize) {
-        return JdbcExecutor.INSTANCE.fetchPage(sessionId, pageSize);
+        return AgentExecutionContext.jdbcExecutor().fetchPage(sessionId, pageSize);
     }
 
     default boolean closeQuerySession(String sessionId) {
-        return JdbcExecutor.INSTANCE.closeQuerySession(sessionId);
+        return AgentExecutionContext.jdbcExecutor().closeQuerySession(sessionId);
     }
 
     default QueryPageResult startTableRead(String sql, String schema, QueryPageOptions options) {
@@ -125,22 +173,22 @@ public interface DatabaseAgent {
         if (conn == null) {
             throw new IllegalStateException("Not connected");
         }
-        return JdbcExecutor.INSTANCE.startTableRead(
+        return AgentExecutionContext.jdbcExecutor().startTableRead(
             conn,
             sql,
             schema,
             this::setSchemaSQL,
             options,
-            JdbcExecutor.INSTANCE::defaultResultValue
+            AgentExecutionContext.jdbcExecutor()::defaultResultValue
         );
     }
 
     default QueryPageResult fetchTableReadPage(String sessionId, int pageSize) {
-        return JdbcExecutor.INSTANCE.fetchTableReadPage(sessionId, pageSize);
+        return AgentExecutionContext.jdbcExecutor().fetchTableReadPage(sessionId, pageSize);
     }
 
     default boolean closeTableReadSession(String sessionId) {
-        return JdbcExecutor.INSTANCE.closeTableReadSession(sessionId);
+        return AgentExecutionContext.jdbcExecutor().closeTableReadSession(sessionId);
     }
 
     /**

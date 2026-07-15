@@ -381,16 +381,14 @@ export function drawCanvasDataGrid(options: DrawCanvasDataGridOptions) {
       ctx.font = value === null ? italicFont : tabularFont;
       setCanvasNumericVariant(ctx, value === null ? "normal" : "tabular-nums");
       const textLeft = alignCanvasPixel(drawX + 12, dpr);
-      const paddedMaxWidth = Math.max(0, drawX + colWidth - textLeft - 12);
+      const cellMaxWidth = Math.max(0, colWidth - 24);
       const isEditingThisCell = editingCell?.rowId === item.id && editingCell.col === actualColIdx;
       const rawDisplayText = item.isDraft && value === null ? (draftCellPlaceholder ?? "") : formatCell(value, actualColIdx);
       const displayText = isEditingThisCell ? "" : firstLineCellDisplayValue(rawDisplayText);
-      const needsTruncation = ctx.measureText(displayText).width > paddedMaxWidth;
-      const textMaxWidth = needsTruncation ? Math.max(0, drawX + colWidth - textLeft) : paddedMaxWidth;
-      const text = isEditingThisCell ? displayText : fitCanvasText(ctx, displayText, textMaxWidth - 12);
+      const text = isEditingThisCell ? displayText : fitCanvasText(ctx, displayText, cellMaxWidth);
       ctx.fillText(text, textLeft, textY);
       if (item.isDeleted && text) {
-        const textWidth = Math.min(ctx.measureText(text).width, textMaxWidth);
+        const textWidth = ctx.measureText(text).width;
         ctx.strokeStyle = theme.foreground;
         ctx.beginPath();
         ctx.moveTo(textLeft, textY);

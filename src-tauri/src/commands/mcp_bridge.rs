@@ -63,6 +63,16 @@ struct MongoFindDocumentsRequest {
 }
 
 #[derive(Deserialize)]
+struct MongoCountDocumentsRequest {
+    connection_name: String,
+    connection_id: Option<String>,
+    database: Option<String>,
+    collection: String,
+    filter: Option<String>,
+    mode: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct MongoServerVersionRequest {
     connection_name: String,
     connection_id: Option<String>,
@@ -214,6 +224,8 @@ pub fn start(app_handle: AppHandle, state: Arc<AppState>, data_dir: PathBuf) {
                     handle_describe_table_data(&st, body, &mut stream).await;
                 } else if first_line.starts_with("POST /data/mongo/list-collections") {
                     handle_mongo_list_collections_data(&st, body, &mut stream).await;
+                } else if first_line.starts_with("POST /data/mongo/count-documents") {
+                    handle_mongo_count_documents_data(&st, body, &mut stream).await;
                 } else if first_line.starts_with("POST /data/mongo/find-documents") {
                     handle_mongo_find_documents_data(&st, body, &mut stream).await;
                 } else if first_line.starts_with("POST /data/mongo/server-version") {
@@ -514,6 +526,34 @@ async fn handle_mongo_find_documents_data(state: &Arc<AppState>, body: &str, str
     .await
     {
         Ok(result) => respond_json(stream, &result).await,
+        Err(e) => respond_error(stream, "500 Internal Server Error", &e).await,
+    }
+}
+
+async fn handle_mongo_count_documents_data(state: &Arc<AppState>, body: &str, stream: &mut tokio::net::TcpStream) {
+    let req: MongoCountDocumentsRequest = match serde_json::from_str(body) {
+        Ok(r) => r,
+        Err(_) => {
+            respond_error(stream, "400 Bad Request", "Invalid JSON").await;
+            return;
+        }
+    };
+    let Some((pool_key, database, _connection_id)) =
+        resolve_mongo_pool_key(state, req.connection_id.as_deref(), &req.connection_name, req.database, stream).await
+    else {
+        return;
+    };
+    match dbx_core::mongo_ops::mongo_count_documents_core(
+        state,
+        &pool_key,
+        &database,
+        &req.collection,
+        req.filter.as_deref(),
+        req.mode.as_deref(),
+    )
+    .await
+    {
+        Ok(total) => respond_json(stream, &total).await,
         Err(e) => respond_error(stream, "500 Internal Server Error", &e).await,
     }
 }

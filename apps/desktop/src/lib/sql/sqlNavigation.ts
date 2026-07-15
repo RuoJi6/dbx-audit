@@ -128,6 +128,29 @@ export interface ExtractedSqlIdentifier {
   quoted: boolean;
 }
 
+export interface SqlObjectNavigationTarget {
+  name: string;
+  schema?: string;
+  type?: "table" | "view";
+}
+
+export function sqlObjectNavigationTarget(table: SqlObjectNavigationTarget): SqlObjectNavigationTarget {
+  return {
+    name: table.name,
+    ...(table.schema ? { schema: table.schema } : {}),
+    ...(table.type ? { type: table.type } : {}),
+  };
+}
+
+export function sqlObjectHoverDetail(table: SqlObjectNavigationTarget): string {
+  const objectType = table.type === "view" ? "view" : "table";
+  return table.schema ? `${objectType} in ${table.schema}` : objectType;
+}
+
+export function sqlObjectNavigationTableType(table: SqlObjectNavigationTarget): "TABLE" | "VIEW" {
+  return table.type === "view" ? "VIEW" : "TABLE";
+}
+
 function isIdentifierChar(char: string | undefined): boolean {
   return !!char && /^[A-Za-z0-9_$]$/.test(char);
 }
@@ -237,7 +260,7 @@ export function splitQualifiedIdentifier(identifier: string): string[] {
 }
 
 /** Match identifier against known table names (case-insensitive). Supports qualified identifiers like schema.table. */
-export function matchTable(identifier: string, tables: Array<{ name: string; schema?: string }>): { name: string; schema?: string } | null {
+export function matchTable<T extends { name: string; schema?: string }>(identifier: string, tables: T[]): T | null {
   const parts = splitQualifiedIdentifier(identifier);
   const normalizedIdentifier = parts.length > 0 ? parts.join(".").toLowerCase() : identifier.toLowerCase();
 

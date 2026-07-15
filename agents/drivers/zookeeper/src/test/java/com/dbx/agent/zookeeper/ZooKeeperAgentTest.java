@@ -4,7 +4,12 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import org.apache.curator.framework.CuratorFramework;
+import org.apache.curator.framework.CuratorFrameworkFactory;
+import org.apache.curator.retry.ExponentialBackoffRetry;
 import org.apache.curator.test.TestingServer;
+import org.apache.zookeeper.CreateMode;
+import org.apache.zookeeper.ZooDefs;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
@@ -133,6 +138,58 @@ final class ZooKeeperAgentTest {
     }
 
     @Test
+    void connectFailsFastWhenAllServersAreUnreachable() {
+        long startedAt = System.nanoTime();
+        JsonObject error = error(request(
+            1,
+            "connect",
+            "{\"connection\":{\"connect_string\":\"127.0.0.1:1\",\"connection_timeout_ms\":15000}}"
+        ));
+        long elapsedMs = (System.nanoTime() - startedAt) / 1_000_000;
+
+        Assertions.assertTrue(
+            error.get("message").getAsString().contains("No reachable ZooKeeper server"),
+            "expected fast unreachable error, got: " + error.get("message").getAsString()
+        );
+        Assertions.assertTrue(elapsedMs < 4000, "expected fast failure, took " + elapsedMs + "ms");
+    }
+
+    @Test
+    void connectUsesReachableServerWithoutDroppingEnsembleMembers() throws Exception {
+        try (TestingServer server = new TestingServer()) {
+            JsonObject connect = result(request(
+                1,
+                "connect",
+                "{\"connection\":{\"connect_string\":\"127.0.0.1:1," + server.getConnectString() + "\"}}"
+            ));
+            Assertions.assertTrue(connect.get("ok").getAsBoolean());
+
+            JsonObject get = result(request(2, "kv_get", "{\"key\":\"/\"}"));
+            Assertions.assertTrue(get.get("found").getAsBoolean());
+        }
+    }
+
+    @Test
+    void reachableConnectStringPreservesFullEnsembleAndChroot() throws Exception {
+        try (TestingServer server = new TestingServer()) {
+            String alive = server.getConnectString();
+            String ensemble = "127.0.0.1:1," + alive + "/app";
+
+            Assertions.assertEquals(
+                ensemble,
+                ZooKeeperAgent.reachableConnectString(ensemble, 1000)
+            );
+            Assertions.assertEquals(alive, ZooKeeperAgent.reachableConnectString(alive, 1000));
+
+            IllegalStateException error = Assertions.assertThrows(
+                IllegalStateException.class,
+                () -> ZooKeeperAgent.reachableConnectString("127.0.0.1:1/app", 1000)
+            );
+            Assertions.assertTrue(error.getMessage().contains("No reachable ZooKeeper server"));
+        }
+    }
+
+    @Test
     void testConnectionDoesNotReplaceActiveClient() throws Exception {
         try (TestingServer active = new TestingServer(); TestingServer probe = new TestingServer()) {
             result(request(1, "connect", "{\"connection\":{\"connect_string\":\"" + active.getConnectString() + "\"}}"));
@@ -172,6 +229,31 @@ final class ZooKeeperAgentTest {
             Assertions.assertEquals(metadata.get("czxid").getAsLong(), metadata.get("createRevision").getAsLong());
             Assertions.assertEquals(metadata.get("mzxid").getAsLong(), metadata.get("modRevision").getAsLong());
             Assertions.assertEquals(metadata.get("dataLength").getAsInt(), metadata.get("valueSize").getAsInt());
+        }
+    }
+
+    @Test
+    void kvGetReadsZnodeCreatedWithoutDataAsEmptyUtf8() throws Exception {
+        try (TestingServer server = new TestingServer();
+             CuratorFramework curator = CuratorFrameworkFactory.newClient(
+                 server.getConnectString(),
+                 new ExponentialBackoffRetry(100, 3)
+            )) {
+            curator.start();
+            curator.getZookeeperClient().getZooKeeper().create(
+                "/empty",
+                null,
+                ZooDefs.Ids.OPEN_ACL_UNSAFE,
+                CreateMode.PERSISTENT
+            );
+            connect(server);
+
+            JsonObject get = result(request(3, "kv_get", "{\"key\":\"/empty\"}"));
+
+            Assertions.assertTrue(get.get("found").getAsBoolean());
+            Assertions.assertEquals("utf8", get.getAsJsonObject("value").get("encoding").getAsString());
+            Assertions.assertEquals("", get.getAsJsonObject("value").get("data").getAsString());
+            Assertions.assertEquals(0, get.getAsJsonObject("metadata").get("valueSize").getAsInt());
         }
     }
 

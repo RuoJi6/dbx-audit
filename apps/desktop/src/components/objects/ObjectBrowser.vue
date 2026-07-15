@@ -439,9 +439,9 @@ const selectableRows = computed(() => rows.value.filter((row) => row.type === "T
 // at once, which stalls the UI on schemas with thousands of objects.
 const OBJECT_GRID_MIN_CARD_WIDTH = 160; // former `minmax(160px, 1fr)` floor
 const OBJECT_GRID_GAP = 12; // 0.75rem, former grid gap (both axes)
-// Card height is variable: only timestamp/comment rows that actually appear in
-// the current dataset contribute. objectGridRowHeight (below) adapts accordingly
-// so the row slot is as tight as possible instead of always using the worst case.
+// Card height is dataset-stable: if any object has timestamps/comments, every card
+// reserves those slots (even when empty) so borders stay level across a row.
+// objectGridRowHeight adapts to the dataset instead of always using the worst case.
 //   Base: p-3 top+bottom(24) + icon h-11(44) + name(18) + type/bytes(18) + gap-1×2(8) = 112
 //   + optional timestamp row: text-[10px](15) + gap-1(4) = 19
 //   + optional comment row:   text-[10px](15) + gap-1(4) = 19
@@ -852,7 +852,7 @@ async function fetchTableDdl() {
   tableDdlLoading.value = true;
   try {
     const schema = row.schema || selectedSchema.value || props.database;
-    const ddl = await api.getTableDdl(props.connection.id, props.database || "", schema, row.name, tableDdlObjectType(row.type));
+    const ddl = await api.getTableDdl(props.connection.id, props.database || "", schema, row.name, tableDdlObjectType(row.type), props.catalog);
     if (sidePanelGuard.isStale(epoch)) return;
     tableDdlContent.value = ddl;
   } catch (e: any) {
@@ -870,7 +870,7 @@ async function fetchTableColumns() {
   tableColumnsLoading.value = true;
   try {
     const schema = row.schema || selectedSchema.value || props.database;
-    const columns = await api.getColumns(props.connection.id, props.database || "", schema, row.name);
+    const columns = await api.getColumns(props.connection.id, props.database || "", schema, row.name, props.catalog);
     if (sidePanelGuard.isStale(epoch)) return;
     tableColumns.value = columns;
   } catch {
@@ -888,7 +888,7 @@ async function fetchTableIndexes() {
   tableIndexesLoading.value = true;
   try {
     const schema = row.schema || selectedSchema.value || props.database;
-    const indexes = await api.listIndexes(props.connection.id, props.database || "", schema, row.name);
+    const indexes = await api.listIndexes(props.connection.id, props.database || "", schema, row.name, props.catalog);
     if (sidePanelGuard.isStale(epoch)) return;
     tableIndexes.value = indexes;
   } catch {
@@ -906,7 +906,7 @@ async function fetchTableForeignKeys() {
   tableForeignKeysLoading.value = true;
   try {
     const schema = row.schema || selectedSchema.value || props.database;
-    const fks = await api.listForeignKeys(props.connection.id, props.database || "", schema, row.name);
+    const fks = await api.listForeignKeys(props.connection.id, props.database || "", schema, row.name, props.catalog);
     if (sidePanelGuard.isStale(epoch)) return;
     tableForeignKeys.value = fks;
   } catch {
@@ -924,7 +924,7 @@ async function fetchTableTriggers() {
   tableTriggersLoading.value = true;
   try {
     const schema = row.schema || selectedSchema.value || props.database;
-    const triggers = await api.listTriggers(props.connection.id, props.database || "", schema, row.name);
+    const triggers = await api.listTriggers(props.connection.id, props.database || "", schema, row.name, props.catalog);
     if (sidePanelGuard.isStale(epoch)) return;
     tableTriggers.value = triggers;
   } catch {
@@ -987,7 +987,7 @@ const canOpenTableStructureEditor = computed(() => sidePanelRow.value?.type === 
 function openTableStructureEditor() {
   const row = sidePanelRow.value;
   if (!row || row.type !== "TABLE" || !canOpenTableStructureEditor.value) return;
-  queryStore.openTableStructure(props.connection.id, props.database, row.schema || selectedSchema.value, row.name, tableInfoTab.value);
+  queryStore.openTableStructure(props.connection.id, props.database, row.schema || selectedSchema.value, row.name, tableInfoTab.value, undefined, props.catalog);
 }
 
 async function openSource(row: ObjectBrowserRow) {
@@ -1048,6 +1048,7 @@ async function openNewQuery(row: ObjectBrowserRow) {
     tabId,
     await buildTableSelectSql({
       databaseType: effectiveDatabaseType.value,
+      identifierQuote: connectionStore.connectionIdentifierQuote?.(props.connection.id),
       schema: row.schema || selectedSchema.value,
       tableName: row.name,
       limit: 100,
@@ -1273,7 +1274,7 @@ function openViewData(row: ObjectBrowserRow) {
 
 function openStructureEditor(row: ObjectBrowserRow) {
   if (row.type !== "TABLE") return;
-  queryStore.openTableStructure(props.connection.id, props.database, row.schema || selectedSchema.value, row.name);
+  queryStore.openTableStructure(props.connection.id, props.database, row.schema || selectedSchema.value, row.name, undefined, undefined, props.catalog);
 }
 
 function droppedTableObjectTypeForRow(row: ObjectBrowserRow): "TABLE" | "VIEW" | "MATERIALIZED_VIEW" | null {
@@ -1376,7 +1377,7 @@ async function fetchSortedTableRowsForDrop(): Promise<ObjectBrowserRow[]> {
   const rows = [...selectedTableRows.value];
   if (rows.length <= 1) return rows;
 
-  const fkResults = await Promise.all(rows.map((row) => api.listForeignKeys(props.connection.id, props.database, row.schema || selectedSchema.value || "", row.name).catch(() => [] as ForeignKeyInfo[])));
+  const fkResults = await Promise.all(rows.map((row) => api.listForeignKeys(props.connection.id, props.database, row.schema || selectedSchema.value || "", row.name, props.catalog).catch(() => [] as ForeignKeyInfo[])));
 
   const tablesWithFk: TableWithFk[] = rows.map((row, i) => ({
     name: row.name,
@@ -1566,7 +1567,7 @@ async function confirmBatchEmptyTables() {
 async function exportStructure(row: ObjectBrowserRow) {
   try {
     const schema = row.schema || selectedSchema.value || props.database;
-    const ddl = await api.getTableDdl(props.connection.id, props.database, schema, row.name, tableDdlObjectType(row.type));
+    const ddl = await api.getTableDdl(props.connection.id, props.database, schema, row.name, tableDdlObjectType(row.type), props.catalog);
     await saveFileContent(buildSingleDdlExportFileContent(ddl), `${row.name}.sql`, "SQL", "sql");
   } catch (e: any) {
     console.error("Export structure failed:", e);
@@ -1581,10 +1582,11 @@ function tableDdlObjectType(type: ObjectBrowserRow["type"]): ObjectSourceKind | 
 async function exportDataLegacy(row: ObjectBrowserRow, format: "json" | "sql") {
   try {
     const schema = row.schema || selectedSchema.value;
-    const tableColumns = format === "sql" ? await api.getColumns(props.connection.id, props.database, schema || props.database, row.name) : undefined;
-    const queryColumns = props.connection.db_type === "neo4j" ? (tableColumns ?? (await api.getColumns(props.connection.id, props.database, schema || props.database, row.name))).map((column) => column.name) : undefined;
+    const tableColumns = format === "sql" ? await api.getColumns(props.connection.id, props.database, schema || props.database, row.name, props.catalog) : undefined;
+    const queryColumns = props.connection.db_type === "neo4j" ? (tableColumns ?? (await api.getColumns(props.connection.id, props.database, schema || props.database, row.name, props.catalog))).map((column) => column.name) : undefined;
     const result = await fetchTableDataForExport({
       databaseType: effectiveDatabaseType.value,
+      identifierQuote: connectionStore.connectionIdentifierQuote?.(props.connection.id),
       schema,
       tableName: row.name,
       columns: queryColumns,
@@ -1667,7 +1669,7 @@ async function exportTableData(row: ObjectBrowserRow, format: "csv" | "xlsx") {
 
   let task: ExportTask | null = null;
   try {
-    const queryColumns = props.connection.db_type === "neo4j" ? (await api.getColumns(props.connection.id, props.database, schema || props.database, row.name)).map((column) => column.name) : undefined;
+    const queryColumns = props.connection.db_type === "neo4j" ? (await api.getColumns(props.connection.id, props.database, schema || props.database, row.name, props.catalog)).map((column) => column.name) : undefined;
 
     task = addExportTask(row.name, format, filePath);
     const currentTask = task;
@@ -1830,7 +1832,7 @@ async function confirmPasteTable() {
         if (!executed) return;
       }
       if (copyData) {
-        const sourceColumns = await api.getColumns(props.connection.id, props.database, schema || "", entry.sourceName);
+        const sourceColumns = await api.getColumns(props.connection.id, props.database, schema || "", entry.sourceName, props.catalog);
         const dataCopyColumnOptions = tableDataCopyColumnOptions(effectiveDatabaseType.value, sourceColumns);
         if (dataCopyColumnOptions.columns.length === 0) {
           throw new Error("No writable columns available for table data copy.");
@@ -2624,7 +2626,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
               <div class="object-browser-grid-row" :style="{ gridTemplateColumns: `repeat(${gridColumns}, minmax(0, 1fr))`, height: `${objectGridRowHeight - OBJECT_GRID_GAP}px` }">
                 <CustomContextMenu v-for="item in row.cards" :key="item.id" :items="getObjectBrowserMenuItems(item)" v-slot="{ onContextMenu }">
                   <div
-                    class="relative flex cursor-pointer flex-col items-center gap-1 rounded-lg border bg-card p-3 text-center transition-all hover:border-primary/40 hover:shadow-sm"
+                    class="relative flex h-full min-h-0 cursor-pointer flex-col items-center gap-1 rounded-lg border bg-card p-3 text-center transition-all hover:border-primary/40 hover:shadow-sm"
                     :class="{
                       'border-primary bg-primary/5': selectedTableIds.has(item.id),
                       'border-primary/60': sourceRow?.id === item.id && !selectedTableIds.has(item.id),
@@ -2648,13 +2650,14 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
                       }}</span>
                       <span v-if="item.totalBytes != null && item.totalBytes > 0" class="object-browser-stat-badge object-browser-stat-badge-bytes rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium tabular-nums text-muted-foreground">{{ formatObjectBrowserBytes(item.totalBytes) }}</span>
                     </div>
-                    <div v-if="item.created_at?.trim() || item.updated_at?.trim()" class="flex items-center gap-1 text-[10px] text-muted-foreground/70">
+                    <!-- Always reserve timestamp/comment slots when the dataset has them so every card shares one height. -->
+                    <div v-if="hasCreatedAt || hasUpdatedAt" class="flex min-h-[15px] items-center gap-1 text-[10px] leading-[15px] text-muted-foreground/70">
                       <span v-if="item.created_at?.trim()">{{ formatObjectBrowserTimestamp(item.created_at) }}</span>
                       <span v-if="item.created_at?.trim() && item.updated_at?.trim()">·</span>
                       <span v-if="item.updated_at?.trim()">{{ formatObjectBrowserTimestamp(item.updated_at) }}</span>
                     </div>
-                    <div v-if="item.comment?.trim()" class="w-full truncate text-[10px] text-muted-foreground/60" :title="item.comment">
-                      {{ item.comment }}
+                    <div v-if="hasAnyComment" class="w-full truncate text-[10px] leading-[15px] text-muted-foreground/60" :title="item.comment?.trim() || undefined">
+                      {{ item.comment?.trim() || "\u00A0" }}
                     </div>
                   </div>
                 </CustomContextMenu>
@@ -3071,7 +3074,8 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
 .object-browser-grid-row {
   display: grid;
   column-gap: 12px;
-  align-items: start;
+  /* Stretch so cards with/without comment share one border height in the row. */
+  align-items: stretch;
 }
 
 .object-browser-icon-bg-table {

@@ -6,7 +6,11 @@ use crate::commands::connection::{ensure_connection_writable, AppState};
 use dbx_core::db::mongo_driver::MongoDocumentResult;
 use dbx_core::document_ops::CollectionInfo;
 
-async fn run_cancellable<T, F>(state: &Arc<AppState>, execution_id: Option<String>, future: F) -> Result<T, String>
+pub(crate) async fn run_cancellable<T, F>(
+    state: &Arc<AppState>,
+    execution_id: Option<String>,
+    future: F,
+) -> Result<T, String>
 where
     F: Future<Output = Result<T, String>>,
 {

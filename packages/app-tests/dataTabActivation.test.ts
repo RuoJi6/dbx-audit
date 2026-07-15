@@ -22,6 +22,10 @@ test("activates an existing data table tab while it is still loading", () => {
   assert.equal(canActivateExistingDataTableTab(dataTab({ isExecuting: true })), true);
 });
 
+test("sidebar can restart a loading tab after superseding its request", () => {
+  assert.equal(canActivateExistingDataTableTab(dataTab({ isExecuting: true }), { activateExecuting: false }), false);
+});
+
 test("activates an existing data table tab with a usable result", () => {
   assert.equal(
     canActivateExistingDataTableTab(

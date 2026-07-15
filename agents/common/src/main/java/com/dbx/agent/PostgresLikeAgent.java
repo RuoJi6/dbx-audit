@@ -29,8 +29,13 @@ public abstract class PostgresLikeAgent extends AbstractJdbcAgent {
     }
 
     @Override
+    public String getIdentifierQuote() {
+        return mysqlCompatMode ? "`" : super.getIdentifierQuote();
+    }
+
+    @Override
     public QueryResult executeQuery(String sql, String schema, ExecuteQueryOptions options) {
-        return JdbcExecutor.INSTANCE.execute(
+        return JdbcExecutor.current().execute(
             requireConnected(),
             sql,
             schema,
@@ -44,7 +49,7 @@ public abstract class PostgresLikeAgent extends AbstractJdbcAgent {
 
     @Override
     public QueryPageResult executeQueryPage(String sql, String schema, QueryPageOptions options) {
-        return JdbcExecutor.INSTANCE.executePage(
+        return JdbcExecutor.current().executePage(
             requireConnected(),
             sql,
             schema,
@@ -56,7 +61,7 @@ public abstract class PostgresLikeAgent extends AbstractJdbcAgent {
 
     @Override
     public QueryPageResult startTableRead(String sql, String schema, QueryPageOptions options) {
-        return JdbcExecutor.INSTANCE.startTableRead(
+        return JdbcExecutor.current().startTableRead(
             requireConnected(),
             sql,
             schema,
@@ -254,6 +259,13 @@ public abstract class PostgresLikeAgent extends AbstractJdbcAgent {
             checkConstraints = Collections.emptyList();
         }
 
+        String tableComment = null;
+        try {
+            tableComment = getTableComment(schema, table);
+        } catch (RuntimeException e) {
+            // Table comment is optional; DDL generation should still succeed without it.
+        }
+
         return DdlBuilder.buildTableDdl(
             schema,
             table,
@@ -262,8 +274,32 @@ public abstract class PostgresLikeAgent extends AbstractJdbcAgent {
             foreignKeys,
             checkConstraints,
             mysqlCompatMode,
-            true
+            true,
+            tableComment
         );
+    }
+
+    @Override
+    public String getTableComment(String schema, String table) {
+        return unchecked(() -> {
+            try (java.sql.PreparedStatement stmt = requireConnection().prepareStatement(
+                "SELECT obj_description(c.oid) AS table_comment " +
+                "FROM pg_catalog.pg_class c " +
+                "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace " +
+                "WHERE n.nspname = ? AND c.relname = ? AND c.relkind IN ('r','m','f','p') " +
+                "LIMIT 1"
+            )) {
+                stmt.setString(1, schema);
+                stmt.setString(2, table);
+                try (ResultSet rs = stmt.executeQuery()) {
+                    if (rs.next()) {
+                        String comment = rs.getString("table_comment");
+                        return (comment != null && !comment.trim().isEmpty()) ? comment : null;
+                    }
+                }
+            }
+            return null;
+        });
     }
 
     protected List<CheckConstraintInfo> listCheckConstraints(String schema, String table) {

@@ -32,6 +32,13 @@ pub struct CloseDatabaseConnectionRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ConnectionIdentifierQuoteRequest {
+    pub connection_id: String,
+    pub database: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SaveConnectionsRequest {
     pub configs: Vec<ConnectionConfig>,
 }
@@ -131,6 +138,18 @@ pub async fn check_connection_health(
 ) -> Result<Json<()>, AppError> {
     state.app.check_connection_health(&body.connection_id).await.map_err(AppError)?;
     Ok(Json(()))
+}
+
+pub async fn connection_identifier_quote(
+    State(state): State<Arc<WebState>>,
+    Json(body): Json<ConnectionIdentifierQuoteRequest>,
+) -> Result<Json<Option<String>>, AppError> {
+    state
+        .app
+        .connection_identifier_quote(&body.connection_id, body.database.as_deref())
+        .await
+        .map(Json)
+        .map_err(AppError)
 }
 
 pub async fn close_database_connection(
@@ -276,6 +295,7 @@ mod tests {
             visible_databases: None,
             visible_schemas: None,
             attached_databases: Vec::new(),
+            init_script: None,
             color: None,
             transport_layers: Vec::new(),
             connect_timeout_secs: dbx_core::models::connection::default_connect_timeout_secs(),

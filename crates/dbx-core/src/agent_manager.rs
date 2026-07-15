@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use crate::db::agent_driver::{AgentDriverClient, AgentLaunchSpec, AgentMethod};
+use crate::db::agent_driver::{AgentDriverClient, AgentLaunchSpec, AgentMethod, AgentRuntimeClient};
 use crate::models::connection::DatabaseType;
 
 pub const DEFAULT_JRE_KEY: &str = "21";
@@ -394,6 +394,9 @@ pub struct AgentManager {
     base_dir: PathBuf,
     app_version: String,
     pub(crate) daemons: Mutex<std::collections::HashMap<String, AgentDriverClient>>,
+    pub(crate) connection_runtimes: Mutex<
+        std::collections::HashMap<String, std::sync::Arc<tokio::sync::OnceCell<std::sync::Arc<AgentRuntimeClient>>>>,
+    >,
 }
 
 impl Default for AgentManager {
@@ -414,8 +417,12 @@ impl AgentManager {
     }
 
     pub fn new_with_base_dir_and_app_version(base_dir: PathBuf, app_version: impl Into<String>) -> Self {
-        let mgr =
-            Self { base_dir, app_version: app_version.into(), daemons: Mutex::new(std::collections::HashMap::new()) };
+        let mgr = Self {
+            base_dir,
+            app_version: app_version.into(),
+            daemons: Mutex::new(std::collections::HashMap::new()),
+            connection_runtimes: Mutex::new(std::collections::HashMap::new()),
+        };
         mgr.migrate_legacy_jre();
         mgr.cleanup_pending_jre_dirs();
         mgr.cleanup_orphan_jre_dirs();
@@ -760,7 +767,13 @@ impl AgentManager {
     }
 
     pub async fn active_daemon_keys(&self) -> Vec<String> {
-        self.daemons.lock().await.keys().cloned().collect()
+        let mut keys = self.daemons.lock().await.keys().cloned().collect::<std::collections::HashSet<_>>();
+        for runtime_key in self.connection_runtimes.lock().await.keys() {
+            if let Some((agent_key, _)) = runtime_key.split_once('|') {
+                keys.insert(agent_key.to_string());
+            }
+        }
+        keys.into_iter().collect()
     }
 
     pub fn db_type_to_agent_key(db_type: &DatabaseType, driver_profile: Option<&str>) -> Option<&'static str> {
@@ -786,6 +799,27 @@ impl AgentManager {
         extra_java_args: &[String],
     ) -> Result<AgentDriverClient, String> {
         crate::agent_runtime::spawn_connection_client(self, db_type, driver_profile, extra_java_args).await
+    }
+
+    pub async fn spawn_shared_connection_client(
+        &self,
+        db_type: &DatabaseType,
+        driver_profile: Option<&str>,
+        extra_java_args: &[String],
+        agent_session_id: String,
+        connect_params: serde_json::Value,
+        connect_timeout: std::time::Duration,
+    ) -> Result<AgentDriverClient, String> {
+        crate::agent_runtime::spawn_shared_connection_client(
+            self,
+            db_type,
+            driver_profile,
+            extra_java_args,
+            agent_session_id,
+            connect_params,
+            connect_timeout,
+        )
+        .await
     }
 
     pub async fn call_daemon<T: serde::de::DeserializeOwned + Send + 'static>(

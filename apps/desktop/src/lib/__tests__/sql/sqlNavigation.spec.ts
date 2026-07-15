@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { extractIdentifierAt, extractIdentifierDetailsAt, isSqlKeyword, matchTable, splitQualifiedIdentifier } from "@/lib/sql/sqlNavigation";
+import { extractIdentifierAt, extractIdentifierDetailsAt, isSqlKeyword, matchTable, splitQualifiedIdentifier, sqlObjectHoverDetail, sqlObjectNavigationTableType, sqlObjectNavigationTarget } from "@/lib/sql/sqlNavigation";
 
 describe("extractIdentifierAt", () => {
   it("extracts unquoted qualified identifiers", () => {
@@ -52,9 +52,10 @@ describe("splitQualifiedIdentifier", () => {
 
 describe("matchTable", () => {
   it("matches schema-qualified table identifiers", () => {
-    const table = { schema: "MAAC00", name: "Accounts" };
+    const table = { schema: "MAAC00", name: "Accounts", type: "view" as const };
 
     expect(matchTable("maac00.accounts", [table])).toBe(table);
+    expect(matchTable("maac00.accounts", [table])?.type).toBe("view");
   });
 
   it("matches catalog.schema.table identifiers against schema-scoped tables", () => {
@@ -71,5 +72,25 @@ describe("matchTable", () => {
 
   it("does not treat non-schema qualifiers as table matches", () => {
     expect(matchTable("u.users", [{ schema: "public", name: "users" }])).toBeNull();
+  });
+});
+
+describe("SQL object navigation metadata", () => {
+  it("preserves view type and schema for command-click navigation", () => {
+    expect(sqlObjectNavigationTarget({ name: "active_users", schema: "dbo", type: "view" })).toEqual({
+      name: "active_users",
+      schema: "dbo",
+      type: "view",
+    });
+  });
+
+  it("uses the object type in hover details", () => {
+    expect(sqlObjectHoverDetail({ name: "active_users", schema: "dbo", type: "view" })).toBe("view in dbo");
+    expect(sqlObjectHoverDetail({ name: "users", schema: "dbo", type: "table" })).toBe("table in dbo");
+  });
+
+  it("maps navigation types to table metadata types", () => {
+    expect(sqlObjectNavigationTableType({ name: "active_users", type: "view" })).toBe("VIEW");
+    expect(sqlObjectNavigationTableType({ name: "users", type: "table" })).toBe("TABLE");
   });
 });

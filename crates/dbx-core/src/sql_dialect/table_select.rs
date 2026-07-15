@@ -21,12 +21,22 @@ pub fn build_table_data_select_sql(options: TableDataSelectSqlOptions) -> String
     }
 
     // Doris / StarRocks multi-catalog: prefix the catalog for external-catalog tables.
-    let table = qualified_table_name_with_catalog(
-        database_type,
-        options.catalog.as_deref(),
-        options.schema.as_deref(),
-        &options.table_name,
-    );
+    let table = if database_type == Some(DatabaseType::Kingbase) {
+        table_data_qualified_table_name(
+            database_type,
+            options.schema.as_deref(),
+            &options.table_name,
+            options.identifier_quote.as_deref(),
+        )
+    } else {
+        qualified_table_name_with_catalog(
+            database_type,
+            options.catalog.as_deref(),
+            options.schema.as_deref(),
+            options.database.as_deref(),
+            &options.table_name,
+        )
+    };
     let predicate = normalize_where_input(options.where_input.as_deref());
     let where_clause = if predicate.is_empty() { String::new() } else { format!(" WHERE ({predicate})") };
     let default_order_by = if database_type == Some(DatabaseType::InfluxDb) {
@@ -141,6 +151,40 @@ pub fn build_table_data_select_sql(options: TableDataSelectSqlOptions) -> String
             format!("SELECT {select_columns} FROM {table_alias}{where_clause}{order} LIMIT {limit}{offset};")
         }
     }
+}
+
+pub(crate) fn table_data_qualified_table_name(
+    database_type: Option<DatabaseType>,
+    schema: Option<&str>,
+    table_name: &str,
+    identifier_quote: Option<&str>,
+) -> String {
+    if database_type != Some(DatabaseType::Kingbase) {
+        return qualified_table_name(database_type, schema, table_name);
+    }
+    let table = quote_table_data_identifier(database_type, table_name, identifier_quote);
+    schema
+        .map(str::trim)
+        .filter(|schema| !schema.is_empty())
+        .map(|schema| format!("{}.{}", quote_table_data_identifier(database_type, schema, identifier_quote), table))
+        .unwrap_or(table)
+}
+
+fn quote_table_data_identifier(
+    database_type: Option<DatabaseType>,
+    name: &str,
+    identifier_quote: Option<&str>,
+) -> String {
+    if database_type != Some(DatabaseType::Kingbase) {
+        return quote_table_identifier(database_type, name);
+    }
+    let Some(quote) = identifier_quote else {
+        return quote_table_identifier(database_type, name);
+    };
+    if quote.is_empty() {
+        return name.to_string();
+    }
+    format!("{quote}{}{quote}", name.replace(quote, &format!("{quote}{quote}")))
 }
 
 fn is_view_table_type(table_type: Option<&str>) -> bool {
@@ -415,12 +459,19 @@ pub(super) fn build_questdb_table_select_sql(
 mod tests {
     use super::*;
 
-    fn opts(database_type: DatabaseType, catalog: Option<&str>, table: &str) -> TableDataSelectSqlOptions {
+    fn opts(
+        database_type: DatabaseType,
+        catalog: Option<&str>,
+        database: Option<&str>,
+        table: &str,
+    ) -> TableDataSelectSqlOptions {
         TableDataSelectSqlOptions {
             database_type: Some(database_type),
+            identifier_quote: None,
             schema: None,
             table_name: table.to_string(),
             catalog: catalog.map(|c| c.to_string()),
+            database: database.map(|d| d.to_string()),
             table_type: None,
             primary_keys: Vec::new(),
             columns: Vec::new(),
@@ -435,32 +486,42 @@ mod tests {
 
     #[test]
     fn doris_external_catalog_prefixes_from_clause() {
-        let sql = build_table_data_select_sql(opts(DatabaseType::Doris, Some("iceberg_catalog"), "orders"));
-        assert!(sql.contains("FROM `iceberg_catalog`.`orders`"), "sql was: {sql}");
+        let sql =
+            build_table_data_select_sql(opts(DatabaseType::Doris, Some("iceberg_catalog"), Some("sales"), "orders"));
+        assert!(sql.contains("FROM `iceberg_catalog`.`sales`.`orders`"), "sql was: {sql}");
     }
 
     #[test]
     fn starrocks_external_catalog_prefixes_from_clause() {
-        let sql = build_table_data_select_sql(opts(DatabaseType::StarRocks, Some("hive_catalog"), "orders"));
-        assert!(sql.contains("FROM `hive_catalog`.`orders`"), "sql was: {sql}");
+        let sql =
+            build_table_data_select_sql(opts(DatabaseType::StarRocks, Some("hive_catalog"), Some("sales"), "orders"));
+        assert!(sql.contains("FROM `hive_catalog`.`sales`.`orders`"), "sql was: {sql}");
+    }
+
+    #[test]
+    fn doris_external_catalog_without_database_degrades_to_two_part() {
+        // When neither schema nor database is provided the name degrades to the
+        // 2-part `catalog.table` form.
+        let sql = build_table_data_select_sql(opts(DatabaseType::Doris, Some("iceberg_catalog"), None, "orders"));
+        assert!(sql.contains("FROM `iceberg_catalog`.`orders`"), "sql was: {sql}");
     }
 
     #[test]
     fn doris_internal_catalog_is_not_prefixed() {
-        let sql = build_table_data_select_sql(opts(DatabaseType::Doris, Some("internal"), "orders"));
+        let sql = build_table_data_select_sql(opts(DatabaseType::Doris, Some("internal"), None, "orders"));
         assert!(!sql.contains("internal"), "sql was: {sql}");
         assert!(sql.contains("FROM `orders`"), "sql was: {sql}");
     }
 
     #[test]
     fn doris_empty_catalog_is_not_prefixed() {
-        let sql = build_table_data_select_sql(opts(DatabaseType::Doris, Some("   "), "orders"));
+        let sql = build_table_data_select_sql(opts(DatabaseType::Doris, Some("   "), None, "orders"));
         assert!(sql.contains("FROM `orders`"), "sql was: {sql}");
     }
 
     #[test]
     fn doris_no_catalog_is_not_prefixed() {
-        let sql = build_table_data_select_sql(opts(DatabaseType::Doris, None, "orders"));
+        let sql = build_table_data_select_sql(opts(DatabaseType::Doris, None, None, "orders"));
         assert!(sql.contains("FROM `orders`"), "sql was: {sql}");
     }
 
@@ -468,7 +529,8 @@ mod tests {
     fn external_catalog_is_ignored_for_non_doris_engines() {
         // Postgres does not support the 3-part catalog naming; the catalog
         // must be ignored to avoid emitting an invalid qualified name.
-        let sql = build_table_data_select_sql(opts(DatabaseType::Postgres, Some("iceberg_catalog"), "orders"));
+        let sql =
+            build_table_data_select_sql(opts(DatabaseType::Postgres, Some("iceberg_catalog"), Some("sales"), "orders"));
         assert!(!sql.contains("iceberg_catalog"), "sql was: {sql}");
         assert!(sql.contains("orders"), "sql was: {sql}");
     }

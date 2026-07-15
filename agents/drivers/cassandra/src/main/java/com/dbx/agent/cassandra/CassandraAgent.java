@@ -7,7 +7,7 @@ import com.dbx.agent.DatabaseInfo;
 import com.dbx.agent.ForeignKeyInfo;
 import com.dbx.agent.IndexInfo;
 import com.dbx.agent.JdbcIdentifiers;
-import com.dbx.agent.JsonRpcServer;
+import com.dbx.agent.MultiSessionJsonRpcServer;
 import com.dbx.agent.TableInfo;
 import com.dbx.agent.TriggerInfo;
 import java.sql.PreparedStatement;
@@ -189,6 +189,6 @@ public final class CassandraAgent extends AbstractJdbcAgent {
     }
 
     public static void main(String[] args) {
-        new JsonRpcServer(new CassandraAgent()).run();
+        new MultiSessionJsonRpcServer(CassandraAgent::new).run();
     }
 }

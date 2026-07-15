@@ -1,7 +1,7 @@
 import { strict as assert } from "node:assert";
 import { test } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
-import { activeResultRun, databaseDisplayNameForTab, executionSummaryItems, nextExecutionSummaryView, resultGridCacheKey, resultRunItems, resultSqlForGrid, tabDisplayTitle, tabModeLabel, tabularResultItems } from "../../apps/desktop/src/lib/tabs/tabPresentation.ts";
+import { activeResultRun, databaseDisplayNameForTab, executionSummaryItems, middleEllipsis, nextExecutionSummaryView, resultGridCacheKey, resultRunItems, resultSourceRange, resultSqlForGrid, tabDisplayTitle, tabModeLabel, tabularResultItems } from "../../apps/desktop/src/lib/tabs/tabPresentation.ts";
 import { useConnectionStore } from "../../apps/desktop/src/stores/connectionStore.ts";
 import type { ConnectionConfig, QueryResult, QueryTab } from "../../apps/desktop/src/types/database.ts";
 
@@ -184,7 +184,7 @@ test("tabular result items expose source labels when available", () => {
   assert.deepEqual(
     tabularResultItems(results).map((item) => ({ index: item.index, n: item.n, label: item.label, title: item.title })),
     [
-      { index: 1, n: 1, label: "public.users", title: "select * from public.users" },
+      { index: 1, n: 1, label: "public.users", title: "public.users" },
       { index: 2, n: 2, label: undefined, title: "select id, name, email, created_at from users where active = true order by created_at desc" },
     ],
   );
@@ -192,6 +192,43 @@ test("tabular result items expose source labels when available", () => {
     tabularResultItems([result(["id"], { sourceLabel: "db.users" })]).map((item) => item.label),
     ["db.users"],
   );
+});
+
+test("middleEllipsis preserves the beginning and end of long source labels", () => {
+  assert.equal(middleEllipsis("easy_manager_tool.tool_monitor_data_index_item"), "easy_manage...index_item");
+  assert.equal(middleEllipsis("aaa.apis"), "aaa.apis");
+});
+
+test("resultSourceRange uses the result index for repeated SQL", () => {
+  const sql = "select * from users;\nselect * from users;";
+  assert.deepEqual(resultSourceRange(sql, { sourceStatement: "select * from users" }, 1, "mysql"), {
+    from: sql.lastIndexOf("select"),
+    to: sql.length - 1,
+    sql: "select * from users",
+  });
+  assert.equal(resultSourceRange("select * from users;", { sourceStatement: "select * from orders" }, 0, "mysql"), undefined);
+});
+
+test("resultSourceRange resolves newline-separated MongoDB commands", () => {
+  const sql = "db.model_field_group.find({})\n\ndb.model_info.find({})";
+  const sourceStatement = "db.model_info.find({})";
+
+  assert.deepEqual(resultSourceRange(sql, { sourceStatement }, 1, "mongodb"), {
+    from: sql.indexOf(sourceStatement),
+    to: sql.length,
+    sql: sourceStatement,
+  });
+});
+
+test("resultSourceRange resolves newline-separated Redis commands", () => {
+  const sql = "GET first\n\nGET second";
+  const sourceStatement = "GET second";
+
+  assert.deepEqual(resultSourceRange(sql, { sourceStatement }, 1, "redis"), {
+    from: sql.indexOf(sourceStatement),
+    to: sql.length,
+    sql: sourceStatement,
+  });
 });
 
 test("resultSqlForGrid prefers the active result source statement", () => {

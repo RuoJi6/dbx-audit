@@ -219,19 +219,18 @@ export async function executeQuery(config: ConnectionConfig, sql: string, option
     }
     const count = parseMongoCountDocumentsCommand(sql);
     if (count) {
-      const res = await apiFetch("/api/mongo/find-documents", {
+      const res = await apiFetch("/api/mongo/count-documents", {
         method: "POST",
         body: JSON.stringify({
           connectionId: config.id,
           database: config.database || "",
           collection: count.collection,
-          skip: 0,
-          limit: 1,
           filter: count.filter,
+          mode: count.mode,
         }),
       });
-      const result = (await res.json()) as { documents: unknown[]; total: number };
-      return { columns: ["count"], rows: [{ count: result.total }], row_count: 1 };
+      const total = (await res.json()) as number;
+      return { columns: ["count"], rows: [{ count: total }], row_count: 1 };
     }
     const find = parseMongoFindCommand(sql);
     if (find) {

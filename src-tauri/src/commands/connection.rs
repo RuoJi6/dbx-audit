@@ -172,6 +172,7 @@ mod tests {
             visible_databases: None,
             visible_schemas: None,
             attached_databases: Vec::new(),
+            init_script: None,
             color: None,
             transport_layers: Vec::new(),
             connect_timeout_secs: dbx_core::models::connection::default_connect_timeout_secs(),
@@ -687,13 +688,8 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
             }
             #[cfg(feature = "duckdb-bundled")]
             DatabaseType::DuckDb => {
-                if state.duckdb_existing_pool_is_usable_for_config(&config).await? {
-                    Ok("Connection successful".to_string())
-                } else {
-                    let con = db::duckdb_driver::connect_path(&expand_tilde(&config.host))?;
-                    dbx_core::db::duckdb_driver::close_connection(con);
-                    Ok("Connection successful".to_string())
-                }
+                state.test_duckdb_connection_config(&config).await?;
+                Ok("Connection successful".to_string())
             }
             #[cfg(not(feature = "duckdb-bundled"))]
             DatabaseType::DuckDb => Err("DuckDB support not compiled (enable duckdb-bundled feature)".to_string()),
@@ -957,6 +953,9 @@ pub async fn connect_db(
                 let locked = con.lock().map_err(|e| e.to_string())?;
                 for attached in &db_config.attached_databases {
                     dbx_core::schema::duckdb_attach_database(&locked, &attached.name, &expand_tilde(&attached.path))?;
+                }
+                if let Some(script) = db_config.init_script.as_deref() {
+                    db::duckdb_driver::run_init_script(&locked, script)?;
                 }
             }
             PoolKind::DuckDb(con)
@@ -1244,6 +1243,15 @@ pub async fn refresh_connections(state: State<'_, Arc<AppState>>) -> Result<(), 
 #[tauri::command]
 pub async fn check_connection_health(state: State<'_, Arc<AppState>>, connection_id: String) -> Result<(), String> {
     state.check_connection_health(&connection_id).await
+}
+
+#[tauri::command]
+pub async fn connection_identifier_quote(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    database: Option<String>,
+) -> Result<Option<String>, String> {
+    state.connection_identifier_quote(&connection_id, database.as_deref()).await
 }
 
 /// Check whether a connection has read-only protection enabled.
