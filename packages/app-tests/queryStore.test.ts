@@ -3000,6 +3000,58 @@ test("replacing one paginated SQL result preserves the grouped refresh SQL", asy
   }
 });
 
+test("mongo count execution uses the dedicated count endpoint", async () => {
+  const restoreStorage = installMemoryStorage();
+  setActivePinia(createPinia());
+  const connectionStore = useConnectionStore();
+  const store = useQueryStore();
+  const originalFetch = globalThis.fetch;
+  let countBody: any;
+
+  connectionStore.addEphemeralConnection({
+    ...conn("mongo-1"),
+    db_type: "mongodb",
+    port: 27017,
+  });
+
+  globalThis.fetch = withConnectionHealthMock(async (input, init) => {
+    const url = String(input);
+    if (url === "/api/query/prepare-pagination-plan") {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      return new Response(JSON.stringify({ sqlToExecute: body.options.sql, useAgentResultSession: false }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (url === "/api/mongo/count-documents") {
+      countBody = JSON.parse(String(init?.body ?? "{}"));
+      return new Response(JSON.stringify(21606536), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    return new Response("unexpected request", { status: 500 });
+  });
+
+  try {
+    const tabId = store.createTab("mongo-1", "dbx_issue_2959", "Query", "query", "");
+    await store.executeTabSql(tabId, "db.large_count.count()");
+    const tab = store.tabs.find((item) => item.id === tabId);
+
+    assert.deepEqual(countBody, {
+      connectionId: "mongo-1",
+      database: "dbx_issue_2959",
+      collection: "large_count",
+      filter: "{}",
+      mode: "legacy",
+      executionId: countBody.executionId,
+    });
+    assert.equal(typeof countBody.executionId, "string");
+    assert.deepEqual(tab?.result?.columns, ["count"]);
+    assert.deepEqual(tab?.result?.rows, [[21606536]]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreStorage();
+  }
+});
+
 test("mongo createIndex execution uses the dedicated create-index endpoint", async () => {
   const restoreStorage = installMemoryStorage();
   setActivePinia(createPinia());
@@ -3760,6 +3812,7 @@ test("buildQueryResultExportRequest uses sorted SQL and independent row-limit se
     assert.equal(request?.useAgentCursor, false);
     assert.equal(request?.filePath, "C:\\tmp\\events.csv");
     assert.equal(request?.format, "csv");
+    assert.equal(request?.includeSqlSheet, false);
     assert.equal(request?.pageSize, 2500);
     assert.equal(request?.rowLimit, null);
     assert.equal(request?.totalRows, 123456);
@@ -3800,10 +3853,12 @@ test("buildQueryResultExportRequest uses exportRowLimit when enabled", async () 
       exportId: "export-2",
       filePath: "C:\\tmp\\events.xlsx",
       format: "xlsx",
+      includeSqlSheet: true,
     });
 
     assert.equal(request?.pageSize, 2500);
     assert.equal(request?.rowLimit, 200000);
+    assert.equal(request?.includeSqlSheet, true);
   } finally {
     globalThis.fetch = originalFetch;
     restoreStorage();

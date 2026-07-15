@@ -26,11 +26,15 @@ const pageIcons: Record<string, keyof typeof icons> = {
   "ai-assistant": "Bot",
   cli: "Terminal",
   mcp: "Cable",
+  "web-api": "Webhook",
+  contributing: "GitPullRequest",
   plugins: "Plug",
   "driver-management": "Package",
+  "sql-formatter": "AlignLeft",
   "keyboard-shortcuts": "Keyboard",
   "connection-import": "Import",
   "config-export": "FileUp",
+  "cloud-sync": "CloudUpload",
   "ssh-tunnel": "ShieldCheck",
 };
 

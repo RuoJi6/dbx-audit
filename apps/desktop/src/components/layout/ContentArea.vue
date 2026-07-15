@@ -55,6 +55,8 @@ const ObjectBrowser = defineAsyncComponent(() => import("@/components/objects/Ob
 const TableStructureEditor = defineAsyncComponent(() => import("@/components/structure/TableStructureEditor.vue"));
 const DatabaseUserAdmin = defineAsyncComponent(() => import("@/components/admin/DatabaseUserAdmin.vue"));
 const AuditPanel = defineAsyncComponent(() => import("@/components/audit/AuditPanel.vue"));
+const ProcessListPanel = defineAsyncComponent(() => import("@/components/admin/ProcessListPanel.vue"));
+const MySqlDashboard = defineAsyncComponent(() => import("@/components/admin/MySqlDashboard.vue"));
 const DamengJobAdmin = defineAsyncComponent(() => import("@/components/admin/DamengJobAdmin.vue"));
 const ExplainPlanViewer = defineAsyncComponent(() => import("@/components/explain/ExplainPlanViewer.vue"));
 const QueryChart = defineAsyncComponent(() => import("@/components/chart/QueryChart.vue"));
@@ -63,7 +65,7 @@ import { useConnectionStore } from "@/stores/connectionStore";
 import { TABLE_FONT_SIZE_MAX, TABLE_FONT_SIZE_MIN, useSettingsStore, type DataGridSearchMode } from "@/stores/settingsStore";
 import { useToast } from "@/composables/useToast";
 import { canCancelQueryExecution, queryExecutionLabelKey } from "@/lib/sql/queryExecutionState";
-import { databaseDisplayNameForTab, executionSummaryItems, resultGridCacheKey, resultRunItems, resultSqlForGrid, tabularResultItems } from "@/lib/tabs/tabPresentation";
+import { databaseDisplayNameForTab, executionSummaryItems, queryResultExecutionSql, resultGridCacheKey, resultRunItems, resultSourceRange, resultSqlForGrid, tabularResultItems } from "@/lib/tabs/tabPresentation";
 import { defaultQueryResultArchiveFileName } from "@/lib/query/queryResultArchive";
 import { saveQueryResultArchiveFile } from "@/lib/query/queryResultArchiveFile";
 import { isTableDataEditable } from "@/lib/table/tableEditing";
@@ -74,7 +76,7 @@ import { effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
 import { chartableColumnIndexes } from "@/lib/dataGrid/chartData";
 import { elasticsearchJsonResponseForResult } from "@/lib/elasticsearch/elasticsearchJsonResponse";
 import * as api from "@/lib/backend/api";
-import { applyMongoGridChangesToDocument, buildMongoUpdateDocument, formatMongoShellLiteral, type MongoInputValue } from "@/lib/mongo/mongoDocumentValues";
+import { applyMongoGridChangesToDocument, buildMongoUpdateDocument, formatMongoShellLiteral, serializeMongoDocumentId, type MongoInputValue } from "@/lib/mongo/mongoDocumentValues";
 import type { SqlExecutionOverride } from "@/lib/sql/sqlExecutionTarget";
 import type { DataGridSortMode } from "@/lib/dataGrid/dataGridSort";
 import { DATA_GRID_COMPACT_TOPBAR_WIDTH, type DataGridReloadIntent } from "@/lib/dataGrid/dataGridToolbar";
@@ -82,6 +84,7 @@ import { useTabScroll } from "@/composables/useTabScroll";
 import { formatElapsedSeconds } from "@/lib/common/elapsedTime";
 import type { CustomSaveHandler } from "@/composables/useDataGridEditor";
 import type { QueryTab, ConnectionConfig, TableInfoTab, TreeNode, VectorCollectionMeta, ObjectBrowserViewport } from "@/types/database";
+import type { SqlObjectNavigationTarget } from "@/lib/sql/sqlNavigation";
 import { sqlFormatDialectForDbType, type SqlFormatDialect } from "@/lib/sql/sqlFormatter";
 import { productionContextForDatabase } from "@/lib/database/productionSafety";
 
@@ -155,7 +158,7 @@ const emit = defineEmits<{
   paginate: [offset: number, limit: number, whereInput?: string, orderBy?: string];
   sort: [column: string, columnIndex: number, direction: "asc" | "desc" | null, whereInput?: string, mode?: DataGridSortMode];
   executeSql: [sql: string];
-  clickTable: [tableName: string];
+  clickTable: [target: SqlObjectNavigationTarget];
   viewTableData: [tableName: string];
   viewTableDdl: [tableName: string];
   editTableStructure: [tableName: string];
@@ -201,6 +204,7 @@ const columnInfoLoading = ref(false);
 const columnInfoError = ref<string | undefined>(undefined);
 const dataGridRef = ref<DataGridHandle>();
 const queryEditorRef = ref<InstanceType<typeof QueryEditor>>();
+const tableStructureEditorRef = ref<{ applyChanges: () => Promise<boolean> }>();
 const standaloneResultToolbarRef = ref<HTMLElement | null>(null);
 const standaloneResultToolbarWidth = ref(0);
 const resultTabsScrollerRef = ref<HTMLElement | null>(null);
@@ -327,12 +331,14 @@ const allResultExportSheets = computed(() =>
   tabularResults.value.map((item) => ({
     sheetName: item.label || t("tabs.resultN", { n: item.n }),
     result: item.result,
+    sql: item.index === props.activeTab.activeResultIndex ? queryResultExecutionSql(props.activeTab) : item.result.sourceStatement,
   })),
 );
 const resultRuns = computed(() => resultRunItems(props.activeTab));
 const activeResultRunItem = computed(() => resultRuns.value.find((run) => run.active));
 const activeResultGridCacheKey = computed(() => resultGridCacheKey(props.activeTab));
 const activeResultSql = computed(() => resultSqlForGrid(props.activeTab));
+const activeResultExportSql = computed(() => queryResultExecutionSql(props.activeTab));
 const activeElasticsearchJsonResponse = computed(() => elasticsearchJsonResponseForResult(activeEffectiveDatabaseType.value, activeResultSql.value, props.activeTab.result));
 const resultArchiveExporting = ref(false);
 const canExportResultArchive = computed(() => props.activeTab.mode === "query" && (!!props.activeTab.result || !!props.activeTab.results?.length || !!props.activeTab.resultRuns?.length));
@@ -385,6 +391,11 @@ function mongoIdPreview(val: unknown): string {
 function mongoCollectionExpression(collection: string): string {
   return `db.getCollection(${JSON.stringify(collection)})`;
 }
+function mongoQueryResultDocumentId(rowIdx: number, fallback: unknown): unknown {
+  const document = props.activeTab.result?.mongo_documents?.[rowIdx];
+  if (!document || typeof document !== "object" || Array.isArray(document)) return fallback;
+  return (document as Record<string, unknown>)._id ?? fallback;
+}
 const mongoQueryResultSaveHandler = computed<CustomSaveHandler | undefined>(() => {
   const tab = props.activeTab;
   const target = tab.mongoEditTarget;
@@ -401,9 +412,9 @@ const mongoQueryResultSaveHandler = computed<CustomSaveHandler | undefined>(() =
       const row = changes.rows[rowIdx];
       const id = row?.[idColIdx];
       if (id === null || id === undefined || String(id).trim() === "") continue;
-      const updateDoc = buildMongoUpdateDocument(dirtyCols, changes.columns);
+      const updateDoc = buildMongoUpdateDocument(dirtyCols, changes.columns, tab.result?.mongo_documents?.[rowIdx]);
       if (Object.keys(updateDoc).length === 0) continue;
-      await api.mongoUpdateDocument(tab.connectionId, tab.database, target.collection, String(id), JSON.stringify(updateDoc));
+      await api.mongoUpdateDocument(tab.connectionId, tab.database, target.collection, serializeMongoDocumentId(mongoQueryResultDocumentId(rowIdx, id)), JSON.stringify(updateDoc));
     }
   };
 
@@ -415,9 +426,9 @@ const mongoQueryResultSaveHandler = computed<CustomSaveHandler | undefined>(() =
       const row = changes.rows[rowIdx];
       const id = row?.[idColIdx];
       if (id === null || id === undefined || String(id).trim() === "") continue;
-      const updateDoc = buildMongoUpdateDocument(dirtyCols, changes.columns);
+      const updateDoc = buildMongoUpdateDocument(dirtyCols, changes.columns, tab.result?.mongo_documents?.[rowIdx]);
       if (Object.keys(updateDoc).length === 0) continue;
-      stmts.push(`${mongoCollectionExpression(target.collection)}.updateOne({_id: ${mongoIdPreview(id)}}, ${formatMongoShellLiteral(updateDoc)})`);
+      stmts.push(`${mongoCollectionExpression(target.collection)}.updateOne({_id: ${mongoIdPreview(mongoQueryResultDocumentId(rowIdx, id))}}, ${formatMongoShellLiteral(updateDoc)})`);
     }
     return stmts;
   };
@@ -646,8 +657,8 @@ function closeColumnInfo() {
   columnInfoError.value = undefined;
 }
 
-function onHandleClickTable(tableName: string) {
-  emit("clickTable", tableName);
+function onHandleClickTable(target: SqlObjectNavigationTarget) {
+  emit("clickTable", target);
 }
 
 function onHandleViewTableData(tableName: string) {
@@ -739,6 +750,14 @@ function toggleResultAutoSave() {
   toast(t(enabled ? "tabs.autoKeepResultsEnabled" : "tabs.autoKeepResultsDisabled"), 2500);
 }
 
+function selectResultItem(item: (typeof visibleResultItems.value)[number]) {
+  queryStore.setActiveResultIndex(props.activeTab.id, item.index);
+  emit("update:activeOutputView", "result");
+  nextTick(() => {
+    queryEditorRef.value?.previewStatementRange(resultSourceRange(props.activeTab.sql, item.result, item.index, activeEffectiveDatabaseType.value) ?? null);
+  });
+}
+
 function handleModRTarget(target: Element): boolean {
   if (target.closest("[data-query-editor-root]")) return queryEditorRef.value?.openReplace() ?? false;
   if (target.closest("[data-cell-detail-editor-root]")) return dataGridRef.value?.openCellDetailSearch() ?? false;
@@ -755,7 +774,11 @@ function pasteClipboardAsSqlInCondition() {
   return queryEditorRef.value?.pasteClipboardAsSqlInCondition();
 }
 
-defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExecute, pasteClipboardAsSqlInCondition });
+function applyTableStructureChanges() {
+  return tableStructureEditorRef.value?.applyChanges() ?? Promise.resolve(false);
+}
+
+defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExecute, pasteClipboardAsSqlInCondition, applyTableStructureChanges });
 </script>
 
 <template>
@@ -780,6 +803,7 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
             <QueryEditor
               ref="queryEditorRef"
               class="relative z-0 flex-1"
+              auto-focus
               :model-value="activeTab.sql"
               :connection-id="activeTab.connectionId"
               :database="activeTab.database"
@@ -865,20 +889,11 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
                     <div class="result-tab-scrollbar__thumb" :style="resultTabsScrollbarThumbStyle" />
                   </div>
                   <div ref="resultTabsScrollerRef" class="result-tab-scroll flex h-full items-center gap-1 overflow-x-auto overflow-y-hidden px-1" :style="resultTabsScrollerStyle" @scroll="updateResultTabsScrollbar" @wheel="onResultTabsWheel">
-                    <Button
-                      v-for="item in visibleResultItems"
-                      :key="item.index"
-                      size="sm"
-                      :variant="activeOutputView === 'result' && (activeTab.activeResultIndex ?? 0) === item.index ? 'default' : 'ghost'"
-                      class="h-6 max-w-48 shrink-0 overflow-hidden text-ellipsis whitespace-nowrap px-2 text-xs"
-                      :title="item.title || item.label || t('tabs.resultN', { n: item.n })"
-                      @click="
-                        queryStore.setActiveResultIndex(activeTab.id, item.index);
-                        emit('update:activeOutputView', 'result');
-                      "
-                    >
-                      {{ item.label || t("tabs.resultN", { n: item.n }) }}
-                    </Button>
+                    <LightTooltip v-for="item in visibleResultItems" :key="item.index" :text="item.label || item.title || t('tabs.resultN', { n: item.n })" :disabled="!item.labelTruncated && !(!item.label && item.title)" :delay="150" :close-delay="0" nowrap>
+                      <Button size="sm" :variant="activeOutputView === 'result' && (activeTab.activeResultIndex ?? 0) === item.index ? 'default' : 'ghost'" class="h-6 min-w-0 max-w-48 shrink-0 px-2 text-xs" :aria-label="item.label || t('tabs.resultN', { n: item.n })" @click="selectResultItem(item)">
+                        <span class="block min-w-0 max-w-44 whitespace-nowrap">{{ item.displayLabel || item.label || t("tabs.resultN", { n: item.n }) }}</span>
+                      </Button>
+                    </LightTooltip>
                   </div>
                 </div>
               </template>
@@ -1119,6 +1134,7 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
                 :sort-mode="activeTab.resultSortMode"
                 :initial-order-by-input="activeTab.orderByInput"
                 :sql="activeResultSql"
+                :export-sql="activeResultExportSql"
                 :loading="activeTab.isExecuting"
                 :editable="!!activeTab.queryAnalysis || !!mongoQueryResultSaveHandler"
                 :source-columns="activeTab.querySourceColumns"
@@ -1140,7 +1156,7 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
                 :total-row-count-loading="activeTab.resultTotalRowCountLoading"
                 :on-execute-sql="async (sql: string) => emit('executeSql', sql)"
                 :full-export-result="(onProgress?: (info: { rowsExported: number; totalRows: number | null }) => void) => queryStore.fetchTabResultForExport(activeTab.id, onProgress)"
-                :query-result-export-request="(options: { exportId: string; filePath: string; format: 'csv' | 'xlsx' }) => queryStore.buildQueryResultExportRequest(activeTab.id, options)"
+                :query-result-export-request="(options: { exportId: string; filePath: string; format: 'csv' | 'xlsx' | 'txt'; includeSqlSheet?: boolean }) => queryStore.buildQueryResultExportRequest(activeTab.id, options)"
                 :all-export-results="allResultExportSheets"
                 :export-file-base-name="activeTab.title"
                 @update:order-by-input="(v: string) => (activeTab.orderByInput = v)"
@@ -1572,6 +1588,7 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
     <!-- Structure mode: table structure editor -->
     <template v-else-if="activeTab.mode === 'structure'">
       <TableStructureEditor
+        ref="tableStructureEditorRef"
         :key="activeTab.id"
         :connection-id="activeTab.connectionId"
         :database="activeTab.database"
@@ -1590,6 +1607,16 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
 
     <template v-else-if="activeTab.mode === 'users' && activeConnection">
       <DatabaseUserAdmin :key="activeTab.id" :connection="activeConnection" />
+    </template>
+
+    <template v-else-if="activeTab.mode === 'processlist' && activeConnection">
+      <ProcessListPanel :key="activeTab.id" :connection="activeConnection" />
+    </template>
+
+    <template v-else-if="activeTab.mode === 'mysql-dashboard'">
+      <div class="min-h-0 flex-1">
+        <MySqlDashboard :key="activeTab.id" :connection-id="activeTab.connectionId" />
+      </div>
     </template>
 
     <template v-else-if="activeTab.mode === 'dameng-jobs' && activeConnection">

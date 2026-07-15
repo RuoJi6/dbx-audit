@@ -5,6 +5,7 @@ export type GridCellValue = string | number | boolean | null | unknown[] | { [ke
 
 export interface DataGridTableMeta {
   catalog?: string;
+  database?: string;
   schema?: string;
   tableName: string;
   primaryKeys: string[];
@@ -52,13 +53,15 @@ export interface DataGridCopyInsertStatementOptions {
   insertMode?: DataGridCopyInsertMode;
 }
 
-export type DataGridContextFilterMode = "equals" | "not-equals" | "is-null" | "is-not-null" | "like" | "not-like" | "less-than" | "greater-than";
+export type DataGridContextFilterMode = "equals" | "not-equals" | "is-null" | "is-not-null" | "like" | "not-like" | "less-than" | "greater-than" | "in" | "not-in" | "between" | "not-between";
 
 export interface DataGridContextFilterConditionOptions {
   databaseType?: DatabaseType;
   columnName: string;
   mode: DataGridContextFilterMode;
   value: GridCellValue;
+  values?: GridCellValue[];
+  endValue?: GridCellValue;
   columnInfo?: DataGridColumnInfo;
 }
 
@@ -79,6 +82,7 @@ export interface DataGridColumnValuesFilterConditionOptions {
 export interface DataGridColumnDistinctValuesSqlOptions {
   databaseType?: DatabaseType;
   catalog?: string;
+  database?: string;
   schema?: string;
   tableName: string;
   columnName: string;
@@ -91,7 +95,9 @@ export interface DataGridColumnDistinctValuesSqlOptions {
 
 export interface DataGridCountSqlOptions {
   databaseType?: DatabaseType;
+  identifierQuote?: string;
   catalog?: string;
+  database?: string;
   schema?: string;
   tableName: string;
   whereInput?: string;

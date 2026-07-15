@@ -55,12 +55,14 @@ export const connectDb = forward("connectDb");
 export const connectionFinalProxyPort = forward("connectionFinalProxyPort");
 export const disconnectDb = forward("disconnectDb");
 export const checkConnectionHealth = forward("checkConnectionHealth");
+export const connectionIdentifierQuote = forward("connectionIdentifierQuote");
 export const closeDatabaseConnection = forward("closeDatabaseConnection");
 export const refreshConnections = forward("refreshConnections");
 export const saveConnections = forward("saveConnections");
 export const loadConnections = forward("loadConnections");
 export const loadTunnelProfiles = forward("loadTunnelProfiles");
 export const saveTunnelProfiles = forward("saveTunnelProfiles");
+export const testTunnelProfile = forward("testTunnelProfile");
 export const readKeychainPassword = forward("readKeychainPassword");
 export const readKeychainPasswords = forward("readKeychainPasswords");
 export const decryptConfig = forward("decryptConfig");
@@ -441,6 +443,7 @@ export const mongoDropDatabase = forward("mongoDropDatabase");
 export const mongoDropCollection = forward("mongoDropCollection");
 export const documentFindDocuments = forward("documentFindDocuments");
 export const mongoFindDocuments = forward("mongoFindDocuments");
+export const mongoCountDocuments = forward("mongoCountDocuments");
 export const mongoServerVersion = forward("mongoServerVersion");
 export const mongoAggregateDocuments = forward("mongoAggregateDocuments");
 export const mongoCollectionStats = forward("mongoCollectionStats");
@@ -472,6 +475,7 @@ export const deleteHistoryEntry = forward("deleteHistoryEntry");
 export const checkMcpServerStatus = forward("checkMcpServerStatus");
 export const installMcpServer = forward("installMcpServer");
 export const checkForUpdates = forward("checkForUpdates");
+export const fetchChangelog = forward("fetchChangelog");
 export const getSystemProxyUrl = forward("getSystemProxyUrl");
 export const downloadAndInstallUpdate = forward("downloadAndInstallUpdate");
 export const getAppVersion = forward("getAppVersion");
@@ -562,6 +566,7 @@ export type {
   TableImportStatus,
   TableImportSourceFormat,
   TableImportJsonShape,
+  TableImportTextEncoding,
   TableImportColumnMapping,
   TableImportParseOptions,
   TableImportPreviewRequest,

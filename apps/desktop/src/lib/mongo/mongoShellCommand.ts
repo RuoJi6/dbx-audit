@@ -1,4 +1,5 @@
 import type { QueryResult } from "@/types/database";
+import { mongoDocumentIdForGrid } from "@/lib/mongo/mongoDocumentValues";
 
 export interface MongoFindCommand {
   collection: string;
@@ -12,6 +13,7 @@ export interface MongoFindCommand {
 export interface MongoCountDocumentsCommand {
   collection: string;
   filter: string;
+  mode: "accurate" | "legacy";
 }
 
 export interface MongoAggregateCommand {
@@ -145,8 +147,6 @@ export function applyMongoFindSort(input: string, column: string, direction: "as
 
 export function parseMongoCountDocumentsCommand(input: string): MongoCountDocumentsCommand | null {
   const source = input.trim().replace(/;$/, "").trim();
-  // Accept deprecated Mongo shell count helpers for old server workflows, but
-  // keep DBX's internal execution mapped to the countDocuments result shape.
   return parseCollectionCountCommand(source, "countDocuments") ?? parseCollectionCountCommand(source, "count") ?? parseFindCountCommand(source);
 }
 
@@ -166,6 +166,7 @@ function parseCollectionCountCommand(source: string, method: "countDocuments" | 
   return {
     collection: target.collection,
     filter,
+    mode: method === "countDocuments" ? "accurate" : "legacy",
   };
 }
 
@@ -188,6 +189,7 @@ function parseFindCountCommand(source: string): MongoCountDocumentsCommand | nul
   return {
     collection: target.collection,
     filter,
+    mode: "legacy",
   };
 }
 
@@ -637,11 +639,12 @@ function normalizeJsonArgument(value: string): string | null {
   if (!trimmed) return "{}";
   // Rewrite mongo shell constructors that are not valid JSON into the extended
   // JSON the backend understands (mongo_driver::json_value_to_bson): ObjectId(x)
-  // -> {"$oid":x} and ISODate(x)/new Date(x) -> {"$date":x}. Without this a
+  // -> {"$oid":x}, NumberLong(x) -> {"$numberLong":x}, and
+  // ISODate(x)/new Date(x) -> {"$date":x}. Without this a
   // filter such as { createdAt: { $gte: ISODate("...") } } fails JSON.parse,
   // the command is left unrecognized and falls through to the SQL executor,
   // which rejects it with "Use MongoDB-specific commands".
-  const withExtendedJson = trimmed.replace(/ObjectId\s*\(\s*["']([^"']+)["']\s*\)/g, '{"$oid":"$1"}').replace(/(?:ISODate|new\s+Date)\s*\(\s*["']([^"']+)["']\s*\)/g, '{"$date":"$1"}');
+  const withExtendedJson = replaceMongoShellConstructors(trimmed);
   const preprocessed = quoteUnquotedObjectKeys(convertSingleQuotedStrings(withExtendedJson));
   try {
     JSON.parse(preprocessed);
@@ -649,6 +652,41 @@ function normalizeJsonArgument(value: string): string | null {
   } catch {
     return null;
   }
+}
+
+function replaceMongoShellConstructors(source: string): string {
+  const constructor = /^(ObjectId|NumberLong|ISODate)\s*\(\s*["']([^"']+)["']\s*\)|^(ObjectId|NumberLong)\s*\(\s*(-?\d+)\s*\)|^(?:new\s+Date)\s*\(\s*["']([^"']+)["']\s*\)/;
+  let result = "";
+  let index = 0;
+  while (index < source.length) {
+    const quote = source[index];
+    if (quote === '"' || quote === "'") {
+      const start = index++;
+      while (index < source.length) {
+        if (source[index] === "\\") index += 2;
+        else if (source[index] === quote) {
+          index++;
+          break;
+        } else index++;
+      }
+      result += source.slice(start, index);
+      continue;
+    }
+    const match = source.slice(index).match(constructor);
+    if (!match) {
+      result += source[index++];
+      continue;
+    }
+    if (match[1]) {
+      result += match[1] === "ObjectId" ? `{"$oid":"${match[2]}"}` : match[1] === "NumberLong" ? `{"$numberLong":"${match[2]}"}` : `{"$date":"${match[2]}"}`;
+    } else if (match[3]) {
+      result += match[3] === "NumberLong" ? `{"$numberLong":"${match[4]}"}` : `{"$oid":"${match[4]}"}`;
+    } else {
+      result += `{"$date":"${match[5]}"}`;
+    }
+    index += match[0].length;
+  }
+  return result;
 }
 
 function parseMethodArgs(source: string, methodCallIndex: number): string[] | null {
@@ -1170,5 +1208,5 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function toCellValue(value: unknown): string | number | boolean | null {
   if (value === undefined || value === null) return null;
   if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return value;
-  return JSON.stringify(value);
+  return mongoDocumentIdForGrid(value);
 }

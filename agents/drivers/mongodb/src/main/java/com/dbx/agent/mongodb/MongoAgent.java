@@ -42,6 +42,9 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import javax.net.ssl.KeyManager;
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
@@ -59,7 +62,10 @@ public final class MongoAgent {
     private static final JsonWriterSettings EXTENDED_JSON_SETTINGS = JsonWriterSettings.builder()
         .outputMode(JsonMode.RELAXED)
         .build();
-    private static MongoClient client;
+    private static final String LEGACY_SESSION_ID = "__legacy__";
+    private static final int MAX_SESSIONS = 256;
+    private static final ThreadLocal<MongoClient> CURRENT_CLIENT = new ThreadLocal<>();
+    private static MongoClient legacyClient;
 
     private MongoAgent() {
     }
@@ -110,7 +116,7 @@ public final class MongoAgent {
         return builder;
     }
 
-    private static Object connect(JsonObject params) {
+    private static MongoClient openClient(JsonObject params) {
         JsonObject connObj = params.has("connection") && params.get("connection").isJsonObject()
             ? params.getAsJsonObject("connection")
             : params;
@@ -118,11 +124,19 @@ public final class MongoAgent {
 
         MongoClientSettings.Builder builder = configureBuilder(connObj);
 
-        if (client != null) {
+        MongoClient client = MongoClients.create(builder.build());
+        try {
+            client.getDatabase(database).runCommand(new Document("ping", 1));
+        } catch (RuntimeException error) {
             client.close();
+            throw error;
         }
-        client = MongoClients.create(builder.build());
-        client.getDatabase(database).runCommand(new Document("ping", 1));
+        return client;
+    }
+
+    private static Object connect(JsonObject params) {
+        closeLegacyClient();
+        legacyClient = openClient(params);
         return Collections.singletonMap("ok", true);
     }
 
@@ -429,6 +443,29 @@ public final class MongoAgent {
         return result;
     }
 
+    private static Object countDocuments(JsonObject params) {
+        MongoClient c = requireClient();
+        String database = params.get("database").getAsString();
+        String collection = params.get("collection").getAsString();
+        Document filterDoc = documentOrNull(params, "filter");
+        if (filterDoc == null) {
+            filterDoc = new Document();
+        }
+
+        boolean accurate = !params.has("accurate") || params.get("accurate").getAsBoolean();
+        if (accurate) {
+            return c.getDatabase(database).getCollection(collection).countDocuments(filterDoc);
+        }
+
+        // MongoDB 3.4 count() needs the legacy command to avoid the slow countDocuments path.
+        Document result = c.getDatabase(database).runCommand(new Document("count", collection).append("query", filterDoc));
+        Object n = result.get("n");
+        if (n instanceof Number number) {
+            return number.longValue();
+        }
+        return 0L;
+    }
+
     private static Object serverVersion(JsonObject params) {
         MongoClient c = requireClient();
         String database = defaultString(stringOrNull(params, "database"), "admin");
@@ -595,11 +632,53 @@ public final class MongoAgent {
         return Collections.singletonMap("inserted_id", insertedId);
     }
 
-    private static Object parseId(String id) {
+    static Object parseId(String id) {
+        String stringId = decodeStringDocumentId(id);
+        if (stringId != null) {
+            return stringId;
+        }
+        String trimmed = id.trim();
+        if (isNumberLongIdWrapper(trimmed)) {
+            try {
+                return Document.parse("{\"_id\":" + trimmed + "}").get("_id");
+            } catch (Exception e) {
+                // Fall through to the legacy ObjectId/string handling below.
+            }
+        }
         try {
             return new ObjectId(id);
         } catch (Exception e) {
             return id;
+        }
+    }
+
+    private static String decodeStringDocumentId(String id) {
+        String prefix = "__dbx_mongo_string_id__";
+        if (!id.startsWith(prefix)) {
+            return null;
+        }
+        try {
+            JsonElement value = JsonParser.parseString(id.substring(prefix.length()));
+            return value.isJsonPrimitive() && value.getAsJsonPrimitive().isString() ? value.getAsString() : null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static boolean isNumberLongIdWrapper(String value) {
+        try {
+            JsonElement parsed = JsonParser.parseString(value);
+            if (!parsed.isJsonObject()) {
+                return false;
+            }
+            JsonObject wrapper = parsed.getAsJsonObject();
+            JsonElement numberLong = wrapper.get("$numberLong");
+            return wrapper.size() == 1
+                && numberLong != null
+                && numberLong.isJsonPrimitive()
+                && numberLong.getAsJsonPrimitive().isString();
+        } catch (Exception e) {
+            return false;
         }
     }
 
@@ -728,9 +807,16 @@ public final class MongoAgent {
     private static Map<String, Object> bsonToJson(Document doc) {
         Map<String, Object> result = new LinkedHashMap<>();
         for (Map.Entry<String, Object> entry : doc.entrySet()) {
-            result.put(entry.getKey(), convertValue(entry.getValue()));
+            result.put(entry.getKey(), convertDocumentFieldValue(entry.getKey(), entry.getValue()));
         }
         return result;
+    }
+
+    static Object convertDocumentFieldValue(String key, Object value) {
+        if ("_id".equals(key) && value instanceof Long longValue) {
+            return Collections.singletonMap("$numberLong", longValue.toString());
+        }
+        return convertValue(value);
     }
 
     static JsonObject bsonToExtendedJson(Document doc) {
@@ -846,6 +932,7 @@ public final class MongoAgent {
             case AgentProtocol.METHOD_LIST_INDEXES -> listIndexes(params);
             case AgentProtocol.MONGO_METHOD_FIND_DOCUMENTS -> findDocuments(params);
             case AgentProtocol.MONGO_METHOD_FIND_DOCUMENTS_EXTENDED_JSON -> findDocumentsExtendedJson(params);
+            case AgentProtocol.MONGO_METHOD_COUNT_DOCUMENTS -> countDocuments(params);
             case AgentProtocol.MONGO_METHOD_SERVER_VERSION -> serverVersion(params);
             case AgentProtocol.MONGO_METHOD_CREATE_INDEX -> createIndex(params);
             case AgentProtocol.MONGO_METHOD_DROP_INDEXES -> dropIndexes(params);
@@ -856,10 +943,7 @@ public final class MongoAgent {
             case AgentProtocol.MONGO_METHOD_DELETE_DOCUMENT -> deleteDocument(params);
             case AgentProtocol.MONGO_METHOD_DELETE_DOCUMENTS -> deleteDocuments(params);
             case AgentProtocol.METHOD_DISCONNECT, AgentProtocol.METHOD_SHUTDOWN -> {
-                if (client != null) {
-                    client.close();
-                    client = null;
-                }
+                closeLegacyClient();
                 if (AgentProtocol.METHOD_SHUTDOWN.equals(method)) {
                     System.exit(0);
                 }
@@ -870,10 +954,21 @@ public final class MongoAgent {
     }
 
     private static MongoClient requireClient() {
+        MongoClient client = CURRENT_CLIENT.get();
+        if (client == null) {
+            client = legacyClient;
+        }
         if (client == null) {
             throw new IllegalStateException("Not connected");
         }
         return client;
+    }
+
+    private static void closeLegacyClient() {
+        if (legacyClient != null) {
+            legacyClient.close();
+            legacyClient = null;
+        }
     }
 
     private static String coalesce(String value) {
@@ -912,16 +1007,149 @@ public final class MongoAgent {
     public static void main(String[] args) throws Exception {
         System.out.println("{\"ready\":true}");
         System.out.flush();
+        new RuntimeServer().run();
+    }
 
-        BufferedReader reader = new BufferedReader(new InputStreamReader(System.in));
-        while (true) {
-            String line = reader.readLine();
-            if (line == null) {
-                break;
+    private static final class RuntimeServer {
+        private final Map<String, Session> sessions = new ConcurrentHashMap<>();
+        private final ExecutorService requests = Executors.newCachedThreadPool();
+        private final Object outputLock = new Object();
+
+        private void run() throws Exception {
+            BufferedReader reader = new BufferedReader(new InputStreamReader(System.in));
+            String line;
+            while ((line = reader.readLine()) != null) {
+                String request = line;
+                requests.submit(() -> writeResponse(handleRuntimeRequest(request)));
             }
+            closeAllSessions();
+            requests.shutdownNow();
+        }
 
-            System.out.println(handleRequest(line));
-            System.out.flush();
+        private String handleRuntimeRequest(String line) {
+            JsonObject req = JsonParser.parseString(line).getAsJsonObject();
+            JsonElement id = req.get("id");
+            String method = req.get("method").getAsString();
+            JsonObject params = req.has("params") && req.get("params").isJsonObject()
+                ? req.getAsJsonObject("params")
+                : new JsonObject();
+            JsonObject response = new JsonObject();
+            response.addProperty("jsonrpc", "2.0");
+            response.add("id", id);
+            try {
+                Object result;
+                if (AgentProtocol.METHOD_HANDSHAKE.equals(method)) {
+                    result = AgentProtocol.multiSessionHandshakeResult();
+                } else if (AgentProtocol.METHOD_OPEN_SESSION.equals(method)) {
+                    result = openSession(requiredSessionId(params), params);
+                } else if (AgentProtocol.METHOD_CLOSE_SESSION.equals(method)) {
+                    result = closeSession(requiredSessionId(params));
+                } else if (AgentProtocol.METHOD_VALIDATE_SESSION.equals(method)) {
+                    result = session(requiredSessionId(params)).validate(params);
+                } else if (AgentProtocol.METHOD_CANCEL_SESSION.equals(method)) {
+                    // The legacy synchronous MongoDB driver has no safe per-operation cancel API.
+                    result = Collections.singletonMap("ok", true);
+                } else if (AgentProtocol.METHOD_CONNECT.equals(method)) {
+                    closeSession(LEGACY_SESSION_ID);
+                    result = openSession(LEGACY_SESSION_ID, params);
+                } else if (AgentProtocol.METHOD_DISCONNECT.equals(method)) {
+                    result = closeSession(LEGACY_SESSION_ID);
+                } else if (AgentProtocol.METHOD_SHUTDOWN.equals(method)) {
+                    closeAllSessions();
+                    result = Collections.singletonMap("ok", true);
+                } else {
+                    String sessionId = params.has("agentSessionId")
+                        ? params.get("agentSessionId").getAsString()
+                        : LEGACY_SESSION_ID;
+                    result = session(sessionId).handle(method, params);
+                }
+                response.add("result", GSON.toJsonTree(result));
+            } catch (Exception error) {
+                JsonObject rpcError = new JsonObject();
+                rpcError.addProperty("code", -1);
+                rpcError.addProperty("message", error.getMessage() == null ? "Unknown error" : error.getMessage());
+                response.add("error", rpcError);
+            }
+            return GSON.toJson(response);
+        }
+
+        private Object openSession(String sessionId, JsonObject params) {
+            if (sessions.size() >= MAX_SESSIONS && !sessions.containsKey(sessionId)) {
+                throw new IllegalStateException("Agent session limit reached: " + MAX_SESSIONS);
+            }
+            Session created = new Session(openClient(params));
+            Session existing = sessions.putIfAbsent(sessionId, created);
+            if (existing != null) {
+                created.close();
+                throw new IllegalStateException("Agent session already exists: " + sessionId);
+            }
+            return Collections.singletonMap("ok", true);
+        }
+
+        private Object closeSession(String sessionId) {
+            Session removed = sessions.remove(sessionId);
+            if (removed != null) {
+                removed.close();
+            }
+            return Collections.singletonMap("ok", true);
+        }
+
+        private Session session(String sessionId) {
+            Session session = sessions.get(sessionId);
+            if (session == null) {
+                throw new IllegalStateException("Agent session not found: " + sessionId);
+            }
+            return session;
+        }
+
+        private void closeAllSessions() {
+            for (String sessionId : sessions.keySet()) {
+                closeSession(sessionId);
+            }
+        }
+
+        private static String requiredSessionId(JsonObject params) {
+            if (!params.has("agentSessionId") || params.get("agentSessionId").getAsString().trim().isEmpty()) {
+                throw new IllegalArgumentException("agentSessionId is required");
+            }
+            return params.get("agentSessionId").getAsString();
+        }
+
+        private void writeResponse(String response) {
+            synchronized (outputLock) {
+                System.out.println(response);
+                System.out.flush();
+            }
+        }
+    }
+
+    private static final class Session {
+        private final MongoClient client;
+
+        private Session(MongoClient client) {
+            this.client = client;
+        }
+
+        private synchronized Object handle(String method, JsonObject params) {
+            CURRENT_CLIENT.set(client);
+            try {
+                return dispatch(method, params);
+            } finally {
+                CURRENT_CLIENT.remove();
+            }
+        }
+
+        private Object validate(JsonObject params) {
+            JsonObject connection = params.has("connection") && params.get("connection").isJsonObject()
+                ? params.getAsJsonObject("connection")
+                : params;
+            String database = defaultString(stringOrNull(connection, "database"), "admin");
+            client.getDatabase(database).runCommand(new Document("ping", 1));
+            return Collections.singletonMap("ok", true);
+        }
+
+        private synchronized void close() {
+            client.close();
         }
     }
 }

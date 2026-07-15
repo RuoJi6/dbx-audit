@@ -70,6 +70,8 @@ function close() {
   show.value = false;
 }
 
+defineExpose({ close });
+
 function onPointerDownOutside(e: PointerEvent) {
   // Only respond to primary (left) button presses. This avoids a macOS
   // issue where Ctrl+right-click generates a synthetic click event on
@@ -125,9 +127,12 @@ function handleSubItemClick(item: ContextMenuItem) {
   item.action?.();
 }
 
-function onContextMenu(event: MouseEvent) {
+function onContextMenu(event: MouseEvent, itemsOverride?: ContextMenuItem[]) {
   // Some callers build large context menus; resolve them only for actual opens.
-  const items = typeof props.items === "function" ? props.items() : props.items;
+  // Tree-level hosts may replace their items and open in the same event turn.
+  // Accepting the resolved items directly avoids reading the previous prop
+  // value before Vue has flushed the parent-to-child update.
+  const items = itemsOverride ?? (typeof props.items === "function" ? props.items() : props.items);
   if (items.length === 0) return;
   activeItems.value = items;
   event.preventDefault();

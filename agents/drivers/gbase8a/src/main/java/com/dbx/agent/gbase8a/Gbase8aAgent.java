@@ -4,7 +4,7 @@ import com.dbx.agent.ConfiguredJdbcAgent;
 import com.dbx.agent.ExecuteQueryOptions;
 import com.dbx.agent.JdbcIdentifiers;
 import com.dbx.agent.JdbcAgentProfile;
-import com.dbx.agent.JsonRpcServer;
+import com.dbx.agent.MultiSessionJsonRpcServer;
 import com.dbx.agent.MetadataListConstraints;
 import com.dbx.agent.ObjectInfo;
 import com.dbx.agent.ObjectSource;
@@ -340,6 +340,6 @@ public final class Gbase8aAgent extends ConfiguredJdbcAgent {
     }
 
     public static void main(String[] args) {
-        new JsonRpcServer(new Gbase8aAgent()).run();
+        new MultiSessionJsonRpcServer(Gbase8aAgent::new).run();
     }
 }

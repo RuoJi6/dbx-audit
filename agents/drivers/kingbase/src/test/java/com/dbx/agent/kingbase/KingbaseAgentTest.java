@@ -9,6 +9,7 @@ import com.dbx.agent.MetadataListConstraints;
 import com.dbx.agent.ObjectInfo;
 import com.dbx.agent.ObjectSource;
 import com.dbx.agent.TableInfo;
+import com.dbx.agent.TriggerInfo;
 import com.dbx.agent.test.JdbcFakeExecutionBehaviorTest;
 import com.dbx.agent.test.TestSupport;
 import org.junit.jupiter.api.Assertions;
@@ -138,6 +139,22 @@ class KingbaseAgentTest extends JdbcFakeExecutionBehaviorTest {
     }
 
     @Test
+    void detectsMysqlCompatModeFromServerSqlMode() throws Exception {
+        List<String> sql = new ArrayList<>();
+        KingbaseAgent agent = new KingbaseAgent();
+        Connection connection = mysqlCompatConnection(sql);
+
+        Method afterConnect = KingbaseAgent.class.getDeclaredMethod("afterConnect", ConnectParams.class, Connection.class);
+        afterConnect.setAccessible(true);
+        afterConnect.invoke(agent, new ConnectParams(), connection);
+
+        Assertions.assertTrue(agent.isMysqlCompatMode());
+        Assertions.assertEquals("`", agent.getIdentifierQuote());
+        Assertions.assertEquals("SELECT 1 FROM sys_catalog.sys_namespace WHERE 1 = 0", sql.get(0));
+        Assertions.assertEquals("SELECT 1 FROM sys_settings WHERE LOWER(name) = 'sql_mode'", sql.get(1));
+    }
+
+    @Test
     void mysqlCompatListTablesUsesInformationSchema() {
         List<String> sql = new ArrayList<>();
         KingbaseAgent agent = new KingbaseAgent();
@@ -205,6 +222,56 @@ class KingbaseAgentTest extends JdbcFakeExecutionBehaviorTest {
         Assertions.assertTrue(sql.get(1).contains("FROM sys_catalog.sys_proc"), sql.get(1));
         Assertions.assertTrue(sql.get(1).contains("p.prorettype = 2278"), sql.get(1));
         Assertions.assertFalse(sql.get(1).contains("prokind"), sql.get(1));
+    }
+
+    @Test
+    void regularListTriggersDecodesTimingFromTgtype() {
+        List<String> sql = new ArrayList<>();
+        KingbaseAgent agent = new KingbaseAgent();
+        TestSupport.setPrivateConnection(agent, preparedConnection(sql, resultSet(
+            new String[]{"trigger_name", "event_manipulation", "trigger_type"},
+            new Object[][]{
+                {"trg_instead_update", "UPDATE", 1 | 16 | 64},
+                {"trg_before_insert", "INSERT", 2 | 4},
+                {"trg_after_update", "UPDATE", 16}
+            }
+        )));
+
+        List<TriggerInfo> triggers = agent.listTriggers("public", "app_table");
+
+        Assertions.assertEquals(3, triggers.size());
+        Assertions.assertEquals("INSTEAD OF", triggers.get(0).getTiming());
+        Assertions.assertEquals("BEFORE", triggers.get(1).getTiming());
+        Assertions.assertEquals("AFTER", triggers.get(2).getTiming());
+        Assertions.assertTrue(sql.get(0).contains("tg.tgtype AS trigger_type"), sql.get(0));
+        Assertions.assertTrue(sql.get(0).contains("FROM sys_catalog.sys_trigger"), sql.get(0));
+        Assertions.assertTrue(sql.get(0).contains("sys_catalog.sys_class"), sql.get(0));
+        Assertions.assertTrue(sql.get(0).contains("sys_catalog.sys_namespace"), sql.get(0));
+        Assertions.assertTrue(sql.get(0).contains("NOT tg.tgisinternal"), sql.get(0));
+        Assertions.assertFalse(sql.get(0).contains("pg_catalog"), sql.get(0));
+    }
+
+    @Test
+    void postgresCompatListTriggersUsesPgCatalogTrigger() throws Exception {
+        List<String> sql = new ArrayList<>();
+        KingbaseAgent agent = new KingbaseAgent();
+        Connection connection = postgresCatalogConnection(sql, resultSet(
+            new String[]{"trigger_name", "event_manipulation", "action_timing"},
+            new Object[][]{{"trg_insert", "INSERT", "AFTER"}}
+        ));
+
+        Method afterConnect = KingbaseAgent.class.getDeclaredMethod("afterConnect", ConnectParams.class, Connection.class);
+        afterConnect.setAccessible(true);
+        afterConnect.invoke(agent, new ConnectParams(), connection);
+        TestSupport.setPrivateConnection(agent, connection);
+
+        List<TriggerInfo> triggers = agent.listTriggers("public", "app_table");
+
+        Assertions.assertEquals(1, triggers.size());
+        Assertions.assertEquals("trg_insert", triggers.get(0).getName());
+        // Verify the last SQL statement uses pg_catalog.pg_trigger
+        String lastSql = sql.get(sql.size() - 1);
+        Assertions.assertTrue(lastSql.contains("FROM pg_catalog.pg_trigger"), lastSql);
     }
 
     @Test
@@ -512,6 +579,26 @@ class KingbaseAgentTest extends JdbcFakeExecutionBehaviorTest {
         });
     }
 
+    private static Connection mysqlCompatConnection(List<String> sql) {
+        return proxy(Connection.class, (method, args) -> {
+            if ("createStatement".equals(method.getName())) {
+                return proxy(Statement.class, (statementMethod, statementArgs) -> {
+                    if ("executeQuery".equals(statementMethod.getName())) {
+                        String query = String.valueOf(statementArgs[0]);
+                        sql.add(query);
+                        if (query.contains("sys_settings")) {
+                            return resultSet(new String[]{"probe"}, new Object[][]{{1}});
+                        }
+                        return resultSet(new String[]{"probe"}, new Object[][]{});
+                    }
+                    return defaultValue(statementMethod.getReturnType());
+                });
+            }
+            if ("isClosed".equals(method.getName())) return false;
+            return defaultValue(method.getReturnType());
+        });
+    }
+
     private static ResultSet resultSet(String[] columns, Object[][] rows) {
         int[] index = {-1};
         return proxy(ResultSet.class, (method, args) -> {
@@ -535,6 +622,10 @@ class KingbaseAgentTest extends JdbcFakeExecutionBehaviorTest {
                     if (booleanValue instanceof Boolean) return booleanValue;
                     if (booleanValue instanceof Number) return ((Number) booleanValue).intValue() != 0;
                     return Boolean.parseBoolean(String.valueOf(booleanValue));
+                case "getInt":
+                    Object intValue = columnValue(columns, rows[index[0]], args[0]);
+                    if (intValue instanceof Number) return ((Number) intValue).intValue();
+                    return Integer.parseInt(String.valueOf(intValue));
                 case "getObject":
                     return columnValue(columns, rows[index[0]], args[0]);
                 case "wasNull":

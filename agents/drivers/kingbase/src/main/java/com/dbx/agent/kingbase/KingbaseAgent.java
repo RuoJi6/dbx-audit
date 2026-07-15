@@ -6,7 +6,7 @@ import com.dbx.agent.DatabaseInfo;
 import com.dbx.agent.ForeignKeyInfo;
 import com.dbx.agent.IndexInfo;
 import com.dbx.agent.JdbcIdentifiers;
-import com.dbx.agent.JsonRpcServer;
+import com.dbx.agent.MultiSessionJsonRpcServer;
 import com.dbx.agent.MetadataListConstraints;
 import com.dbx.agent.MetadataSqlSupport;
 import com.dbx.agent.ObjectInfo;
@@ -30,6 +30,8 @@ import java.util.Map;
 import java.util.Set;
 
 public final class KingbaseAgent extends PostgresLikeAgent {
+    private static final int TRIGGER_TYPE_BEFORE = 1 << 1;
+    private static final int TRIGGER_TYPE_INSTEAD = 1 << 6;
     private static final int KINGBASE_VOID_TYPE_OID = 2278;
     private static final String KINGBASE_REL_NAME = "CAST(c.relname AS varchar(256))";
     private static final String KINGBASE_REL_OID = "CAST(c.oid AS varchar(64))";
@@ -58,12 +60,24 @@ public final class KingbaseAgent extends PostgresLikeAgent {
     @Override
     protected void afterConnect(ConnectParams params, Connection connection) {
         postgresCatalogMode = false;
+        setMysqlCompatMode(params.isMysql_compat_mode());
         if (params.isMysql_compat_mode()) {
-            setMysqlCompatMode(true);
             return;
         }
         postgresCatalogMode = !catalogExists(connection, "sys_catalog.sys_namespace")
             && catalogExists(connection, "pg_catalog.pg_namespace");
+        if (!postgresCatalogMode && mysqlSqlModeExists(connection)) {
+            setMysqlCompatMode(true);
+        }
+    }
+
+    private static boolean mysqlSqlModeExists(Connection connection) {
+        try (Statement stmt = connection.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT 1 FROM sys_settings WHERE LOWER(name) = 'sql_mode'")) {
+            return rs.next();
+        } catch (Exception ignored) {
+            return false;
+        }
     }
 
     private static boolean catalogExists(Connection connection, String catalog) {
@@ -551,7 +565,41 @@ public final class KingbaseAgent extends PostgresLikeAgent {
     @Override
     public List<TriggerInfo> listTriggers(String schema, String table) {
         if (postgresCatalogMode) return super.listTriggers(schema, table);
-        return Collections.emptyList();
+        return unchecked(() -> {
+            List<TriggerInfo> result = new ArrayList<>();
+            String sql = "SELECT tg.tgname AS trigger_name, " +
+                "trim(trailing ',' FROM (" +
+                "CASE WHEN (tg.tgtype & 4) <> 0 THEN 'INSERT,' ELSE '' END || " +
+                "CASE WHEN (tg.tgtype & 8) <> 0 THEN 'DELETE,' ELSE '' END || " +
+                "CASE WHEN (tg.tgtype & 16) <> 0 THEN 'UPDATE,' ELSE '' END || " +
+                "CASE WHEN (tg.tgtype & 32) <> 0 THEN 'TRUNCATE,' ELSE '' END" +
+                ")) AS event_manipulation, tg.tgtype AS trigger_type " +
+                "FROM sys_catalog.sys_trigger tg " +
+                "JOIN sys_catalog.sys_class c ON c.oid = tg.tgrelid " +
+                "JOIN sys_catalog.sys_namespace n ON n.oid = c.relnamespace " +
+                "WHERE n.nspname = " + sqlString(effectiveSchema(schema)) +
+                " AND c.relname = " + sqlString(table) + " AND NOT tg.tgisinternal " +
+                "ORDER BY tg.tgname";
+            try (Statement stmt = requireConnected().createStatement()) {
+                try (ResultSet rs = stmt.executeQuery(sql)) {
+                    while (rs.next()) {
+                        result.add(new TriggerInfo(
+                            rs.getString("trigger_name"),
+                            rs.getString("event_manipulation"),
+                            decodeTriggerTiming(rs.getInt("trigger_type"))
+                        ));
+                    }
+                }
+            }
+            return result;
+        });
+    }
+
+    private static String decodeTriggerTiming(int triggerType) {
+        // INSTEAD OF has its own catalog bit and must not fall through to AFTER.
+        if ((triggerType & TRIGGER_TYPE_INSTEAD) != 0) return "INSTEAD OF";
+        if ((triggerType & TRIGGER_TYPE_BEFORE) != 0) return "BEFORE";
+        return "AFTER";
     }
 
     @Override
@@ -834,6 +882,6 @@ public final class KingbaseAgent extends PostgresLikeAgent {
     }
 
     public static void main(String[] args) {
-        new JsonRpcServer(new KingbaseAgent()).run();
+        new MultiSessionJsonRpcServer(KingbaseAgent::new).run();
     }
 }

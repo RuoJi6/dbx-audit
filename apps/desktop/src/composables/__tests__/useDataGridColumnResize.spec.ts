@@ -44,12 +44,29 @@ describe("useDataGridColumnResize", () => {
     });
 
     state.initColumnWidths();
-    expect(state.columnWidths.value[0]).toBe(DATA_GRID_COL_MAX_WIDTH);
+    // standard valueTextLimit=40, 120 chars → truncated to 40: 40×8+24=344
+    // header "description"=11×8+85=173 < 344 → 344
+    expect(state.columnWidths.value[0]).toBe(344);
 
     state.autoFitColumn(0);
 
-    expect(state.columnWidths.value[0]).toBeGreaterThan(DATA_GRID_COL_MAX_WIDTH);
+    expect(state.columnWidths.value[0]).toBeGreaterThan(344);
     expect(state.columnWidths.value[0]).toBeLessThanOrEqual(DATA_GRID_COL_AUTO_FIT_MAX_WIDTH);
+  });
+
+  it("includes values when explicitly auto-fitting a compact column", () => {
+    const state = createResizeState({
+      columns: ["id"],
+      rows: [["x".repeat(120)]],
+      density: "compact",
+    });
+
+    state.initColumnWidths();
+    expect(state.columnWidths.value[0]).toBe(60);
+
+    state.autoFitColumn(0);
+
+    expect(state.columnWidths.value[0]).toBeGreaterThan(60);
   });
 
   it("clamps manual column resizing to the minimum width", () => {
@@ -76,7 +93,7 @@ describe("useDataGridColumnResize", () => {
     const state = createResizeState({
       columns: ["some_column_name_here"],
       rows: [["a"]],
-      density: "compact",
+      density: "standard",
       compactColumnHeaderActions: true,
     });
 
@@ -87,8 +104,83 @@ describe("useDataGridColumnResize", () => {
     await nextTick();
 
     const widthNonCompact = state.renderedColumnWidths.value[0];
-    // compact: charWidth*nameLen + headerControlWidthCompact(20) = 7*21+20=167
-    // non-compact: 7*21+headerControlWidth(36)=183
+    // standard compactActions=true: 21×8+59=227
+    // standard compactActions=false: 21×8+83=251
     expect(widthNonCompact).toBeGreaterThan(widthCompact);
+  });
+
+  it("compact mode bases width on field name only, capping long names", () => {
+    // 短字段名：列宽=字段名宽度，值不参与撑宽
+    const short = createResizeState({
+      columns: ["id"],
+      rows: [["x".repeat(100)]],
+      density: "compact",
+      compactColumnHeaderActions: true,
+    });
+    short.initColumnWidths();
+    // "id"=2×7+45=59 < min 60 → 60
+    expect(short.columnWidths.value[0]).toBe(60);
+
+    // 中等字段名：刚好完整显示
+    const mid = createResizeState({
+      columns: ["user_name"],
+      rows: [["a"]],
+      density: "compact",
+      compactColumnHeaderActions: true,
+    });
+    mid.initColumnWidths();
+    // 9×7+45=108
+    expect(mid.columnWidths.value[0]).toBe(108);
+
+    // 过长字段名：截断到边界
+    const capped = createResizeState({
+      columns: ["x".repeat(70)],
+      rows: [["a"]],
+      density: "compact",
+      compactColumnHeaderActions: true,
+    });
+    capped.initColumnWidths();
+    // 70×7+45=535 > maxWidth 480 → 480
+    expect(capped.columnWidths.value[0]).toBe(480);
+  });
+
+  it("comfortable mode uses percentile to ignore outlier values", () => {
+    const shortRows = Array.from({ length: 49 }, () => ["short"]);
+    const rows = [...shortRows, ["x".repeat(200)]];
+
+    const state = createResizeState({
+      columns: ["data"],
+      rows,
+      density: "comfortable",
+      compactColumnHeaderActions: true,
+    });
+
+    state.initColumnWidths();
+    // P95 of 50 samples ignores the single 200-char outlier;
+    // "short" = 5 chars → 5×8+24=64, header "data"=4×8+59=91 → max=91
+    expect(state.columnWidths.value[0]).toBeLessThan(600);
+    expect(state.columnWidths.value[0]).toBe(91);
+  });
+
+  it("comfortable mode is never narrower than standard for the same column", () => {
+    const rows = Array.from({ length: 50 }, () => ["medium_value"]);
+
+    const std = createResizeState({
+      columns: ["description"],
+      rows,
+      density: "standard",
+      compactColumnHeaderActions: true,
+    });
+    std.initColumnWidths();
+
+    const comf = createResizeState({
+      columns: ["description"],
+      rows,
+      density: "comfortable",
+      compactColumnHeaderActions: true,
+    });
+    comf.initColumnWidths();
+
+    expect(comf.columnWidths.value[0]).toBeGreaterThanOrEqual(std.columnWidths.value[0]);
   });
 });

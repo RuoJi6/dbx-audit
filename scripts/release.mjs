@@ -31,7 +31,6 @@ const AGENT_RELEASE_PATHS = [
   "agents/common/build.gradle",
   "agents/common/src/main/",
   "agents/drivers/",
-  "agents/opengauss/",
 ];
 
 const args = process.argv.slice(2);

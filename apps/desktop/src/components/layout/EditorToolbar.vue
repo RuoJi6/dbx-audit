@@ -14,6 +14,7 @@ import { useSchemaOptions } from "@/composables/useSchemaOptions";
 import { connectionIconType } from "@/lib/connection/connectionPresentation";
 import { formatDatabaseLabel, isDefaultDatabase } from "@/lib/database/defaultDatabase";
 import { connectionDisplayName } from "@/lib/tabs/tabPresentation";
+import { buildConnectionGroupPathMap } from "@/lib/sidebar/sidebarLayout";
 import { isSingleDatabase, supportsSqlInListPaste, supportsTransaction as supportsTransactionFeature } from "@/lib/database/databaseCapabilities";
 import { hexToRgba } from "@/lib/common/color";
 import { productionContextForDatabase } from "@/lib/database/productionSafety";
@@ -66,6 +67,7 @@ const activeDatabaseOptions = computed(() => {
 });
 
 const connectionOptionIds = computed(() => connectionStore.connections.map((connection) => connection.id));
+const connectionGroupPaths = computed(() => buildConnectionGroupPathMap(connectionStore.sidebarLayout));
 const activeDatabaseValue = computed(() => props.activeTab.database || "");
 const activeProductionContext = computed(() => productionContextForDatabase(props.activeConnection, props.activeTab.database));
 const showConnectionProductionBadge = computed(() => activeProductionContext.value.reason === "connection");
@@ -152,6 +154,10 @@ function databaseDisplayName(database: string): string {
 
 function connectionById(connectionId: string): ConnectionConfig | undefined {
   return connectionStore.getConfig(connectionId);
+}
+
+function connectionGroupLabel(connectionId: string): string {
+  return connectionGroupPaths.value.get(connectionId)?.join(" / ") || t("connectionGroup.ungroupedLabel");
 }
 
 function databaseOptionIsProduction(database: string): boolean {
@@ -326,6 +332,8 @@ function databaseOptionIsProduction(database: string): boolean {
           :loading-text="t('common.loading')"
           trigger-class="font-medium text-foreground"
           :display-name="connectionDisplayName"
+          list-class="w-96 max-w-[calc(100vw-2rem)]"
+          item-class="h-9"
           @update:model-value="(connectionId) => emit('changeConnection', connectionId)"
         >
           <template #trigger-label="{ label }">
@@ -339,7 +347,10 @@ function databaseOptionIsProduction(database: string): boolean {
           <template #option-label="{ option, label }">
             <div class="flex min-w-0 items-center gap-2">
               <DatabaseIcon :db-type="connectionIconType(connectionById(option))" class="h-3.5 w-3.5 shrink-0" />
-              <TruncatedTextTooltip :text="label" class="min-w-0 flex-1" side="left" :side-offset="8" />
+              <div class="flex min-w-0 flex-1 items-center gap-2">
+                <TruncatedTextTooltip :text="connectionGroupLabel(option)" class="block min-w-0 max-w-48 shrink-0 rounded-sm bg-muted/70 px-1.5 py-0.5 text-[11px] text-muted-foreground" side="left" :side-offset="8" />
+                <TruncatedTextTooltip :text="label" class="block min-w-[7rem] flex-1 text-sm font-medium" side="left" :side-offset="8" />
+              </div>
             </div>
           </template>
         </SearchableSelect>

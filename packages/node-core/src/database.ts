@@ -881,8 +881,8 @@ export async function executeQuery(config: ConnectionConfig, sql: string, option
     }
     const count = parseMongoCountDocumentsCommand(sql);
     if (count) {
-      const result = await withTimeout(mongoFindDocuments(config, count.collection, 0, 1, count.filter), resolveTimeoutMs(options));
-      return { columns: ["count"], rows: [{ count: result.total }], row_count: 1 };
+      const total = await withTimeout(mongoCountDocuments(config, count.collection, count.filter, count.mode), resolveTimeoutMs(options));
+      return { columns: ["count"], rows: [{ count: total }], row_count: 1 };
     }
     const find = parseMongoFindCommand(sql);
     if (find) {
@@ -1125,6 +1125,17 @@ async function mongoFindDocuments(config: ConnectionConfig, collection: string, 
   });
 }
 
+async function mongoCountDocuments(config: ConnectionConfig, collection: string, filter: string, mode: MongoCountDocumentsCommand["mode"]): Promise<number> {
+  return bridgeDataRequest<number>("/data/mongo/count-documents", {
+    connection_id: config.id,
+    connection_name: config.name,
+    database: config.database || "",
+    collection,
+    filter,
+    mode,
+  });
+}
+
 async function mongoServerVersion(config: ConnectionConfig): Promise<string> {
   return bridgeDataRequest<string>("/data/mongo/server-version", {
     connection_id: config.id,
@@ -1296,6 +1307,7 @@ interface MongoFindCommand {
 interface MongoCountDocumentsCommand {
   collection: string;
   filter: string;
+  mode: "accurate" | "legacy";
 }
 
 interface MongoAggregateCommand {
@@ -1364,8 +1376,6 @@ export function parseMongoVersionCommand(input: string): boolean {
 
 export function parseMongoCountDocumentsCommand(input: string): MongoCountDocumentsCommand | null {
   const source = input.trim().replace(/;$/, "").trim();
-  // Accept deprecated Mongo shell count helpers for old server workflows, but
-  // keep DBX's internal execution mapped to the countDocuments result shape.
   return parseCollectionCountCommand(source, "countDocuments") ?? parseCollectionCountCommand(source, "count") ?? parseFindCountCommand(source);
 }
 
@@ -1378,7 +1388,7 @@ function parseCollectionCountCommand(source: string, method: "countDocuments" | 
   const args = splitTopLevel(source.slice(openIndex + 1, closeIndex));
   if (args.length > 1 && args.slice(1).some((arg) => arg.trim())) return null;
   const filter = normalizeJsonArgument(args[0] || "{}");
-  return filter ? { collection: target.collection, filter } : null;
+  return filter ? { collection: target.collection, filter, mode: method === "countDocuments" ? "accurate" : "legacy" } : null;
 }
 
 function parseFindCountCommand(source: string): MongoCountDocumentsCommand | null {
@@ -1392,7 +1402,7 @@ function parseFindCountCommand(source: string): MongoCountDocumentsCommand | nul
   const findArgs = splitTopLevel(source.slice(findOpenIndex + 1, findCloseIndex));
   if (findArgs.length > 2 && findArgs.slice(2).some((arg) => arg.trim())) return null;
   const filter = normalizeJsonArgument(findArgs[0] || "{}");
-  return filter ? { collection: target.collection, filter } : null;
+  return filter ? { collection: target.collection, filter, mode: "legacy" } : null;
 }
 
 export function parseMongoAggregateCommand(input: string): MongoAggregateCommand | null {

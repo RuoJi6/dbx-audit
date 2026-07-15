@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -13,14 +14,18 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	_ "gitee.com/XuguDB/go-xugu-driver"
 )
 
 const protocolVersion = 1
+const multiSessionProtocolVersion = 2
 const defaultMaxRows = 1000
 const defaultXuguPort = 5138
+const legacyAgentSessionID = "__legacy__"
+const maxAgentSessions = 256
 const xuguListDatabasesSQL = `
 SELECT DB_NAME
 FROM ALL_DATABASES
@@ -259,15 +264,43 @@ type triggerInfo struct {
 }
 
 type server struct {
-	db            *sql.DB
-	params        connectParams
-	sessions      map[string]*querySession
-	nextSessionID int64
+	db                *sql.DB
+	cancelDB          *sql.DB
+	ownsCancelDB      bool
+	params            connectParams
+	nodeID            int
+	databaseSessionID int64
+	sessions          map[string]*querySession
+	nextSessionID     int64
+	activeCancelMu    sync.Mutex
+	activeCancel      context.CancelFunc
+	activeRows        map[*sql.Rows]context.CancelFunc
+}
+
+type agentSession struct {
+	server     *server
+	controlKey string
+	mu         sync.Mutex
+}
+
+type sharedControl struct {
+	db   *sql.DB
+	refs int
+}
+
+type runtimeServer struct {
+	mu        sync.RWMutex
+	sessions  map[string]*agentSession
+	connectMu sync.Mutex
+	controlMu sync.Mutex
+	controls  map[string]*sharedControl
 }
 
 func main() {
-	s := newServer()
+	runtime := newRuntimeServer()
 	encoder := json.NewEncoder(os.Stdout)
+	var encoderMu sync.Mutex
+	var requests sync.WaitGroup
 	fmt.Fprintln(os.Stdout, `{"ready":true}`)
 
 	scanner := bufio.NewScanner(os.Stdin)
@@ -277,22 +310,260 @@ func main() {
 		if line == "" {
 			continue
 		}
-		resp, shutdown := s.handleLine(line)
-		if err := encoder.Encode(resp); err != nil {
-			fmt.Fprintf(os.Stderr, "failed to write response: %v\n", err)
+		var requestEnvelope request
+		if json.Unmarshal([]byte(line), &requestEnvelope) == nil && requestEnvelope.Method == "shutdown" {
+			requests.Wait()
+			resp, _ := runtime.handleLine(line)
+			encoderMu.Lock()
+			err := encoder.Encode(resp)
+			encoderMu.Unlock()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "failed to write response: %v\n", err)
+			}
 			return
 		}
-		if shutdown {
-			return
-		}
+		requests.Add(1)
+		go func(line string) {
+			defer requests.Done()
+			resp, _ := runtime.handleLine(line)
+			encoderMu.Lock()
+			err := encoder.Encode(resp)
+			encoderMu.Unlock()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "failed to write response: %v\n", err)
+			}
+		}(line)
 	}
+	requests.Wait()
 	if err := scanner.Err(); err != nil && !errors.Is(err, io.EOF) {
 		fmt.Fprintf(os.Stderr, "failed to read stdin: %v\n", err)
 	}
 }
 
 func newServer() *server {
-	return &server{sessions: map[string]*querySession{}}
+	return &server{sessions: map[string]*querySession{}, activeRows: map[*sql.Rows]context.CancelFunc{}}
+}
+
+func newRuntimeServer() *runtimeServer {
+	return &runtimeServer{sessions: map[string]*agentSession{}, controls: map[string]*sharedControl{}}
+}
+
+func (r *runtimeServer) handleLine(line string) (response, bool) {
+	var req request
+	if err := json.Unmarshal([]byte(line), &req); err != nil {
+		return errorResponse(nil, err), false
+	}
+	if len(req.ID) == 0 {
+		req.ID = json.RawMessage("1")
+	}
+	result, shutdown, err := r.dispatch(req.Method, req.Params)
+	if err != nil {
+		return errorResponse(req.ID, err), false
+	}
+	return response{JSONRPC: "2.0", ID: req.ID, Result: result}, shutdown
+}
+
+func (r *runtimeServer) dispatch(method string, params map[string]json.RawMessage) (any, bool, error) {
+	switch method {
+	case "handshake":
+		return map[string]any{
+			"protocolVersion":      multiSessionProtocolVersion,
+			"agentProtocolVersion": multiSessionProtocolVersion,
+			"capabilities":         []string{"connect", "test_connection", "metadata", "query", "ddl", "multi_session"},
+		}, false, nil
+	case "open_session":
+		agentSessionID := stringParam(params, "agentSessionId")
+		if agentSessionID == "" {
+			return nil, false, errors.New("agentSessionId is required")
+		}
+		var cp connectParams
+		if err := decodeParams(params, &cp); err != nil {
+			return nil, false, err
+		}
+		return map[string]bool{"ok": true}, false, r.openSession(agentSessionID, cp)
+	case "close_session":
+		return map[string]bool{"ok": true}, false, r.closeSession(stringParam(params, "agentSessionId"))
+	case "validate_session":
+		agentSessionID := stringParam(params, "agentSessionId")
+		session, err := r.session(agentSessionID)
+		if err != nil {
+			return nil, false, err
+		}
+		session.mu.Lock()
+		defer session.mu.Unlock()
+		if err := session.server.validateConnection(); err == nil {
+			return map[string]bool{"ok": true}, false, nil
+		}
+		r.connectMu.Lock()
+		err = session.server.connectWithControl(session.server.params, session.server.cancelDB, false)
+		r.connectMu.Unlock()
+		return map[string]bool{"ok": true}, false, err
+	case "cancel_session":
+		session, err := r.session(stringParam(params, "agentSessionId"))
+		if err != nil {
+			return nil, false, err
+		}
+		session.server.cancelActiveQuery()
+		return map[string]bool{"ok": true}, false, nil
+	case "test_connection":
+		return newServer().dispatch(method, params)
+	case "shutdown":
+		return map[string]bool{"ok": true}, true, r.closeAllSessions()
+	case "connect":
+		var cp connectParams
+		if err := decodeParams(params, &cp); err != nil {
+			return nil, false, err
+		}
+		return map[string]bool{"ok": true}, false, r.replaceSession(legacyAgentSessionID, cp)
+	case "disconnect":
+		return map[string]bool{"ok": true}, false, r.closeSession(legacyAgentSessionID)
+	default:
+		agentSessionID := stringParam(params, "agentSessionId")
+		if agentSessionID == "" {
+			agentSessionID = legacyAgentSessionID
+		}
+		return r.withSession(agentSessionID, method, params)
+	}
+}
+
+func (r *runtimeServer) withSession(agentSessionID, method string, params map[string]json.RawMessage) (any, bool, error) {
+	session, err := r.session(agentSessionID)
+	if err != nil {
+		return nil, false, err
+	}
+	// Database, schema, transaction, and cursor state are connection-scoped.
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	return session.server.dispatch(method, params)
+}
+
+func (r *runtimeServer) openSession(agentSessionID string, params connectParams) error {
+	r.mu.Lock()
+	if _, exists := r.sessions[agentSessionID]; exists {
+		r.mu.Unlock()
+		return fmt.Errorf("agent session already exists: %s", agentSessionID)
+	}
+	if len(r.sessions) >= maxAgentSessions {
+		r.mu.Unlock()
+		return fmt.Errorf("agent session limit reached: %d", maxAgentSessions)
+	}
+	r.mu.Unlock()
+
+	server := newServer()
+	params.URLParams = appendURLParam(params.URLParams, "APP_NAME", xuguSessionAppName(agentSessionID))
+	r.connectMu.Lock()
+	controlKey, controlDB, err := r.acquireControl(params)
+	if err == nil {
+		err = server.connectWithControl(params, controlDB, false)
+	}
+	r.connectMu.Unlock()
+	if err != nil {
+		if controlKey != "" {
+			r.releaseControl(controlKey)
+		}
+		return err
+	}
+	session := &agentSession{server: server, controlKey: controlKey}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, exists := r.sessions[agentSessionID]; exists {
+		_ = server.disconnect()
+		r.releaseControl(controlKey)
+		return fmt.Errorf("agent session already exists: %s", agentSessionID)
+	}
+	if len(r.sessions) >= maxAgentSessions {
+		_ = server.disconnect()
+		r.releaseControl(controlKey)
+		return fmt.Errorf("agent session limit reached: %d", maxAgentSessions)
+	}
+	r.sessions[agentSessionID] = session
+	return nil
+}
+
+func (r *runtimeServer) replaceSession(agentSessionID string, params connectParams) error {
+	_ = r.closeSession(agentSessionID)
+	return r.openSession(agentSessionID, params)
+}
+
+func (r *runtimeServer) session(agentSessionID string) (*agentSession, error) {
+	r.mu.RLock()
+	session := r.sessions[agentSessionID]
+	r.mu.RUnlock()
+	if session == nil {
+		return nil, fmt.Errorf("agent session not found: %s", agentSessionID)
+	}
+	return session, nil
+}
+
+func (r *runtimeServer) closeSession(agentSessionID string) error {
+	r.mu.Lock()
+	session := r.sessions[agentSessionID]
+	delete(r.sessions, agentSessionID)
+	r.mu.Unlock()
+	if session == nil {
+		return nil
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	err := session.server.disconnect()
+	r.releaseControl(session.controlKey)
+	return err
+}
+
+func (r *runtimeServer) acquireControl(params connectParams) (string, *sql.DB, error) {
+	r.controlMu.Lock()
+	defer r.controlMu.Unlock()
+	cancelParams := xuguControlParams(params)
+	key := buildDSN(cancelParams)
+	if control := r.controls[key]; control != nil {
+		control.refs++
+		return key, control.db, nil
+	}
+	db, err := openDB(cancelParams)
+	if err != nil {
+		return "", nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
+		db.Close()
+		return "", nil, err
+	}
+	r.controls[key] = &sharedControl{db: db, refs: 1}
+	return key, db, nil
+}
+
+func (r *runtimeServer) releaseControl(key string) {
+	if key == "" {
+		return
+	}
+	r.controlMu.Lock()
+	defer r.controlMu.Unlock()
+	control := r.controls[key]
+	if control == nil {
+		return
+	}
+	control.refs--
+	if control.refs <= 0 {
+		_ = control.db.Close()
+		delete(r.controls, key)
+	}
+}
+
+func (r *runtimeServer) closeAllSessions() error {
+	r.mu.Lock()
+	ids := make([]string, 0, len(r.sessions))
+	for id := range r.sessions {
+		ids = append(ids, id)
+	}
+	r.mu.Unlock()
+	var firstErr error
+	for _, id := range ids {
+		if err := r.closeSession(id); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 func (s *server) handleLine(line string) (response, bool) {
@@ -340,6 +611,8 @@ func (s *server) dispatch(method string, params map[string]json.RawMessage) (any
 			return nil, false, err
 		}
 		return map[string]bool{"ok": true}, false, nil
+	case "validate_connection":
+		return map[string]bool{"ok": true}, false, s.validateConnection()
 	case "list_databases":
 		result, err := s.listDatabases()
 		return result, false, err
@@ -409,6 +682,18 @@ func (s *server) dispatch(method string, params map[string]json.RawMessage) (any
 		return result, false, err
 	case "close_query_session":
 		return s.closeQuerySession(stringParam(params, "sessionId")), false, nil
+	case "start_table_read":
+		var opts queryOptions
+		if err := decodeParams(params, &opts); err != nil {
+			return nil, false, err
+		}
+		result, err := s.executeQueryPage(opts, intParam(params, "pageSize"))
+		return result, false, err
+	case "fetch_table_read_page":
+		result, err := s.fetchQueryPage(stringParam(params, "sessionId"), intParam(params, "pageSize"))
+		return result, false, err
+	case "close_table_read_session":
+		return s.closeQuerySession(stringParam(params, "sessionId")), false, nil
 	case "list_indexes":
 		if err := s.useDatabase(stringParam(params, "database")); err != nil {
 			return nil, false, err
@@ -451,30 +736,84 @@ func (s *server) dispatch(method string, params map[string]json.RawMessage) (any
 }
 
 func (s *server) connect(params connectParams) error {
-	_ = s.disconnect()
-	db, err := openDB(params)
+	cancelParams := xuguControlParams(params)
+	cancelDB, err := openDB(cancelParams)
 	if err != nil {
 		return err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
+	if err := cancelDB.PingContext(ctx); err != nil {
+		cancelDB.Close()
+		return err
+	}
+	if err := s.connectWithControl(params, cancelDB, true); err != nil {
+		cancelDB.Close()
+		return err
+	}
+	return nil
+}
+
+func (s *server) connectWithControl(params connectParams, cancelDB *sql.DB, ownsCancelDB bool) error {
+	_ = s.disconnect()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	before, err := xuguDatabaseSessions(cancelDB)
+	if err != nil {
+		return err
+	}
+	db, err := openDB(params)
+	if err != nil {
+		return err
+	}
 	if err := db.PingContext(ctx); err != nil {
 		db.Close()
 		return err
 	}
+	after, err := xuguDatabaseSessions(cancelDB)
+	if err != nil {
+		db.Close()
+		return err
+	}
+	databaseSession, err := newXuguDatabaseSession(before, after)
+	if err != nil {
+		db.Close()
+		return err
+	}
 	s.db = db
+	s.cancelDB = cancelDB
+	s.ownsCancelDB = ownsCancelDB
 	s.params = params
+	s.nodeID = databaseSession.nodeID
+	s.databaseSessionID = databaseSession.sessionID
 	return nil
 }
 
 func (s *server) disconnect() error {
+	s.cancelActiveQuery()
 	s.closeAllQuerySessions()
+	if s.ownsCancelDB && s.cancelDB != nil {
+		_ = s.cancelDB.Close()
+	}
 	if s.db == nil {
 		return nil
 	}
 	err := s.db.Close()
 	s.db = nil
+	s.cancelDB = nil
+	s.ownsCancelDB = false
+	s.nodeID = 0
+	s.databaseSessionID = 0
 	return err
+}
+
+func (s *server) validateConnection() error {
+	if s.db == nil {
+		return errors.New("not connected")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return s.db.PingContext(ctx)
 }
 
 func openDB(params connectParams) (*sql.DB, error) {
@@ -483,10 +822,74 @@ func openDB(params connectParams) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(4)
+	// One logical Agent session must map to exactly one server-side session so
+	// schema, transaction, cursor, and cancellation state stay deterministic.
+	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(30 * time.Minute)
 	return db, nil
+}
+
+func appendURLParam(raw, key, value string) string {
+	parts := make([]string, 0, 2)
+	for _, part := range strings.Split(raw, ";") {
+		part = strings.TrimSpace(part)
+		if part != "" && !strings.HasPrefix(strings.ToUpper(part), strings.ToUpper(key)+"=") {
+			parts = append(parts, part)
+		}
+	}
+	parts = append(parts, key+"="+value)
+	return strings.Join(parts, ";")
+}
+
+func xuguSessionAppName(agentSessionID string) string {
+	digest := sha256.Sum256([]byte(agentSessionID))
+	return fmt.Sprintf("DBX_%x", digest[:8])
+}
+
+func xuguControlParams(params connectParams) connectParams {
+	params.Database = "SYSTEM"
+	params.ConnectionString = ""
+	params.URLParams = appendURLParam(params.URLParams, "APP_NAME", "DBX_CONTROL")
+	return params
+}
+
+type xuguDatabaseSession struct {
+	nodeID    int
+	sessionID int64
+}
+
+func xuguDatabaseSessions(db *sql.DB) (map[xuguDatabaseSession]struct{}, error) {
+	rows, err := db.Query("SELECT NODEID, SESSION_ID FROM SYS_SESSIONS")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := map[xuguDatabaseSession]struct{}{}
+	for rows.Next() {
+		var session xuguDatabaseSession
+		if err := rows.Scan(&session.nodeID, &session.sessionID); err != nil {
+			return nil, err
+		}
+		result[session] = struct{}{}
+	}
+	return result, rows.Err()
+}
+
+func newXuguDatabaseSession(
+	before map[xuguDatabaseSession]struct{},
+	after map[xuguDatabaseSession]struct{},
+) (xuguDatabaseSession, error) {
+	var candidates []xuguDatabaseSession
+	for session := range after {
+		if _, existed := before[session]; !existed {
+			candidates = append(candidates, session)
+		}
+	}
+	if len(candidates) != 1 {
+		return xuguDatabaseSession{}, fmt.Errorf("failed to identify Xugu server session: found %d new sessions", len(candidates))
+	}
+	return candidates[0], nil
 }
 
 func buildDSN(params connectParams) string {
@@ -684,7 +1087,7 @@ func (s *server) listDatabases() ([]databaseInfo, error) {
 		}
 		return nil, err
 	}
-	defer rows.Close()
+	defer s.closeRows(rows)
 	var result []databaseInfo
 	for rows.Next() {
 		var name string
@@ -759,7 +1162,7 @@ func (s *server) listSchemas() ([]string, error) {
 		}
 		return nil, err
 	}
-	defer rows.Close()
+	defer s.closeRows(rows)
 	var result []string
 	for rows.Next() {
 		var schema string
@@ -784,7 +1187,7 @@ ORDER BY CASE WHEN UPPER(s.SCHEMA_NAME) = UPPER(?) THEN 0 ELSE 1 END, s.SCHEMA_N
 		}
 		return "", err
 	}
-	defer rows.Close()
+	defer s.closeRows(rows)
 	if rows.Next() {
 		var schema string
 		if err := rows.Scan(&schema); err != nil {
@@ -816,7 +1219,7 @@ func (s *server) listTables(schema string, constraints metadataListConstraints) 
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer s.closeRows(rows)
 	var result []tableInfo
 	for rows.Next() {
 		var item tableInfo
@@ -838,7 +1241,7 @@ func (s *server) listObjects(schema string, constraints metadataListConstraints)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer s.closeRows(rows)
 	var result []objectInfo
 	for rows.Next() {
 		var item objectInfo
@@ -1021,7 +1424,7 @@ func (s *server) getColumns(schema, table string) ([]columnInfo, error) {
 		}
 		return nil, err
 	}
-	defer rows.Close()
+	defer s.closeRows(rows)
 	var result []columnInfo
 	for rows.Next() {
 		var item columnInfo
@@ -1056,7 +1459,7 @@ func (s *server) columnsFromSelect(schema, table string, primaryKeys map[string]
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer s.closeRows(rows)
 	types, err := rows.ColumnTypes()
 	if err != nil {
 		return nil, err
@@ -1090,7 +1493,7 @@ func (s *server) primaryKeyColumns(schema, table string) (map[string]bool, error
 		}
 		return nil, err
 	}
-	defer rows.Close()
+	defer s.closeRows(rows)
 	result := map[string]bool{}
 	for rows.Next() {
 		var define string
@@ -1117,7 +1520,7 @@ func (s *server) listIndexes(schema, table string) ([]indexInfo, error) {
 		}
 		return nil, err
 	}
-	defer rows.Close()
+	defer s.closeRows(rows)
 
 	var result []indexInfo
 	for rows.Next() {
@@ -1160,7 +1563,7 @@ ORDER BY c.CONS_NAME`, []any{schema, table})
 		}
 		return nil, err
 	}
-	defer rows.Close()
+	defer s.closeRows(rows)
 	var result []foreignKeyInfo
 	for rows.Next() {
 		var name, define, refTable string
@@ -1199,7 +1602,7 @@ ORDER BY tr.TRIG_NAME`, []any{schema, table})
 		}
 		return nil, err
 	}
-	defer rows.Close()
+	defer s.closeRows(rows)
 	var result []triggerInfo
 	for rows.Next() {
 		var item triggerInfo
@@ -1228,7 +1631,7 @@ func (s *server) getObjectSource(schema, name, objectType string) (map[string]an
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer s.closeRows(rows)
 	var builder strings.Builder
 	for rows.Next() {
 		var line string
@@ -1249,7 +1652,7 @@ func (s *server) getTableDDL(schema, table string) (string, error) {
 	var ddl string
 	rows, err := s.queryRows("SELECT TO_CHAR(DBMS_METADATA.GET_DDL('TABLE', ?, ?)) FROM DUAL", []any{strings.ToUpper(table), schema})
 	if err == nil {
-		defer rows.Close()
+		defer s.closeRows(rows)
 		if rows.Next() {
 			if scanErr := rows.Scan(&ddl); scanErr == nil && strings.TrimSpace(ddl) != "" {
 				if err := rows.Err(); err != nil {
@@ -1274,7 +1677,7 @@ func (s *server) getExplainInfo(sqlText string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer rows.Close()
+	defer s.closeRows(rows)
 	columns, err := rows.Columns()
 	if err != nil {
 		return "", err
@@ -1303,12 +1706,14 @@ func (s *server) executeTransaction(params map[string]json.RawMessage) (queryRes
 	if err != nil {
 		return queryResult{}, err
 	}
-	tx, err := db.Begin()
+	ctx, cancel := s.beginActiveOperation()
+	defer s.endActiveOperation(cancel)
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return queryResult{}, err
 	}
 	if strings.TrimSpace(payload.Schema) != "" {
-		if _, err := tx.Exec("SET SCHEMA " + quoteIdentifier(payload.Schema)); err != nil {
+		if _, err := tx.ExecContext(ctx, "SET SCHEMA "+quoteIdentifier(payload.Schema)); err != nil {
 			tx.Rollback()
 			return queryResult{}, err
 		}
@@ -1320,7 +1725,7 @@ func (s *server) executeTransaction(params map[string]json.RawMessage) (queryRes
 		if statement == "" {
 			continue
 		}
-		result, err := tx.Exec(statement)
+		result, err := tx.ExecContext(ctx, statement)
 		if err != nil {
 			tx.Rollback()
 			return queryResult{}, err
@@ -1370,7 +1775,7 @@ func (s *server) executeQueryPage(opts queryOptions, pageSize int) (queryPageRes
 	}
 	columns, err := rows.Columns()
 	if err != nil {
-		rows.Close()
+		s.closeRows(rows)
 		return queryPageResult{}, err
 	}
 	columnTypes := columnTypeNames(rows)
@@ -1382,14 +1787,14 @@ func (s *server) executeQueryPage(opts queryOptions, pageSize int) (queryPageRes
 	result, err := readQuerySessionPage(session, pageSize)
 	result.ExecutionTimeMS = time.Since(start).Milliseconds()
 	if err != nil {
-		rows.Close()
+		s.closeRows(rows)
 		return queryPageResult{}, err
 	}
 	if result.HasMore {
 		sessionID := s.storeQuerySession(session)
 		result.SessionID = &sessionID
 	} else {
-		rows.Close()
+		s.closeRows(rows)
 	}
 	return result, nil
 }
@@ -1424,7 +1829,7 @@ func (s *server) closeQuerySession(sessionID string) bool {
 	if session == nil {
 		return false
 	}
-	session.rows.Close()
+	s.closeRows(session.rows)
 	delete(s.sessions, sessionID)
 	return true
 }
@@ -1497,7 +1902,9 @@ func (s *server) executeQuery(opts queryOptions) (queryResult, error) {
 	if err != nil {
 		return queryResult{}, err
 	}
-	execResult, err := db.Exec(sqlText)
+	ctx, cancel := s.beginActiveOperation()
+	defer s.endActiveOperation(cancel)
+	execResult, err := db.ExecContext(ctx, sqlText)
 	if err != nil {
 		return queryResult{}, err
 	}
@@ -1510,7 +1917,7 @@ func (s *server) executeSelect(sqlText string, maxRows int) (queryResult, error)
 	if err != nil {
 		return queryResult{}, err
 	}
-	defer rows.Close()
+	defer s.closeRows(rows)
 	columns, err := rows.Columns()
 	if err != nil {
 		return queryResult{}, err
@@ -1562,7 +1969,9 @@ func (s *server) setSchema(schema string) error {
 	if err != nil {
 		return err
 	}
-	_, err = db.Exec("SET SCHEMA " + quoteIdentifier(schema))
+	ctx, cancel := s.beginActiveOperation()
+	defer s.endActiveOperation(cancel)
+	_, err = db.ExecContext(ctx, "SET SCHEMA "+quoteIdentifier(schema))
 	return err
 }
 
@@ -1571,10 +1980,70 @@ func (s *server) queryRows(sqlText string, args []any) (*sql.Rows, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(args) == 0 {
-		return db.Query(sqlText)
+	ctx, cancel := s.beginActiveOperation()
+	rows, queryErr := db.QueryContext(ctx, sqlText, args...)
+	s.activeCancelMu.Lock()
+	s.activeCancel = nil
+	if queryErr != nil {
+		cancel()
+	} else {
+		// Paged queries may continue fetching after QueryContext returns.
+		s.activeRows[rows] = cancel
 	}
-	return db.Query(sqlText, args...)
+	s.activeCancelMu.Unlock()
+	return rows, queryErr
+}
+
+func (s *server) beginActiveOperation() (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	s.activeCancelMu.Lock()
+	s.activeCancel = cancel
+	s.activeCancelMu.Unlock()
+	return ctx, cancel
+}
+
+func (s *server) endActiveOperation(cancel context.CancelFunc) {
+	cancel()
+	s.activeCancelMu.Lock()
+	s.activeCancel = nil
+	s.activeCancelMu.Unlock()
+}
+
+func (s *server) cancelActiveQuery() {
+	s.activeCancelMu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(s.activeRows)+1)
+	if s.activeCancel != nil {
+		cancels = append(cancels, s.activeCancel)
+	}
+	for _, cancel := range s.activeRows {
+		cancels = append(cancels, cancel)
+	}
+	s.activeCancelMu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+	if len(cancels) > 0 && s.cancelDB != nil && s.databaseSessionID > 0 {
+		// go-xugu-driver does not implement QueryerContext/ExecerContext and
+		// blocks in network reads, so context cancellation alone cannot interrupt
+		// an in-flight statement. Xugu's control procedure stops the target
+		// session's current transaction while preserving the connection. Runtime
+		// sessions share one control connection per database endpoint.
+		_, _ = s.cancelDB.Exec(fmt.Sprintf("CALL DBMS_DBA.KILL_SESSION_TRANS(%d, %d)", s.nodeID, s.databaseSessionID))
+	}
+}
+
+func (s *server) closeRows(rows *sql.Rows) error {
+	if rows == nil {
+		return nil
+	}
+	s.activeCancelMu.Lock()
+	cancel := s.activeRows[rows]
+	delete(s.activeRows, rows)
+	s.activeCancelMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	return rows.Close()
 }
 
 func objectSourceQuery(schema, name, objectType string) (string, []any, error) {
@@ -1718,7 +2187,7 @@ func (s *server) tableIndexDDL(schema, table string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer rows.Close()
+	defer s.closeRows(rows)
 	var ddl string
 	if rows.Next() {
 		if err := rows.Scan(&ddl); err != nil {
@@ -1741,7 +2210,7 @@ WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
 	if err != nil {
 		return "", err
 	}
-	defer rows.Close()
+	defer s.closeRows(rows)
 	var comment *string
 	if rows.Next() {
 		if err := rows.Scan(&comment); err != nil {

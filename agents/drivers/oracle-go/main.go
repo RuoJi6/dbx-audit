@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/sijms/go-ora/v2"
@@ -25,8 +26,11 @@ import (
 )
 
 const protocolVersion = 1
+const multiSessionProtocolVersion = 2
 const defaultMaxRows = 1000
 const oracleCharsetZHS32GB18030 = 854
+const legacyAgentSessionID = "__legacy__"
+const maxAgentSessions = 256
 
 var (
 	oraclePlSQLBlockStartRegexp          = regexp.MustCompile(`(?is)^\s*(?:DECLARE|BEGIN|CREATE\s+(?:OR\s+REPLACE\s+)?(?:(?:EDITIONABLE|NONEDITIONABLE)\s+)?(?:FUNCTION|PROCEDURE|TRIGGER|PACKAGE(?:\s+BODY)?|TYPE(?:\s+BODY)?))\b`)
@@ -162,6 +166,37 @@ type connectParams struct {
 	SysDBA           bool   `json:"sysdba"`
 	URLParams        string `json:"url_params"`
 	ConnectionString string `json:"connection_string"`
+}
+
+type completionAssistantRequest struct {
+	ConnectionID  string   `json:"connection_id"`
+	Database      string   `json:"database"`
+	Schema        string   `json:"schema"`
+	ObjectKinds   []string `json:"object_kinds"`
+	Mask          string   `json:"mask"`
+	CaseSensitive bool     `json:"case_sensitive"`
+	GlobalSearch  bool     `json:"global_search"`
+	MaxResults    int      `json:"max_results"`
+	ParentSchema  string   `json:"parent_schema"`
+	ParentName    string   `json:"parent_name"`
+	MatchMode     string   `json:"match_mode"`
+}
+
+type completionAssistantCandidate struct {
+	Name         string  `json:"name"`
+	Kind         string  `json:"kind"`
+	Database     *string `json:"database"`
+	Schema       *string `json:"schema"`
+	ParentSchema *string `json:"parent_schema"`
+	ParentName   *string `json:"parent_name"`
+	Comment      *string `json:"comment"`
+	DataType     *string `json:"data_type"`
+}
+
+type completionAssistantResponse struct {
+	Candidates   []completionAssistantCandidate `json:"candidates"`
+	Incomplete   bool                           `json:"incomplete"`
+	FallbackUsed bool                           `json:"fallback_used"`
 }
 
 type queryOptions struct {
@@ -317,11 +352,28 @@ type server struct {
 	tableReadSessions      map[string]*querySession
 	nextSessionID          int64
 	nextTableReadSessionID int64
+	activeCancelMu         sync.Mutex
+	activeCancel           context.CancelFunc
+	activeRows             map[*sql.Rows]context.CancelFunc
+}
+
+type agentSession struct {
+	server *server
+	mu     sync.Mutex
+}
+
+type runtimeServer struct {
+	mu       sync.RWMutex
+	sessions map[string]*agentSession
 }
 
 func main() {
-	s := newServer()
+	runtime := newRuntimeServer()
 	encoder := json.NewEncoder(os.Stdout)
+	var encoderMu sync.Mutex
+	var requests sync.WaitGroup
+	shutdown := make(chan struct{})
+	var shutdownOnce sync.Once
 	fmt.Fprintln(os.Stdout, `{"ready":true}`)
 
 	scanner := bufio.NewScanner(os.Stdin)
@@ -331,22 +383,230 @@ func main() {
 		if line == "" {
 			continue
 		}
-		resp, shutdown := s.handleLine(line)
-		if err := encoder.Encode(resp); err != nil {
-			fmt.Fprintf(os.Stderr, "failed to write response: %v\n", err)
+		var requestEnvelope request
+		if json.Unmarshal([]byte(line), &requestEnvelope) == nil && requestEnvelope.Method == "shutdown" {
+			requests.Wait()
+			resp, _ := runtime.handleLine(line)
+			encoderMu.Lock()
+			err := encoder.Encode(resp)
+			encoderMu.Unlock()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "failed to write response: %v\n", err)
+			}
 			return
 		}
-		if shutdown {
+		requests.Add(1)
+		go func() {
+			defer requests.Done()
+			resp, shouldShutdown := runtime.handleLine(line)
+			encoderMu.Lock()
+			err := encoder.Encode(resp)
+			encoderMu.Unlock()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "failed to write response: %v\n", err)
+				shutdownOnce.Do(func() { close(shutdown) })
+				return
+			}
+			if shouldShutdown {
+				shutdownOnce.Do(func() { close(shutdown) })
+			}
+		}()
+		select {
+		case <-shutdown:
+			requests.Wait()
 			return
+		default:
 		}
 	}
+	requests.Wait()
 	if err := scanner.Err(); err != nil && !errors.Is(err, io.EOF) {
 		fmt.Fprintf(os.Stderr, "failed to read stdin: %v\n", err)
 	}
 }
 
+func newRuntimeServer() *runtimeServer {
+	return &runtimeServer{sessions: map[string]*agentSession{}}
+}
+
+func (r *runtimeServer) handleLine(line string) (response, bool) {
+	var req request
+	if err := json.Unmarshal([]byte(line), &req); err != nil {
+		return errorResponse(nil, err), false
+	}
+	if len(req.ID) == 0 {
+		req.ID = json.RawMessage("1")
+	}
+	result, shutdown, err := r.dispatch(req.Method, req.Params)
+	if err != nil {
+		return errorResponse(req.ID, err), false
+	}
+	return response{JSONRPC: "2.0", ID: req.ID, Result: result}, shutdown
+}
+
+func (r *runtimeServer) dispatch(method string, params map[string]json.RawMessage) (any, bool, error) {
+	switch method {
+	case "handshake":
+		return map[string]any{
+			"protocolVersion":      multiSessionProtocolVersion,
+			"agentProtocolVersion": multiSessionProtocolVersion,
+			"capabilities":         []string{"connect", "test_connection", "metadata", "query", "ddl", "multi_session"},
+		}, false, nil
+	case "open_session":
+		agentSessionID := stringParam(params, "agentSessionId")
+		if agentSessionID == "" {
+			return nil, false, errors.New("agentSessionId is required")
+		}
+		var connectParams connectParams
+		if err := decodeParams(params, &connectParams); err != nil {
+			return nil, false, err
+		}
+		return map[string]bool{"ok": true}, false, r.openSession(agentSessionID, connectParams)
+	case "close_session":
+		return map[string]bool{"ok": true}, false, r.closeSession(stringParam(params, "agentSessionId"))
+	case "validate_session":
+		agentSessionID := stringParam(params, "agentSessionId")
+		session, err := r.session(agentSessionID)
+		if err != nil {
+			return nil, false, err
+		}
+		session.mu.Lock()
+		defer session.mu.Unlock()
+		if _, _, err := session.server.dispatch("validate_connection", params); err == nil {
+			return map[string]bool{"ok": true}, false, nil
+		}
+		// Reconnect only this logical session. Other sessions in the runtime keep
+		// their connections, transactions, cursors, and in-flight requests.
+		if err := session.server.connect(session.server.params); err != nil {
+			return nil, false, err
+		}
+		return map[string]bool{"ok": true}, false, nil
+	case "cancel_session":
+		session, err := r.session(stringParam(params, "agentSessionId"))
+		if err != nil {
+			return nil, false, err
+		}
+		session.server.cancelActiveQuery()
+		return map[string]bool{"ok": true}, false, nil
+	case "test_connection":
+		return newServer().dispatch(method, params)
+	case "shutdown":
+		return map[string]bool{"ok": true}, true, r.closeAllSessions()
+	case "connect":
+		var connectParams connectParams
+		if err := decodeParams(params, &connectParams); err != nil {
+			return nil, false, err
+		}
+		return map[string]bool{"ok": true}, false, r.replaceSession(legacyAgentSessionID, connectParams)
+	case "disconnect":
+		return map[string]bool{"ok": true}, false, r.closeSession(legacyAgentSessionID)
+	default:
+		agentSessionID := stringParam(params, "agentSessionId")
+		if agentSessionID == "" {
+			agentSessionID = legacyAgentSessionID
+		}
+		return r.withSession(agentSessionID, method, params)
+	}
+}
+
+func (r *runtimeServer) withSession(agentSessionID, method string, params map[string]json.RawMessage) (any, bool, error) {
+	session, err := r.session(agentSessionID)
+	if err != nil {
+		return nil, false, err
+	}
+	// Oracle connection state, transactions, and cursors are session-scoped;
+	// serialize one session while allowing separate sessions to run in parallel.
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	return session.server.dispatch(method, params)
+}
+
+func (r *runtimeServer) openSession(agentSessionID string, params connectParams) error {
+	r.mu.Lock()
+	if _, exists := r.sessions[agentSessionID]; exists {
+		r.mu.Unlock()
+		return fmt.Errorf("agent session already exists: %s", agentSessionID)
+	}
+	if len(r.sessions) >= maxAgentSessions {
+		r.mu.Unlock()
+		return fmt.Errorf("agent session limit reached: %d", maxAgentSessions)
+	}
+	session := &agentSession{server: newServer()}
+	r.sessions[agentSessionID] = session
+	r.mu.Unlock()
+
+	// Reserve the id under the registry lock, then connect outside it so unrelated
+	// sessions can establish database connections concurrently.
+	session.mu.Lock()
+	err := session.server.connect(params)
+	session.mu.Unlock()
+	if err != nil {
+		r.mu.Lock()
+		if r.sessions[agentSessionID] == session {
+			delete(r.sessions, agentSessionID)
+		}
+		r.mu.Unlock()
+		return err
+	}
+	return nil
+}
+
+func (r *runtimeServer) replaceSession(agentSessionID string, params connectParams) error {
+	_ = r.closeSession(agentSessionID)
+	return r.openSession(agentSessionID, params)
+}
+
+func (r *runtimeServer) session(agentSessionID string) (*agentSession, error) {
+	if agentSessionID == "" {
+		return nil, errors.New("agentSessionId is required")
+	}
+	r.mu.RLock()
+	session := r.sessions[agentSessionID]
+	r.mu.RUnlock()
+	if session == nil {
+		return nil, fmt.Errorf("agent session not found: %s", agentSessionID)
+	}
+	return session, nil
+}
+
+func (r *runtimeServer) closeSession(agentSessionID string) error {
+	if agentSessionID == "" {
+		return errors.New("agentSessionId is required")
+	}
+	r.mu.Lock()
+	session := r.sessions[agentSessionID]
+	delete(r.sessions, agentSessionID)
+	r.mu.Unlock()
+	if session == nil {
+		return nil
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	return session.server.disconnect()
+}
+
+func (r *runtimeServer) closeAllSessions() error {
+	r.mu.Lock()
+	sessions := r.sessions
+	r.sessions = map[string]*agentSession{}
+	r.mu.Unlock()
+	var firstErr error
+	for _, session := range sessions {
+		session.mu.Lock()
+		err := session.server.disconnect()
+		session.mu.Unlock()
+		if firstErr == nil && err != nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
 func newServer() *server {
-	return &server{sessions: map[string]*querySession{}, tableReadSessions: map[string]*querySession{}}
+	return &server{
+		sessions:          map[string]*querySession{},
+		tableReadSessions: map[string]*querySession{},
+		activeRows:        map[*sql.Rows]context.CancelFunc{},
+	}
 }
 
 func (s *server) handleLine(line string) (response, bool) {
@@ -389,6 +649,11 @@ func (s *server) dispatch(method string, params map[string]json.RawMessage) (any
 		}
 		defer db.Close()
 		return map[string]bool{"ok": true}, false, nil
+	case "validate_connection":
+		if s.db == nil {
+			return nil, false, errors.New("not connected")
+		}
+		return map[string]bool{"ok": true}, false, pingDB(s.db, 5*time.Second)
 	case "list_databases":
 		result, err := s.listDatabases()
 		return result, false, err
@@ -402,6 +667,13 @@ func (s *server) dispatch(method string, params map[string]json.RawMessage) (any
 	case "list_objects":
 		schema := stringParam(params, "schema")
 		result, err := s.listObjects(schema, metadataListConstraintsFromParams(params))
+		return result, false, err
+	case "completion_assistant_search_v1":
+		var request completionAssistantRequest
+		if err := decodeParams(params, &request); err != nil {
+			return nil, false, err
+		}
+		result, err := s.completionAssistantSearch(request)
 		return result, false, err
 	case "get_columns":
 		schema := stringParam(params, "schema")
@@ -750,7 +1022,7 @@ func (s *server) listDatabases() ([]databaseInfo, error) {
 		}
 		return nil, err
 	}
-	defer rows.Close()
+	defer s.closeRows(rows)
 	var result []databaseInfo
 	for rows.Next() {
 		var name string
@@ -810,7 +1082,7 @@ func (s *server) listDatabasesFiltered(visibleSchemas []string) ([]databaseInfo,
 		}
 		return nil, err
 	}
-	defer rows.Close()
+	defer s.closeRows(rows)
 	var result []databaseInfo
 	for rows.Next() {
 		var name string
@@ -1054,7 +1326,7 @@ func (s *server) listTables(schema string, constraints metadataListConstraints) 
 		}
 		return nil, err
 	}
-	defer rows.Close()
+	defer s.closeRows(rows)
 	var result []tableInfo
 	for rows.Next() {
 		var item tableInfo
@@ -1082,7 +1354,7 @@ func (s *server) listObjects(schema string, constraints metadataListConstraints)
 		}
 		return nil, err
 	}
-	defer rows.Close()
+	defer s.closeRows(rows)
 	var result []objectInfo
 	for rows.Next() {
 		var item objectInfo
@@ -1093,6 +1365,406 @@ func (s *server) listObjects(schema string, constraints metadataListConstraints)
 		result = append(result, item)
 	}
 	return emptyIfNil(result), rows.Err()
+}
+
+func (s *server) completionAssistantSearch(request completionAssistantRequest) (completionAssistantResponse, error) {
+	limit := request.MaxResults
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	preferredSchema := strings.ToUpper(strings.TrimSpace(request.Schema))
+	if preferredSchema == "" {
+		var err error
+		preferredSchema, err = s.currentSchema()
+		if err != nil {
+			return completionAssistantResponse{}, err
+		}
+	}
+
+	if completionRequestHasTableLikeKind(request.ObjectKinds) {
+		return s.completionAssistantTables(request, preferredSchema, limit)
+	}
+	if completionRequestHasRoutineKind(request.ObjectKinds) {
+		return s.completionAssistantRoutines(request, preferredSchema, limit)
+	}
+	return completionAssistantResponse{Candidates: []completionAssistantCandidate{}}, nil
+}
+
+func completionRequestHasTableLikeKind(kinds []string) bool {
+	if len(kinds) == 0 {
+		return true
+	}
+	for _, kind := range kinds {
+		switch strings.ToLower(strings.TrimSpace(kind)) {
+		case "table", "view":
+			return true
+		}
+	}
+	return false
+}
+
+func completionRequestHasRoutineKind(kinds []string) bool {
+	for _, kind := range kinds {
+		switch strings.ToLower(strings.TrimSpace(kind)) {
+		case "routine", "procedure", "function":
+			return true
+		}
+	}
+	return false
+}
+
+func (s *server) completionAssistantTables(request completionAssistantRequest, preferredSchema string, limit int) (completionAssistantResponse, error) {
+	scanLimit := limit * 3
+	if scanLimit < limit+1 {
+		scanLimit = limit + 1
+	}
+	if scanLimit > 1000 {
+		scanLimit = 1000
+	}
+	query := oracleCompletionTablesQuery(request, preferredSchema, scanLimit+1)
+	rows, err := s.queryRows(query.SQL, query.Args)
+	if err != nil {
+		return completionAssistantResponse{}, err
+	}
+
+	type tableRow struct {
+		owner, name, objectType string
+		targetOwner, targetName sql.NullString
+	}
+	rawRows := make([]tableRow, 0, scanLimit+1)
+	targets := make([]oracleCompletionSynonymTarget, 0)
+	for rows.Next() {
+		var row tableRow
+		if err := rows.Scan(&row.owner, &row.name, &row.objectType, &row.targetOwner, &row.targetName); err != nil {
+			s.closeRows(rows)
+			return completionAssistantResponse{}, err
+		}
+		rawRows = append(rawRows, row)
+		if strings.EqualFold(row.objectType, "SYNONYM") && row.targetOwner.Valid && row.targetName.Valid {
+			targets = append(targets, oracleCompletionSynonymTarget{Owner: row.targetOwner.String, Name: row.targetName.String})
+		}
+	}
+	rowsErr := rows.Err()
+	closeErr := s.closeRows(rows)
+	if rowsErr != nil {
+		return completionAssistantResponse{}, rowsErr
+	}
+	if closeErr != nil {
+		return completionAssistantResponse{}, closeErr
+	}
+
+	validTargets, err := s.oracleCompletionValidSynonymTargets(targets, oracleCompletionTableObjectTypes(request.ObjectKinds))
+	if err != nil {
+		return completionAssistantResponse{}, err
+	}
+	candidates := make([]completionAssistantCandidate, 0, limit+1)
+	for _, row := range rawRows {
+		if strings.EqualFold(row.objectType, "SYNONYM") {
+			if !row.targetOwner.Valid || !row.targetName.Valid {
+				continue
+			}
+			if _, ok := validTargets[oracleCompletionSynonymTargetKey(row.targetOwner.String, row.targetName.String)]; !ok {
+				continue
+			}
+		}
+		kind := "table"
+		if strings.EqualFold(row.objectType, "VIEW") {
+			kind = "view"
+		}
+		candidates = append(candidates, completionAssistantCandidate{
+			Name:     row.name,
+			Kind:     kind,
+			Database: stringPointer(request.Database),
+			Schema:   stringPointer(row.owner),
+			DataType: stringPointer(row.objectType),
+		})
+	}
+	incomplete := len(candidates) > limit || len(rawRows) > scanLimit
+	if incomplete {
+		if len(candidates) > limit {
+			candidates = candidates[:limit]
+		}
+	}
+	return completionAssistantResponse{Candidates: candidates, Incomplete: incomplete}, nil
+}
+
+type oracleCompletionSynonymTarget struct {
+	Owner string
+	Name  string
+}
+
+func oracleCompletionSynonymTargetKey(owner, name string) string {
+	return owner + "\x00" + name
+}
+
+func (s *server) oracleCompletionValidSynonymTargets(targets []oracleCompletionSynonymTarget, objectTypes []string) (map[string]struct{}, error) {
+	unique := make([]oracleCompletionSynonymTarget, 0, len(targets))
+	seen := make(map[string]struct{}, len(targets))
+	for _, target := range targets {
+		key := oracleCompletionSynonymTargetKey(target.Owner, target.Name)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		unique = append(unique, target)
+	}
+
+	valid := make(map[string]struct{}, len(unique))
+	const batchSize = 100
+	for start := 0; start < len(unique); start += batchSize {
+		end := start + batchSize
+		if end > len(unique) {
+			end = len(unique)
+		}
+		query := oracleCompletionSynonymTargetsQuery(unique[start:end], objectTypes)
+		rows, err := s.queryRows(query.SQL, query.Args)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var owner, name string
+			if err := rows.Scan(&owner, &name); err != nil {
+				s.closeRows(rows)
+				return nil, err
+			}
+			valid[oracleCompletionSynonymTargetKey(owner, name)] = struct{}{}
+		}
+		rowsErr := rows.Err()
+		closeErr := s.closeRows(rows)
+		if rowsErr != nil {
+			return nil, rowsErr
+		}
+		if closeErr != nil {
+			return nil, closeErr
+		}
+	}
+	return valid, nil
+}
+
+func (s *server) completionAssistantRoutines(request completionAssistantRequest, preferredSchema string, limit int) (completionAssistantResponse, error) {
+	query := oracleCompletionRoutinesQuery(request, preferredSchema, limit+1)
+	rows, err := s.queryRows(query.SQL, query.Args)
+	if err != nil {
+		return completionAssistantResponse{}, err
+	}
+	defer s.closeRows(rows)
+
+	candidates := make([]completionAssistantCandidate, 0, limit+1)
+	for rows.Next() {
+		var owner, name, objectType string
+		var parentName sql.NullString
+		if err := rows.Scan(&owner, &name, &objectType, &parentName); err != nil {
+			return completionAssistantResponse{}, err
+		}
+		kind := strings.ToLower(objectType)
+		if objectType == "PACKAGE" {
+			kind = "object"
+		}
+		candidate := completionAssistantCandidate{
+			Name:     name,
+			Kind:     kind,
+			Database: stringPointer(request.Database),
+			Schema:   stringPointer(owner),
+			DataType: stringPointer(objectType),
+		}
+		if parentName.Valid {
+			candidate.ParentSchema = stringPointer(owner)
+			candidate.ParentName = stringPointer(parentName.String)
+		}
+		candidates = append(candidates, candidate)
+	}
+	if err := rows.Err(); err != nil {
+		return completionAssistantResponse{}, err
+	}
+	incomplete := len(candidates) > limit
+	if incomplete {
+		candidates = candidates[:limit]
+	}
+	return completionAssistantResponse{Candidates: candidates, Incomplete: incomplete}, nil
+}
+
+func stringPointer(value string) *string {
+	if value == "" {
+		return nil
+	}
+	result := value
+	return &result
+}
+
+func oracleCompletionTableObjectTypes(kinds []string) []string {
+	objectTypes := make([]string, 0, 2)
+	for _, kind := range kinds {
+		switch strings.ToLower(strings.TrimSpace(kind)) {
+		case "table":
+			objectTypes = append(objectTypes, "'TABLE'")
+		case "view":
+			objectTypes = append(objectTypes, "'VIEW'")
+		}
+	}
+	if len(objectTypes) == 0 {
+		objectTypes = []string{"'TABLE'", "'VIEW'"}
+	}
+	return objectTypes
+}
+
+func oracleCompletionTablesQuery(request completionAssistantRequest, preferredSchema string, limit int) oracleMetadataListQuery {
+	objectTypes := oracleCompletionTableObjectTypes(request.ObjectKinds)
+	pattern := oracleCompletionLikePattern(request.Mask, request.MatchMode)
+	args := make([]any, 0, 7)
+	args = append(args, pattern)
+	objectNamePredicate := oracleCompletionNamePredicate("o.OBJECT_NAME", len(args), request.CaseSensitive)
+	objectOwnerPredicate := ""
+	synonymOwnerPredicate := ""
+	owner := ""
+	if !request.GlobalSearch {
+		owner = strings.ToUpper(strings.TrimSpace(request.ParentSchema))
+		if owner == "" {
+			owner = strings.ToUpper(strings.TrimSpace(request.Schema))
+		}
+		if owner == "" {
+			owner = preferredSchema
+		}
+		args = append(args, owner)
+		objectOwnerPredicate = fmt.Sprintf(" AND o.OWNER = :%d", len(args))
+	}
+	args = append(args, pattern)
+	synonymNamePredicate := oracleCompletionNamePredicate("s.SYNONYM_NAME", len(args), request.CaseSensitive)
+	if owner != "" {
+		args = append(args, owner)
+		synonymOwnerPredicate = fmt.Sprintf(" AND s.OWNER = :%d", len(args))
+	}
+	args = append(args, preferredSchema)
+	preferredParam := len(args)
+	args = append(args, strings.TrimSpace(request.Mask))
+	exactParam := len(args)
+	args = append(args, limit)
+	limitParam := len(args)
+
+	baseSQL := fmt.Sprintf(`SELECT o.OWNER,
+       o.OBJECT_NAME,
+       o.OBJECT_TYPE,
+       CAST(NULL AS VARCHAR2(128)) AS TARGET_OWNER,
+       CAST(NULL AS VARCHAR2(128)) AS TARGET_NAME
+  FROM ALL_OBJECTS o
+  WHERE o.OBJECT_TYPE IN (%s)
+    AND %s%s
+  UNION ALL
+  SELECT s.OWNER,
+       s.SYNONYM_NAME AS OBJECT_NAME,
+       'SYNONYM' AS OBJECT_TYPE,
+       s.TABLE_OWNER AS TARGET_OWNER,
+       s.TABLE_NAME AS TARGET_NAME
+  FROM ALL_SYNONYMS s
+	WHERE s.DB_LINK IS NULL
+	    AND %s%s`, strings.Join(objectTypes, ","), objectNamePredicate, objectOwnerPredicate, synonymNamePredicate, synonymOwnerPredicate)
+	unionSQL := fmt.Sprintf("SELECT OWNER, OBJECT_NAME, OBJECT_TYPE, TARGET_OWNER, TARGET_NAME\nFROM (\n%s\n)", baseSQL)
+	orderedSQL := oracleCompletionOrderedSQL(unionSQL, "OBJECT_NAME", "OBJECT_TYPE", preferredParam, exactParam)
+	return oracleMetadataListQuery{
+		SQL:  fmt.Sprintf("SELECT OWNER, OBJECT_NAME, OBJECT_TYPE, TARGET_OWNER, TARGET_NAME FROM (\n%s\n) WHERE ROWNUM <= :%d", orderedSQL, limitParam),
+		Args: args,
+	}
+}
+
+func oracleCompletionSynonymTargetsQuery(targets []oracleCompletionSynonymTarget, objectTypes []string) oracleMetadataListQuery {
+	args := make([]any, 0, len(targets)*2)
+	predicates := make([]string, 0, len(targets))
+	for _, target := range targets {
+		args = append(args, target.Owner, target.Name)
+		predicates = append(predicates, fmt.Sprintf("(o.OWNER = :%d AND o.OBJECT_NAME = :%d)", len(args)-1, len(args)))
+	}
+	return oracleMetadataListQuery{
+		SQL:  fmt.Sprintf("SELECT DISTINCT o.OWNER, o.OBJECT_NAME\nFROM ALL_OBJECTS o\nWHERE o.OBJECT_TYPE IN (%s)\n  AND (%s)", strings.Join(objectTypes, ","), strings.Join(predicates, " OR ")),
+		Args: args,
+	}
+}
+
+func oracleCompletionRoutinesQuery(request completionAssistantRequest, preferredSchema string, limit int) oracleMetadataListQuery {
+	pattern := oracleCompletionLikePattern(request.Mask, request.MatchMode)
+	args := make([]any, 0, 6)
+	baseSQL := `
+SELECT o.OWNER, o.OBJECT_NAME, o.OBJECT_TYPE, CAST(NULL AS VARCHAR2(128)) AS PARENT_NAME
+FROM ALL_OBJECTS o
+WHERE o.OBJECT_TYPE IN ('FUNCTION', 'PROCEDURE', 'PACKAGE')`
+	if parentName := strings.ToUpper(strings.TrimSpace(request.ParentName)); parentName != "" {
+		args = append(args, parentName)
+		parentParam := len(args)
+		baseSQL = fmt.Sprintf(`
+SELECT p.OWNER,
+       p.PROCEDURE_NAME AS OBJECT_NAME,
+       CASE WHEN EXISTS (
+         SELECT 1
+         FROM ALL_ARGUMENTS a
+         WHERE a.OWNER = p.OWNER
+           AND a.OBJECT_ID = p.OBJECT_ID
+           AND a.SUBPROGRAM_ID = p.SUBPROGRAM_ID
+           AND a.POSITION = 0
+       ) THEN 'FUNCTION' ELSE 'PROCEDURE' END AS OBJECT_TYPE,
+       p.OBJECT_NAME AS PARENT_NAME
+FROM ALL_PROCEDURES p
+WHERE p.OBJECT_TYPE = 'PACKAGE'
+  AND p.PROCEDURE_NAME IS NOT NULL
+  AND p.OBJECT_NAME = :%d`, parentParam)
+	}
+	args = append(args, pattern)
+	nameParam := len(args)
+
+	ownerPredicate := ""
+	if !request.GlobalSearch {
+		owner := strings.ToUpper(strings.TrimSpace(request.ParentSchema))
+		if owner == "" {
+			owner = strings.ToUpper(strings.TrimSpace(request.Schema))
+		}
+		if owner == "" {
+			owner = preferredSchema
+		}
+		args = append(args, owner)
+		ownerPredicate = fmt.Sprintf(" AND OWNER = :%d", len(args))
+	}
+	args = append(args, preferredSchema)
+	preferredParam := len(args)
+	args = append(args, strings.TrimSpace(request.Mask))
+	exactParam := len(args)
+	args = append(args, limit)
+	limitParam := len(args)
+
+	filteredSQL := fmt.Sprintf("SELECT DISTINCT OWNER, OBJECT_NAME, OBJECT_TYPE, PARENT_NAME\nFROM (\n%s\n)\nWHERE %s%s", baseSQL, oracleCompletionNamePredicate("OBJECT_NAME", nameParam, request.CaseSensitive), ownerPredicate)
+	orderedSQL := oracleCompletionOrderedSQL(filteredSQL, "OBJECT_NAME", "OBJECT_TYPE", preferredParam, exactParam)
+	return oracleMetadataListQuery{
+		SQL:  fmt.Sprintf("SELECT OWNER, OBJECT_NAME, OBJECT_TYPE, PARENT_NAME FROM (\n%s\n) WHERE ROWNUM <= :%d", orderedSQL, limitParam),
+		Args: args,
+	}
+}
+
+func oracleCompletionNamePredicate(column string, parameter int, caseSensitive bool) string {
+	if caseSensitive {
+		return fmt.Sprintf("%s LIKE :%d ESCAPE '\\'", column, parameter)
+	}
+	return fmt.Sprintf("UPPER(%s) LIKE UPPER(:%d) ESCAPE '\\'", column, parameter)
+}
+
+func oracleCompletionLikePattern(mask, matchMode string) string {
+	escaped := strings.NewReplacer("\\", "\\\\", "%", "\\%", "_", "\\_").Replace(strings.TrimSpace(mask))
+	if strings.EqualFold(strings.TrimSpace(matchMode), "contains") {
+		return "%" + escaped + "%"
+	}
+	return escaped + "%"
+}
+
+func oracleCompletionOrderedSQL(baseSQL, nameColumn, typeColumn string, preferredParam, exactParam int) string {
+	return fmt.Sprintf(`%s
+ORDER BY CASE
+           WHEN OWNER = :%d THEN 0
+           WHEN OWNER = 'PUBLIC' THEN 1
+           WHEN OWNER IN ('SYS','SYSTEM','SYSMAN','DBSNMP','OUTLN','XDB','MDSYS','CTXSYS','WMSYS') THEN 3
+           ELSE 2
+         END,
+         CASE WHEN UPPER(%s) = UPPER(:%d) THEN 0 ELSE 1 END,
+         CASE %s WHEN 'TABLE' THEN 0 WHEN 'VIEW' THEN 1 WHEN 'FUNCTION' THEN 0 WHEN 'PROCEDURE' THEN 1 WHEN 'PACKAGE' THEN 2 WHEN 'SYNONYM' THEN 3 ELSE 4 END,
+         %s,
+         OWNER`, baseSQL, preferredParam, nameColumn, exactParam, typeColumn, nameColumn)
 }
 
 func (s *server) getColumns(schema, table string) ([]columnInfo, error) {
@@ -1124,7 +1796,7 @@ ORDER BY c.COLUMN_ID`, []any{schema, table})
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer s.closeRows(rows)
 	var result []columnInfo
 	for rows.Next() {
 		var item columnInfo
@@ -1165,7 +1837,7 @@ ORDER BY COLUMN_ID`, []any{schema, table})
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer s.closeRows(rows)
 	var result []oracleColumnMeta
 	for rows.Next() {
 		var item oracleColumnMeta
@@ -1201,7 +1873,7 @@ ORDER BY i.INDEX_NAME, ic.COLUMN_POSITION`, []any{schema, table})
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer s.closeRows(rows)
 
 	byName := map[string]*indexInfo{}
 	order := []string{}
@@ -1259,7 +1931,7 @@ ORDER BY ac.CONSTRAINT_NAME, acc.POSITION`, []any{schema, table})
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer s.closeRows(rows)
 	var result []foreignKeyInfo
 	for rows.Next() {
 		var item foreignKeyInfo
@@ -1285,7 +1957,7 @@ ORDER BY TRIGGER_NAME`, []any{schema, table})
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer s.closeRows(rows)
 	var result []triggerInfo
 	for rows.Next() {
 		var item triggerInfo
@@ -1329,7 +2001,7 @@ ORDER BY LINE`, []any{schema, strings.ToUpper(name), upperType})
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer s.closeRows(rows)
 	var builder strings.Builder
 	for rows.Next() {
 		var line string
@@ -1748,7 +2420,7 @@ func (s *server) executeQueryPage(opts queryOptions, pageSize int) (queryPageRes
 	}
 	columns, err := rows.Columns()
 	if err != nil {
-		rows.Close()
+		s.closeRows(rows)
 		return queryPageResult{}, err
 	}
 	columnTypes := columnTypeNames(rows)
@@ -1760,14 +2432,14 @@ func (s *server) executeQueryPage(opts queryOptions, pageSize int) (queryPageRes
 	result, err := readQuerySessionPage(session, pageSize)
 	result.ExecutionTimeMS = time.Since(start).Milliseconds()
 	if err != nil {
-		rows.Close()
+		s.closeRows(rows)
 		return queryPageResult{}, err
 	}
 	if result.HasMore {
 		sessionID := s.storeQuerySession(session)
 		result.SessionID = &sessionID
 	} else {
-		rows.Close()
+		s.closeRows(rows)
 	}
 	return result, nil
 }
@@ -1814,7 +2486,7 @@ func (s *server) startTableRead(opts queryOptions, pageSize int) (queryPageResul
 	}
 	columns, err := rows.Columns()
 	if err != nil {
-		rows.Close()
+		s.closeRows(rows)
 		return queryPageResult{}, err
 	}
 	columnTypes := columnTypeNames(rows)
@@ -1826,14 +2498,14 @@ func (s *server) startTableRead(opts queryOptions, pageSize int) (queryPageResul
 	result, err := readQuerySessionPage(session, pageSize)
 	result.ExecutionTimeMS = time.Since(start).Milliseconds()
 	if err != nil {
-		rows.Close()
+		s.closeRows(rows)
 		return queryPageResult{}, err
 	}
 	if result.HasMore {
 		sessionID := s.storeTableReadSession(session)
 		result.SessionID = &sessionID
 	} else {
-		rows.Close()
+		s.closeRows(rows)
 	}
 	return result, nil
 }
@@ -1868,7 +2540,7 @@ func (s *server) closeQuerySession(sessionID string) bool {
 	if session == nil {
 		return false
 	}
-	session.rows.Close()
+	s.closeRows(session.rows)
 	delete(s.sessions, sessionID)
 	return true
 }
@@ -1878,7 +2550,7 @@ func (s *server) closeTableReadSession(sessionID string) bool {
 	if session == nil {
 		return false
 	}
-	session.rows.Close()
+	s.closeRows(session.rows)
 	delete(s.tableReadSessions, sessionID)
 	return true
 }
@@ -1964,7 +2636,7 @@ func (s *server) executeSelect(sqlText string, maxRows int) (queryResult, error)
 	if err != nil {
 		return queryResult{}, err
 	}
-	defer rows.Close()
+	defer s.closeRows(rows)
 	columns, err := rows.Columns()
 	if err != nil {
 		return queryResult{}, err
@@ -2029,7 +2701,7 @@ func (s *server) queryRowsWithXMLTypeRewriteIfNeeded(sqlText string) (*sql.Rows,
 	}
 	rewritten, err := s.rewriteXMLTypeSelectSQL(sqlText)
 	if err != nil {
-		rows.Close()
+		s.closeRows(rows)
 		return nil, err
 	}
 	if rewritten == sqlText {
@@ -2037,7 +2709,7 @@ func (s *server) queryRowsWithXMLTypeRewriteIfNeeded(sqlText string) (*sql.Rows,
 	}
 	// Only pay the ALL_TAB_COLUMNS rewrite cost when the result metadata shows
 	// XMLTYPE. Ordinary Oracle queries should not run dictionary probes first.
-	rows.Close()
+	s.closeRows(rows)
 	return s.queryRows(rewritten, nil)
 }
 
@@ -2671,10 +3343,51 @@ func (s *server) queryRows(sqlText string, args []any) (*sql.Rows, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(args) == 0 {
-		return db.Query(sqlText)
+	ctx, cancel := context.WithCancel(context.Background())
+	s.activeCancelMu.Lock()
+	s.activeCancel = cancel
+	s.activeCancelMu.Unlock()
+	rows, queryErr := db.QueryContext(ctx, sqlText, args...)
+	s.activeCancelMu.Lock()
+	s.activeCancel = nil
+	if queryErr != nil {
+		cancel()
+	} else {
+		// Keep the context alive for paged reads; database/sql may continue
+		// fetching from the driver until Rows is closed or exhausted.
+		s.activeRows[rows] = cancel
 	}
-	return db.Query(sqlText, args...)
+	s.activeCancelMu.Unlock()
+	return rows, queryErr
+}
+
+func (s *server) cancelActiveQuery() {
+	s.activeCancelMu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(s.activeRows)+1)
+	if s.activeCancel != nil {
+		cancels = append(cancels, s.activeCancel)
+	}
+	for _, cancel := range s.activeRows {
+		cancels = append(cancels, cancel)
+	}
+	s.activeCancelMu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+}
+
+func (s *server) closeRows(rows *sql.Rows) error {
+	if rows == nil {
+		return nil
+	}
+	s.activeCancelMu.Lock()
+	cancel := s.activeRows[rows]
+	delete(s.activeRows, rows)
+	s.activeCancelMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	return rows.Close()
 }
 
 func decodeParams(params map[string]json.RawMessage, target any) error {

@@ -19,6 +19,7 @@ import java.nio.file.Path;
 import java.security.KeyStore;
 import java.security.PrivateKey;
 import java.util.Base64;
+import java.util.Collections;
 import java.util.Date;
 import org.bson.Document;
 import org.bson.types.ObjectId;
@@ -82,6 +83,14 @@ class MongoAgentTest {
     // ─── existing tests ───
 
     @Test
+    void parsesExplicitStringDocumentIdsWithoutTreatingThemAsExtendedJson() {
+        assertEquals(
+            "{\"$numberLong\":\"2048938405781032962\"}",
+            MongoAgent.parseId("__dbx_mongo_string_id__\"{\\\"$numberLong\\\":\\\"2048938405781032962\\\"}\"")
+        );
+    }
+
+    @Test
     void exposesProtocolHandshakeOverJsonRpc() {
         String response = MongoAgent.handleRequest(
             "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"handshake\","
@@ -99,6 +108,16 @@ class MongoAgentTest {
     }
 
     @Test
+    void legacyJsonRpcHandshakeRemainsProtocolV1() {
+        JsonObject result = JsonParser.parseString(MongoAgent.handleRequest(
+            "{\"jsonrpc\":\"2.0\",\"id\":71,\"method\":\"handshake\",\"params\":{}}"
+        )).getAsJsonObject().getAsJsonObject("result");
+
+        assertEquals(1, result.get("protocolVersion").getAsInt());
+        assertFalse(containsCapability(result.getAsJsonArray("capabilities"), AgentProtocol.CAPABILITY_MULTI_SESSION));
+    }
+
+    @Test
     void listIndexesMethodIsRecognizedOverJsonRpc() {
         String response = MongoAgent.handleRequest(
             "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"list_indexes\","
@@ -106,6 +125,18 @@ class MongoAgentTest {
 
         JsonObject json = JsonParser.parseString(response).getAsJsonObject();
         assertEquals(8, json.get("id").getAsInt());
+        assertEquals("Not connected", json.getAsJsonObject("error").get("message").getAsString());
+        assertFalse(json.getAsJsonObject("error").get("message").getAsString().contains("Unknown method"));
+    }
+
+    @Test
+    void countDocumentsMethodIsRecognizedOverJsonRpc() {
+        String response = MongoAgent.handleRequest(
+            "{\"jsonrpc\":\"2.0\",\"id\":15,\"method\":\"count_documents\","
+                + "\"params\":{\"database\":\"app\",\"collection\":\"orders\",\"filter\":\"{}\"}}");
+
+        JsonObject json = JsonParser.parseString(response).getAsJsonObject();
+        assertEquals(15, json.get("id").getAsInt());
         assertEquals("Not connected", json.getAsJsonObject("error").get("message").getAsString());
         assertFalse(json.getAsJsonObject("error").get("message").getAsString().contains("Unknown method"));
     }
@@ -135,6 +166,27 @@ class MongoAgentTest {
         assertNotNull(filter);
         assertEquals(2_048_938_405_781_032_962L, filter.get("processInfoId"));
         assertEquals(9_007_199_254_740_993L, filter.get("snowflake"));
+    }
+
+    @Test
+    void preservesLongDocumentIdTypeForGridUpdates() {
+        Object id = MongoAgent.convertDocumentFieldValue("_id", 2_048_938_405_781_032_962L);
+        Object value = MongoAgent.convertDocumentFieldValue("snowflake", 2_048_938_405_781_032_962L);
+
+        assertEquals(Collections.singletonMap("$numberLong", "2048938405781032962"), id);
+        assertEquals("2048938405781032962", value);
+        assertEquals(2_048_938_405_781_032_962L, MongoAgent.parseId("{\"$numberLong\":\"2048938405781032962\"}"));
+    }
+
+    @Test
+    void preservesJsonLookingStringDocumentIds() {
+        assertEquals("{}", MongoAgent.parseId("{}"));
+        assertEquals("{\"tenant\":1}", MongoAgent.parseId("{\"tenant\":1}"));
+        assertEquals(
+            "{\"$numberLong\":\"2048938405781032962\",\"tenant\":1}",
+            MongoAgent.parseId("{\"$numberLong\":\"2048938405781032962\",\"tenant\":1}")
+        );
+        assertEquals("{\"$numberLong\":\"invalid\"}", MongoAgent.parseId("{\"$numberLong\":\"invalid\"}"));
     }
 
     @Test

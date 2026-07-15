@@ -10,6 +10,7 @@ import {
   extractCteDefinitions,
   getSqlCompletionContext,
   recordCompletionSelection,
+  shouldChainSqlCompletionAfterAccept,
   type SqlCompletionColumn,
   type SqlCompletionForeignKey,
   type SqlCompletionObject,
@@ -141,6 +142,86 @@ test("suggests PostgreSQL-specific data types and functions", () => {
     postgresDateItems.some((item) => item.type === "function" && item.label === "DATE_FORMAT"),
     false,
   );
+});
+
+test("suggests Oracle SQL, PL/SQL, and data type keywords", () => {
+  const keywordCases = [
+    ["tru", "TRUNCATE"],
+    ["mer", "MERGE"],
+    ["dec", "DECLARE"],
+    ["els", "ELSIF"],
+    ["pac", "PACKAGE"],
+    ["seq", "SEQUENCE"],
+    ["flash", "FLASHBACK"],
+    ["mat", "MATERIALIZED VIEW"],
+  ] as const;
+
+  for (const [prefix, expected] of keywordCases) {
+    const items = buildSqlCompletionItems(prefix, prefix.length, {
+      tables: [],
+      columnsByTable: new Map(),
+      databaseType: "oracle",
+    });
+    assert.ok(
+      items.some((item) => item.type === "keyword" && item.label === expected),
+      `${expected} should be suggested for ${prefix}`,
+    );
+  }
+
+  const typeSql = "CREATE TABLE events (payload varc";
+  const typeItems = buildSqlCompletionItems(typeSql, typeSql.length, {
+    tables: [],
+    columnsByTable: new Map(),
+    databaseType: "oracle",
+  });
+  assert.ok(typeItems.some((item) => item.type === "keyword" && item.label === "VARCHAR2"));
+});
+
+test("does not suggest cross-dialect words for Oracle", () => {
+  const unsupportedWords = ["LIMIT", "LOCALTIME", "USE", "ELSEIF", "SERIAL", "BIGSERIAL", "TEXT", "BOOLEAN", "STRING", "TIME"];
+
+  for (const unsupportedWord of unsupportedWords) {
+    const prefix = unsupportedWord.toLowerCase();
+    const items = buildSqlCompletionItems(prefix, prefix.length, {
+      tables: [],
+      columnsByTable: new Map(),
+      databaseType: "oracle",
+    });
+    assert.equal(
+      items.some((item) => item.type === "keyword" && item.label === unsupportedWord),
+      false,
+      `${unsupportedWord} should not be suggested for Oracle`,
+    );
+  }
+
+  for (const supportedWord of ["LOCALTIMESTAMP", "NUMBER", "VARCHAR2", "XMLTYPE"]) {
+    const prefix = supportedWord.toLowerCase();
+    const items = buildSqlCompletionItems(prefix, prefix.length, {
+      tables: [],
+      columnsByTable: new Map(),
+      databaseType: "oracle",
+    });
+    assert.ok(
+      items.some((item) => item.type === "keyword" && item.label === supportedWord),
+      `${supportedWord} should be suggested for Oracle`,
+    );
+  }
+});
+
+test("keeps TRUNCATE as a statement keyword for Oracle-compatible databases", () => {
+  for (const databaseType of ["oracle", "oceanbase-oracle"] as const) {
+    const items = buildSqlCompletionItems("tru", 3, {
+      tables: [],
+      columnsByTable: new Map(),
+      databaseType,
+    });
+
+    assert.ok(items.some((item) => item.type === "keyword" && item.label === "TRUNCATE"));
+    assert.equal(
+      items.some((item) => item.type === "function" && item.label === "TRUNCATE"),
+      false,
+    );
+  }
 });
 
 test("suggests Manticore Search SQL functions and command snippets", () => {
@@ -317,6 +398,20 @@ test("suggests only matching columns for an explicit alias qualifier prefix", ()
     columnItems.map((item) => [item.label, item.type, item.detail]),
     [["name", "column", "public.users  [varchar]"]],
   );
+});
+
+test("does not mix routines into an explicit table alias column completion", () => {
+  const sql = "select u.na from public.users u";
+  const cursor = "select u.na".length;
+  const items = buildSqlCompletionItems(sql, cursor, {
+    tables,
+    columnsByTable,
+    objects: [{ name: "name_formatter", schema: "u", type: "function", applyName: "u.name_formatter" }],
+    databaseType: "oracle",
+  });
+
+  assert.ok(items.some((item) => item.label === "name" && item.type === "column"));
+  assert.equal(items.some((item) => item.label === "name_formatter"), false);
 });
 
 test("keeps explicit alias column suggestions scoped to the alias table", () => {
@@ -621,6 +716,16 @@ test("keeps schema-qualified FROM object input in table suggestion mode", () => 
     tableItems.map((item) => item.label),
     ["users", "user_profiles"],
   );
+});
+
+test("keeps an accepted schema with trailing dot in table suggestion mode", () => {
+  const sql = "SELECT *\nFROM DBX_TEST.";
+  const context = getSqlCompletionContext(sql, sql.length);
+
+  assert.equal(context.qualifier, "DBX_TEST");
+  assert.equal(context.prefix, "");
+  assert.equal(context.suggestTables, true);
+  assert.equal(context.exclusiveTableSuggestions, true);
 });
 
 test("keeps database-qualified FROM input in table suggestion mode", () => {
@@ -1464,6 +1569,88 @@ test("suggests package members after package qualifier", () => {
   assert.equal(member.apply, "calculate_bonus()");
 });
 
+test("keeps Oracle functions available in qualified expression routine context", () => {
+  const sql = "select HGY.FN_";
+  const items = buildSqlCompletionItems(sql, sql.length, {
+    tables,
+    columnsByTable,
+    objects: [
+      { name: "FN_CHECKIDCARD", schema: "HGY", type: "function" },
+      { name: "FN_REFRESH", schema: "HGY", type: "procedure" },
+    ],
+    databaseType: "oracle",
+  });
+
+  const fn = items.find((item) => item.label === "FN_CHECKIDCARD");
+  assert.ok(fn);
+  assert.equal(fn.apply, "FN_CHECKIDCARD()");
+  assert.equal(items.find((item) => item.type === "function")?.label, "FN_CHECKIDCARD");
+});
+
+test("prioritizes current Oracle schema tables and safely qualifies other schemas", () => {
+  const sql = "select * from dept_d";
+  const items = buildSqlCompletionItems(sql, sql.length, {
+    tables: [
+      { name: "DEPT_DICT", schema: "COMM", type: "table", applyName: "COMM.DEPT_DICT", boost: 0 },
+      { name: "DEPT_DICT", schema: "APP", type: "table", applyName: "DEPT_DICT", boost: 2400 },
+      { name: "DEPT_DICT", schema: "SYS", type: "view", applyName: "SYS.DEPT_DICT", boost: -1200 },
+    ],
+    columnsByTable,
+    databaseType: "oracle",
+  });
+  const matches = items.filter((item) => item.label === "DEPT_DICT");
+
+  assert.deepEqual(
+    matches.map((item) => item.apply),
+    ["DEPT_DICT", "COMM.DEPT_DICT", "SYS.DEPT_DICT"],
+  );
+});
+
+test("does not duplicate an Oracle schema qualifier when applying a scoped table", () => {
+  const sql = "select * from COMM.DEPT_D";
+  const items = buildSqlCompletionItems(sql, sql.length, {
+    tables: [{ name: "DEPT_DICT", schema: "COMM", type: "table" }],
+    columnsByTable,
+    databaseType: "oracle",
+    currentSchema: "APP",
+  });
+
+  const table = items.find((item) => item.label === "DEPT_DICT");
+  assert.ok(table);
+  assert.equal(table.apply, "DEPT_DICT");
+});
+
+test("keeps same-name Oracle routines from different schemas", () => {
+  const sql = "select FN_CHECK";
+  const items = buildSqlCompletionItems(sql, sql.length, {
+    tables: [],
+    objects: [
+      { name: "FN_CHECK", schema: "APP", type: "function", boost: 2400 },
+      { name: "FN_CHECK", schema: "HR", type: "function" },
+    ],
+    columnsByTable: new Map(),
+    databaseType: "oracle",
+    currentSchema: "APP",
+  });
+
+  assert.deepEqual(
+    items.filter((item) => item.label === "FN_CHECK").map((item) => item.apply),
+    ["FN_CHECK()", "HR.FN_CHECK()"],
+  );
+});
+
+test("still deduplicates built-in and database routines outside Oracle metadata search", () => {
+  const sql = "select DATE_FORMAT";
+  const items = buildSqlCompletionItems(sql, sql.length, {
+    tables: [],
+    objects: [{ name: "DATE_FORMAT", schema: "app", type: "function" }],
+    columnsByTable: new Map(),
+    databaseType: "mysql",
+  });
+
+  assert.equal(items.filter((item) => item.type === "function" && item.label === "DATE_FORMAT").length, 1);
+});
+
 test("matches alias qualifier case-insensitively", () => {
   const sql = "select O. from public.orders o";
   const cursor = "select O.".length;
@@ -1827,6 +2014,8 @@ test("schema items include apply value with trailing dot", () => {
   const schemaItems = items.filter((item) => item.type === "schema");
   assert.equal(schemaItems.length, 1);
   assert.equal(schemaItems[0]?.apply, "public.");
+  assert.equal(shouldChainSqlCompletionAfterAccept(schemaItems[0]!), true);
+  assert.equal(shouldChainSqlCompletionAfterAccept({ type: "table", apply: "users" }), false);
 });
 
 // --- Quoted identifier fix ---

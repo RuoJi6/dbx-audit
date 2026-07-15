@@ -610,6 +610,49 @@ impl AppState {
         }
     }
 
+    #[cfg(feature = "duckdb-bundled")]
+    async fn create_duckdb_pool(&self, config: &ConnectionConfig) -> Result<PoolKind, String> {
+        if self.duckdb_worker_process_isolation.load(Ordering::Relaxed) {
+            let attached_databases = config
+                .attached_databases
+                .iter()
+                .map(|attached| crate::models::connection::AttachedDatabaseConfig {
+                    name: attached.name.clone(),
+                    path: expand_tilde(&attached.path),
+                })
+                .collect();
+            let client = db::duckdb_worker_process::DuckDbWorkerClient::open_with_process_limit(
+                expand_tilde(&config.host),
+                attached_databases,
+                config.init_script.clone(),
+                self.duckdb_worker_max_processes.load(Ordering::Relaxed),
+            )
+            .await?;
+            Ok(PoolKind::DuckDbWorker(Arc::new(client)))
+        } else {
+            let con = db::duckdb_driver::connect_path(&expand_tilde(&config.host))?;
+            {
+                let locked = con.lock().map_err(|e| e.to_string())?;
+                for attached in &config.attached_databases {
+                    crate::schema::duckdb_attach_database(&locked, &attached.name, &expand_tilde(&attached.path))?;
+                }
+                if let Some(script) = config.init_script.as_deref() {
+                    db::duckdb_driver::run_init_script(&locked, script)?;
+                }
+            }
+            Ok(PoolKind::DuckDb(con))
+        }
+    }
+
+    #[cfg(feature = "duckdb-bundled")]
+    pub async fn test_duckdb_connection_config(&self, config: &ConnectionConfig) -> Result<(), String> {
+        // Test the submitted form as a fresh session so unsaved ATTACH/init
+        // changes cannot be masked by a pool created from older settings.
+        let pool = self.create_duckdb_pool(config).await?;
+        close_pool_kind(pool).await;
+        Ok(())
+    }
+
     pub async fn test_external_driver(&self, driver_id: &str, config: &ConnectionConfig) -> Result<String, String> {
         let params = serde_json::json!({ "connection": config });
         let env = self.external_driver_runtime_env(driver_id)?;
@@ -642,13 +685,13 @@ impl AppState {
         port: u16,
         connect_timeout: Duration,
     ) -> Result<String, String> {
-        match db::sqlserver::connect(
+        match db::sqlserver::connect_with_port_explicit(
             host,
             port,
+            config.sqlserver_port_explicit(),
             &config.username,
             &config.password,
             config.database.as_deref(),
-            config.url_params.as_deref(),
             connect_timeout,
         )
         .await
@@ -687,13 +730,13 @@ impl AppState {
         port: u16,
         connect_timeout: Duration,
     ) -> Result<PoolKind, String> {
-        match db::sqlserver::connect(
+        match db::sqlserver::connect_with_port_explicit(
             host,
             port,
+            config.sqlserver_port_explicit(),
             &config.username,
             &config.password,
             config.database.as_deref(),
-            config.url_params.as_deref(),
             connect_timeout,
         )
         .await
@@ -1108,38 +1151,7 @@ impl AppState {
                 PoolKind::Redis(con)
             }
             #[cfg(feature = "duckdb-bundled")]
-            DatabaseType::DuckDb => {
-                if self.duckdb_worker_process_isolation.load(Ordering::Relaxed) {
-                    let attached_databases = db_config
-                        .attached_databases
-                        .iter()
-                        .map(|attached| crate::models::connection::AttachedDatabaseConfig {
-                            name: attached.name.clone(),
-                            path: expand_tilde(&attached.path),
-                        })
-                        .collect();
-                    let client = db::duckdb_worker_process::DuckDbWorkerClient::open_with_process_limit(
-                        expand_tilde(&db_config.host),
-                        attached_databases,
-                        self.duckdb_worker_max_processes.load(Ordering::Relaxed),
-                    )
-                    .await?;
-                    PoolKind::DuckDbWorker(Arc::new(client))
-                } else {
-                    let con = db::duckdb_driver::connect_path(&expand_tilde(&db_config.host))?;
-                    {
-                        let locked = con.lock().map_err(|e| e.to_string())?;
-                        for attached in &db_config.attached_databases {
-                            crate::schema::duckdb_attach_database(
-                                &locked,
-                                &attached.name,
-                                &expand_tilde(&attached.path),
-                            )?;
-                        }
-                    }
-                    PoolKind::DuckDb(con)
-                }
-            }
+            DatabaseType::DuckDb => self.create_duckdb_pool(&db_config).await?,
             #[cfg(not(feature = "duckdb-bundled"))]
             DatabaseType::DuckDb => {
                 return Err("DuckDB support is not compiled in this build. Rebuild with default features.".to_string());
@@ -1264,71 +1276,161 @@ impl AppState {
             agent_connection_pool_database_type!() => {
                 let connect_params =
                     agent_connect_params(&db_config, &host, port, db_config.effective_database().unwrap_or(""));
-                // Kerberos JVM properties are connection-scoped; shared agent daemons must not inherit them.
-                let mut client = self
-                    .agent_manager
-                    .spawn_with_extra_java_args(
-                        &db_config.db_type,
-                        db_config.driver_profile.as_deref(),
-                        &db_config.agent_java_options,
-                    )
-                    .await?;
-                let connect_result = client
-                    .call_method_with_timeout::<serde_json::Value>(
-                        AgentMethod::Connect,
-                        connect_params,
-                        Some(agent_connect_timeout(&db_config)),
-                    )
-                    .await;
-                if let Err(err) = connect_result {
-                    let alternate_configs = oracle_alternate_connect_configs(&db_config, &err);
-                    if !alternate_configs.is_empty() {
-                        log::warn!(
+                if db_config.db_type != DatabaseType::Etcd && db_config.db_type != DatabaseType::ZooKeeper {
+                    let agent_session_id = uuid::Uuid::new_v4().simple().to_string();
+                    let initial_result = self
+                        .agent_manager
+                        .spawn_shared_connection_client(
+                            &db_config.db_type,
+                            db_config.driver_profile.as_deref(),
+                            &db_config.agent_java_options,
+                            agent_session_id.clone(),
+                            connect_params,
+                            agent_connect_timeout(&db_config),
+                        )
+                        .await;
+                    let client = match initial_result {
+                        Ok(client) => client,
+                        Err(err) => {
+                            let alternate_configs = oracle_alternate_connect_configs(&db_config, &err);
+                            if alternate_configs.is_empty() {
+                                if err.contains("does not support multi_session protocol v2") {
+                                    let mut client = self
+                                        .agent_manager
+                                        .spawn_with_extra_java_args(
+                                            &db_config.db_type,
+                                            db_config.driver_profile.as_deref(),
+                                            &db_config.agent_java_options,
+                                        )
+                                        .await?;
+                                    client
+                                        .call_method_with_timeout::<serde_json::Value>(
+                                            AgentMethod::Connect,
+                                            agent_connect_params(
+                                                &db_config,
+                                                &host,
+                                                port,
+                                                db_config.effective_database().unwrap_or(""),
+                                            ),
+                                            Some(agent_connect_timeout(&db_config)),
+                                        )
+                                        .await?;
+                                    client
+                                } else {
+                                    return Err(oracle_error_with_driver_hint(&db_config, &err));
+                                }
+                            } else {
+                                let mut fallback_errors = Vec::new();
+                                let mut connected = None;
+                                for alternate_config in alternate_configs {
+                                    let label =
+                                        oracle_alternate_connect_config_labels(std::slice::from_ref(&alternate_config))
+                                            .into_iter()
+                                            .next()
+                                            .unwrap_or_else(|| "alternate".to_string());
+                                    let alternate_params = agent_connect_params(
+                                        &alternate_config,
+                                        &host,
+                                        port,
+                                        alternate_config.effective_database().unwrap_or(""),
+                                    );
+                                    match self
+                                        .agent_manager
+                                        .spawn_shared_connection_client(
+                                            &alternate_config.db_type,
+                                            alternate_config.driver_profile.as_deref(),
+                                            &alternate_config.agent_java_options,
+                                            agent_session_id.clone(),
+                                            alternate_params,
+                                            agent_connect_timeout(&alternate_config),
+                                        )
+                                        .await
+                                    {
+                                        Ok(client) => {
+                                            connected = Some(client);
+                                            break;
+                                        }
+                                        Err(alternate_err) => fallback_errors.push(format!("{label}: {alternate_err}")),
+                                    }
+                                }
+                                connected.ok_or_else(|| {
+                                    format!(
+                                        "{err}\n\nFallback with alternate Oracle connection descriptors failed: {}",
+                                        fallback_errors.join("\n")
+                                    )
+                                })?
+                            }
+                        }
+                    };
+                    PoolKind::Agent(Arc::new(tokio::sync::Mutex::new(client)))
+                } else {
+                    // Kerberos JVM properties are connection-scoped; shared agent daemons must not inherit them.
+                    let mut client = self
+                        .agent_manager
+                        .spawn_with_extra_java_args(
+                            &db_config.db_type,
+                            db_config.driver_profile.as_deref(),
+                            &db_config.agent_java_options,
+                        )
+                        .await?;
+                    let connect_result = client
+                        .call_method_with_timeout::<serde_json::Value>(
+                            AgentMethod::Connect,
+                            connect_params,
+                            Some(agent_connect_timeout(&db_config)),
+                        )
+                        .await;
+                    if let Err(err) = connect_result {
+                        let alternate_configs = oracle_alternate_connect_configs(&db_config, &err);
+                        if !alternate_configs.is_empty() {
+                            log::warn!(
                             "Oracle connect failed with {:?} descriptor: {}. Retrying with Oracle JDBC URL variants: {:?}.",
                             db_config.oracle_connection_type,
                             err,
                             oracle_alternate_connect_config_labels(&alternate_configs)
                         );
-                        let mut fallback_errors = Vec::new();
-                        let mut connected = false;
-                        for alternate_config in alternate_configs {
-                            let label = oracle_alternate_connect_config_labels(std::slice::from_ref(&alternate_config))
-                                .into_iter()
-                                .next()
-                                .unwrap_or_else(|| "alternate".to_string());
-                            match client
-                                .call_method_with_timeout::<serde_json::Value>(
-                                    AgentMethod::Connect,
-                                    agent_connect_params(
-                                        &alternate_config,
-                                        &host,
-                                        port,
-                                        alternate_config.effective_database().unwrap_or(""),
-                                    ),
-                                    Some(agent_connect_timeout(&alternate_config)),
-                                )
-                                .await
-                            {
-                                Ok(_) => {
-                                    connected = true;
-                                    break;
-                                }
-                                Err(alternate_err) => {
-                                    fallback_errors.push(format!("{label}: {alternate_err}"));
+                            let mut fallback_errors = Vec::new();
+                            let mut connected = false;
+                            for alternate_config in alternate_configs {
+                                let label =
+                                    oracle_alternate_connect_config_labels(std::slice::from_ref(&alternate_config))
+                                        .into_iter()
+                                        .next()
+                                        .unwrap_or_else(|| "alternate".to_string());
+                                match client
+                                    .call_method_with_timeout::<serde_json::Value>(
+                                        AgentMethod::Connect,
+                                        agent_connect_params(
+                                            &alternate_config,
+                                            &host,
+                                            port,
+                                            alternate_config.effective_database().unwrap_or(""),
+                                        ),
+                                        Some(agent_connect_timeout(&alternate_config)),
+                                    )
+                                    .await
+                                {
+                                    Ok(_) => {
+                                        connected = true;
+                                        break;
+                                    }
+                                    Err(alternate_err) => {
+                                        fallback_errors.push(format!("{label}: {alternate_err}"));
+                                    }
                                 }
                             }
+                            if !connected {
+                                return Err(format!(
+                                    "{err}\n\nFallback with alternate Oracle JDBC URLs failed: {}",
+                                    fallback_errors.join("\n")
+                                ));
+                            }
+                        } else {
+                            return Err(oracle_error_with_driver_hint(&db_config, &err));
                         }
-                        if !connected {
-                            return Err(format!(
-                                "{err}\n\nFallback with alternate Oracle JDBC URLs failed: {}",
-                                fallback_errors.join("\n")
-                            ));
-                        }
-                    } else {
-                        return Err(oracle_error_with_driver_hint(&db_config, &err));
                     }
+                    PoolKind::Agent(Arc::new(tokio::sync::Mutex::new(client)))
                 }
-                PoolKind::Agent(Arc::new(tokio::sync::Mutex::new(client)))
             }
             DatabaseType::PrestoSql => {
                 let jdbc_config = prestosql_jdbc_config_for_endpoint(&db_config, &host, port);
@@ -1432,6 +1534,52 @@ impl AppState {
                 Ok(layer.resolved_from_profile(profile))
             })
             .collect()
+    }
+
+    /// Tests a shared tunnel profile in isolation (no downstream database), for
+    /// the Test button in Settings > Tunnels. Only SSH profiles are checked:
+    /// starting an SSH tunnel connects and authenticates eagerly, so a
+    /// successful start verifies host reachability and credentials. Proxy and
+    /// HTTP-tunnel layers connect lazily (nothing happens until traffic flows),
+    /// so there is nothing to verify here without a target to probe.
+    pub async fn test_tunnel_profile(&self, profile: &TransportLayerConfig) -> Result<String, String> {
+        let TransportLayerConfig::Ssh(ssh) = profile else {
+            return Err("Tunnel test is currently only supported for SSH profiles.".to_string());
+        };
+        let ssh = crate::ssh_config::resolve_ssh_tunnel_config(ssh);
+        if ssh.host.trim().is_empty() {
+            return Err("SSH host is required.".to_string());
+        }
+        let timeout = if ssh.connect_timeout_secs == 0 {
+            crate::models::connection::default_ssh_connect_timeout_secs()
+        } else {
+            ssh.connect_timeout_secs
+        };
+        // A throwaway id so the probe never reuses or evicts a live tunnel, and
+        // a sentinel forward target: SSH auth completes on connect, before any
+        // channel to this target is opened, so it need not be reachable.
+        let probe_id = format!("__tunnel_profile_test__:{}", uuid::Uuid::new_v4());
+        let result = self
+            .tunnels
+            .start_tunnel(
+                &probe_id,
+                &ssh.host,
+                ssh.port,
+                &ssh.user,
+                &ssh.password,
+                &ssh.key_path,
+                &ssh.key_passphrase,
+                ssh.use_ssh_agent,
+                &ssh.ssh_agent_sock_path,
+                &ssh.auth_method,
+                timeout,
+                "127.0.0.1",
+                1,
+                false,
+            )
+            .await;
+        self.tunnels.stop_tunnel(&probe_id).await;
+        result.map(|_| "SSH tunnel connection successful".to_string())
     }
 
     pub async fn connection_host_port(
@@ -2169,37 +2317,33 @@ impl AppState {
         keys
     }
 
-    #[cfg(feature = "duckdb-bundled")]
-    pub async fn duckdb_existing_pool_is_usable_for_config(&self, config: &ConnectionConfig) -> Result<bool, String> {
-        if config.db_type != DatabaseType::DuckDb {
-            return Ok(false);
+    pub async fn connection_identifier_quote(
+        &self,
+        connection_id: &str,
+        database: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        let config = self
+            .configs
+            .read()
+            .await
+            .get(connection_id)
+            .cloned()
+            .ok_or_else(|| format!("Connection config not found: {connection_id}"))?;
+        if !database_capabilities::is_agent_type(&config.db_type) {
+            return Ok(None);
         }
 
-        let matches_existing_config = {
-            let configs = self.configs.read().await;
-            configs.get(&config.id).is_some_and(|existing| {
-                existing.db_type == DatabaseType::DuckDb && duckdb_paths_match(&existing.host, &config.host)
-            })
-        };
-        if !matches_existing_config {
-            return Ok(false);
-        }
-
-        let duckdb_pool = {
-            let conns = self.connections.read().await;
-            match conns.get(&config.id) {
-                Some(PoolKind::DuckDb(con)) => Some(con.clone()),
-                _ => None,
+        let pool_key = self.get_or_create_pool(connection_id, database).await?;
+        let client = {
+            let connections = self.connections.read().await;
+            match connections.get(&pool_key) {
+                Some(PoolKind::Agent(client)) => client.clone(),
+                _ => return Ok(None),
             }
         };
-
-        let Some(con) = duckdb_pool else {
-            return Ok(false);
-        };
-
-        let locked = con.lock().map_err(|e| e.to_string())?;
-        locked.execute_batch("SELECT 1;").map_err(|e| format!("DuckDb connection failed: {e}"))?;
-        Ok(true)
+        let mut agent = client.lock().await;
+        let info = agent.connection_info(Some(db::connection_timeout())).await?;
+        Ok(Some(info.identifier_quote))
     }
 
     pub async fn reset_connection_transport(&self, connection_id: &str) {
@@ -3180,8 +3324,8 @@ mod tests {
     use crate::database_capabilities;
     use crate::db;
     use crate::models::connection::{
-        default_connect_timeout_secs, default_redis_key_separator, ConnectionConfig, DatabaseType, HttpTunnelConfig,
-        ProxyTunnelConfig, ProxyType, SshTunnelConfig, TransportLayerConfig,
+        default_connect_timeout_secs, default_redis_key_separator, AttachedDatabaseConfig, ConnectionConfig,
+        DatabaseType, HttpTunnelConfig, ProxyTunnelConfig, ProxyType, SshTunnelConfig, TransportLayerConfig,
     };
     use crate::query;
     use crate::schema;
@@ -3205,6 +3349,7 @@ mod tests {
             visible_databases: None,
             visible_schemas: None,
             attached_databases: Vec::new(),
+            init_script: None,
             color: None,
             transport_layers: Vec::new(),
             connect_timeout_secs: default_connect_timeout_secs(),
@@ -3335,6 +3480,17 @@ mod tests {
         assert_eq!(params["username"], "informix");
         assert_eq!(params["password"], "in4mix");
         assert_eq!(params["url_params"], "INFORMIXSERVER=informix;CLIENT_LOCALE=en_US.utf8");
+    }
+
+    #[test]
+    fn agent_connect_params_include_sqlserver_explicit_port_state() {
+        let mut config = mysql_config(Some("master"));
+        config.db_type = DatabaseType::SqlServer;
+        config.external_config = Some(serde_json::json!({ "portExplicit": true }));
+
+        let params = agent_connect_params(&config, r"db.example.com\SQLEXPRESS", 1433, "master");
+
+        assert_eq!(params["port_explicit"], true);
     }
 
     #[test]
@@ -3640,6 +3796,48 @@ mod tests {
         );
 
         assert_eq!(state.agent_manager.base_dir(), &agent_dir);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn test_tunnel_profile_rejects_non_ssh_and_missing_host() {
+        let (state, dir) = test_app_state().await;
+
+        // Non-SSH profiles cannot be tested in isolation (they connect lazily).
+        let proxy = TransportLayerConfig::Proxy(ProxyTunnelConfig {
+            id: "p1".to_string(),
+            name: String::new(),
+            enabled: true,
+            proxy_type: ProxyType::Socks5,
+            host: "127.0.0.1".to_string(),
+            port: 1080,
+            username: String::new(),
+            password: String::new(),
+            profile_id: String::new(),
+        });
+        let err = state.test_tunnel_profile(&proxy).await.unwrap_err();
+        assert!(err.contains("SSH"), "unexpected error: {err}");
+
+        // An SSH profile with no host fails fast rather than dialing an empty host.
+        let ssh = TransportLayerConfig::Ssh(SshTunnelConfig {
+            id: "s1".to_string(),
+            name: String::new(),
+            enabled: true,
+            host: String::new(),
+            port: 22,
+            user: "root".to_string(),
+            password: String::new(),
+            key_path: String::new(),
+            key_passphrase: String::new(),
+            connect_timeout_secs: 5,
+            expose_lan: false,
+            use_ssh_agent: false,
+            ssh_agent_sock_path: String::new(),
+            auth_method: "password".to_string(),
+            profile_id: String::new(),
+        });
+        assert!(state.test_tunnel_profile(&ssh).await.is_err());
+
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -4004,6 +4202,17 @@ mod tests {
     }
 
     #[test]
+    fn oracle_uses_isolated_pool_keys_for_tab_sessions() {
+        let mut config = mysql_config(Some("ORCLPDB1"));
+        config.db_type = DatabaseType::Oracle;
+
+        assert_eq!(
+            super::session_scoped_pool_key_for(Some(&config), "oracle-conn".to_string(), Some("table-tab-1")),
+            "oracle-conn:session:table-tab-1"
+        );
+    }
+
+    #[test]
     fn other_agent_single_connection_types_keep_database_scoped_pool_keys() {
         assert_eq!(
             super::base_pool_key_for(Some(DatabaseType::Kingbase), "kingbase-conn", Some("app1"), false),
@@ -4169,7 +4378,7 @@ mod tests {
 
     #[cfg(feature = "duckdb-bundled")]
     #[tokio::test]
-    async fn duckdb_existing_pool_can_be_used_for_connection_test() {
+    async fn duckdb_connection_test_does_not_reuse_stale_pool_config() {
         let (state, dir) = test_app_state().await;
         let db_path = dir.join("app.duckdb");
         duckdb::Connection::open(&db_path).unwrap();
@@ -4183,7 +4392,48 @@ mod tests {
         state.configs.write().await.insert(config.id.clone(), config.clone());
         state.get_or_create_pool("duckdb-conn", None).await.unwrap();
 
-        assert!(state.duckdb_existing_pool_is_usable_for_config(&config).await.unwrap());
+        config.init_script = Some("SELECT definitely_invalid_syntax(".to_string());
+        let error = state.test_duckdb_connection_config(&config).await.expect_err("invalid submitted script must fail");
+
+        assert!(error.contains("Connection init script statement 1 failed"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(feature = "duckdb-bundled")]
+    #[tokio::test]
+    async fn duckdb_connection_test_validates_attached_databases() {
+        let (state, dir) = test_app_state().await;
+        let mut config = mysql_config(None);
+        config.id = "duckdb-conn".to_string();
+        config.name = "DuckDB".to_string();
+        config.db_type = DatabaseType::DuckDb;
+        config.host = ":memory:".to_string();
+        config.port = 0;
+        config.attached_databases.push(AttachedDatabaseConfig {
+            name: "missing".to_string(),
+            path: dir.join("missing-parent").join("missing.duckdb").to_string_lossy().to_string(),
+        });
+
+        let error = state.test_duckdb_connection_config(&config).await.expect_err("invalid attach must fail");
+
+        assert!(error.to_ascii_lowercase().contains("attach"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(feature = "duckdb-bundled")]
+    #[tokio::test]
+    async fn duckdb_connection_test_supports_memory_bootstrap() {
+        let (state, dir) = test_app_state().await;
+        let mut config = mysql_config(None);
+        config.id = "duckdb-memory".to_string();
+        config.name = "DuckDB memory".to_string();
+        config.db_type = DatabaseType::DuckDb;
+        config.host = ":memory:".to_string();
+        config.port = 0;
+        config.init_script = Some(r#"CREATE TABLE probe AS SELECT E'it\'s;ok' AS value;"#.to_string());
+
+        state.test_duckdb_connection_config(&config).await.expect("memory bootstrap succeeds");
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -4334,6 +4584,25 @@ mod tests {
         assert!(state.close_client_session_pool("conn", None, "tab-1").await.unwrap());
         assert!(!state.connections.read().await.contains_key(pool_key));
         assert!(!state.pool_activity.read().await.contains_key(pool_key));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn closing_oracle_table_tab_keeps_connection_scoped_pool() {
+        let (state, dir) = test_app_state().await;
+        let mut config = mysql_config(Some("ORCLPDB1"));
+        config.id = "oracle-conn".to_string();
+        config.db_type = DatabaseType::Oracle;
+        state.configs.write().await.insert(config.id.clone(), config);
+
+        let pool = crate::db::sqlite::connect_path(":memory:").await.unwrap();
+        state.connections.write().await.insert("oracle-conn".to_string(), PoolKind::Sqlite(pool));
+        state.pool_activity.write().await.insert("oracle-conn".to_string(), super::PoolActivity::now());
+
+        assert!(!state.close_client_session_pool("oracle-conn", Some("APP"), "table-tab-1").await.unwrap());
+        assert!(state.connections.read().await.contains_key("oracle-conn"));
+        assert!(state.pool_activity.read().await.contains_key("oracle-conn"));
 
         let _ = std::fs::remove_dir_all(dir);
     }

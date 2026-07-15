@@ -6,11 +6,17 @@ import java.util.List;
 
 public final class AgentProtocol {
     public static final int PROTOCOL_VERSION = 1;
+    public static final int MULTI_SESSION_PROTOCOL_VERSION = 2;
 
     public static final String METHOD_HANDSHAKE = "handshake";
     public static final String METHOD_CONNECT = "connect";
+    public static final String METHOD_OPEN_SESSION = "open_session";
+    public static final String METHOD_CLOSE_SESSION = "close_session";
+    public static final String METHOD_VALIDATE_SESSION = "validate_session";
+    public static final String METHOD_CANCEL_SESSION = "cancel_session";
     public static final String METHOD_TEST_CONNECTION = "test_connection";
     public static final String METHOD_VALIDATE_CONNECTION = "validate_connection";
+    public static final String METHOD_CONNECTION_INFO = "connection_info";
     public static final String METHOD_LIST_DATABASES = "list_databases";
     public static final String METHOD_LIST_SCHEMAS = "list_schemas";
     public static final String METHOD_LIST_TABLES = "list_tables";
@@ -43,6 +49,7 @@ public final class AgentProtocol {
      * MongoDB read path that returns documents as relaxed Extended JSON for transfer.
      */
     public static final String MONGO_METHOD_FIND_DOCUMENTS_EXTENDED_JSON = "find_documents_extended_json";
+    public static final String MONGO_METHOD_COUNT_DOCUMENTS = "count_documents";
     public static final String MONGO_METHOD_SERVER_VERSION = "server_version";
     public static final String MONGO_METHOD_CREATE_INDEX = "create_index";
     public static final String MONGO_METHOD_DROP_INDEXES = "drop_indexes";
@@ -66,6 +73,7 @@ public final class AgentProtocol {
     public static final String CAPABILITY_TRANSACTION = "transaction";
     public static final String CAPABILITY_DDL = "ddl";
     public static final String CAPABILITY_KV = "kv";
+    public static final String CAPABILITY_MULTI_SESSION = "multi_session";
 
     public static final List<String> CAPABILITIES = Collections.unmodifiableList(Arrays.asList(
         CAPABILITY_CONNECT,
@@ -93,6 +101,7 @@ public final class AgentProtocol {
         METHOD_CONNECT,
         METHOD_TEST_CONNECTION,
         METHOD_VALIDATE_CONNECTION,
+        METHOD_CONNECTION_INFO,
         METHOD_LIST_DATABASES,
         METHOD_LIST_SCHEMAS,
         METHOD_LIST_TABLES,
@@ -119,11 +128,26 @@ public final class AgentProtocol {
         METHOD_SHUTDOWN
     ));
 
+    public static final List<String> MULTI_SESSION_METHODS;
+
+    static {
+        List<String> methods = new java.util.ArrayList<>(COMMON_METHODS);
+        int insertAt = methods.indexOf(METHOD_CONNECT) + 1;
+        methods.addAll(insertAt, Arrays.asList(
+            METHOD_OPEN_SESSION,
+            METHOD_CLOSE_SESSION,
+            METHOD_VALIDATE_SESSION,
+            METHOD_CANCEL_SESSION
+        ));
+        MULTI_SESSION_METHODS = Collections.unmodifiableList(methods);
+    }
+
     public static final List<String> MONGO_LEGACY_METHODS = Collections.unmodifiableList(Arrays.asList(
         MONGO_METHOD_LIST_DATABASES,
         MONGO_METHOD_LIST_COLLECTIONS,
         MONGO_METHOD_FIND_DOCUMENTS,
         MONGO_METHOD_FIND_DOCUMENTS_EXTENDED_JSON,
+        MONGO_METHOD_COUNT_DOCUMENTS,
         MONGO_METHOD_SERVER_VERSION,
         MONGO_METHOD_CREATE_INDEX,
         MONGO_METHOD_DROP_INDEXES,
@@ -147,6 +171,12 @@ public final class AgentProtocol {
 
     public static HandshakeResult handshakeResult() {
         return new HandshakeResult(PROTOCOL_VERSION, PROTOCOL_VERSION, CAPABILITIES);
+    }
+
+    public static HandshakeResult multiSessionHandshakeResult() {
+        List<String> capabilities = new java.util.ArrayList<>(CAPABILITIES);
+        capabilities.add(CAPABILITY_MULTI_SESSION);
+        return new HandshakeResult(MULTI_SESSION_PROTOCOL_VERSION, MULTI_SESSION_PROTOCOL_VERSION, capabilities);
     }
 
     public static final class HandshakeResult {

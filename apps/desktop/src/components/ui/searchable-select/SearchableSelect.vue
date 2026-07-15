@@ -27,6 +27,7 @@ const props = withDefaults(
     triggerClass?: HTMLAttributes["class"];
     triggerIconClass?: HTMLAttributes["class"];
     contentClass?: HTMLAttributes["class"];
+    listClass?: HTMLAttributes["class"];
     itemClass?: HTMLAttributes["class"];
     displayName?: (option: string) => string;
     optionTooltip?: (option: string) => string | undefined;
@@ -236,13 +237,13 @@ function handleKeydown(event: KeyboardEvent) {
     </PopoverTrigger>
     <PopoverContent :align="SEARCHABLE_SELECT_HELP_PANEL_ALIGN" :class="cn('w-auto max-w-[calc(100vw-1rem)] border-0 bg-transparent p-0 shadow-none ring-0', contentClass)">
       <div class="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-start">
-        <div ref="listCard" class="w-52 shrink-0 rounded-md border bg-popover p-1.5 shadow-md">
+        <div ref="listCard" :class="cn('w-52 shrink-0 rounded-md border bg-popover p-1.5 shadow-md', listClass)">
           <div class="relative rounded-sm border bg-background">
             <Search class="pointer-events-none absolute left-2 top-1/2 h-3 w-3 -translate-y-1/2 text-muted-foreground" />
             <span v-if="!searchText" class="pointer-events-none absolute left-[25px] top-1/2 -translate-y-1/2 text-sm text-muted-foreground">{{ searchPlaceholder }}</span>
             <Input ref="searchInput" :model-value="searchText" class="h-6 border-0 pl-6 pr-2 text-sm caret-foreground shadow-none focus-visible:ring-0" @update:model-value="(value) => (searchText = String(value))" @keydown="handleKeydown" />
           </div>
-          <div ref="listContainer" class="max-h-64 overflow-y-auto py-1" @scroll="updateHelpPanelOffset">
+          <div ref="listContainer" class="dbx-searchable-select-list max-h-64 overflow-y-auto py-1" @scroll="updateHelpPanelOffset">
             <div v-if="loading" class="px-2 py-2 text-sm text-muted-foreground">
               {{ loadingText }}
             </div>
@@ -347,5 +348,44 @@ function handleKeydown(event: KeyboardEvent) {
 .dark .dbx-searchable-select-trigger:focus-visible {
   border-color: rgb(147, 197, 253) !important;
   box-shadow: 0 0 0 2px rgba(147, 197, 253, 0.24) !important;
+}
+
+.dbx-searchable-select-list {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in oklch, var(--foreground) 30%, transparent) transparent;
+}
+
+.dbx-searchable-select-list::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.dbx-searchable-select-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.dbx-searchable-select-list::-webkit-scrollbar-thumb {
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: color-mix(in oklch, var(--foreground) 30%, transparent);
+  background-clip: padding-box;
+}
+
+.dbx-searchable-select-list:hover::-webkit-scrollbar-thumb {
+  border: 0;
+  background: color-mix(in oklch, var(--foreground) 48%, transparent);
+}
+
+.dark .dbx-searchable-select-list {
+  scrollbar-color: rgb(82, 82, 91) transparent;
+}
+
+.dark .dbx-searchable-select-list::-webkit-scrollbar-thumb {
+  background: rgb(82, 82, 91);
+  background-clip: padding-box;
+}
+
+.dark .dbx-searchable-select-list:hover::-webkit-scrollbar-thumb {
+  background: rgb(113, 113, 122);
 }
 </style>

@@ -109,6 +109,32 @@ describe("useSqlExecution", () => {
     setActivePinia(createPinia());
   });
 
+  it("passes the selected statement's editor offset to the query store", async () => {
+    const fullSql = "SELECT * FROM users;\nSELECT * FROM users;";
+    const selectionFrom = fullSql.lastIndexOf("SELECT");
+    const selectedSql = fullSql.slice(selectionFrom, -1);
+    const activeTab = ref<QueryTab | undefined>({ ...queryTab("app"), sql: fullSql });
+    const activeConnection = ref<ConnectionConfig | undefined>(connection("mysql"));
+    const activeOutputView = ref<"result" | "summary" | "explain" | "chart">("result");
+    const queryStore = useQueryStore();
+    const executeCurrentSql = vi.spyOn(queryStore, "executeCurrentSql").mockImplementation(async () => {
+      if (activeTab.value) activeTab.value.result = { columns: ["id"], rows: [[1]], affected_rows: 0, execution_time_ms: 1 };
+    });
+    vi.spyOn(useHistoryStore(), "add").mockResolvedValue(undefined);
+
+    const execution = useSqlExecution({
+      activeTab: computed(() => activeTab.value),
+      activeConnection: computed(() => activeConnection.value),
+      executableSql: computed(() => selectedSql),
+      resolveExecutableSql: async () => selectedSql,
+      activeOutputView,
+    });
+
+    await execution.tryExecute({ fullSql, selectedSql, cursorPos: selectionFrom, selectionFrom, selectionTo: fullSql.length - 1 });
+
+    expect(executeCurrentSql).toHaveBeenCalledWith(selectedSql, { sourceOffset: selectionFrom });
+  });
+
   it("sends native SET variables without client-side expansion", async () => {
     const activeTab = ref<QueryTab | undefined>(queryTab("app"));
     const activeConnection = ref<ConnectionConfig | undefined>(connection("mysql"));
@@ -139,6 +165,39 @@ describe("useSqlExecution", () => {
     const executedSql = executeCurrentSql.mock.calls[0]?.[0] ?? "";
     expect(executedSql).toContain("set @date_start = '2026-07-04 00:00:00'");
     expect(executedSql).toContain("where fp.create_at < @date_start");
+  });
+
+  it("sends Doris STRUCT DDL unchanged without opening the parameter dialog", async () => {
+    const sql = `
+      create table \`events\` (
+        \`field0\` int not null comment 'field 0',
+        \`field_list\` array<struct<field1:smallint, field2:int, field3:decimal(16,5), field4:varchar(255)>> comment 'field list'
+      )
+      engine = olap
+      properties ("replication_num" = "1");
+    `;
+    const activeTab = ref<QueryTab | undefined>(queryTab("analytics"));
+    const activeConnection = ref<ConnectionConfig | undefined>(connection("doris"));
+    const activeOutputView = ref<"result" | "summary" | "explain" | "chart">("result");
+    const queryStore = useQueryStore();
+    const executeCurrentSql = vi.spyOn(queryStore, "executeCurrentSql").mockImplementation(async () => {
+      if (activeTab.value) activeTab.value.result = { columns: ["ok"], rows: [[1]], affected_rows: 0, execution_time_ms: 1 };
+    });
+    vi.spyOn(useHistoryStore(), "add").mockResolvedValue(undefined);
+    vi.spyOn(useConnectionStore(), "refreshObjectListTreeNode").mockResolvedValue(undefined);
+
+    const execution = useSqlExecution({
+      activeTab: computed(() => activeTab.value),
+      activeConnection: computed(() => activeConnection.value),
+      executableSql: computed(() => sql),
+      activeOutputView,
+    });
+
+    await execution.tryExecute();
+
+    expect(execution.showSqlParameterDialog.value).toBe(false);
+    expect(execution.sqlParameterNames.value).toEqual([]);
+    expect(executeCurrentSql).toHaveBeenCalledWith(sql, {});
   });
 
   it("records a later MySQL batch error and skips metadata refresh", async () => {

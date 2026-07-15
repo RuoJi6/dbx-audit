@@ -166,7 +166,7 @@
         # ------------------------------------------------------------------ #
         packages.dbx-desktop = pkgs.stdenv.mkDerivation (finalAttrs: {
           pname = "dbx-desktop";
-          version = "0.5.55";
+          version = "0.5.57";
 
           src = pkgs.lib.cleanSource ./.;
 
@@ -175,8 +175,8 @@
           # a content-addressed store path so the build sandbox has no network. #
           pnpmDeps = pkgs.fetchPnpmDeps {
             inherit (finalAttrs) pname version src;
-            # nixpkgs 26.11+ requires fetcherVersion = 3 (versions 1 & 2 removed)
-            fetcherVersion = 3;
+            # `fetcherVersion = 4` is supported for `pnpm_11`
+            fetcherVersion = 4;
             # Replace with the correct hash after the first failed build:
             #   nix build .#dbx-desktop 2>&1 | grep 'got:'
             hash = "sha256-e2/C37EaymMy3vG1MBZyxCa2sWlsl3OV9LLfJAHXrO0=";

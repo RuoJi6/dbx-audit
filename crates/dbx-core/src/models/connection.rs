@@ -27,6 +27,10 @@ pub struct ConnectionConfig {
     pub visible_schemas: Option<HashMap<String, Vec<String>>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attached_databases: Vec<AttachedDatabaseConfig>,
+    /// SQL statements executed right after the connection is established
+    /// (DuckDB only for now): INSTALL/LOAD, SET, CREATE SECRET, ATTACH, ...
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub init_script: Option<String>,
     #[serde(default)]
     pub color: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -317,7 +321,7 @@ pub fn default_connect_timeout_secs() -> u64 {
 }
 
 pub fn default_query_timeout_secs() -> u64 {
-    30
+    60
 }
 
 pub fn default_idle_timeout_secs() -> u64 {
@@ -477,6 +481,8 @@ struct ConnectionConfigData {
     #[serde(default)]
     pub attached_databases: Vec<AttachedDatabaseConfig>,
     #[serde(default)]
+    pub init_script: Option<String>,
+    #[serde(default)]
     pub color: Option<String>,
     #[serde(default)]
     pub transport_layers: Vec<TransportLayerConfig>,
@@ -560,6 +566,7 @@ impl From<ConnectionConfigData> for ConnectionConfig {
             visible_databases: data.visible_databases,
             visible_schemas: data.visible_schemas,
             attached_databases: data.attached_databases,
+            init_script: data.init_script,
             color: data.color,
             transport_layers: data.transport_layers,
             connect_timeout_secs: data.connect_timeout_secs,
@@ -1196,6 +1203,17 @@ impl ConnectionConfig {
             DatabaseType::MessageQueue => self.message_queue_admin_url(),
             DatabaseType::Nacos => self.nacos_admin_url(),
         }
+    }
+
+    pub fn sqlserver_port_explicit(&self) -> bool {
+        if self.db_type != DatabaseType::SqlServer {
+            return false;
+        }
+        self.external_config
+            .as_ref()
+            .and_then(|value| value.get("portExplicit").or_else(|| value.get("port_explicit")))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
     }
 
     fn message_queue_admin_url(&self) -> String {
@@ -1880,6 +1898,11 @@ mod tests {
     };
     use std::str::FromStr;
 
+    #[test]
+    fn default_query_timeout_is_sixty_seconds() {
+        assert_eq!(default_query_timeout_secs(), 60);
+    }
+
     fn mysql_config(username: &str, password: &str, database: Option<&str>) -> ConnectionConfig {
         ConnectionConfig {
             id: "id".to_string(),
@@ -1897,6 +1920,7 @@ mod tests {
             visible_databases: None,
             visible_schemas: None,
             attached_databases: Vec::new(),
+            init_script: None,
             color: None,
             transport_layers: Vec::new(),
             connect_timeout_secs: super::default_connect_timeout_secs(),
@@ -2158,6 +2182,16 @@ mod tests {
         config.query_timeout_secs = 3600;
 
         assert_eq!(config.effective_query_timeout_secs(), 3600);
+    }
+
+    #[test]
+    fn mysql_url_encodes_proxy_style_username_with_colons_and_at() {
+        let config = mysql_config("1234:xxx@xx.xx:abc123", "p@ss:word", None);
+
+        assert_eq!(
+            config.connection_url(),
+            "mysql://1234%3Axxx%40xx%2Exx%3Aabc123:p%40ss%3Aword@10.1.2.3:2883?ssl-mode=disabled&charset=utf8mb4"
+        );
     }
 
     #[test]

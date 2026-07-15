@@ -1,4 +1,4 @@
-import { COLUMN_WIDTH_DENSITY_PRESETS } from "@/lib/dataGrid/dataGridColumnWidth";
+import { COLUMN_WIDTH_DENSITY_PRESETS, percentileValue } from "@/lib/dataGrid/dataGridColumnWidth";
 import type { ColumnWidthDensity } from "@/stores/settingsStore";
 
 export interface DataGridTransposeState {
@@ -99,10 +99,16 @@ const TRANSPOSE_RECORD_MIN_WIDTH = 96;
 const TRANSPOSE_RECORD_DEFAULT_WIDTH = 168;
 const TRANSPOSE_FIELD_MIN_WIDTH = 104;
 const TRANSPOSE_FIELD_MAX_WIDTH = 220;
-const STANDARD_CHAR_WIDTH = COLUMN_WIDTH_DENSITY_PRESETS.standard.charWidth;
+
+// 转置视图每种密度对应的缩放因子（不再依赖 charWidth）
+const TRANSPOSE_DENSITY_SCALE: Record<ColumnWidthDensity, number> = {
+  compact: 0.875,
+  standard: 1,
+  comfortable: 1.125,
+};
 
 function densityScaledWidth(width: number, density: ColumnWidthDensity): number {
-  return Math.round((width * COLUMN_WIDTH_DENSITY_PRESETS[density].charWidth) / STANDARD_CHAR_WIDTH);
+  return Math.round(width * TRANSPOSE_DENSITY_SCALE[density]);
 }
 
 function transposeDisplayText(value: unknown): string {
@@ -125,11 +131,13 @@ export function minTransposeFieldWidth(density: ColumnWidthDensity): number {
 export function calculateTransposeRecordWidth(values: readonly unknown[], density: ColumnWidthDensity): number {
   const preset = COLUMN_WIDTH_DENSITY_PRESETS[density];
   const minWidth = minTransposeRecordWidth(density);
-  let maxWidth = minWidth;
+  const scale = TRANSPOSE_DENSITY_SCALE[density];
+  const valueWidths: number[] = [];
   for (const value of values) {
     const displayLen = Math.min(transposeDisplayText(value).length, preset.valueTextLimit);
-    maxWidth = Math.max(maxWidth, displayLen * preset.charWidth + preset.cellPadding);
+    valueWidths.push(Math.round((displayLen * preset.charWidth + preset.cellPadding) * scale));
   }
+  const maxWidth = Math.max(minWidth, percentileValue(valueWidths, preset.valueWidthPercentile));
   return Math.max(minWidth, Math.min(preset.maxWidth, Math.round(maxWidth)));
 }
 

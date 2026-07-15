@@ -64,6 +64,19 @@ pub fn connect_path(path: &str) -> Result<Arc<DuckDbConnection>, String> {
     Ok(Arc::new(DuckDbConnection::new(connection)))
 }
 
+/// Runs a connection init script statement-by-statement so a failure can
+/// point at the offending statement instead of the whole batch.
+pub fn run_init_script(con: &duckdb::Connection, script: &str) -> Result<(), String> {
+    for (index, statement) in crate::db::duckdb_sql::split_sql_statements(script).iter().enumerate() {
+        if crate::db::duckdb_sql::strip_leading_comments(statement).is_empty() {
+            continue;
+        }
+        con.execute_batch(statement)
+            .map_err(|e| format!("Connection init script statement {} failed: {e}", index + 1))?;
+    }
+    Ok(())
+}
+
 fn validate_duckdb_path(path: &str) -> Result<(), String> {
     if path.is_empty() {
         return Err("Database file path cannot be empty".to_string());
@@ -167,5 +180,17 @@ mod tests {
 
         assert!(std::fs::metadata(&path).expect("database metadata").len() > 0);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn run_init_script_executes_duckdb_escape_strings() {
+        let con = connect_path(":memory:").expect("connect in-memory DuckDB");
+        let locked = con.lock().expect("lock connection");
+
+        run_init_script(&locked, r#"CREATE TABLE probe AS SELECT E'it\'s;ok' AS value; SELECT 2;"#)
+            .expect("run init script");
+        let value: String = locked.query_row("SELECT value FROM probe", [], |row| row.get(0)).expect("select value");
+
+        assert_eq!(value, "it's;ok");
     }
 }
