@@ -696,10 +696,12 @@ enum MySqlSetupMode {
     Compatible,
 }
 
+const MYSQL_GROUP_CONCAT_MAX_LEN: u64 = 1_048_576;
+
 impl MySqlSetupMode {
-    fn group_concat_max_len_query(self) -> Option<&'static str> {
+    fn group_concat_max_len_query(self) -> Option<String> {
         match self {
-            Self::Standard => Some("SET SESSION group_concat_max_len = 1048576"),
+            Self::Standard => Some(format!("SET SESSION group_concat_max_len = {MYSQL_GROUP_CONCAT_MAX_LEN}")),
             Self::Compatible => None,
         }
     }
@@ -745,7 +747,10 @@ fn mysql_group_concat_setup_fallback_mode(setup_mode: MySqlSetupMode, error: &st
     let lower = error.to_ascii_lowercase();
     let setup_query_rejected =
         lower.contains("1193") || lower.contains("unknown system variable") || lower.contains("syntax error");
-    if lower.contains("group_concat_max_len") && setup_query_rejected {
+    let sphinxql_setup_query_rejected = lower.contains("sphinxql")
+        && lower.contains("only 0 and 1 could be used as boolean values")
+        && lower.contains(&format!("near '{MYSQL_GROUP_CONCAT_MAX_LEN}'"));
+    if (lower.contains("group_concat_max_len") && setup_query_rejected) || sphinxql_setup_query_rejected {
         return Some(MySqlSetupMode::Compatible);
     }
 
@@ -944,7 +949,7 @@ fn mysql_setup_queries_for_database_with_mode(
     // GROUP_CONCAT results. Skip it for MySQL protocol-compatible databases
     // such as old StarRocks versions that reject unknown MySQL variables.
     if let Some(query) = setup_mode.group_concat_max_len_query() {
-        queries.push(query.to_string());
+        queries.push(query);
     }
     // StarRocks/Doris expose external storage (Paimon, Hive, ...) through a
     // catalog. `SET catalog` must run *before* `USE <database>` (the database
@@ -4650,6 +4655,26 @@ UNIQUE KEY(`tenant_id`, `name``part`)
             mysql_group_concat_setup_fallback_mode(MySqlSetupMode::Standard, error),
             Some(MySqlSetupMode::Compatible)
         );
+    }
+
+    #[test]
+    fn mysql_sphinxql_group_concat_boolean_error_retries_without_session_variable() {
+        let error = "MySQL connection failed: Server error: `ERROR 42000 (1064): sphinxql: only 0 and 1 could be used as boolean values near '1048576'`";
+
+        assert_eq!(
+            mysql_group_concat_setup_fallback_mode(MySqlSetupMode::Standard, error),
+            Some(MySqlSetupMode::Compatible)
+        );
+    }
+
+    #[test]
+    fn mysql_sphinxql_boolean_error_retry_stays_scoped_to_group_concat_setup() {
+        for error in [
+            "Server error: sphinxql: only 0 and 1 could be used as boolean values near '42'",
+            "Server error: only 0 and 1 could be used as boolean values near '1048576'",
+        ] {
+            assert_eq!(mysql_group_concat_setup_fallback_mode(MySqlSetupMode::Standard, error), None);
+        }
     }
 
     #[test]
