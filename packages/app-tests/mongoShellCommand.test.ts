@@ -13,12 +13,17 @@ import {
   parseMongoCommand,
   parseMongoCountDocumentsCommand,
   parseMongoFindCommand,
+  parseMongoFindOneCommand,
+  parseMongoFindOneAndUpdateCommand,
+  parseMongoFindOneAndReplaceCommand,
+  parseMongoFindOneAndDeleteCommand,
   parseMongoGetIndexesCommand,
   parseMongoVersionCommand,
   parseMongoWriteCommand,
   splitMongoCommands,
   splitMongoCommandRanges,
 } from "../../apps/desktop/src/lib/mongo/mongoShellCommand.ts";
+import type { MongoWriteCommand } from "../../apps/desktop/src/lib/mongo/mongoShellCommand.ts";
 import { buildMongoUpdateDocument as buildMongoDocumentUpdate, formatMongoShellLiteral as formatMongoDocumentShellLiteral } from "../../apps/desktop/src/lib/mongo/mongoDocumentValues.ts";
 
 test("parseMongoFindCommand parses db collection find with an empty JSON filter", () => {
@@ -127,6 +132,91 @@ test("parseMongoFindCommand parses projection arguments", () => {
 test("parseMongoFindCommand rejects unsupported mongo shell commands", () => {
   assert.equal(parseMongoFindCommand("db.users.drop()"), null);
   assert.equal(parseMongoFindCommand("db.users.find({}, {}, { hint: { name: 1 } })"), null);
+});
+
+test("parseMongoFindOneCommand parses a dedicated findOne command", () => {
+  assert.deepEqual(parseMongoFindOneCommand("db.users.findOne({email:'a@b.com'})"), {
+    collection: "users",
+    filter: '{"email":"a@b.com"}',
+  });
+});
+
+test("parseMongoFindOneCommand defaults an empty filter and parses projection", () => {
+  assert.deepEqual(parseMongoFindOneCommand("db.users.findOne()"), {
+    collection: "users",
+    filter: "{}",
+  });
+  const withProjection = parseMongoFindOneCommand('db.getCollection("audit.logs").findOne({ level: "warn" }, { message: 1, _id: 0 })');
+  assert.ok(withProjection);
+  assert.equal(withProjection.collection, "audit.logs");
+  assert.deepEqual(JSON.parse(withProjection.projection || "{}"), { message: 1, _id: 0 });
+});
+
+test("parseMongoFindOneCommand accepts documented projection and options arguments", () => {
+  const command = parseMongoFindOneCommand("db.users.findOne({ active: true }, { name: 1 }, { sort: { createdAt: -1 } })");
+  assert.ok(command);
+  assert.deepEqual(JSON.parse(command.filter), { active: true });
+  assert.deepEqual(JSON.parse(command.projection || "{}"), { name: 1 });
+  assert.deepEqual(JSON.parse(command.options || "{}"), { sort: { createdAt: -1 } });
+});
+
+test("parseMongoFindOneCommand rejects cursor chaining and does not collide with find", () => {
+  assert.equal(parseMongoFindOneCommand("db.users.findOne({}).limit(5)"), null);
+  assert.equal(parseMongoFindOneCommand("db.users.find({})"), null);
+});
+
+test("parseMongoCommand tags findOne with its own kind", () => {
+  const parsed = parseMongoCommand("db.users.findOne({active:true})");
+  assert.deepEqual(parsed?.command, {
+    kind: "findOne",
+    collection: "users",
+    filter: '{"active":true}',
+  });
+});
+
+test("parseMongoFindOneAndUpdateCommand parses filter, update and options", () => {
+  assert.deepEqual(parseMongoFindOneAndUpdateCommand("db.users.findOneAndUpdate({_id:1},{$set:{active:true}},{returnDocument:'after'})"), {
+    collection: "users",
+    filter: '{"_id":1}',
+    update: '{"$set":{"active":true}}',
+    options: '{"returnDocument":"after"}',
+  });
+  // requires both filter and update
+  assert.equal(parseMongoFindOneAndUpdateCommand("db.users.findOneAndUpdate({_id:1})"), null);
+});
+
+test("parseMongoFindOneAndReplaceCommand parses filter and replacement", () => {
+  assert.deepEqual(parseMongoFindOneAndReplaceCommand("db.users.findOneAndReplace({_id:1},{name:'a'})"), {
+    collection: "users",
+    filter: '{"_id":1}',
+    replacement: '{"name":"a"}',
+  });
+});
+
+test("parseMongoFindOneAndDeleteCommand parses filter and defaults empty", () => {
+  assert.deepEqual(parseMongoFindOneAndDeleteCommand("db.users.findOneAndDelete({_id:1})"), {
+    collection: "users",
+    filter: '{"_id":1}',
+  });
+  assert.deepEqual(parseMongoFindOneAndDeleteCommand("db.users.findOneAndDelete()"), {
+    collection: "users",
+    filter: "{}",
+  });
+});
+
+test("parseMongoCommand tags find-and-modify commands with their kind", () => {
+  assert.equal(parseMongoCommand("db.users.findOneAndUpdate({_id:1},{$set:{a:1}})")?.command.kind, "findOneAndUpdate");
+  assert.equal(parseMongoCommand("db.users.findOneAndReplace({_id:1},{a:1})")?.command.kind, "findOneAndReplace");
+  assert.equal(parseMongoCommand("db.users.findOneAndDelete({_id:1})")?.command.kind, "findOneAndDelete");
+  // findOne must not be swallowed by the find-and-modify parsers
+  assert.equal(parseMongoCommand("db.users.findOne({_id:1})")?.command.kind, "findOne");
+});
+
+test("evaluateMongoWriteSafety blocks empty-filter find-and-modify unless dangerous", () => {
+  const command = parseMongoCommand("db.users.findOneAndDelete({})")?.command as MongoWriteCommand;
+  assert.ok(command);
+  assert.equal(evaluateMongoWriteSafety(command, { allowWrites: true, allowDangerous: false }).allowed, false);
+  assert.equal(evaluateMongoWriteSafety(command, { allowWrites: true, allowDangerous: true }).allowed, true);
 });
 
 test("parseMongoVersionCommand parses db.version", () => {
@@ -536,12 +626,24 @@ test("mongoDocumentsToQueryResult turns mongo documents into grid rows", () => {
   assert.equal(result.truncated, true);
 });
 
-test("mongoDocumentsToQueryResult displays typed int64 ids without losing raw type metadata", () => {
-  const id = { $numberLong: "2048938405781032962" };
-  const result = mongoDocumentsToQueryResult([{ _id: id, name: "snowflake" }], 1, 1);
+test("mongoDocumentsToQueryResult displays ids without losing raw type metadata", () => {
+  const documents = [
+    { _id: { $oid: "6743e4bfa3f6f84bc3fff6c8" }, name: "object id" },
+    { _id: { $numberLong: "2048938405781032962" }, name: "int64" },
+    { _id: 42, name: "int" },
+    { _id: 42.5, name: "double" },
+    { _id: "customer-42", name: "string" },
+  ];
+  const result = mongoDocumentsToQueryResult(documents, documents.length, documents.length);
 
-  assert.deepEqual(result.rows, [["2048938405781032962", "snowflake"]]);
-  assert.deepEqual(result.mongo_documents, [{ _id: id, name: "snowflake" }]);
+  assert.deepEqual(result.rows, [
+    ["6743e4bfa3f6f84bc3fff6c8", "object id"],
+    ["2048938405781032962", "int64"],
+    [42, "int"],
+    [42.5, "double"],
+    ["customer-42", "string"],
+  ]);
+  assert.deepEqual(result.mongo_documents, documents);
 });
 
 test("buildMongoUpdateDocument ignores _id and preserves typed values", () => {

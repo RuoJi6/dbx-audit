@@ -12,7 +12,7 @@ use std::time::Duration;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::models::connection::DatabaseType;
+use crate::models::connection::{ConnectionConfig, DatabaseConnectionInfo, DatabaseType};
 use crate::sql::starts_with_executable_sql_keyword;
 use crate::types::{
     ColumnInfo, CompletionAssistantCandidate, CompletionAssistantCandidateKind, CompletionAssistantMatchMode,
@@ -101,6 +101,55 @@ fn first_nonempty_str_by_name(row: &mysql_async::Row, names: &[&str]) -> String 
         }
     }
     String::new()
+}
+
+fn nonblank(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+async fn query_first_nonblank_string(conn: &mut mysql_async::Conn, sql: &str) -> Option<String> {
+    match conn.query_first::<String, _>(sql).await {
+        Ok(Some(value)) => nonblank(value),
+        Ok(None) => None,
+        Err(error) => {
+            log::debug!("Failed to read optional MySQL database information with `{sql}`: {error}");
+            None
+        }
+    }
+}
+
+pub async fn database_connection_info(
+    pool: &MySqlPool,
+    product_name: impl Into<String>,
+) -> Result<DatabaseConnectionInfo, String> {
+    let product_name = nonblank(product_name.into()).unwrap_or_else(|| "MySQL".to_string());
+    let mut conn = get_conn_with_health_check(pool).await?;
+
+    Ok(DatabaseConnectionInfo {
+        product_name: Some(product_name),
+        product_version: query_first_nonblank_string(&mut conn, "SELECT VERSION()").await,
+        current_database: query_first_nonblank_string(&mut conn, "SELECT COALESCE(DATABASE(), '')").await,
+        server_comment: query_first_nonblank_string(&mut conn, "SELECT @@version_comment").await,
+        server_charset: query_first_nonblank_string(&mut conn, "SELECT @@character_set_server").await,
+        server_collation: query_first_nonblank_string(&mut conn, "SELECT @@collation_server").await,
+        ..DatabaseConnectionInfo::default()
+    })
+}
+
+pub fn protocol_product_name(config: &ConnectionConfig) -> String {
+    config.driver_label.as_deref().map(str::trim).filter(|value| !value.is_empty()).map(str::to_string).unwrap_or_else(
+        || match config.db_type {
+            DatabaseType::Doris => "Doris".to_string(),
+            DatabaseType::StarRocks => "StarRocks".to_string(),
+            DatabaseType::ManticoreSearch => "Manticore Search".to_string(),
+            _ => "MySQL".to_string(),
+        },
+    )
 }
 
 fn get_opt_metadata_string(row: &mysql_async::Row, name: &str) -> Option<String> {
@@ -644,7 +693,9 @@ fn mysql_group_concat_setup_fallback_mode(setup_mode: MySqlSetupMode, error: &st
     }
 
     let lower = error.to_ascii_lowercase();
-    if lower.contains("group_concat_max_len") && (lower.contains("1193") || lower.contains("unknown system variable")) {
+    let setup_query_rejected =
+        lower.contains("1193") || lower.contains("unknown system variable") || lower.contains("syntax error");
+    if lower.contains("group_concat_max_len") && setup_query_rejected {
         return Some(MySqlSetupMode::Compatible);
     }
 
@@ -4488,6 +4539,16 @@ UNIQUE KEY(`tenant_id`, `name``part`)
     }
 
     #[test]
+    fn mysql_cnch_group_concat_syntax_error_retries_without_session_variable() {
+        let error = "MySQL connection failed: Server error: `ERROR HY000 (1105): unknown error: Error 62 (HY000): Code: 62, e.displayText() = DB::Exception: host = cnch-server-2: Syntax error: failed at position 13 ('group_concat_max_len'): group_concat_max_len = 1048576. Expected one of: Dot, token, Equals SQLSTATE: 42000 (version 21.8.7.1)'";
+
+        assert_eq!(
+            mysql_group_concat_setup_fallback_mode(MySqlSetupMode::Standard, error),
+            Some(MySqlSetupMode::Compatible)
+        );
+    }
+
+    #[test]
     fn mysql_proxy_parse_tablename_1105_does_not_disable_group_concat() {
         let error = "MySQL connection failed: Server error: `ERROR 07000 (1105): SQL操作失败 (operate fail ) ：解析表名出错 ( parse tablename error ) '";
 
@@ -4562,6 +4623,16 @@ UNIQUE KEY(`tenant_id`, `name``part`)
         let queries = mysql_setup_queries("mysql://root:secret@localhost:3306/db%2Fname?charset=utf8mb4", &[]);
 
         assert_eq!(queries, vec!["USE `db/name`", "SET NAMES utf8mb4", "SET SESSION group_concat_max_len = 1048576"]);
+    }
+
+    #[test]
+    fn mysql_setup_queries_preserve_database_identifier_whitespace() {
+        let queries = mysql_setup_queries("mysql://root:secret@localhost:3306/%20analytics%20?charset=utf8mb4", &[]);
+
+        assert_eq!(
+            queries,
+            vec!["USE ` analytics `", "SET NAMES utf8mb4", "SET SESSION group_concat_max_len = 1048576"]
+        );
     }
 
     #[test]
