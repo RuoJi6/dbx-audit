@@ -65,6 +65,7 @@ function buildExportHarness(
     totalRows: null as number | null,
     status: "",
     errorMessage: null as string | null,
+    filePath: null as string | null,
   });
   const exportCancelHandler = ref<(() => Promise<void>) | null>(null);
   const fullExportResult = vi.fn(async () => {
@@ -150,6 +151,7 @@ function buildTableDataExportHarness() {
     totalRows: null as number | null,
     status: "",
     errorMessage: null as string | null,
+    filePath: null as string | null,
   });
   const exportCancelHandler = ref<(() => Promise<void>) | null>(null);
 
@@ -312,6 +314,7 @@ test("copy MongoDB row as INSERT uses Mongo shell insert syntax", async () => {
   const jsonString = '{"endingBalance":{"beginningBalance":"0","endingBalance":"100","endingDate":"2024-11-25"},"Line":[]}';
   const row = {
     id: 1,
+    sourceIndex: 0,
     data: ["6743e4bfa3f6f84bc3fff6c8", "577", "done", jsonString, 'ISODate("2024-11-25T02:45:36.184Z")'],
     isNew: false,
     isDeleted: false,
@@ -329,6 +332,15 @@ test("copy MongoDB row as INSERT uses Mongo shell insert syntax", async () => {
     database: computed(() => "db"),
     context: computed(() => "results"),
     sourceColumns: computed(() => undefined),
+    mongoDocuments: computed(() => [
+      {
+        _id: { $oid: "6743e4bfa3f6f84bc3fff6c8" },
+        accountId: 577,
+        status: "done",
+        data: { endingBalance: { beginningBalance: "0", endingBalance: "100", endingDate: "2024-11-25" }, Line: [] },
+        lastUpdatedDate: { $date: "2024-11-25T02:45:36.184Z" },
+      },
+    ]),
     columnTypes: computed(() => undefined),
     whereInput: computed(() => undefined),
     orderBy: computed(() => undefined),
@@ -348,7 +360,20 @@ test("copy MongoDB row as INSERT uses Mongo shell insert syntax", async () => {
   assert.equal(apiMock.buildDataGridCopyInsertStatement.mock.calls.length, 0);
   assert.equal(
     clipboardMock.copyToClipboard.mock.calls[0][0],
-    'db.getCollection("accounting_reconciliations").insert({"_id":ObjectId("6743e4bfa3f6f84bc3fff6c8"),"accountId":577,"status":"done","data":{"endingBalance":{"beginningBalance":"0","endingBalance":"100","endingDate":"2024-11-25"},"Line":[]},"lastUpdatedDate":ISODate("2024-11-25T02:45:36.184Z")});',
+    `db.getCollection("accounting_reconciliations").insert({
+  "_id": ObjectId("6743e4bfa3f6f84bc3fff6c8"),
+  "accountId": 577,
+  "status": "done",
+  "data": {
+    "endingBalance": {
+      "beginningBalance": "0",
+      "endingBalance": "100",
+      "endingDate": "2024-11-25"
+    },
+    "Line": []
+  },
+  "lastUpdatedDate": ISODate("2024-11-25T02:45:36.184Z")
+});`,
   );
 });
 
@@ -388,7 +413,18 @@ test("copy MongoDB rows as INSERT excludes _id for insert without primary keys",
   await composable.copyRowAsInsertWithoutPrimaryKeys();
 
   assert.equal(apiMock.buildDataGridCopyInsertStatement.mock.calls.length, 0);
-  assert.equal(clipboardMock.copyToClipboard.mock.calls[0][0], 'db.getCollection("accounting_reconciliations").insertMany([{"status":"done"},{"status":"draft"}]);');
+  assert.equal(
+    clipboardMock.copyToClipboard.mock.calls[0][0],
+    `db.getCollection("accounting_reconciliations")
+  .insertMany([
+    {
+      "status": "done"
+    },
+    {
+      "status": "draft"
+    }
+  ]);`,
+  );
 });
 
 test("copy row as INSERT refreshes prepared SQL after row data changes", async () => {
@@ -626,6 +662,7 @@ test("full query result CSV export streams through the backend without loading a
   assert.equal(apiMock.exportQueryResultCsv.mock.calls.length, 0);
   assert.equal(exportProgressDialog.value, true);
   assert.equal(exportProgressState.value.status, "Done");
+  assert.equal(exportProgressState.value.filePath, apiMock.startQueryResultExport.mock.calls[0][0].filePath);
 });
 
 test("full query result CSV export defaults to the saved SQL title", async () => {
@@ -662,11 +699,12 @@ test("table data export keeps the table name as the default file base", async ()
   const restoreStorage = installMemoryStorage();
   try {
     vi.setSystemTime(new Date(2026, 5, 2, 15, 4, 5));
-    const { composable } = buildTableDataExportHarness();
+    const { composable, exportProgressState } = buildTableDataExportHarness();
 
     await composable.exportCsv();
 
     assert.equal(apiMock.startTableExport.mock.calls[0][0].filePath, "users_260602150405.csv");
+    assert.equal(exportProgressState.value.filePath, "users_260602150405.csv");
   } finally {
     vi.useRealTimers();
     restoreStorage();

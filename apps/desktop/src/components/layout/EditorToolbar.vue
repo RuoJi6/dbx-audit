@@ -14,8 +14,8 @@ import { useSchemaOptions } from "@/composables/useSchemaOptions";
 import { connectionIconType } from "@/lib/connection/connectionPresentation";
 import { formatDatabaseLabel, isDefaultDatabase } from "@/lib/database/defaultDatabase";
 import { connectionDisplayName } from "@/lib/tabs/tabPresentation";
-import { buildConnectionGroupPathMap } from "@/lib/sidebar/sidebarLayout";
-import { isSingleDatabase, supportsSqlInListPaste, supportsTransaction as supportsTransactionFeature } from "@/lib/database/databaseCapabilities";
+import { useConnectionGroupLabel } from "@/composables/useConnectionGroupLabel";
+import { isSingleDatabase, supportsClearableQuerySchema, supportsSqlInListPaste, supportsTransaction as supportsTransactionFeature } from "@/lib/database/databaseCapabilities";
 import { hexToRgba } from "@/lib/common/color";
 import { productionContextForDatabase } from "@/lib/database/productionSafety";
 import type { QueryTab, ConnectionConfig } from "@/types/database";
@@ -67,7 +67,7 @@ const activeDatabaseOptions = computed(() => {
 });
 
 const connectionOptionIds = computed(() => connectionStore.connections.map((connection) => connection.id));
-const connectionGroupPaths = computed(() => buildConnectionGroupPathMap(connectionStore.sidebarLayout));
+const { connectionGroupLabel } = useConnectionGroupLabel();
 const activeDatabaseValue = computed(() => props.activeTab.database || "");
 const activeProductionContext = computed(() => productionContextForDatabase(props.activeConnection, props.activeTab.database));
 const showConnectionProductionBadge = computed(() => activeProductionContext.value.reason === "connection");
@@ -154,10 +154,6 @@ function databaseDisplayName(database: string): string {
 
 function connectionById(connectionId: string): ConnectionConfig | undefined {
   return connectionStore.getConfig(connectionId);
-}
-
-function connectionGroupLabel(connectionId: string): string {
-  return connectionGroupPaths.value.get(connectionId)?.join(" / ") || t("connectionGroup.ungroupedLabel");
 }
 
 function databaseOptionIsProduction(database: string): boolean {
@@ -411,6 +407,7 @@ function databaseOptionIsProduction(database: string): boolean {
           :empty-text="t('grid.noSearchResults')"
           :loading-text="t('common.loading')"
           :loading="!!activeConnection && isLoadingSchemas(activeConnection.id, schemaDatabaseKey)"
+          :clear-selected-option="supportsClearableQuerySchema(activeConnection?.db_type)"
           trigger-class="gap-1.5"
           @update:model-value="(schema) => emit('changeSchema', schema || undefined)"
           @update:open="

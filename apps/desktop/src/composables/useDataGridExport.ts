@@ -13,9 +13,10 @@ import { uuid } from "@/lib/common/utils";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { expandNestedJsonStringsForCopy } from "@/lib/common/jsonCopyValue";
 import { buildMongoCopyDocumentFromOriginal, buildMongoCopyInsertDocument, formatMongoShellLiteral, type MongoInputValue } from "@/lib/mongo/mongoDocumentValues";
+import { formatMongoShellText } from "@/lib/mongo/mongoFormatter";
 import type { DatabaseType, QueryResult } from "@/types/database";
 import type { QueryResultExportRequest } from "@/lib/backend/api";
-import { DBX_ROWID_COLUMN } from "@/lib/table/tableEditing";
+import { usesSyntheticRowIdKey } from "@/lib/table/tableEditing";
 import { buildXlsxSqlWorksheet } from "@/lib/export/xlsxSqlSheet";
 
 /**
@@ -103,6 +104,7 @@ export interface UseDataGridExportOptions {
     totalRows: number | null;
     status: string;
     errorMessage: string | null;
+    filePath: string | null;
   }>;
   exportCancelHandler?: Ref<(() => Promise<void>) | null>;
 }
@@ -351,15 +353,17 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
     const promise = Promise.resolve().then(async () => {
       const statement =
         databaseType.value === "mongodb"
-          ? buildMongoCopyInsertStatement({
-              collection: copyInsertTargetLabel?.value || tableMeta.value?.tableName || "collection",
-              columns: columns.value,
-              sourceColumns: sourceColumns.value,
-              rows,
-              mongoDocuments: options.mongoDocuments?.value,
-              excludePrimaryKeys,
-              insertMode,
-            })
+          ? formatMongoCopyInsertStatement(
+              buildMongoCopyInsertStatement({
+                collection: copyInsertTargetLabel?.value || tableMeta.value?.tableName || "collection",
+                columns: columns.value,
+                sourceColumns: sourceColumns.value,
+                rows,
+                mongoDocuments: options.mongoDocuments?.value,
+                excludePrimaryKeys,
+                insertMode,
+              }),
+            )
           : await buildDataGridCopyInsertStatement({
               databaseType: databaseType.value,
               tableMeta: tableMeta.value,
@@ -688,6 +692,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
             totalRows: null,
             status: "Running",
             errorMessage: null,
+            filePath: null,
           };
           exportProgressDialog.value = true;
         }
@@ -733,6 +738,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
         if (needsFullExport && exportProgressState) {
           exportProgressState.value = {
             ...exportProgressState.value,
+            filePath: outputPath,
             status: "Done",
             rowsExported: result.rows.length,
             totalRows: result.rows.length,
@@ -920,6 +926,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
             totalRows: null,
             status: "Running",
             errorMessage: null,
+            filePath: outputPath,
           };
           exportProgressDialog.value = true;
         }
@@ -1073,6 +1080,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
         totalRows: null,
         status: "Running",
         errorMessage: null,
+        filePath: outputPath,
       };
     }
     if (exportProgressDialog) exportProgressDialog.value = true;
@@ -1160,6 +1168,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
         totalRows: request.totalRows ?? null,
         status: "Running",
         errorMessage: null,
+        filePath: outputPath,
       };
     }
     if (exportProgressDialog) exportProgressDialog.value = true;
@@ -1369,6 +1378,15 @@ function buildMongoCopyInsertStatement(options: { collection: string; columns: s
   return `${collection}.insertMany(${formatMongoShellLiteral(documents)});`;
 }
 
+function formatMongoCopyInsertStatement(statement: string | undefined): string | undefined {
+  if (!statement) return undefined;
+  try {
+    return formatMongoShellText(statement);
+  } catch {
+    return statement;
+  }
+}
+
 function compactLocalTimestamp(date = new Date()): string {
   const yy = String(date.getFullYear() % 100).padStart(2, "0");
   const month = String(date.getMonth() + 1).padStart(2, "0");
@@ -1385,7 +1403,7 @@ function effectiveColumns(sourceColumns: Array<string | undefined> | undefined, 
 }
 
 function isCopyInsertOmittedColumn(databaseType: DatabaseType | undefined, column: string, tableMeta: DataGridTableMeta | undefined): boolean {
-  if (databaseType === "oracle" && column.toUpperCase() === DBX_ROWID_COLUMN) return true;
+  if (usesSyntheticRowIdKey(databaseType, [column])) return true;
   const columnInfo = tableMeta?.columns?.find((item) => normalizeColumnName(item.name) === normalizeColumnName(column));
   const normalizedType = columnInfo?.data_type.trim().replace(/^"|"$/g, "").toLowerCase();
   if (databaseType === "postgres" && (normalizedType === "tsvector" || normalizedType?.endsWith(".tsvector"))) return true;

@@ -24,7 +24,7 @@ const structuredFilterStateCache = new Map<string, StructuredFilterCacheState>()
 </script>
 
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, onActivated, onDeactivated, ref, shallowRef, useSlots, watch, defineAsyncComponent, type Component, type CSSProperties } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, onActivated, onDeactivated, ref, shallowRef, toRaw, useSlots, watch, defineAsyncComponent, type Component, type CSSProperties } from "vue";
 import { useI18n } from "vue-i18n";
 import {
   ArrowUp,
@@ -68,7 +68,7 @@ import {
   TableProperties,
   Database,
   Columns3,
-  Columns3Cog,
+  PencilRuler,
   Timer,
 } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
@@ -167,9 +167,9 @@ import { isCancelSearchShortcut, isCopyCurrentRowShortcut, isDeleteCurrentRowSho
 import { dataGridHeaderContentWidth, scrollbarGutterWidth } from "@/lib/dataGrid/dataGridScrollGutter";
 import { canGoNextDataGridPage } from "@/lib/dataGrid/dataGridPagination";
 import { dataGridCountQueryOptions } from "@/lib/dataGrid/dataGridQueryOptions";
-import { dataGridBottomScrollTop, dataGridScrollPosition, isDataGridAtScrollBottom, isDataGridNearScrollBottom, shouldCheckInfiniteScrollAfterScroll, type DataGridScrollPosition } from "@/lib/dataGrid/dataGridInfiniteScroll";
+import { dataGridBottomScrollTop, dataGridScrollPosition, isDataGridAtScrollBottom, isDataGridNearScrollBottom, restoredDataGridScrollLeft, shouldCheckInfiniteScrollAfterScroll, type DataGridScrollPosition } from "@/lib/dataGrid/dataGridInfiniteScroll";
 import { CANVAS_DATA_GRID_ROW_HEIGHT, drawCanvasDataGrid } from "@/lib/dataGrid/canvasDataGridRenderer";
-import { dataGridSaveActionMode, dataGridSaveToolbarState } from "@/lib/dataGrid/dataGridSaveUi";
+import { dataGridPreviewLabelKey, dataGridSaveActionMode, dataGridSaveToolbarState } from "@/lib/dataGrid/dataGridSaveUi";
 import type { QueryEditabilityReason } from "@/lib/sql/sqlAnalysis";
 import { EDITOR_FONT_FAMILY_CSS_VAR } from "@/lib/editor/editorThemes";
 import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/backend/safeStorage";
@@ -212,6 +212,7 @@ import { columnHeaderCanvasPointerDisabled, columnHeaderClickShouldBeSuppressed,
 import { useToast } from "@/composables/useToast";
 import { useDataGridExport } from "@/composables/useDataGridExport";
 import { eventTargetAllowsNativeClipboard, isPlainClipboardShortcut, readTextFromClipboard } from "@/lib/common/clipboard";
+import { claimDataGridPaste } from "@/lib/dataGrid/dataGridClipboard";
 import ExportProgressDialog from "@/components/export/ExportProgressDialog.vue";
 import { DATA_GRID_ROW_NUM_WIDTH, useDataGridColumnResize } from "@/composables/useDataGridColumnResize";
 import { useDataGridSelection } from "@/composables/useDataGridSelection";
@@ -1938,7 +1939,8 @@ function persistStructuredFilterState() {
     manualWhereInput: whereFilterInput.value,
     rules: cloneStructuredFilterRules(structuredFilterRules.value),
     appliedWhereInput: appliedStructuredWhereInput.value,
-    serverColumnFilters: structuredClone(serverColumnFilters.value),
+    // Vue wraps ref-held objects in proxies; structuredClone cannot clone those proxies.
+    serverColumnFilters: structuredClone(toRaw(serverColumnFilters.value)),
   });
 }
 
@@ -2911,6 +2913,7 @@ const gridStyle = computed(() => ({
 }));
 const gridHorizontalScrollLeft = ref(0);
 const gridViewportWidth = ref(0);
+let gridScrollLeftBeforeTranspose = 0;
 const renderedColumnOffsets = computed(() => {
   const widths = renderedColumnWidths.value;
   const offsets = Array.from({ length: widths.length + 1 }, () => 0);
@@ -4232,6 +4235,7 @@ const saveActionMode = computed(() =>
     useTransaction: !!useTransaction.value,
   }),
 );
+const previewLabelKey = computed(() => dataGridPreviewLabelKey(resolvedDatabaseType.value));
 const saveToolbarState = computed(() =>
   dataGridSaveToolbarState({
     editable: props.editable,
@@ -6588,6 +6592,7 @@ const exportProgressState = ref({
   totalRows: null as number | null,
   status: "",
   errorMessage: null as string | null,
+  filePath: null as string | null,
 });
 const exportCancelHandler = ref<(() => Promise<void>) | null>(null);
 
@@ -6646,7 +6651,7 @@ const {
   database: computed(() => props.executionDatabase ?? props.database),
   context: computed(() => props.context),
   sourceColumns: visibleSourceColumns,
-  mongoDocuments: computed(() => props.result.mongo_documents),
+  mongoDocuments: computed(() => props.result.mongo_copy_documents ?? props.result.mongo_documents),
   columnTypes: visibleColumnTypes,
   whereInput: computed(() => currentWhereInput()),
   orderBy: computed(() => currentOrderBy()),
@@ -6916,8 +6921,6 @@ function clipboardShortcut(event: KeyboardEvent, key: string): boolean {
   return isPlainClipboardShortcut(event, key);
 }
 
-let lastPasteEventAt = 0;
-
 async function pasteClipboardIntoSelection() {
   if (!props.editable) return;
   const text = await readTextFromClipboard();
@@ -6950,13 +6953,11 @@ function pasteTextIntoSelection(text: string): boolean {
 }
 
 function onGridPaste(event: ClipboardEvent) {
-  if (!props.editable || (!selectedRange.value && !hasColumnSelection.value)) return;
-  const target = event.target as HTMLElement | null;
-  if (target?.closest("input, textarea, [contenteditable='true'], [role='textbox']")) return;
+  const intent = claimDataGridPaste(event, props.editable, !!selectedRange.value || hasColumnSelection.value);
+  if (intent === "native") return;
+  if (intent === "block") return;
   const text = event.clipboardData?.getData("text/plain");
   if (text === undefined) return;
-  event.preventDefault();
-  lastPasteEventAt = Date.now();
   pasteTextIntoSelection(text);
 }
 
@@ -7042,6 +7043,11 @@ function selectionHasEditableCells(): boolean {
     }
   }
   return false;
+}
+
+function setSelectionNull() {
+  if (!props.editable || !selectionHasEditableCells()) return;
+  fillSelectionWithValue(null);
 }
 
 function openBulkEditDialog() {
@@ -7265,8 +7271,12 @@ function prepareTransposeCellMouseDown(rowIndex: number, actualColIdx: number) {
   if (item) prepareDataCellMouseDown(item, actualColIdx);
 }
 
+function canSaveGridChangesFromShortcut() {
+  return saveToolbarState.value.showActions && !saveToolbarState.value.actionsDisabled;
+}
+
 async function saveGridChangesFromShortcut() {
-  if (!saveToolbarState.value.showActions || saveToolbarState.value.actionsDisabled) return false;
+  if (!canSaveGridChangesFromShortcut()) return false;
   await onToolbarCommit();
   return true;
 }
@@ -7340,9 +7350,10 @@ async function onGridKeydown(event: KeyboardEvent) {
     return;
   }
   if (isSaveShortcut(event, settingsStore.editorSettings.shortcuts)) {
-    if (await saveGridChangesFromShortcut()) {
+    if (canSaveGridChangesFromShortcut()) {
       event.preventDefault();
       event.stopPropagation();
+      await saveGridChangesFromShortcut();
     }
     return;
   }
@@ -7413,12 +7424,11 @@ async function onGridKeydown(event: KeyboardEvent) {
     return;
   }
   if (clipboardShortcut(event, "v")) {
-    if (!props.editable || (!selectedRange.value && !hasColumnSelection.value)) return;
-    const keydownAt = Date.now();
-    window.setTimeout(() => {
-      if (lastPasteEventAt >= keydownAt) return;
-      pasteClipboardIntoSelection().catch((e) => toast(t("grid.copyFailed", { message: e?.message || String(e) }), 5000));
-    }, 50);
+    const intent = claimDataGridPaste(event, props.editable, !!selectedRange.value || hasColumnSelection.value);
+    if (intent === "native") return;
+    // A focused grid owns the shortcut even when read-only; otherwise the webview may paste into the previously focused SQL editor.
+    if (intent === "block") return;
+    pasteClipboardIntoSelection().catch((e) => toast(t("grid.copyFailed", { message: e?.message || String(e) }), 5000));
     return;
   }
 }
@@ -7876,7 +7886,20 @@ function transposeNav(delta: number) {
 }
 
 watch(isTransposeMode, (active) => {
-  if (active) nextTick(updateTransposeViewport);
+  if (active) {
+    gridScrollLeftBeforeTranspose = gridScrollerElement()?.scrollLeft ?? gridHorizontalScrollLeft.value;
+    nextTick(updateTransposeViewport);
+    return;
+  }
+
+  nextTick(() => {
+    const scroller = gridScrollerElement();
+    if (!scroller) return;
+    // Transpose mode replaces the normal grid scroller, so restore its state and
+    // reconnect overflow observers only after Vue mounts the new element.
+    scroller.scrollLeft = restoredDataGridScrollLeft(gridScrollLeftBeforeTranspose, scroller.scrollWidth, scroller.clientWidth);
+    refreshGridScrollerMetrics();
+  });
 });
 
 watch(
@@ -8974,10 +8997,19 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
   }
 
   if (props.editable && hasCellSelection.value) {
+    const hasEditableSelection = selectionHasEditableCells();
+    if (!contextHeaderColumn.value) {
+      items.push({
+        label: t("grid.setNull"),
+        action: setSelectionNull,
+        disabled: !hasEditableSelection,
+        icon: X,
+      });
+    }
     items.push({
       label: t("grid.bulkEditSelection"),
       action: openBulkEditDialog,
-      disabled: !selectionHasEditableCells(),
+      disabled: !hasEditableSelection,
       icon: Pencil,
     });
   }
@@ -9646,11 +9678,11 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                   >
                     <Loader2 v-if="isPreviewLoading" class="data-grid-topbar-action-icon w-3 h-3 animate-spin" />
                     <Eye v-else class="data-grid-topbar-action-icon w-3 h-3" />
-                    <span class="data-grid-topbar-action-label" :class="{ 'data-grid-topbar-action-label--compact': compactDataGridToolbar }">{{ t("toolbar.previewSql") }}</span>
+                    <span class="data-grid-topbar-action-label" :class="{ 'data-grid-topbar-action-label--compact': compactDataGridToolbar }">{{ t(previewLabelKey) }}</span>
                   </Button>
                 </TooltipTrigger>
                 <TooltipContent side="bottom" class="max-w-sm">
-                  {{ t("toolbar.previewSql") }}
+                  {{ t(previewLabelKey) }}
                 </TooltipContent>
               </Tooltip>
               <Tooltip>
@@ -10632,7 +10664,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                 </Button>
               </div>
               <Button v-if="canOpenTableStructureEditor" variant="ghost" size="sm" class="table-info-action-button h-6 px-2 text-xs" :title="t('contextMenu.editStructure')" :aria-label="t('contextMenu.editStructure')" @click="openTableStructureEditor">
-                <Columns3Cog class="w-3 h-3" />
+                <PencilRuler class="w-3 h-3" />
                 <span class="table-info-action-label">{{ t("contextMenu.editStructure") }}</span>
               </Button>
               <Button variant="ghost" size="icon" class="h-5 w-5" @click="showTableInfo = false">

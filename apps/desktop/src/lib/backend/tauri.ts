@@ -2,6 +2,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   ConnectionConfig,
+  ConnectionTestResult,
+  DatabaseConnectionInfo,
   DatabaseInfo,
   SchemaInfo,
   LinkedServerInfo,
@@ -36,6 +38,7 @@ import type {
   SshConfigHostEntry,
   TunnelProfile,
 } from "@/types/database";
+import { isTauriCommandUnavailable, normalizeConnectionTestResult } from "@/lib/connection/connectionDatabaseInfo";
 import type { CollectionInfo } from "@/types/database";
 import type { SidebarObjectKind } from "@/lib/database/databaseObjectCapabilities";
 import type { AiConfig, AiTestConnectionResult } from "@/stores/settingsStore";
@@ -816,8 +819,27 @@ export async function testConnection(config: ConnectionConfig): Promise<string> 
   return invoke("test_connection", { config });
 }
 
+export async function testConnectionWithInfo(config: ConnectionConfig): Promise<ConnectionTestResult> {
+  try {
+    const result = await invoke<unknown>("test_connection_with_info", { config });
+    return normalizeConnectionTestResult(result, config);
+  } catch (error) {
+    if (!isTauriCommandUnavailable(error, "test_connection_with_info")) throw error;
+    return normalizeConnectionTestResult(await testConnection(config), config);
+  }
+}
+
 export async function connectDb(config: ConnectionConfig, clientAttempt?: number): Promise<string> {
   return invoke("connect_db", { config, clientAttempt });
+}
+
+export async function connectionDatabaseInfo(connectionId: string, database?: string): Promise<DatabaseConnectionInfo | undefined> {
+  const info = await invoke<DatabaseConnectionInfo | null>("connection_database_info", { connectionId, database });
+  return info ?? undefined;
+}
+
+export async function saveConnectionDatabaseInfo(connectionId: string, databaseInfo: DatabaseConnectionInfo): Promise<void> {
+  return invoke("save_connection_database_info", { connectionId, databaseInfo });
 }
 
 export async function connectionFinalProxyPort(config: ConnectionConfig): Promise<number> {
@@ -1646,7 +1668,7 @@ export interface RedisStreamEntry {
 
 export type RedisValueData =
   | { kind: "string"; content: RedisBlob }
-  | { kind: "json"; value: unknown }
+  | { kind: "json"; value: string }
   | { kind: "list"; items: RedisListItem[]; total: number; scan_cursor?: number }
   | { kind: "set"; items: RedisSetItem[]; total: number; scan_cursor?: number }
   | { kind: "hash"; items: RedisHashItem[]; total: number; scan_cursor?: number }
@@ -1909,6 +1931,8 @@ export async function zookeeperDelete(connectionId: string, key: string): Promis
 // --- MongoDB ---
 export interface MongoDocumentResult {
   documents: any[];
+  raw_documents?: string[];
+  extended_documents?: any[];
   total: number;
 }
 
@@ -1982,6 +2006,10 @@ export async function vectorListCollections(connectionId: string, database?: str
 
 export async function mongoFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, projection?: string, sort?: string, executionId?: string): Promise<MongoDocumentResult> {
   return documentFindDocuments(connectionId, database, collection, skip, limit, filter, projection, sort, executionId);
+}
+
+export async function mongoFindOne(connectionId: string, database: string, collection: string, filter?: string, projection?: string, options?: string, executionId?: string): Promise<MongoDocumentResult> {
+  return invoke("mongo_find_one", { connectionId, database, collection, filter, projection, options, executionId });
 }
 
 export async function documentFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, projection?: string, sort?: string, executionId?: string): Promise<MongoDocumentResult> {
@@ -2099,6 +2127,18 @@ export async function mongoDeleteDocuments(connectionId: string, database: strin
     many,
   });
   return { affected_rows: affectedRows };
+}
+
+export async function mongoFindOneAndUpdate(connectionId: string, database: string, collection: string, filterJson: string, updateJson: string, optionsJson?: string): Promise<MongoDocumentResult> {
+  return invoke("mongo_find_one_and_update", { connectionId, database, collection, filterJson, updateJson, optionsJson });
+}
+
+export async function mongoFindOneAndReplace(connectionId: string, database: string, collection: string, filterJson: string, replacementJson: string, optionsJson?: string): Promise<MongoDocumentResult> {
+  return invoke("mongo_find_one_and_replace", { connectionId, database, collection, filterJson, replacementJson, optionsJson });
+}
+
+export async function mongoFindOneAndDelete(connectionId: string, database: string, collection: string, filterJson: string, optionsJson?: string): Promise<MongoDocumentResult> {
+  return invoke("mongo_find_one_and_delete", { connectionId, database, collection, filterJson, optionsJson });
 }
 
 // --- History ---
