@@ -1611,7 +1611,7 @@ fn oracle_object_info_can_have_table_comment(object: &db::ObjectInfo) -> bool {
 }
 
 fn oracle_type_is_table_or_view(value: &str) -> bool {
-    let normalized = value.to_ascii_uppercase().replace(' ', "_").replace('-', "_");
+    let normalized = value.to_ascii_uppercase().replace([' ', '-'], "_");
     matches!(normalized.as_str(), "TABLE" | "BASE_TABLE" | "VIEW")
 }
 

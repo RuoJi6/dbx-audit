@@ -3139,9 +3139,9 @@ fn clone_pool_kind(pool: &PoolKind) -> PoolKind {
         #[cfg(feature = "duckdb-bundled")]
         PoolKind::DuckDbWorker(client) => PoolKind::DuckDbWorker(client.clone()),
         #[cfg(not(feature = "duckdb-bundled"))]
-        PoolKind::DuckDb(con) => PoolKind::DuckDb(con.clone()),
+        PoolKind::DuckDb(_) => PoolKind::DuckDb(()),
         #[cfg(not(feature = "duckdb-bundled"))]
-        PoolKind::DuckDbWorker(client) => PoolKind::DuckDbWorker(client.clone()),
+        PoolKind::DuckDbWorker(_) => PoolKind::DuckDbWorker(()),
         PoolKind::MongoDb(client) => PoolKind::MongoDb(client.clone()),
         PoolKind::ClickHouse(client) => PoolKind::ClickHouse(client.clone()),
         PoolKind::SqlServer(client) => PoolKind::SqlServer(client.clone()),
@@ -3149,7 +3149,10 @@ fn clone_pool_kind(pool: &PoolKind) -> PoolKind {
         PoolKind::VectorDb(client) => PoolKind::VectorDb(client.clone()),
         PoolKind::InfluxDb(client) => PoolKind::InfluxDb(client.clone()),
         PoolKind::Agent(client) => PoolKind::Agent(client.clone()),
+        #[cfg(feature = "duckdb-bundled")]
         PoolKind::ExternalTabular(ext) => PoolKind::ExternalTabular(ext.clone()),
+        #[cfg(not(feature = "duckdb-bundled"))]
+        PoolKind::ExternalTabular(_) => PoolKind::ExternalTabular(()),
         PoolKind::ExternalDriver { driver_id, config, session } => {
             PoolKind::ExternalDriver { driver_id: driver_id.clone(), config: config.clone(), session: session.clone() }
         }

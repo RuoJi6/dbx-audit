@@ -963,7 +963,7 @@ fn add_standard_limit(
     offset: usize,
     dedup_projection_count: Option<usize>,
 ) -> String {
-    let order_sql = dedup_projection_count.map_or(String::new(), |count| format_positional_order_by(count));
+    let order_sql = dedup_projection_count.map_or(String::new(), format_positional_order_by);
 
     if has_top_level_limit(statement) {
         if !order_sql.is_empty() {

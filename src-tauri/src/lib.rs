@@ -334,9 +334,7 @@ fn linux_appimage_system_gtk_immodules_cache(
     let Some(gtk_im_module_file) = gtk_im_module_file else {
         return Some(system_cache_path);
     };
-    let Some(appdir) = appdir else {
-        return None;
-    };
+    let appdir = appdir?;
 
     if std::path::Path::new(gtk_im_module_file).starts_with(std::path::Path::new(appdir)) {
         Some(system_cache_path)
@@ -526,7 +524,7 @@ fn apply_macos_app_icon_theme(app: &tauri::AppHandle, icon_theme: DesktopIconThe
 fn apply_desktop_icon_theme(app: &tauri::AppHandle, icon_theme: DesktopIconTheme) -> tauri::Result<()> {
     #[cfg(target_os = "macos")]
     {
-        return apply_macos_app_icon_theme(app, icon_theme);
+        apply_macos_app_icon_theme(app, icon_theme)
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -1010,11 +1008,11 @@ pub fn run() {
                 let app = window.app_handle();
                 if app.try_state::<CloseBehaviorState>().is_none() {
                     api.prevent_close();
-                    hide_main_window_for_close(&app, window);
+                    hide_main_window_for_close(app, window);
                     return;
                 }
                 api.prevent_close();
-                request_app_close(&app, "settings");
+                request_app_close(app, "settings");
             }
         })
         .invoke_handler(tauri::generate_handler![

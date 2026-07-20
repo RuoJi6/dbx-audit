@@ -31,6 +31,7 @@ impl MqSystemKind {
 /// features are hidden rather than failing at call time.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(Default)]
 pub struct MqCapabilities {
     pub supports_tenants: bool,
     pub supports_namespaces: bool,
@@ -52,31 +53,6 @@ pub struct MqCapabilities {
     /// Whether the adapter supports producing messages to topics.
     #[serde(default)]
     pub supports_send_message: bool,
-}
-
-impl Default for MqCapabilities {
-    fn default() -> Self {
-        Self {
-            supports_tenants: false,
-            supports_namespaces: false,
-            supports_partitioned_topics: false,
-            supports_subscriptions: false,
-            supports_create_subscription: false,
-            supports_reset_cursor: false,
-            supports_skip_messages: false,
-            supports_clear_backlog: false,
-            supports_peek_messages: false,
-            supports_expire_messages: false,
-            supports_rate_limits: false,
-            supports_backlog_quota: false,
-            supports_retention: false,
-            supports_permissions: false,
-            supports_geo_replication: false,
-            supports_token_management: false,
-            supports_raw_admin_api: false,
-            supports_send_message: false,
-        }
-    }
 }
 
 /// Result of a connectivity test, including the detected server version and how

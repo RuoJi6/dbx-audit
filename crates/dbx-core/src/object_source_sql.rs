@@ -445,7 +445,7 @@ fn informix_view_definition(schema: Option<&str>, name: &str, source: &str) -> (
         let view_name = captures.get(1).unwrap();
         let target_name = strip_informix_owner_qualifiers(view_name.as_str(), schema);
         let body = strip_informix_owner_qualifiers(&trimmed[view_name.end()..], schema);
-        return (target_name.trim().to_string(), body);
+        (target_name.trim().to_string(), body)
     } else {
         let body = strip_informix_owner_qualifiers(trimmed, schema);
         (informix_identifier(name), format!(" AS\n{body}"))
@@ -579,7 +579,7 @@ fn informix_owner_qualifier_replacement<'a>(source: &'a str, start: usize, schem
         return None;
     }
     let ident_start = skip_sql_whitespace(source, dot + 1);
-    read_informix_identifier_text(source, ident_start).map(|(ident_end, ident_text)| (ident_end, ident_text))
+    read_informix_identifier_text(source, ident_start)
 }
 
 fn sql_single_quoted_literal_end(source: &str, start: usize) -> Option<usize> {
