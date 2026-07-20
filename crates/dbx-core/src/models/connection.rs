@@ -1694,8 +1694,9 @@ fn normalize_postgres_url_params(value: &str, force_tls: bool) -> String {
     }
 
     if connection_options.is_empty() {
-        if force_tls && !parts.iter().any(|part| url_param_key_is(part, "sslmode")) {
-            parts.insert(0, "sslmode=require".to_string());
+        if !parts.iter().any(|part| url_param_key_is(part, "sslmode")) {
+            // TLS is opt-in in the connection form; avoid tokio-postgres' implicit prefer mode.
+            parts.insert(0, if force_tls { "sslmode=require" } else { "sslmode=disable" }.to_string());
         }
         return parts.join("&");
     }
@@ -1722,8 +1723,8 @@ fn normalize_postgres_url_params(value: &str, force_tls: bool) -> String {
         parts.push(format!("options={}", encode_url_part(&combined)));
     }
 
-    if force_tls && !parts.iter().any(|part| url_param_key_is(part, "sslmode")) {
-        parts.insert(0, "sslmode=require".to_string());
+    if !parts.iter().any(|part| url_param_key_is(part, "sslmode")) {
+        parts.insert(0, if force_tls { "sslmode=require" } else { "sslmode=disable" }.to_string());
     }
 
     parts.join("&")
@@ -1861,7 +1862,7 @@ fn rewrite_mongo_uri_host(uri: &str, new_host: &str, new_port: u16) -> String {
 }
 
 pub fn parse_jdbc_host_port(url: &str) -> Option<(String, u16)> {
-    let rest = url.strip_prefix("jdbc:")?;
+    let rest = jdbc_transport_rest(url)?;
 
     // jdbc:oracle:thin:@host:port:SID  or  jdbc:oracle:thin:@//host:port/service
     if let Some(after) = rest.strip_prefix("oracle:") {
@@ -1903,11 +1904,35 @@ pub fn parse_jdbc_host_port(url: &str) -> Option<(String, u16)> {
     }
 }
 
+fn jdbc_transport_rest(url: &str) -> Option<&str> {
+    if let Some(rest) = url.strip_prefix("jdbc:").or_else(|| url.strip_prefix("JDBC:")) {
+        return Some(rest);
+    }
+
+    let rest = url.strip_prefix("jdbcx:").or_else(|| url.strip_prefix("JDBCX:"))?;
+    if let Some(scheme_end) = rest.find("://") {
+        let scheme = &rest[..scheme_end];
+        return Some(match scheme.rfind(':') {
+            Some(extension_end) => &rest[extension_end + 1..],
+            None => rest,
+        });
+    }
+
+    // Oracle's descriptor and thin URL forms do not contain `://`. In an
+    // extended JDBCX URL the vendor transport follows the first colon.
+    let tail = rest.split_once(':').map(|(_, tail)| tail);
+    match tail {
+        Some(tail) if tail.get(.."oracle:".len()).is_some_and(|prefix| prefix.eq_ignore_ascii_case("oracle:")) => {
+            Some(tail)
+        }
+        _ => Some(rest),
+    }
+}
+
 pub fn rewrite_jdbc_url_host(url: &str, new_host: &str, new_port: u16) -> String {
     let normalized_url = url.to_ascii_uppercase();
-    if normalized_url.starts_with("JDBC:ORACLE:")
-        && normalized_url.contains("(HOST=")
-        && normalized_url.contains("(PORT=")
+    let normalized_rest = jdbc_transport_rest(url).map(str::to_ascii_uppercase).unwrap_or_default();
+    if normalized_rest.starts_with("ORACLE:") && normalized_url.contains("(HOST=") && normalized_url.contains("(PORT=")
     {
         return rewrite_oracle_descriptor_host(url, new_host, new_port);
     }
@@ -2632,6 +2657,14 @@ mod tests {
     }
 
     #[test]
+    fn postgres_url_disables_tls_by_default() {
+        let mut config = mysql_config("postgres", "secret", Some("test"));
+        config.db_type = DatabaseType::Postgres;
+
+        assert_eq!(config.connection_url(), "postgres://postgres:secret@10.1.2.3:2883/test?sslmode=disable");
+    }
+
+    #[test]
     fn postgres_tls_switch_adds_require_sslmode() {
         let mut config = mysql_config("postgres", "secret", Some("test"));
         config.db_type = DatabaseType::Postgres;
@@ -2662,7 +2695,7 @@ mod tests {
 
         assert_eq!(
             config.connection_url(),
-            "postgres://postgres:secret@10.1.2.3:2883/test?options=%2Dc%20search%5Fpath%3Dpublic"
+            "postgres://postgres:secret@10.1.2.3:2883/test?sslmode=disable&options=%2Dc%20search%5Fpath%3Dpublic"
         );
         let pg_config = tokio_postgres::Config::from_str(&config.connection_url()).unwrap();
         assert_eq!(pg_config.get_options(), Some("-c search_path=public"));
@@ -2676,7 +2709,7 @@ mod tests {
 
         assert_eq!(
             config.connection_url(),
-            "postgres://postgres:secret@10.1.2.3:2883/test?options=%2Dc%20search%5Fpath%3Dapp"
+            "postgres://postgres:secret@10.1.2.3:2883/test?sslmode=disable&options=%2Dc%20search%5Fpath%3Dapp"
         );
         let pg_config = tokio_postgres::Config::from_str(&config.connection_url()).unwrap();
         assert_eq!(pg_config.get_options(), Some("-c search_path=app"));
@@ -2710,7 +2743,7 @@ mod tests {
 
         assert_eq!(
             config.connection_url(),
-            "postgres://postgres:secret@10.1.2.3:2883/test?options=%2Dc%20statement%5Ftimeout%3D5000%20%2Dc%20TimeZone%3DUTC"
+            "postgres://postgres:secret@10.1.2.3:2883/test?sslmode=disable&options=%2Dc%20statement%5Ftimeout%3D5000%20%2Dc%20TimeZone%3DUTC"
         );
     }
 
@@ -2722,7 +2755,7 @@ mod tests {
 
         assert_eq!(
             config.connection_url(),
-            "postgres://postgres:secret@10.1.2.3:2883/test?options=-c%20TimeZone%3DUTC"
+            "postgres://postgres:secret@10.1.2.3:2883/test?sslmode=disable&options=-c%20TimeZone%3DUTC"
         );
     }
 
@@ -2731,7 +2764,7 @@ mod tests {
         let mut config = mysql_config("root", "secret", None);
         config.db_type = DatabaseType::Postgres;
 
-        assert_eq!(config.connection_url(), "postgres://root:secret@10.1.2.3:2883/postgres");
+        assert_eq!(config.connection_url(), "postgres://root:secret@10.1.2.3:2883/postgres?sslmode=disable");
     }
 
     #[test]
@@ -2739,7 +2772,7 @@ mod tests {
         let mut config = mysql_config("root", "secret", Some(""));
         config.db_type = DatabaseType::Postgres;
 
-        assert_eq!(config.connection_url(), "postgres://root:secret@10.1.2.3:2883/postgres");
+        assert_eq!(config.connection_url(), "postgres://root:secret@10.1.2.3:2883/postgres?sslmode=disable");
     }
 
     #[test]
@@ -2747,7 +2780,7 @@ mod tests {
         let mut config = mysql_config("awsuser", "secret", Some(""));
         config.db_type = DatabaseType::Redshift;
 
-        assert_eq!(config.connection_url(), "postgres://awsuser:secret@10.1.2.3:2883/dev");
+        assert_eq!(config.connection_url(), "postgres://awsuser:secret@10.1.2.3:2883/dev?sslmode=disable");
     }
 
     #[test]
@@ -3136,6 +3169,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_jdbcx_host_port_with_and_without_extension() {
+        assert_eq!(
+            super::parse_jdbc_host_port("jdbcx:mysql://db.example.com:3306/app"),
+            Some(("db.example.com".to_string(), 3306))
+        );
+        assert_eq!(
+            super::parse_jdbc_host_port("jdbcx:prql:postgresql://pg.example.com:5432/app"),
+            Some(("pg.example.com".to_string(), 5432))
+        );
+        assert_eq!(
+            super::parse_jdbc_host_port("jdbcx:query:sqlserver://sql.example.com:1433;databaseName=app"),
+            Some(("sql.example.com".to_string(), 1433))
+        );
+    }
+
+    #[test]
     fn parse_jdbc_host_port_with_userinfo() {
         let (h, p) = super::parse_jdbc_host_port("jdbc:postgresql://user:pass@pghost:5433/db").unwrap();
         assert_eq!(h, "pghost");
@@ -3206,6 +3255,27 @@ mod tests {
         let url = "jdbc:postgresql://myhost:5432/mydb";
         let rewritten = super::rewrite_jdbc_url_host(url, "127.0.0.1", 54321);
         assert_eq!(rewritten, "jdbc:postgresql://127.0.0.1:54321/mydb");
+    }
+
+    #[test]
+    fn rewrite_jdbcx_url_preserves_extension() {
+        let url = "jdbcx:script:mysql://db.example.com:3306/app";
+        let rewritten = super::rewrite_jdbc_url_host(url, "127.0.0.1", 13306);
+        assert_eq!(rewritten, "jdbcx:script:mysql://127.0.0.1:13306/app");
+
+        let sqlserver = "jdbcx:query:sqlserver://sql.example.com:1433;databaseName=app";
+        let rewritten = super::rewrite_jdbc_url_host(sqlserver, "127.0.0.1", 11433);
+        assert_eq!(rewritten, "jdbcx:query:sqlserver://127.0.0.1:11433;databaseName=app");
+    }
+
+    #[test]
+    fn rewrite_jdbcx_oracle_descriptor() {
+        let url = "jdbcx:web:oracle:thin:@(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=orahost)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=orcl)))";
+        let rewritten = super::rewrite_jdbc_url_host(url, "127.0.0.1", 11521);
+        assert_eq!(
+            rewritten,
+            "jdbcx:web:oracle:thin:@(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=127.0.0.1)(PORT=11521))(CONNECT_DATA=(SERVICE_NAME=orcl)))"
+        );
     }
 
     #[test]

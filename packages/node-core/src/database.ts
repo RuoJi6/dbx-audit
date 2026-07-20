@@ -9,6 +9,24 @@ import { sqlSafetyFromEnv } from "./sql-safety.js";
 import { isDirectQueryType } from "./diagnostics.js";
 import { bridgePortFilePath } from "./paths.js";
 import { parseRedisCommandArgv, classifyRedisCommand, type RedisCommandOptions, type RedisCommandResult, type RedisCommandSafety } from "./redis-command.js";
+import {
+  chainedMethodCallPattern,
+  describeMongoCommandParseFailure,
+  findChainedMethodCallIndex,
+  findMatchingParen,
+  normalizeJsonArgument,
+  parseCollectionMethodTarget,
+  parseMongoAggregateCommand,
+  splitTopLevel,
+  type MongoAggregateCommand,
+} from "@dbx-app/mongo-shell";
+
+export {
+  describeMongoCommandParseFailure,
+  parseMongoAggregateCommand,
+  MONGO_SHELL_COMMAND_HINT,
+} from "@dbx-app/mongo-shell";
+export type { MongoAggregateCommand } from "@dbx-app/mongo-shell";
 
 export interface TableInfo {
   name: string;
@@ -58,6 +76,8 @@ interface PoolEntry {
   pool: unknown;
   timer: ReturnType<typeof setTimeout>;
 }
+
+type PostgresSslMode = "disable" | "prefer" | "require" | "verify-ca" | "verify-full";
 
 interface RqliteResult {
   columns?: string[];
@@ -119,7 +139,7 @@ export async function closeDatabaseResources(): Promise<void> {
   );
 }
 
-async function getPgPool(config: ConnectionConfig): Promise<import("pg").Pool> {
+async function getPgPool(config: ConnectionConfig, sslModeOverride?: PostgresSslMode): Promise<import("pg").Pool> {
   const key = poolKey(config);
   const existing = pools.get(key);
   if (existing?.type === "pg") {
@@ -129,8 +149,12 @@ async function getPgPool(config: ConnectionConfig): Promise<import("pg").Pool> {
 
   const pg = await import("pg");
   const endpoint = await connectionEndpoint(config);
+  const sslMode = sslModeOverride ?? postgresSslMode(config);
   const pool = new pg.default.Pool({
-    connectionString: buildConnectionUrl(config, endpoint),
+    // pg-connection-string lets URL SSL parameters override the explicit ssl
+    // object. Keep all TLS policy in one place so DBX modes cannot conflict.
+    connectionString: withoutPostgresSslUrlParams(buildConnectionUrl(config, endpoint)),
+    ssl: await postgresSslOptions(config, sslMode),
     max: 3,
     idleTimeoutMillis: 30_000,
     connectionTimeoutMillis: 10_000,
@@ -140,6 +164,69 @@ async function getPgPool(config: ConnectionConfig): Promise<import("pg").Pool> {
   pools.set(key, entry);
   resetIdleTimer(key, entry);
   return pool;
+}
+
+function postgresSslMode(config: ConnectionConfig): PostgresSslMode {
+  const normalized = normalizePostgresUrlParams(config.url_params || "", config.ssl);
+  for (const part of normalized.split("&")) {
+    if (!urlParamKeyIs(part, "sslmode")) continue;
+    const [, rawValue] = splitUrlParam(part);
+    const value = decodeUrlParamPart(rawValue).toLowerCase();
+    if (value === "disable" || value === "prefer" || value === "require" || value === "verify-ca" || value === "verify-full") {
+      return value;
+    }
+  }
+  // TLS is opt-in in the DBX connection form; only an explicit prefer mode may downgrade.
+  return config.ssl ? "require" : "disable";
+}
+
+function postgresSslFilePaths(config: ConnectionConfig): { ca?: string; cert?: string; key?: string } {
+  const paths: { ca?: string; cert?: string; key?: string } = {
+    ca: config.ca_cert_path?.trim() || undefined,
+    cert: config.client_cert_path?.trim() || undefined,
+    key: config.client_key_path?.trim() || undefined,
+  };
+  const normalized = normalizePostgresUrlParams(config.url_params || "", config.ssl);
+  for (const part of normalized.split("&")) {
+    const [rawKey, rawValue] = splitUrlParam(part);
+    const key = decodeUrlParamPart(rawKey).toLowerCase();
+    const value = decodeUrlParamPart(rawValue).trim();
+    if (!value) continue;
+    if (key === "sslrootcert") paths.ca = value;
+    else if (key === "sslcert") paths.cert = value;
+    else if (key === "sslkey") paths.key = value;
+  }
+  return paths;
+}
+
+async function postgresSslOptions(config: ConnectionConfig, mode: PostgresSslMode): Promise<import("pg").PoolConfig["ssl"]> {
+  if (mode === "disable") return false;
+
+  const paths = postgresSslFilePaths(config);
+  const ssl: Exclude<import("pg").PoolConfig["ssl"], boolean | undefined> = {};
+  if (paths.ca) ssl.ca = await readFile(paths.ca);
+  if (paths.cert) ssl.cert = await readFile(paths.cert);
+  if (paths.key) ssl.key = await readFile(paths.key);
+
+  if (mode === "prefer" || mode === "require") {
+    ssl.rejectUnauthorized = false;
+  } else if (mode === "verify-ca") {
+    ssl.checkServerIdentity = () => undefined;
+  }
+  return ssl;
+}
+
+function withoutPostgresSslUrlParams(connectionString: string): string {
+  const url = new URL(connectionString);
+  const sslKeys = new Set(["ssl", "sslmode", "ssl-mode", "sslcert", "sslkey", "sslrootcert", "uselibpqcompat"]);
+  for (const key of [...url.searchParams.keys()]) {
+    if (sslKeys.has(key.toLowerCase())) url.searchParams.delete(key);
+  }
+  return url.toString();
+}
+
+function postgresServerRejectedSsl(error: unknown): boolean {
+  return error instanceof Error && error.message === "The server does not support SSL connections";
 }
 
 async function getMysqlPool(config: ConnectionConfig): Promise<import("mysql2/promise").Pool> {
@@ -247,13 +334,14 @@ function normalizePostgresUrlParams(value: string, forceTls: boolean): string {
       if (decoded) searchPath = decoded;
       continue;
     }
-    if (lowerKey === "ssl-mode") {
+    if (lowerKey === "ssl-mode" || lowerKey === "sslmode") {
       const value = decodeUrlParamPart(rawValue).toLowerCase().replaceAll("_", "-");
       if (value === "require" || value === "required") parts.push("sslmode=require");
       else if (value === "prefer" || value === "preferred") parts.push("sslmode=prefer");
       else if (value === "disable" || value === "disabled") parts.push("sslmode=disable");
       else if (value === "verify-ca") parts.push("sslmode=verify-ca");
       else if (value === "verify-full" || value === "verify-identity") parts.push("sslmode=verify-full");
+      else if (lowerKey === "sslmode") parts.push(part);
       continue;
     }
     if (lowerKey === "charset" || lowerKey === "require_ssl" || lowerKey === "verify_ca" || lowerKey === "verify_identity") {
@@ -758,11 +846,28 @@ async function queryWithRetry(config: ConnectionConfig, fn: () => Promise<QueryR
 }
 
 async function pgQuery(config: ConnectionConfig, sql: string, params?: unknown[], options?: QueryOptions): Promise<QueryResult> {
+  const sslMode = postgresSslMode(config);
+  let usePlaintextFallback = false;
   return queryWithRetry(
     config,
     async () => {
-      const pool = await getPgPool(config);
-      const result = await pool.query(sql, params);
+      const pool = await getPgPool(config, usePlaintextFallback ? "disable" : undefined);
+      let result: import("pg").QueryResult;
+      try {
+        result = await pool.query(sql, params);
+      } catch (error) {
+        if (sslMode !== "prefer" || usePlaintextFallback || !postgresServerRejectedSsl(error)) throw error;
+
+        // Prefer may downgrade only when PostgreSQL rejects the SSLRequest
+        // itself. Certificate, authentication, and pg_hba failures stay fatal.
+        usePlaintextFallback = true;
+        const key = poolKey(config);
+        const entry = pools.get(key);
+        // A concurrent query may already have replaced the rejected TLS pool.
+        // Never evict that newer plaintext pool from a late TLS failure.
+        if (entry?.pool === pool) evictPool(key, entry);
+        result = await (await getPgPool(config, "disable")).query(sql, params);
+      }
       const rows = (result.rows || []).slice(0, resolveMaxRows(options));
       return { columns: result.fields?.map((f) => f.name) ?? [], rows, row_count: rows.length };
     },
@@ -893,8 +998,13 @@ export async function executeQuery(config: ConnectionConfig, sql: string, option
     if (aggregate) {
       const safety = evaluateMongoAggregateSafety(aggregate, sqlSafetyFromEnv());
       if (!safety.allowed) throw new Error(safety.reason);
-      const result = await withTimeout(mongoAggregateDocuments(config, aggregate.collection, aggregate.pipeline, resolveMaxRows(options)), resolveTimeoutMs(options));
+      const result = await withTimeout(mongoAggregateDocuments(config, aggregate.collection, aggregate.pipeline, resolveMaxRows(options), aggregate.options), resolveTimeoutMs(options));
       return mongoDocumentsToQueryResult(result.documents.slice(0, resolveMaxRows(options)), result.total);
+    }
+    const distinct = parseMongoDistinctCommand(sql);
+    if (distinct) {
+      const result = await withTimeout(mongoDistinct(config, distinct.collection, distinct.field, distinct.filter), resolveTimeoutMs(options));
+      return mongoDistinctToQueryResult(distinct.field, result.documents.slice(0, resolveMaxRows(options)));
     }
     const getIndexes = parseMongoGetIndexesCommand(sql);
     if (getIndexes) {
@@ -927,9 +1037,7 @@ export async function executeQuery(config: ConnectionConfig, sql: string, option
       }
       return { columns: [], rows: [], row_count: result.affectedRows };
     }
-    throw new Error(
-      'Use MongoDB shell-style commands, for example: db.projects.find({}).limit(100), db.version(), db.projects.countDocuments({}), db.projects.count({}), db.projects.getIndexes(), db.projects.dataSize(), db.projects.storageSize(1024), db.projects.totalIndexSize(), db.projects.stats(), db.projects.createIndex({...}), db.projects.dropIndex("name"), db.projects.dropIndexes(), db.projects.drop(), db.projects.insertOne({...}), db.projects.updateOne({...}, {$set: {...}}), or db.projects.deleteOne({...})',
-    );
+    throw new Error(describeMongoCommandParseFailure(sql));
   }
   if (isDirectQueryType(config.db_type)) {
     return query(config, sql, undefined, options);
@@ -970,7 +1078,7 @@ async function executeRedisCommandDirect(config: ConnectionConfig, db: number, c
   const command = argv[0].toUpperCase();
   const safety = classifyRedisCommand(command) as RedisCommandSafety;
   if (!options?.skipSafetyCheck && safety === "blocked") {
-    throw new Error(`Redis command is blocked for safety: ${command}`);
+    throw new Error("Redis command is blocked for safety. Enable dangerous commands with DBX_MCP_ALLOW_DANGEROUS_SQL=1.");
   }
 
   const { Redis } = await import("ioredis");
@@ -1220,7 +1328,7 @@ async function executeMongoWrite(config: ConnectionConfig, command: MongoWriteCo
   return { affectedRows: result.affected_rows };
 }
 
-async function mongoAggregateDocuments(config: ConnectionConfig, collection: string, pipelineJson: string, maxRows: number): Promise<MongoDocumentResult> {
+async function mongoAggregateDocuments(config: ConnectionConfig, collection: string, pipelineJson: string, maxRows: number, optionsJson?: string): Promise<MongoDocumentResult> {
   return bridgeDataRequest<MongoDocumentResult>("/data/mongo/aggregate-documents", {
     connection_id: config.id,
     connection_name: config.name,
@@ -1228,7 +1336,28 @@ async function mongoAggregateDocuments(config: ConnectionConfig, collection: str
     collection,
     pipeline_json: pipelineJson,
     max_rows: maxRows,
+    ...(optionsJson ? { options_json: optionsJson } : {}),
   });
+}
+
+async function mongoDistinct(config: ConnectionConfig, collection: string, field: string, filter?: string): Promise<MongoDocumentResult> {
+  return bridgeDataRequest<MongoDocumentResult>("/data/mongo/distinct", {
+    connection_id: config.id,
+    connection_name: config.name,
+    database: config.database || "",
+    collection,
+    field,
+    filter,
+  });
+}
+
+/** distinct returns bare values, so the single column is named after the field. */
+export function mongoDistinctToQueryResult(field: string, values: unknown[]): QueryResult {
+  return {
+    columns: [field],
+    rows: values.map((value) => ({ [field]: toCellValue(value) })),
+    row_count: values.length,
+  };
 }
 
 export function mongoCollectionStatsToQueryResult(metric: MongoCollectionStatsMetric, stats: Record<string, unknown>): QueryResult {
@@ -1310,9 +1439,10 @@ interface MongoCountDocumentsCommand {
   mode: "accurate" | "legacy";
 }
 
-interface MongoAggregateCommand {
+interface MongoDistinctCommand {
   collection: string;
-  pipeline: string;
+  field: string;
+  filter?: string;
 }
 
 interface MongoGetIndexesCommand {
@@ -1405,15 +1535,26 @@ function parseFindCountCommand(source: string): MongoCountDocumentsCommand | nul
   return filter ? { collection: target.collection, filter, mode: "legacy" } : null;
 }
 
-export function parseMongoAggregateCommand(input: string): MongoAggregateCommand | null {
+export function parseMongoDistinctCommand(input: string): MongoDistinctCommand | null {
   const source = input.trim().replace(/;$/, "").trim();
-  const target = parseCollectionMethodTarget(source, "aggregate");
+  const target = parseCollectionMethodTarget(source, "distinct");
   if (!target) return null;
   const args = parseMethodArgs(source, target.methodCallIndex);
-  if (!args || args.length !== 1) return null;
-  const pipeline = normalizeJsonArgument(args[0]);
-  if (!pipeline) return null;
-  return Array.isArray(JSON.parse(pipeline)) ? { collection: target.collection, pipeline } : null;
+  if (!args || args.length < 1 || args.length > 2) return null;
+
+  const fieldJson = normalizeJsonArgument(args[0] ?? "");
+  if (!fieldJson) return null;
+  let field: unknown;
+  try {
+    field = JSON.parse(fieldJson);
+  } catch {
+    return null;
+  }
+  if (typeof field !== "string" || !field.trim()) return null;
+
+  if (args.length === 1) return { collection: target.collection, field };
+  const filter = normalizeJsonArgument(args[1] ?? "");
+  return filter ? { collection: target.collection, field, filter } : null;
 }
 
 export function parseMongoGetIndexesCommand(input: string): MongoGetIndexesCommand | null {
@@ -1582,15 +1723,6 @@ export function evaluateMongoAggregateSafety(command: MongoAggregateCommand, opt
   return { allowed: true };
 }
 
-function parseCollectionMethodTarget(source: string, method: string): { collection: string; methodCallIndex: number } | null {
-  const escapedMethod = escapeRegExp(method);
-  const direct = new RegExp(`^db\\s*\\.\\s*([A-Za-z_$][\\w$]*)\\s*\\.\\s*${escapedMethod}\\s*\\(`).exec(source);
-  if (direct) return { collection: direct[1], methodCallIndex: findChainedMethodCallIndex(source, method) };
-  const quoted = new RegExp(`^db\\s*\\.\\s*getCollection\\s*\\(\\s*(['"])([^'"]+)\\1\\s*\\)\\s*\\.\\s*${escapedMethod}\\s*\\(`).exec(source);
-  if (quoted) return { collection: quoted[2], methodCallIndex: findChainedMethodCallIndex(source, method) };
-  return null;
-}
-
 function parseMethodArgs(source: string, methodCallIndex: number): string[] | null {
   const openIndex = source.indexOf("(", methodCallIndex);
   const closeIndex = findMatchingParen(source, openIndex);
@@ -1615,33 +1747,11 @@ function hasSingleEmptyChainedCall(chain: string, method: string): boolean {
   return closeIndex >= 0 && !trimmed.slice(openIndex + 1, closeIndex).trim() && !trimmed.slice(closeIndex + 1).trim();
 }
 
-function findChainedMethodCallIndex(source: string, method: string): number {
-  return chainedMethodCallPattern(method).exec(source)?.index ?? -1;
-}
-
-function chainedMethodCallPattern(method: string): RegExp {
-  return new RegExp(`\\.\\s*${escapeRegExp(method)}\\s*\\(`, "g");
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
 function readChainedIntegerArgument(chain: string, method: string, fallback: number): number | null {
   const arg = readChainedCallArgument(chain, method);
   if (arg === undefined) return fallback;
   if (!/^\d+$/.test(arg.trim())) return null;
   return Number(arg.trim());
-}
-
-function normalizeJsonArgument(arg: string): string | null {
-  const value = quoteUnquotedObjectKeys(convertSingleQuotedStrings((arg.trim() || "{}").replace(/ObjectId\s*\(\s*["']([^"']+)["']\s*\)/g, '{"$oid":"$1"}')));
-  try {
-    JSON.parse(value);
-    return value;
-  } catch {
-    return null;
-  }
 }
 
 function parseMongoDropIndexArgument(args: string[]): string | null {
@@ -1674,98 +1784,6 @@ function parseMongoCollectionStatsScale(args: string[]): number | undefined | nu
   return scale;
 }
 
-function convertSingleQuotedStrings(source: string): string {
-  let result = "";
-  let copiedUntil = 0;
-  let quote: string | null = null;
-  let start = 0;
-  let value = "";
-  let escaped = false;
-
-  for (let i = 0; i < source.length; i += 1) {
-    const char = source[i];
-    if (!quote) {
-      if (char === "'") {
-        quote = char;
-        start = i;
-        value = "";
-        escaped = false;
-      } else if (char === '"') {
-        quote = char;
-      }
-      continue;
-    }
-
-    if (quote === '"') {
-      if (escaped) escaped = false;
-      else if (char === "\\") escaped = true;
-      else if (char === '"') quote = null;
-      continue;
-    }
-
-    if (escaped) {
-      value += char;
-      escaped = false;
-    } else if (char === "\\") {
-      escaped = true;
-    } else if (char === "'") {
-      result += source.slice(copiedUntil, start) + JSON.stringify(value);
-      copiedUntil = i + 1;
-      quote = null;
-    } else {
-      value += char;
-    }
-  }
-
-  return quote === "'" ? source : result + source.slice(copiedUntil);
-}
-
-function quoteUnquotedObjectKeys(source: string): string {
-  let result = "";
-  let quote: string | null = null;
-  let escaped = false;
-
-  for (let i = 0; i < source.length; i += 1) {
-    const char = source[i];
-    if (quote) {
-      result += char;
-      if (escaped) escaped = false;
-      else if (char === "\\") escaped = true;
-      else if (char === quote) quote = null;
-      continue;
-    }
-
-    if (char === '"' || char === "'") {
-      quote = char;
-      result += char;
-      continue;
-    }
-
-    if (/[A-Za-z_$]/.test(char) && shouldQuoteObjectKey(source, i)) {
-      let end = i + 1;
-      while (/[\w$]/.test(source[end] || "")) end += 1;
-      result += `"${source.slice(i, end)}"`;
-      i = end - 1;
-      continue;
-    }
-
-    result += char;
-  }
-
-  return result;
-}
-
-function shouldQuoteObjectKey(source: string, index: number): boolean {
-  let before = index - 1;
-  while (/\s/.test(source[before] || "")) before -= 1;
-  if (source[before] !== "{" && source[before] !== ",") return false;
-
-  let after = index + 1;
-  while (/[\w$]/.test(source[after] || "")) after += 1;
-  while (/\s/.test(source[after] || "")) after += 1;
-  return source[after] === ":";
-}
-
 function parseNormalizedJson(json: string): unknown {
   try {
     return JSON.parse(json);
@@ -1793,51 +1811,6 @@ function mongoDropIndexesRequiresDangerous(command: MongoWriteCommand): boolean 
   const parsed = parseNormalizedJson(command.indexes);
   if (parsed === "*") return true;
   return Array.isArray(parsed) && parsed.length > 1;
-}
-
-function splitTopLevel(source: string): string[] {
-  const parts: string[] = [];
-  let depth = 0;
-  let start = 0;
-  let quote: string | null = null;
-  for (let i = 0; i < source.length; i += 1) {
-    const ch = source[i];
-    if (quote) {
-      if (ch === "\\" && i + 1 < source.length) i += 1;
-      else if (ch === quote) quote = null;
-      continue;
-    }
-    if (ch === "'" || ch === '"') quote = ch;
-    else if (ch === "{" || ch === "[" || ch === "(") depth += 1;
-    else if (ch === "}" || ch === "]" || ch === ")") depth -= 1;
-    else if (ch === "," && depth === 0) {
-      parts.push(source.slice(start, i));
-      start = i + 1;
-    }
-  }
-  parts.push(source.slice(start));
-  return parts;
-}
-
-function findMatchingParen(source: string, openIndex: number): number {
-  if (openIndex < 0 || source[openIndex] !== "(") return -1;
-  let depth = 0;
-  let quote: string | null = null;
-  for (let i = openIndex; i < source.length; i += 1) {
-    const ch = source[i];
-    if (quote) {
-      if (ch === "\\" && i + 1 < source.length) i += 1;
-      else if (ch === quote) quote = null;
-      continue;
-    }
-    if (ch === "'" || ch === '"') quote = ch;
-    else if (ch === "(") depth += 1;
-    else if (ch === ")") {
-      depth -= 1;
-      if (depth === 0) return i;
-    }
-  }
-  return -1;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

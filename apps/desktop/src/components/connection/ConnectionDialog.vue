@@ -21,6 +21,7 @@ import { CONNECTION_ATTEMPT_CANCELLED_MESSAGE, useConnectionStore } from "@/stor
 import { useTunnelProfileStore } from "@/stores/tunnelProfileStore";
 import { detachTunnelProfileLayer, tunnelProfileReferenceLayer, tunnelProfileSummary } from "@/lib/connection/tunnelProfiles";
 import { applySshConfigHostAliasPrefill as prefillSshConfigHostAlias } from "@/lib/connection/sshConfigHosts";
+import { connectionEditDraftSyncAction } from "./connectionEditDraftSync";
 import { REDIS_SCAN_PAGE_SIZE_DEFAULT, REDIS_SCAN_PAGE_SIZE_MIN, REDIS_SCAN_PAGE_SIZE_MAX, REDIS_SCAN_PAGE_SIZE_OPTIONS } from "@/lib/redis/redisKeyPattern";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useToast } from "@/composables/useToast";
@@ -40,9 +41,11 @@ import { copyToClipboard } from "@/lib/common/clipboard";
 import { configuredDatabaseProductName, connectionConfigFingerprint, databaseInfoCopyText, databaseInfoRows, normalizeDatabaseConnectionInfo, type DatabaseInfoField } from "@/lib/connection/connectionDatabaseInfo";
 import { agentDriverInstallKey, appendAgentDriverUpdateHint, hasAgentDriverUpdate, showAgentDriverInstallHint, type AgentDriverInstallState, type DriverStoreFocus } from "@/lib/connection/agentDriverInstallHint";
 import { prestoSqlBuiltinDriverPaths } from "@/lib/database/prestoSqlBuiltinDriver";
+import { JDBCX_DEFAULT_URL, JDBCX_DRIVER_PROFILE, JDBCX_JDBC_DRIVER_CLASS, ensureJdbcxRuntimeDrivers, isJdbcxRuntimeBundle, isJdbcxRuntimePath, jdbcxHighPrivilegeExtensionsEnabled, setJdbcxHighPrivilegeExtensionsEnabled } from "@/lib/database/jdbcxBuiltinDriver";
 import { SQLITE_DATABASE_FILE_EXTENSIONS } from "@/lib/database/databaseFileDetection";
 import { connectionAttemptOriginalErrorMessage, connectionAttemptTimeoutMessage, connectionAttemptTimeoutMs } from "@/lib/connection/connectionAttemptTimeout";
 import { appendConnectionErrorHints } from "@/lib/connection/connectionErrorHints";
+import { postgresTlsModeForForm } from "@/lib/connection/postgresTlsMode";
 import { normalizeKafkaBootstrapServers } from "@/lib/connection/kafkaBootstrapServers";
 import { detectMqUiAuthKind, isMqAuthKindAllowedForSystem, type MqUiAuthKind } from "@/lib/connection/mqAuth";
 import { driverInstallProgressPercent, type DriverInstallProgress } from "@/lib/connection/driverInstallProgressUi";
@@ -99,6 +102,7 @@ type JdbcDriverSelectItem = {
   id: string;
   label: string;
   paths: string[];
+  jdbcxRuntime: boolean;
 };
 
 const DREMIO_ARROW_FLIGHT_SQL_JDBC_URL = "jdbc:arrow-flight-sql://127.0.0.1:32010";
@@ -503,17 +507,17 @@ const mqTlsSkipVerify = ref(false);
 const mqPinnedVersion = ref(pinnedVersionToSelection(undefined));
 const mqTokenSigningMode = ref<MqTokenSigningMode>("none");
 const mqTokenSigningKey = ref("");
-const mqSystemOptions: Array<{ value: MqSystemKind; label: string }> = [
-  { value: "pulsar", label: "Apache Pulsar" },
-  { value: "kafka", label: "Apache Kafka" },
-];
-const mqKafkaSecurityProtocolOptions = [
-  { value: MQ_KAFKA_SECURITY_PROTOCOL_AUTO, label: "Auto" },
+const mqSystemOptions = computed(() => [
+  { value: "pulsar" as const, label: t("connection.mqSystemPulsar") },
+  { value: "kafka" as const, label: t("connection.mqSystemKafka") },
+]);
+const mqKafkaSecurityProtocolOptions = computed(() => [
+  { value: MQ_KAFKA_SECURITY_PROTOCOL_AUTO, label: t("connection.mqSecurityAuto") },
   { value: "PLAINTEXT", label: "PLAINTEXT" },
   { value: "SSL", label: "SSL" },
   { value: "SASL_PLAINTEXT", label: "SASL_PLAINTEXT" },
   { value: "SASL_SSL", label: "SASL_SSL" },
-];
+]);
 const mqKafkaSaslMechanismOptions = [
   { value: "PLAIN", label: "PLAIN" },
   { value: "SCRAM-SHA-256", label: "SCRAM-SHA-256" },
@@ -547,11 +551,13 @@ const jdbcDriverSelectItems = computed<JdbcDriverSelectItem[]>(() => {
     id: `local:${bundle.id}`,
     label: bundle.name,
     paths: bundle.artifacts.map((artifact) => artifact.path),
+    jdbcxRuntime: bundle.artifacts.some((artifact) => isJdbcxRuntimePath(artifact.path)),
   }));
   const bundles = jdbcMavenBundles.value.map((bundle) => ({
     id: `maven:${bundle.id}`,
     label: bundle.coordinate,
     paths: bundle.artifacts.map((artifact) => artifact.path),
+    jdbcxRuntime: isJdbcxRuntimeBundle(bundle),
   }));
   const manual = jdbcDrivers.value
     .filter((driver) => !driver.bundle_id)
@@ -559,6 +565,7 @@ const jdbcDriverSelectItems = computed<JdbcDriverSelectItem[]>(() => {
       id: `manual:${driver.path}`,
       label: driver.name,
       paths: [driver.path],
+      jdbcxRuntime: isJdbcxRuntimePath(driver.path),
     }));
   return [...localBundles, ...bundles, ...manual].sort((left, right) => left.label.localeCompare(right.label));
 });
@@ -722,6 +729,7 @@ const driverProfiles: Record<
   db2: { type: "db2", port: 50000, user: "db2inst1", label: "IBM DB2", icon: "db2" },
   informix: { type: "informix", port: 9088, user: "informix", label: "Informix", icon: "informix" },
   dremio: { type: "jdbc", port: 31010, user: "", label: "Dremio", icon: "dremio" },
+  jdbcx: { type: "jdbc", port: 0, user: "", label: "JDBCX", icon: "jdbcx" },
   neo4j: { type: "neo4j", port: 7687, user: "neo4j", label: "Neo4j", icon: "neo4j" },
   cassandra: { type: "cassandra", port: 9042, user: "cassandra", label: "Cassandra", icon: "cassandra" },
   bigquery: {
@@ -970,9 +978,9 @@ function buildMqAuth(): MqAuth {
     case "oauth2":
       return {
         kind: "oauth2",
-        issuerUrl: requireMqField(mqOauthIssuerUrl.value, "OAuth2 auth requires an issuer URL"),
-        clientId: requireMqField(mqOauthClientId.value, "OAuth2 auth requires a client ID"),
-        clientSecret: requireMqField(mqOauthClientSecret.value, "OAuth2 auth requires a client secret"),
+        issuerUrl: requireMqField(mqOauthIssuerUrl.value, t("connection.mqOauthIssuerRequired")),
+        clientId: requireMqField(mqOauthClientId.value, t("connection.mqOauthClientIdRequired")),
+        clientSecret: requireMqField(mqOauthClientSecret.value, t("connection.mqOauthClientSecretRequired")),
         audience: mqOauthAudience.value.trim() || undefined,
         scope: mqOauthScope.value.trim() || undefined,
       };
@@ -991,7 +999,7 @@ function buildMqTokenSigning() {
   if (mqTokenSigningMode.value === "none") return undefined;
   return {
     algorithm: mqTokenSigningMode.value,
-    key: requireMqField(mqTokenSigningKey.value, "Broker token signing key is required"),
+    key: requireMqField(mqTokenSigningKey.value, t("connection.mqTokenSigningKeyRequired")),
   };
 }
 
@@ -1025,7 +1033,7 @@ function buildMqAdminConfig(): MqAdminConfig {
 
   return {
     systemKind: mqSystemKind.value,
-    adminUrl: requireMqField(mqAdminUrl.value, "MQ Admin URL is required"),
+    adminUrl: requireMqField(mqAdminUrl.value, t("connection.mqAdminUrlRequired")),
     auth: buildMqAuth(),
     tlsSkipVerify: mqTlsSkipVerify.value || undefined,
     pinnedVersion: selectionToPinnedVersion(mqPinnedVersion.value),
@@ -1198,6 +1206,21 @@ async function ensureRequiredAgentDriverInstalled(config: ConnectionConfig): Pro
   }
 }
 
+async function ensureRequiredJdbcxDriverInstalled(config: ConnectionConfig): Promise<void> {
+  const result = await ensureJdbcxRuntimeDrivers(config, api, () => {
+    testResult.value = { ok: true, message: "Installing JDBC plugin..." };
+  });
+  if (!result) return;
+
+  jdbcMavenBundles.value = result.bundles;
+  addJdbcDriverPaths(result.paths);
+  form.value.jdbc_driver_paths = [...(config.jdbc_driver_paths ?? [])];
+  selectedJdbcDriverPath.value = result.runtimeSelectionId;
+  if (result.paths.length > 0) {
+    jdbcManualClasspathOpen.value = false;
+  }
+}
+
 async function installSqlServerLegacyCompatibilityComponentIfNeeded(): Promise<boolean> {
   if (await api.isAgentInstalled(SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY)) return true;
 
@@ -1324,7 +1347,7 @@ function applyMqAdminUrl(config: LegacyConnectionConfig, adminUrl: string) {
   try {
     parsed = new URL(adminUrl);
   } catch {
-    throw new Error("MQ Admin URL is invalid");
+    throw new Error(t("connection.mqAdminUrlInvalid"));
   }
   const port = Number(parsed.port) || (parsed.protocol === "https:" ? 443 : 8080);
   config.host = parsed.hostname;
@@ -1334,12 +1357,12 @@ function applyMqAdminUrl(config: LegacyConnectionConfig, adminUrl: string) {
 
 function applyMqKafkaBootstrapServers(config: LegacyConnectionConfig, bootstrapServers: string, securityProtocol?: string) {
   const first = normalizeKafkaBootstrapServers(bootstrapServers).split(",")[0];
-  if (!first) throw new Error("Kafka bootstrap servers are required");
+  if (!first) throw new Error(t("connection.mqBootstrapServersRequired"));
   let parsed: URL;
   try {
     parsed = new URL(`kafka://${first}`);
   } catch {
-    throw new Error("Kafka bootstrap servers are invalid");
+    throw new Error(t("connection.mqBootstrapServersInvalid"));
   }
   config.host = parsed.hostname;
   config.port = Number(parsed.port) || 9092;
@@ -1470,6 +1493,9 @@ function applyProfile(val: string, preserveConnectionFields = false) {
       if (val === "dremio") {
         resetDremioConnectionUrls();
         applyDremioConnectionMode("legacy");
+      } else if (val === JDBCX_DRIVER_PROFILE) {
+        form.value.connection_string = JDBCX_DEFAULT_URL;
+        form.value.jdbc_driver_class = JDBCX_JDBC_DRIVER_CLASS;
       }
     }
     if (profile.type === "prestosql") {
@@ -1529,8 +1555,9 @@ function switchGbaseProfile(profile: "gbase8a" | "gbase8s") {
 watch(
   [() => props.editConfig, open],
   ([config, isOpen]) => {
-    if (!isOpen) return;
-    if (config) {
+    const syncAction = connectionEditDraftSyncAction(config?.id ?? null, isOpen, editingId.value);
+    if (syncAction === "preserve") return;
+    if (syncAction === "hydrate" && config) {
       clearSavedDatabaseInfo();
       const legacyConfig = config as LegacyConnectionConfig;
       const profile = profileForConfig(config);
@@ -1836,6 +1863,7 @@ const iconTypeMap: Record<string, string> = {
   db2: "db2",
   informix: "informix",
   dremio: "dremio",
+  jdbcx: "jdbcx",
   iris: "iris",
   neo4j: "neo4j",
   cassandra: "cassandra",
@@ -1921,6 +1949,7 @@ const dbOptions: DbOption[] = [
   { value: "nacos", label: "Nacos" },
   { value: "influxdb", label: "InfluxDB" },
   { value: "iris", label: "IRIS" },
+  { value: "jdbcx", label: "JDBCX" },
   { value: "manticoresearch", label: "Manticore Search" },
   { value: "custom_mysql", label: "Custom (MySQL)" },
   { value: "custom_postgres", label: "Custom (PostgreSQL)" },
@@ -1954,6 +1983,14 @@ const hasDbPickerResults = computed(() => filteredDbCategories.value.some((categ
 const selectedDbIcon = computed(() => iconTypeMap[selectedType.value] || selectedProfile().icon || selectedType.value);
 const jdbcBackedDatabaseTypes = new Set<DatabaseType>(["jdbc", "prestosql"]);
 const isJdbcConnection = computed(() => form.value.db_type === "jdbc");
+const isJdbcxConnection = computed(() => isJdbcConnection.value && form.value.driver_profile === JDBCX_DRIVER_PROFILE);
+const jdbcxHighPrivilegeExtensionsAllowed = computed({
+  get: () => jdbcxHighPrivilegeExtensionsEnabled(form.value),
+  set: (enabled: boolean) => {
+    setJdbcxHighPrivilegeExtensionsEnabled(form.value, enabled);
+    resetTestState();
+  },
+});
 const isPrestoSqlConnection = computed(() => form.value.db_type === "prestosql");
 const isH2FileMode = computed(() => form.value.db_type === "h2" && h2ConnectionMode.value === "file");
 const usesLocalFilePathInput = computed(() => isLocalFileTypeDb(form.value.db_type) && (form.value.db_type !== "h2" || isH2FileMode.value));
@@ -2010,11 +2047,7 @@ const mysqlClientKeyPath = computed({
 const nativePostgresTlsDatabaseTypes = new Set<DatabaseType>(["postgres", "redshift", "gaussdb", "kwdb", "opengauss"]);
 const supportsPostgresTlsOptions = computed(() => nativePostgresTlsDatabaseTypes.has(form.value.db_type));
 const postgresTlsMode = computed({
-  get: () => {
-    const value = normalizePostgresSslMode(getUrlParam(form.value.url_params, "sslmode"));
-    if (value) return value;
-    return form.value.ssl ? "require" : "disable";
-  },
+  get: () => postgresTlsModeForForm(getUrlParam(form.value.url_params, "sslmode"), form.value.ssl),
   set: (value: string) => {
     form.value.ssl = value !== "disable";
     form.value.url_params = setUrlParam(form.value.url_params, "sslmode", value);
@@ -2316,6 +2349,7 @@ async function testConnection() {
   try {
     config = connectionConfigForSubmit(editingId.value || draftTestConnectionId.value);
     await ensureRequiredAgentDriverInstalled(config);
+    await ensureRequiredJdbcxDriverInstalled(config);
     const result = await testConnectionWithTimeout(config, runId);
     if (runId !== testRunId) return;
     let successfulConfig = config;
@@ -2547,7 +2581,7 @@ function connectionConfigForSubmit(id: string, generatedName = ""): ConnectionCo
     });
     config.url_params = hiveKerberos.urlParams;
     config.agent_java_options = hiveKerberos.agentJavaOptions;
-  } else {
+  } else if (!(config.db_type === "jdbc" && config.driver_profile === JDBCX_DRIVER_PROFILE)) {
     config.agent_java_options = undefined;
   }
   if (config.db_type === "informix" && config.informix_server) {
@@ -2710,6 +2744,11 @@ function connectionConfigForSubmit(id: string, generatedName = ""): ConnectionCo
     if (config.db_type === "jdbc") {
       if (config.driver_profile === "dremio") {
         applyDremioJdbcMetadata(config);
+      } else if (config.driver_profile === JDBCX_DRIVER_PROFILE) {
+        config.host = "";
+        config.port = 0;
+        config.connection_string = config.connection_string?.trim() || JDBCX_DEFAULT_URL;
+        config.jdbc_driver_class = config.jdbc_driver_class?.trim() || JDBCX_JDBC_DRIVER_CLASS;
       } else {
         config.host = "";
         config.port = 0;
@@ -2878,22 +2917,6 @@ function applyMysqlTlsMode(params: string | undefined, mode: string): string {
   }
   next = setUrlParam(next, "verify_ca", "true");
   return setUrlParam(next, "verify_identity", "true");
-}
-
-function normalizePostgresSslMode(value: string): string {
-  switch (value.trim().toLowerCase()) {
-    case "disable":
-    case "prefer":
-    case "require":
-    case "verify-ca":
-    case "verify-full":
-      return value.trim().toLowerCase();
-    case "verify_identity":
-    case "verify-identity":
-      return "verify-full";
-    default:
-      return "";
-  }
 }
 
 function normalizeRedisSentinelNodes(value: string): string {
@@ -3978,7 +4001,16 @@ function onJdbcDriverSelect(id: any) {
   const item = jdbcDriverSelectItemById.value.get(id);
   if (!item) return;
   selectedJdbcDriverPath.value = id;
-  addJdbcDriverPaths(item.paths);
+  if (isJdbcxConnection.value && item.jdbcxRuntime) {
+    const installedJdbcxRuntimePaths = new Set(jdbcDriverSelectItems.value.filter((candidate) => candidate.jdbcxRuntime).flatMap((candidate) => candidate.paths));
+    const existingPaths = jdbcDriverPathsInput.value
+      .split(/\r?\n/)
+      .map((path) => path.trim())
+      .filter((path) => path && !installedJdbcxRuntimePaths.has(path));
+    jdbcDriverPathsInput.value = Array.from(new Set([...existingPaths, ...item.paths])).join("\n");
+  } else {
+    addJdbcDriverPaths(item.paths);
+  }
   jdbcManualClasspathOpen.value = false;
 }
 
@@ -4255,6 +4287,16 @@ function openExternalUrl(url: string) {
                     <Label :class="connectionLabelClass">{{ t("connection.jdbcUrl") }}</Label>
                     <Input v-model="form.connection_string" class="col-span-3" :placeholder="t('connection.jdbcUrlPlaceholder')" @blur="syncDremioConnectionModeFromUrl" />
                   </div>
+                  <div v-if="isJdbcxConnection" class="grid grid-cols-4 items-start gap-4">
+                    <Label :class="connectionLabelTopClass">{{ t("connection.jdbcxExtensions") }}</Label>
+                    <div class="col-span-3 flex items-start justify-between gap-4 rounded-md border px-3 py-2" :class="jdbcxHighPrivilegeExtensionsAllowed ? 'border-amber-500/60 bg-amber-500/10' : 'bg-muted/20'">
+                      <div class="space-y-1">
+                        <div class="text-sm font-medium">{{ t("connection.jdbcxHighPrivilegeExtensions") }}</div>
+                        <p class="text-xs text-muted-foreground">{{ t("connection.jdbcxHighPrivilegeExtensionsWarning") }}</p>
+                      </div>
+                      <Switch v-model="jdbcxHighPrivilegeExtensionsAllowed" class="mt-0.5 shrink-0" />
+                    </div>
+                  </div>
                   <div class="grid grid-cols-4 items-center gap-4">
                     <Label :class="connectionLabelClass">{{ t("connection.user") }}</Label>
                     <Input v-model="form.username" class="col-span-3" :placeholder="jdbcUsernamePlaceholder" />
@@ -4420,7 +4462,7 @@ function openExternalUrl(url: string) {
                 <!-- Message Queue: admin URL and auth -->
                 <template v-else-if="form.db_type === 'mq'">
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label :class="connectionLabelClass">System</Label>
+                    <Label :class="connectionLabelClass">{{ t("connection.mqSystem") }}</Label>
                     <Select v-model="mqSystemKind">
                       <SelectTrigger class="col-span-3 h-9">
                         <SelectValue />
@@ -4434,11 +4476,11 @@ function openExternalUrl(url: string) {
                   </div>
                   <template v-if="mqSystemKind === 'kafka'">
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label :class="connectionLabelClass">Bootstrap Servers</Label>
-                      <Input v-model="mqKafkaBootstrapServers" class="col-span-3" placeholder="127.0.0.1:9092" />
+                      <Label :class="connectionLabelClass">{{ t("connection.mqBootstrapServers") }}</Label>
+                      <Input v-model="mqKafkaBootstrapServers" class="col-span-3" :placeholder="t('connection.mqBootstrapServersPlaceholder')" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label :class="connectionLabelClass">Security</Label>
+                      <Label :class="connectionLabelClass">{{ t("connection.mqSecurity") }}</Label>
                       <Select v-model="mqKafkaSecurityProtocol">
                         <SelectTrigger class="col-span-3 h-9">
                           <SelectValue />
@@ -4453,24 +4495,24 @@ function openExternalUrl(url: string) {
                   </template>
                   <template v-else>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label :class="connectionLabelClass">Admin URL</Label>
+                      <Label :class="connectionLabelClass">{{ t("connection.mqAdminUrl") }}</Label>
                       <Input v-model="mqAdminUrl" class="col-span-3" placeholder="http://127.0.0.1:8080" />
                     </div>
                   </template>
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label :class="connectionLabelClass">Auth</Label>
+                    <Label :class="connectionLabelClass">{{ t("connection.mqAuth") }}</Label>
                     <div class="col-span-3 flex flex-wrap gap-2">
-                      <Button size="sm" :variant="mqAuthKind === 'none' ? 'default' : 'outline'" @click="mqAuthKind = 'none'">None</Button>
-                      <Button v-if="mqSystemKind !== 'kafka'" size="sm" :variant="mqAuthKind === 'token' ? 'default' : 'outline'" @click="mqAuthKind = 'token'">Token</Button>
-                      <Button size="sm" :variant="mqAuthKind === 'basic' ? 'default' : 'outline'" @click="mqAuthKind = 'basic'">Basic</Button>
-                      <Button v-if="mqSystemKind === 'kafka'" size="sm" :variant="mqAuthKind === 'kerberos' ? 'default' : 'outline'" @click="mqAuthKind = 'kerberos'">Kerberos</Button>
-                      <Button v-if="mqSystemKind !== 'kafka'" size="sm" :variant="mqAuthKind === 'apiKey' ? 'default' : 'outline'" @click="mqAuthKind = 'apiKey'">API Key</Button>
-                      <Button v-if="mqSystemKind !== 'kafka'" size="sm" :variant="mqAuthKind === 'oauth2' ? 'default' : 'outline'" @click="mqAuthKind = 'oauth2'">OAuth2</Button>
+                      <Button size="sm" :variant="mqAuthKind === 'none' ? 'default' : 'outline'" @click="mqAuthKind = 'none'">{{ t("connection.mqAuthNone") }}</Button>
+                      <Button v-if="mqSystemKind !== 'kafka'" size="sm" :variant="mqAuthKind === 'token' ? 'default' : 'outline'" @click="mqAuthKind = 'token'">{{ t("connection.mqAuthToken") }}</Button>
+                      <Button size="sm" :variant="mqAuthKind === 'basic' ? 'default' : 'outline'" @click="mqAuthKind = 'basic'">{{ t("connection.mqAuthBasic") }}</Button>
+                      <Button v-if="mqSystemKind === 'kafka'" size="sm" :variant="mqAuthKind === 'kerberos' ? 'default' : 'outline'" @click="mqAuthKind = 'kerberos'">{{ t("connection.mqAuthKerberos") }}</Button>
+                      <Button v-if="mqSystemKind !== 'kafka'" size="sm" :variant="mqAuthKind === 'apiKey' ? 'default' : 'outline'" @click="mqAuthKind = 'apiKey'">{{ t("connection.mqAuthApiKey") }}</Button>
+                      <Button v-if="mqSystemKind !== 'kafka'" size="sm" :variant="mqAuthKind === 'oauth2' ? 'default' : 'outline'" @click="mqAuthKind = 'oauth2'">{{ t("connection.mqAuthOauth2") }}</Button>
                     </div>
                   </div>
                   <template v-if="mqAuthKind === 'token'">
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label :class="connectionLabelClass">Token</Label>
+                      <Label :class="connectionLabelClass">{{ t("connection.mqToken") }}</Label>
                       <PasswordInput v-model="mqToken" class="col-span-3" />
                     </div>
                   </template>
@@ -4484,7 +4526,7 @@ function openExternalUrl(url: string) {
                       <PasswordInput v-model="mqBasicPassword" class="col-span-3" />
                     </div>
                     <div v-if="mqSystemKind === 'kafka'" class="grid grid-cols-4 items-center gap-4">
-                      <Label :class="connectionLabelClass">SASL Mechanism</Label>
+                      <Label :class="connectionLabelClass">{{ t("connection.mqSaslMechanism") }}</Label>
                       <Select v-model="mqKafkaSaslMechanism">
                         <SelectTrigger class="col-span-3 h-9">
                           <SelectValue />
@@ -4544,45 +4586,45 @@ function openExternalUrl(url: string) {
                   </template>
                   <template v-else-if="mqAuthKind === 'apiKey'">
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label :class="connectionLabelClass">Header</Label>
+                      <Label :class="connectionLabelClass">{{ t("connection.mqApiKeyHeader") }}</Label>
                       <Input v-model="mqApiKeyHeader" class="col-span-3" placeholder="Authorization" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label :class="connectionLabelClass">Value</Label>
+                      <Label :class="connectionLabelClass">{{ t("connection.mqApiKeyValue") }}</Label>
                       <PasswordInput v-model="mqApiKeyValue" class="col-span-3" />
                     </div>
                   </template>
                   <template v-else-if="mqAuthKind === 'oauth2'">
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label :class="connectionLabelClass">Issuer URL</Label>
+                      <Label :class="connectionLabelClass">{{ t("connection.mqOauthIssuerUrl") }}</Label>
                       <Input v-model="mqOauthIssuerUrl" class="col-span-3" placeholder="https://issuer.example.com/oauth/token" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label :class="connectionLabelClass">Client ID</Label>
+                      <Label :class="connectionLabelClass">{{ t("connection.mqOauthClientId") }}</Label>
                       <Input v-model="mqOauthClientId" class="col-span-3" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label :class="connectionLabelClass">Client Secret</Label>
+                      <Label :class="connectionLabelClass">{{ t("connection.mqOauthClientSecret") }}</Label>
                       <PasswordInput v-model="mqOauthClientSecret" class="col-span-3" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label :class="connectionLabelClass">Audience</Label>
+                      <Label :class="connectionLabelClass">{{ t("connection.mqOauthAudience") }}</Label>
                       <Input v-model="mqOauthAudience" class="col-span-3" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label :class="connectionLabelClass">Scope</Label>
+                      <Label :class="connectionLabelClass">{{ t("connection.mqOauthScope") }}</Label>
                       <Input v-model="mqOauthScope" class="col-span-3" />
                     </div>
                   </template>
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label :class="connectionLabelSmallClass">TLS</Label>
+                    <Label :class="connectionLabelSmallClass">{{ t("connection.mqTls") }}</Label>
                     <label class="col-span-3 inline-flex items-center gap-2">
                       <input type="checkbox" v-model="mqTlsSkipVerify" class="mr-0" />
-                      <span class="text-xs text-muted-foreground">Skip certificate verification</span>
+                      <span class="text-xs text-muted-foreground">{{ t("connection.mqTlsSkipVerify") }}</span>
                     </label>
                   </div>
                   <div v-if="mqSystemKind !== 'kafka'" class="grid grid-cols-4 items-center gap-4">
-                    <Label :class="connectionLabelClass">Pinned Version</Label>
+                    <Label :class="connectionLabelClass">{{ t("connection.mqPinnedVersion") }}</Label>
                     <Select v-model="mqPinnedVersion">
                       <SelectTrigger class="col-span-3 h-9">
                         <SelectValue />
@@ -4598,29 +4640,29 @@ function openExternalUrl(url: string) {
                     </Select>
                   </div>
                   <div v-if="mqSystemKind !== 'kafka'" class="grid grid-cols-4 items-center gap-4">
-                    <Label :class="connectionLabelClass">Broker Token 签发</Label>
+                    <Label :class="connectionLabelClass">{{ t("connection.mqTokenSigning") }}</Label>
                     <Select v-model="mqTokenSigningMode">
                       <SelectTrigger class="col-span-3 h-9">
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
-                        <SelectItem value="none">不配置</SelectItem>
+                        <SelectItem value="none">{{ t("connection.mqTokenSigningNone") }}</SelectItem>
                         <SelectItem value="hs256">HS256 SECRET</SelectItem>
                         <SelectItem value="rs256">RS256 PRIVATE</SelectItem>
                       </SelectContent>
                     </Select>
                   </div>
                   <div v-if="mqSystemKind !== 'kafka' && mqTokenSigningMode !== 'none'" class="grid grid-cols-4 items-start gap-4">
-                    <Label class="pt-2 text-right">签发密钥</Label>
+                    <Label class="pt-2 text-right">{{ t("connection.mqTokenSigningKey") }}</Label>
                     <textarea
                       v-model="mqTokenSigningKey"
                       class="col-span-3 min-h-24 rounded-md border border-input bg-background px-3 py-2 text-sm shadow-sm outline-none focus-visible:ring-1 focus-visible:ring-ring"
-                      :placeholder="mqTokenSigningMode === 'hs256' ? 'Broker SECRET' : '-----BEGIN PRIVATE KEY-----'"
+                      :placeholder="mqTokenSigningMode === 'hs256' ? t('connection.mqTokenSigningKeyPlaceholderHs256') : t('connection.mqTokenSigningKeyPlaceholderRs256')"
                     />
                   </div>
                   <div v-if="mqSystemKind !== 'kafka' && mqTokenSigningMode !== 'none'" class="grid grid-cols-4 items-start gap-4">
                     <span />
-                    <p class="col-span-3 m-0 text-xs leading-5 text-muted-foreground">按 Broker 的 jwt.broker.token.mode 选择：SECRET 使用 HS256，PRIVATE 使用 RS256。密钥会走连接 secret 存储。</p>
+                    <p class="col-span-3 m-0 text-xs leading-5 text-muted-foreground">{{ t("connection.mqTokenSigningHint") }}</p>
                   </div>
                 </template>
 

@@ -1,17 +1,20 @@
 import { strict as assert } from "node:assert";
 import { test } from "vitest";
 import {
+  describeMongoCommandParseFailure,
   evaluateMongoAggregateSafety,
   evaluateMongoWriteSafety,
   mongoAggregateWriteStage,
   mongoCollectionStatsToQueryResult,
   mongoCountToQueryResult,
+  mongoDistinctToQueryResult,
   mongoDocumentsToQueryResult,
   mongoIndexesToQueryResult,
   parseMongoAggregateCommand,
   parseMongoCollectionStatsCommand,
   parseMongoCommand,
   parseMongoCountDocumentsCommand,
+  parseMongoDistinctCommand,
   parseMongoFindCommand,
   parseMongoFindOneCommand,
   parseMongoFindOneAndUpdateCommand,
@@ -239,6 +242,37 @@ test("parseMongoCommand normalizes outer comments around a command", () => {
   });
 });
 
+test("parseMongoCommand strips SQL-style -- comments the editor inserts", () => {
+  // The editor runs Mongo through its SQL language mode, whose line comment is `--`.
+  assert.equal(parseMongoCommand("-- current database\ndb.users.find({})")?.command.kind, "find");
+  assert.equal(parseMongoCommand("db.users.find({}) -- run this one")?.command.kind, "find");
+  assert.equal(parseMongoCommand("/* header */ db.users.find({}) -- trailer")?.command.kind, "find");
+  // Native // comments still work alongside --.
+  assert.equal(parseMongoCommand("// keep\ndb.users.find({})")?.command.kind, "find");
+});
+
+test("parseMongoCommand keeps comment markers that live inside string values", () => {
+  // A `--` or `//` inside a string must not be trimmed as a trailing comment.
+  const dash = parseMongoFindCommand('db.users.find({ note: "a--b" })');
+  assert.ok(dash);
+  assert.deepEqual(JSON.parse(dash.filter), { note: "a--b" });
+  const slash = parseMongoFindCommand('db.users.find({ url: "http://x" })');
+  assert.ok(slash);
+  assert.deepEqual(JSON.parse(slash.filter), { url: "http://x" });
+});
+
+test("splitMongoCommands splits statements separated by -- comment lines", () => {
+  const commands = splitMongoCommands(`
+    -- seed two rows
+    db.users.insertOne({ name: "A" });
+    db.users.insertOne({ name: "B" }) -- second
+  `);
+  assert.deepEqual(
+    commands.map(({ command }) => command.kind),
+    ["insert", "insert"],
+  );
+});
+
 test("parseMongoWriteCommand accepts unquoted insert and update commands", () => {
   assert.deepEqual(parseMongoWriteCommand("db.products.insertOne({name: 'demo', price: 1})"), {
     kind: "insert",
@@ -406,10 +440,66 @@ test("parseMongoAggregateCommand accepts an empty pipeline", () => {
   });
 });
 
-test("parseMongoAggregateCommand rejects non-array pipelines and extra arguments", () => {
+test("parseMongoAggregateCommand accepts official aggregate options document", () => {
+  assert.deepEqual(parseMongoAggregateCommand("db.products.aggregate([], {})"), {
+    collection: "products",
+    pipeline: "[]",
+    options: "{}",
+  });
+  const withExplain = parseMongoAggregateCommand("db.uc_user.aggregate([], {explain: true})");
+  assert.equal(withExplain?.collection, "uc_user");
+  assert.equal(withExplain?.pipeline, "[]");
+  assert.deepEqual(JSON.parse(withExplain?.options ?? "null"), { explain: true });
+
+  // Official aggregate options are parsed as a free-form object and forwarded to the server.
+  const fullOptions = parseMongoAggregateCommand(`db.products.aggregate(
+    [{"$match":{"active":true}}],
+    {
+      allowDiskUse: true,
+      cursor: { batchSize: 50 },
+      maxTimeMS: 1000,
+      collation: { locale: "en" },
+      hint: "status_1",
+      comment: "agg-test",
+      let: { year: 2024 }
+    }
+  )`);
+  assert.equal(fullOptions?.collection, "products");
+  assert.deepEqual(JSON.parse(fullOptions?.pipeline ?? "null"), [{ $match: { active: true } }]);
+  assert.deepEqual(JSON.parse(fullOptions?.options ?? "null"), {
+    allowDiskUse: true,
+    cursor: { batchSize: 50 },
+    maxTimeMS: 1000,
+    collation: { locale: "en" },
+    hint: "status_1",
+    comment: "agg-test",
+    let: { year: 2024 },
+  });
+});
+
+test("parseMongoAggregateCommand rejects non-array pipelines and invalid options", () => {
   assert.equal(parseMongoAggregateCommand('db.products.aggregate({"$match":{}})'), null);
-  assert.equal(parseMongoAggregateCommand("db.products.aggregate([], {})"), null);
+  assert.equal(parseMongoAggregateCommand("db.products.aggregate([], [])"), null);
+  assert.equal(parseMongoAggregateCommand("db.products.aggregate([], {explain: true"), null);
   assert.equal(parseMongoAggregateCommand("db.products.aggregate([]).limit(10)"), null);
+  assert.equal(parseMongoAggregateCommand("db.products.aggregate([], {}, true)"), null);
+});
+
+test("describeMongoCommandParseFailure reports unclosed delimiters and shell hints", () => {
+  const unclosed = describeMongoCommandParseFailure("db.uc_user.aggregate([], {explain: true");
+  assert.match(unclosed, /unclosed/i);
+
+  const chained = describeMongoCommandParseFailure("db.products.aggregate([]).limit(10)");
+  assert.match(chained, /chaining|not supported/i);
+
+  const nonArrayPipeline = describeMongoCommandParseFailure('db.products.aggregate({"$match":{}})');
+  assert.match(nonArrayPipeline, /pipeline must be a JSON array/i);
+
+  const badOptions = describeMongoCommandParseFailure("db.products.aggregate([], [])");
+  assert.match(badOptions, /options must be a JSON object/i);
+
+  const generic = describeMongoCommandParseFailure("SELECT 1");
+  assert.match(generic, /MongoDB shell-style commands/i);
 });
 
 test("parseMongoAggregateCommand normalises ObjectId arguments with either quote style", () => {
@@ -420,6 +510,57 @@ test("parseMongoAggregateCommand normalises ObjectId arguments with either quote
     assert.equal(command.collection, "orders");
     assert.deepEqual(JSON.parse(command.pipeline), [{ $match: { _id: { $oid: oid } } }]);
   }
+});
+
+test("parseMongoDistinctCommand parses a field with an optional filter", () => {
+  assert.deepEqual(parseMongoDistinctCommand('db.products.distinct("category")'), {
+    collection: "products",
+    field: "category",
+  });
+  assert.deepEqual(parseMongoDistinctCommand("db.products.distinct('category', { active: true })"), {
+    collection: "products",
+    field: "category",
+    filter: '{ "active": true }',
+  });
+  assert.deepEqual(parseMongoDistinctCommand('db.getCollection("audit.logs").distinct("level");'), {
+    collection: "audit.logs",
+    field: "level",
+  });
+});
+
+test("parseMongoDistinctCommand normalises shell constructors in its filter", () => {
+  const command = parseMongoDistinctCommand("db.orders.distinct(\"status\", { _id: ObjectId('507f1f77bcf86cd799439011') })");
+  assert.ok(command);
+  assert.deepEqual(JSON.parse(command.filter || "{}"), { _id: { $oid: "507f1f77bcf86cd799439011" } });
+});
+
+test("parseMongoDistinctCommand requires a non-empty string field", () => {
+  assert.equal(parseMongoDistinctCommand("db.products.distinct()"), null);
+  assert.equal(parseMongoDistinctCommand('db.products.distinct("")'), null);
+  assert.equal(parseMongoDistinctCommand("db.products.distinct({ category: 1 })"), null);
+  assert.equal(parseMongoDistinctCommand("db.products.distinct(category)"), null);
+  // Cursor chaining and extra arguments are rejected rather than silently ignored.
+  assert.equal(parseMongoDistinctCommand('db.products.distinct("category").limit(5)'), null);
+  assert.equal(parseMongoDistinctCommand('db.products.distinct("category", {}, {})'), null);
+});
+
+test("parseMongoCommand tags distinct with its own kind", () => {
+  assert.deepEqual(parseMongoCommand('db.products.distinct("category")')?.command, {
+    kind: "distinct",
+    collection: "products",
+    field: "category",
+  });
+});
+
+test("mongoDistinctToQueryResult names the column after the field", () => {
+  assert.deepEqual(mongoDistinctToQueryResult("category", ["books", "toys", null], 4), {
+    columns: ["category"],
+    rows: [["books"], ["toys"], [null]],
+    affected_rows: 3,
+    execution_time_ms: 4,
+  });
+  // ObjectId values are displayed, not dumped as raw extended JSON.
+  assert.deepEqual(mongoDistinctToQueryResult("owner", [{ $oid: "507f1f77bcf86cd799439011" }], 0).rows, [["507f1f77bcf86cd799439011"]]);
 });
 
 test("parseMongoGetIndexesCommand parses collection index commands", () => {
@@ -548,7 +689,7 @@ test("splitMongoCommandRanges preserve document offsets for newline-separated co
       },
       {
         from: source.indexOf('db.getCollection("entries")'),
-        to: source.indexOf('      .limit(5)') + "      .limit(5)".length,
+        to: source.indexOf("      .limit(5)") + "      .limit(5)".length,
         text: 'db.getCollection("entries")\n      .find({ status: "open" })\n      .limit(5)',
         kind: "find",
       },

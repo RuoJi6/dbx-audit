@@ -1,5 +1,6 @@
 pub mod agents;
 pub mod ai;
+pub mod ai_multi_config;
 pub mod app_settings;
 pub mod audit;
 pub mod cloud_sync;

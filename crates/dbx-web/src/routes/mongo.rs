@@ -128,6 +128,18 @@ pub struct MongoAggregateRequest {
     pub pipeline_json: String,
     pub max_rows: Option<usize>,
     pub execution_id: Option<String>,
+    pub options_json: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MongoDistinctRequest {
+    pub connection_id: String,
+    pub database: String,
+    pub collection: String,
+    pub field: String,
+    pub filter: Option<String>,
+    pub execution_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -428,6 +440,27 @@ pub async fn aggregate_documents(
             &req.collection,
             &req.pipeline_json,
             req.max_rows,
+            req.options_json.as_deref(),
+        ),
+    )
+    .await?;
+    Ok(Json(serde_json::to_value(result).map_err(|e| AppError(e.to_string()))?))
+}
+
+pub async fn distinct(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<MongoDistinctRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let result = run_cancellable(
+        &state,
+        req.execution_id.clone(),
+        dbx_core::mongo_ops::mongo_distinct_core(
+            &state.app,
+            &req.connection_id,
+            &req.database,
+            &req.collection,
+            &req.field,
+            req.filter.as_deref(),
         ),
     )
     .await?;
@@ -481,6 +514,7 @@ pub async fn insert_document(
         &req.database,
         &req.collection,
         &req.doc_json,
+        None,
     )
     .await
     .map_err(AppError)?;

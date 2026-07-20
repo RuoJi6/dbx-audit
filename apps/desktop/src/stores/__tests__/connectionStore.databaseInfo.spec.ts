@@ -74,6 +74,33 @@ describe("connectionStore database info", () => {
     expect(store.connectedIds.has(config.id)).toBe(true);
   });
 
+  it("preserves the connection tree node while background database info is stored", async () => {
+    const config = mysqlConnection();
+    const saveConnectionDatabaseInfo = vi.fn().mockResolvedValue(undefined);
+
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    vi.doMock("@/lib/backend/api", () => ({
+      connectDb: vi.fn().mockResolvedValue(config.id),
+      connectionDatabaseInfo: vi.fn().mockResolvedValue({ productName: "MySQL", productVersion: "8.0.34" }),
+      saveConnectionDatabaseInfo,
+      saveConnections: vi.fn().mockResolvedValue(undefined),
+      saveSidebarLayout: vi.fn().mockResolvedValue(undefined),
+      connectionIdentifierQuote: vi.fn().mockResolvedValue(undefined),
+    }));
+
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const store = useConnectionStore();
+    await store.addConnection(config);
+    const connectionNode = store.treeNodes[0];
+
+    await store.connect(config);
+    await vi.waitFor(() => expect(saveConnectionDatabaseInfo).toHaveBeenCalled());
+
+    expect(store.treeNodes[0]).toBe(connectionNode);
+    expect(store.getConfig(config.id)?.database_info?.productVersion).toBe("8.0.34");
+    expect(store.connectedIds.has(config.id)).toBe(true);
+  });
+
   it("does not delay connection success while optional metadata is loading", async () => {
     const config = mysqlConnection();
     let resolveDatabaseInfo!: (value: { productName: string; productVersion: string }) => void;
