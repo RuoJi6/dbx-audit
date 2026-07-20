@@ -203,6 +203,7 @@ pub async fn mongo_aggregate_documents(
     collection: String,
     pipeline_json: String,
     max_rows: Option<usize>,
+    options_json: Option<String>,
     execution_id: Option<String>,
 ) -> Result<MongoDocumentResult, String> {
     let app = state.inner().clone();
@@ -216,6 +217,33 @@ pub async fn mongo_aggregate_documents(
             &collection,
             &pipeline_json,
             max_rows,
+            options_json.as_deref(),
+        ),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn mongo_distinct(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    database: String,
+    collection: String,
+    field: String,
+    filter: Option<String>,
+    execution_id: Option<String>,
+) -> Result<MongoDocumentResult, String> {
+    let app = state.inner().clone();
+    run_cancellable(
+        &app,
+        execution_id,
+        dbx_core::mongo_ops::mongo_distinct_core(
+            &app,
+            &connection_id,
+            &database,
+            &collection,
+            &field,
+            filter.as_deref(),
         ),
     )
     .await
@@ -271,8 +299,17 @@ pub async fn mongo_insert_document(
     database: String,
     collection: String,
     doc_json: String,
+    routing: Option<String>,
 ) -> Result<String, String> {
-    crate::commands::document_cmd::document_insert_document(state, connection_id, database, collection, doc_json).await
+    crate::commands::document_cmd::document_insert_document(
+        state,
+        connection_id,
+        database,
+        collection,
+        doc_json,
+        routing,
+    )
+    .await
 }
 
 #[tauri::command]

@@ -329,7 +329,7 @@ function databaseOptionIsProduction(database: string): boolean {
           trigger-class="font-medium text-foreground"
           :display-name="connectionDisplayName"
           list-class="w-96 max-w-[calc(100vw-2rem)]"
-          item-class="h-9"
+          item-class="min-h-9 h-auto py-1"
           @update:model-value="(connectionId) => emit('changeConnection', connectionId)"
         >
           <template #trigger-label="{ label }">
@@ -344,7 +344,9 @@ function databaseOptionIsProduction(database: string): boolean {
             <div class="flex min-w-0 items-center gap-2">
               <DatabaseIcon :db-type="connectionIconType(connectionById(option))" class="h-3.5 w-3.5 shrink-0" />
               <div class="flex min-w-0 flex-1 items-center gap-2">
-                <TruncatedTextTooltip :text="connectionGroupLabel(option)" class="block min-w-0 max-w-48 shrink-0 rounded-sm bg-muted/70 px-1.5 py-0.5 text-[11px] text-muted-foreground" side="left" :side-offset="8" />
+                <span class="block min-w-0 max-w-48 shrink-0 whitespace-normal break-words rounded-sm bg-muted/70 px-1.5 py-0.5 text-[11px] leading-tight text-muted-foreground">
+                  {{ connectionGroupLabel(option) }}
+                </span>
                 <TruncatedTextTooltip :text="label" class="block min-w-[7rem] flex-1 text-sm font-medium" side="left" :side-offset="8" />
               </div>
             </div>

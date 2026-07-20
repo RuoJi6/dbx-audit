@@ -6,6 +6,7 @@ import {
   mongoAggregateWriteStage,
   mongoCollectionStatsToQueryResult,
   mongoDocumentsToQueryResult,
+  describeMongoCommandParseFailure,
   parseMongoAggregateCommand,
   parseMongoCollectionStatsCommand,
   parseMongoCountDocumentsCommand,
@@ -74,19 +75,14 @@ test("parseMongoWriteCommand accepts unquoted update operator keys", () => {
 });
 
 test("parseMongoWriteCommand accepts updateMany arrayFilters options", () => {
-  assert.deepEqual(
-    parseMongoWriteCommand(
-      'db.orders.updateMany({status: "open"}, {$set: {"items.$[item].status": "done"}}, {arrayFilters: [{"item.id": 7}]})',
-    ),
-    {
-      kind: "update",
-      collection: "orders",
-      filter: '{"status": "open"}',
-      update: '{"$set": {"items.$[item].status": "done"}}',
-      options: '{"arrayFilters": [{"item.id": 7}]}',
-      many: true,
-    },
-  );
+  assert.deepEqual(parseMongoWriteCommand('db.orders.updateMany({status: "open"}, {$set: {"items.$[item].status": "done"}}, {arrayFilters: [{"item.id": 7}]})'), {
+    kind: "update",
+    collection: "orders",
+    filter: '{"status": "open"}',
+    update: '{"$set": {"items.$[item].status": "done"}}',
+    options: '{"arrayFilters": [{"item.id": 7}]}',
+    many: true,
+  });
 });
 
 test("parseMongoCountDocumentsCommand accepts shell-style count commands", () => {
@@ -121,6 +117,29 @@ test("parseMongoAggregateCommand accepts aggregate pipelines", () => {
     collection: "projects",
     pipeline: '[{"$match":{"active":true}},{"$group":{"_id":"$owner","total":{"$sum":1}}}]',
   });
+});
+
+test("parseMongoAggregateCommand accepts options including explain", () => {
+  const withExplain = parseMongoAggregateCommand("db.uc_user.aggregate([], {explain: true})");
+  assert.equal(withExplain?.collection, "uc_user");
+  assert.equal(withExplain?.pipeline, "[]");
+  assert.deepEqual(JSON.parse(withExplain?.options ?? "null"), { explain: true });
+  assert.equal(parseMongoAggregateCommand("db.uc_user.aggregate([], {explain: true"), null);
+  assert.equal(parseMongoAggregateCommand("db.products.aggregate([], [])"), null);
+  assert.equal(parseMongoAggregateCommand("db.products.aggregate([]).limit(10)"), null);
+  assert.deepEqual(parseMongoAggregateCommand("db.products.aggregate([], {})"), {
+    collection: "products",
+    pipeline: "[]",
+    options: "{}",
+  });
+});
+
+test("describeMongoCommandParseFailure reports aggregate-specific issues", () => {
+  assert.match(describeMongoCommandParseFailure("db.uc_user.aggregate([], {explain: true"), /unclosed/i);
+  assert.match(describeMongoCommandParseFailure("db.products.aggregate([]).limit(10)"), /chaining|not supported/i);
+  assert.match(describeMongoCommandParseFailure('db.products.aggregate({"$match":{}})'), /pipeline must be a JSON array/i);
+  assert.match(describeMongoCommandParseFailure("db.products.aggregate([], [])"), /options must be a JSON object/i);
+  assert.match(describeMongoCommandParseFailure("SELECT 1"), /MongoDB shell-style commands/i);
 });
 
 test("parseMongoGetIndexesCommand accepts shell-style index commands", () => {

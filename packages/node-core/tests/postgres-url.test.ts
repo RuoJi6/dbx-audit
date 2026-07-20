@@ -42,6 +42,15 @@ test("postgres MCP URL maps ssl-mode to sslmode", () => {
   assert.equal(url, "postgres://postgres:secret@pg.example.com:5432/app?sslmode=require");
 });
 
+test("postgres MCP URL normalizes direct sslmode aliases", () => {
+  const url = buildConnectionUrl(postgresConfig({ url_params: "sslmode=verify_identity" }), {
+    host: "pg.example.com",
+    port: 5432,
+  });
+
+  assert.equal(url, "postgres://postgres:secret@pg.example.com:5432/app?sslmode=verify-full");
+});
+
 test("postgres MCP URL drops MySQL-style TLS params", () => {
   const url = buildConnectionUrl(
     postgresConfig({

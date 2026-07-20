@@ -50,6 +50,10 @@ import java.util.stream.Collectors;
 public final class DbxJdbcPlugin {
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final int MAX_ROWS = 10_000;
+    private static final String JDBCX_URL_PREFIX = "jdbcx:";
+    private static final String JDBCX_EXTENSION_WHITELIST_PROPERTY = "jdbcx.extension.whitelist";
+    private static final String JDBCX_HIGH_PRIVILEGE_EXTENSIONS_OPT_IN = "-Ddbx.jdbcx.allowHighPrivilegeExtensions=";
+    private static final String JDBCX_SAFE_EXTENSION_WHITELIST = "help,var,version";
     private static final String[] DEFAULT_TABLE_TYPES = new String[] {
         "TABLE",
         "VIEW",
@@ -226,11 +230,45 @@ public final class DbxJdbcPlugin {
     }
 
     private static String throwableMessage(Throwable error) {
+        List<Throwable> causes = new ArrayList<>();
         Throwable cause = error;
-        while (cause.getCause() != null && cause.getCause() != cause) {
+        while (cause != null && !causes.contains(cause)) {
+            causes.add(cause);
             cause = cause.getCause();
         }
-        return cause.getMessage() == null ? cause.toString() : cause.getMessage();
+        for (int i = causes.size() - 1; i >= 0; i--) {
+            Throwable current = causes.get(i);
+            String message = informativeThrowableMessage(current);
+            if (message != null) {
+                return message;
+            }
+            for (Throwable suppressed : current.getSuppressed()) {
+                message = informativeThrowableMessage(suppressed);
+                if (message != null) {
+                    return message;
+                }
+            }
+        }
+        return causes.isEmpty() ? error.toString() : causes.get(causes.size() - 1).toString();
+    }
+
+    private static String informativeThrowableMessage(Throwable error) {
+        String message = error.getMessage();
+        if (message == null || message.isBlank()) {
+            return null;
+        }
+        String trimmed = message.trim();
+        if (error instanceof ClassNotFoundException || error instanceof NoClassDefFoundError) {
+            String className = trimmed.replace('/', '.');
+            if (className.startsWith("io.modelcontextprotocol.")) {
+                return "Missing JDBCX MCP runtime class " + className
+                    + ". Install io.github.jdbcx:io.modelcontextprotocol with the version required by the selected JDBCX runtime.";
+            }
+            return "Missing Java class " + className + ". Install the required runtime dependency.";
+        }
+        return trimmed.equals(error.getClass().getName()) || trimmed.equals(error.getClass().getSimpleName())
+            ? null
+            : trimmed;
     }
 
     private static JsonNode handle(String method, JsonNode params, JsonNode connection) throws Exception {
@@ -475,12 +513,37 @@ public final class DbxJdbcPlugin {
             properties.setProperty("password", password);
         }
         applyConnectTimeout(connection, properties);
+        applyJdbcxExtensionSecurity(connection, url, properties);
         if (isOracleUrl(url)) {
             applyOracleProperties(connection, properties);
         }
         sharedConnection = DriverManager.getConnection(url, properties);
         sharedConnectionKey = key;
         return sharedConnection;
+    }
+
+    private static void applyJdbcxExtensionSecurity(JsonNode connection, String url, Properties properties) {
+        if (isJdbcxUrl(url) && !jdbcxHighPrivilegeExtensionsEnabled(connection)) {
+            properties.setProperty(JDBCX_EXTENSION_WHITELIST_PROPERTY, JDBCX_SAFE_EXTENSION_WHITELIST);
+        }
+    }
+
+    private static boolean isJdbcxUrl(String url) {
+        return url != null && url.regionMatches(true, 0, JDBCX_URL_PREFIX, 0, JDBCX_URL_PREFIX.length());
+    }
+
+    private static boolean jdbcxHighPrivilegeExtensionsEnabled(JsonNode connection) {
+        JsonNode options = connection.path("agent_java_options");
+        if (!options.isArray()) {
+            return false;
+        }
+        for (int i = options.size() - 1; i >= 0; i--) {
+            String option = options.path(i).asText("").trim();
+            if (option.startsWith(JDBCX_HIGH_PRIVILEGE_EXTENSIONS_OPT_IN)) {
+                return Boolean.parseBoolean(option.substring(JDBCX_HIGH_PRIVILEGE_EXTENSIONS_OPT_IN.length()));
+            }
+        }
+        return false;
     }
 
     private static void applyConnectTimeout(JsonNode connection, Properties properties) {
@@ -1999,11 +2062,16 @@ public final class DbxJdbcPlugin {
     }
 
     private static String connectionKey(JsonNode connection) {
-        return optionalText(connection, "connection_string")
+        String connectionString = optionalText(connection, "connection_string");
+        String jdbcxSecurityKey = isJdbcxUrl(connectionString)
+            ? "|jdbcxHighPrivilegeExtensions=" + jdbcxHighPrivilegeExtensionsEnabled(connection)
+            : "";
+        return connectionString
             + "|" + optionalText(connection, "url_params")
             + "|" + optionalText(connection, "username")
             + "|" + optionalText(connection, "password")
-            + "|" + connection.path("sysdba").asBoolean(false);
+            + "|" + connection.path("sysdba").asBoolean(false)
+            + jdbcxSecurityKey;
     }
 
     private static Set<String> primaryKeys(DatabaseMetaData meta, String database, String schema, String table) throws SQLException {

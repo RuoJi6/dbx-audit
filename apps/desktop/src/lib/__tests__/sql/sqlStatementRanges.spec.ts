@@ -220,6 +220,54 @@ describe("splitSqlStatementRanges", () => {
 });
 
 describe("statementRangeAtCursor", () => {
+  it("splits Elasticsearch REST requests without semicolons", () => {
+    const sql = `# node information
+GET /_nodes/stats/jvm?pretty
+
+// search orders
+POST /orders/_search
+{
+  "query": { "match_all": {} }
+}
+
+HEAD /orders`;
+
+    expect(rangeSqlTexts(splitSqlStatementRanges(sql, "elasticsearch"))).toEqual(["GET /_nodes/stats/jvm?pretty", 'POST /orders/_search\n{\n  "query": { "match_all": {} }\n}', "HEAD /orders"]);
+    expect(hasMultipleExecutionTargets(sql, "elasticsearch")).toBe(true);
+  });
+
+  it("targets the Elasticsearch request following a comment", () => {
+    const sql = "# JVM statistics\nGET /_nodes/stats/jvm?pretty\n\nGET /_cluster/health";
+
+    expect(statementRangeAtCursor(sql, indexOf(sql, "JVM"), "elasticsearch")?.sql).toBe("GET /_nodes/stats/jvm?pretty");
+    expect(statementRangeAtCursor(sql, indexOf(sql, "cluster"), "elasticsearch")?.sql).toBe("GET /_cluster/health");
+  });
+
+  it("splits and targets Elasticsearch requests after block comments", () => {
+    const sql = `/* node information
+   including JVM details */
+GET /_nodes/stats/jvm?pretty
+
+/* cluster information */
+GET /_cluster/health`;
+
+    expect(rangeSqlTexts(splitSqlStatementRanges(sql, "elasticsearch"))).toEqual(["GET /_nodes/stats/jvm?pretty", "GET /_cluster/health"]);
+    expect(statementRangeAtCursor(sql, indexOf(sql, "JVM details"), "elasticsearch")?.sql).toBe("GET /_nodes/stats/jvm?pretty");
+    expect(statementRangeAtCursor(sql, indexOf(sql, "cluster information"), "elasticsearch")?.sql).toBe("GET /_cluster/health");
+  });
+
+  it("ignores request-looking lines inside Elasticsearch block comments", () => {
+    const sql = `GET /_cluster/health
+
+/* disabled cleanup
+DELETE /important-index
+*/
+GET /_cat/indices`;
+
+    expect(rangeSqlTexts(splitSqlStatementRanges(sql, "elasticsearch"))).toEqual(["GET /_cluster/health", "GET /_cat/indices"]);
+    expect(statementRangeAtCursor(sql, indexOf(sql, "important-index"), "elasticsearch")?.sql).toBe("GET /_cat/indices");
+  });
+
   it("returns the first statement when the cursor is inside it", () => {
     const sql = "SELECT 1;\nSELECT 2;";
     const pos = indexOf(sql, "1");
@@ -723,6 +771,14 @@ describe("buildExecutionCandidates", () => {
     expect(candidateKinds(candidates)).toEqual(["cursor", "all"]);
   });
 
+  it("preserves leading optimizer hints in current statement candidates", () => {
+    const hintedSql = "/*+ SET(polar_csi.enable_query on) SET(polar_csi.cost_threshold 0)*/\nselect count(1) from xxx";
+    const sql = `select 1;\n${hintedSql};`;
+    const candidates = buildExecutionCandidates(sql, indexOf(sql, "count"), "postgres");
+
+    expect(candidates[0].sql).toBe(hintedSql);
+  });
+
   it("uses the cursor statement for the first candidate when there is no selection", () => {
     const sql = "SELECT *\nFROM users\nWHERE active = 1";
     const candidates = buildExecutionCandidates(sql, indexOf(sql, "users"));
@@ -840,7 +896,7 @@ describe("hasMultipleExecutionTargets", () => {
 });
 
 describe("supportsExecutionTargetPicker", () => {
-  it("enables the picker for SQL database connections and Redis", () => {
+  it("enables the picker for SQL database connections, Redis, and Elasticsearch", () => {
     expect(supportsExecutionTargetPicker("mysql")).toBe(true);
     expect(supportsExecutionTargetPicker("postgres")).toBe(true);
     expect(supportsExecutionTargetPicker("sqlserver")).toBe(true);
@@ -848,7 +904,7 @@ describe("supportsExecutionTargetPicker", () => {
     expect(supportsExecutionTargetPicker("jdbc")).toBe(true);
     expect(supportsExecutionTargetPicker("redis")).toBe(true);
     expect(supportsExecutionTargetPicker("mongodb")).toBe(false);
-    expect(supportsExecutionTargetPicker("elasticsearch")).toBe(false);
+    expect(supportsExecutionTargetPicker("elasticsearch")).toBe(true);
     expect(supportsExecutionTargetPicker("qdrant")).toBe(false);
     expect(supportsExecutionTargetPicker("milvus")).toBe(false);
     expect(supportsExecutionTargetPicker("weaviate")).toBe(false);

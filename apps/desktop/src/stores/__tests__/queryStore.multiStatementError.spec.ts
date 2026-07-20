@@ -127,6 +127,21 @@ describe("queryStore multi-statement errors", () => {
     });
   });
 
+  it("uses Name comments for their indexed query results", async () => {
+    mocks.executeMulti.mockResolvedValue([
+      { columns: ["id"], rows: [[2]], affected_rows: 0, execution_time_ms: 1, statement_index: 1 },
+      { columns: ["id"], rows: [[1]], affected_rows: 0, execution_time_ms: 1, statement_index: 0 },
+    ]);
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const store = useQueryStore();
+    const tabId = store.createTab("mysql-1", "app", "Query");
+    const sql = "-- Name: Users\nSELECT * FROM users;\n-- name : Orders\nSELECT * FROM orders";
+
+    await store.executeTabSql(tabId, sql);
+
+    expect(store.tabs.find((item) => item.id === tabId)?.results?.map((result) => result.sourceLabel)).toEqual(["Orders", "Users"]);
+  });
+
   it("does not promote an unmarked Error alias without type metadata as a batch failure", async () => {
     mocks.executeMulti.mockResolvedValue([
       { columns: ["value"], rows: [[1]], affected_rows: 0, execution_time_ms: 1 },

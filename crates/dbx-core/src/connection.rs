@@ -2326,7 +2326,7 @@ impl AppState {
         Ok(closed)
     }
 
-    pub async fn active_agent_driver_keys(&self) -> HashSet<String> {
+    pub async fn active_agent_connection_driver_keys(&self) -> HashSet<String> {
         let configs = self.configs.read().await;
         let connections = self.connections.read().await;
         let mut keys = HashSet::new();
@@ -2346,14 +2346,31 @@ impl AppState {
             }
         }
 
-        drop(connections);
-        drop(configs);
+        keys
+    }
 
-        for key in self.agent_manager.active_daemon_keys().await {
-            keys.insert(key);
+    pub async fn prepare_agent_driver_updates(&self, driver_keys: &[String]) -> HashSet<String> {
+        let candidates = driver_keys.iter().cloned().collect::<HashSet<_>>();
+        if candidates.is_empty() {
+            return HashSet::new();
         }
 
-        keys
+        let blockers = self
+            .active_agent_connection_driver_keys()
+            .await
+            .into_iter()
+            .filter(|key| candidates.contains(key))
+            .collect::<HashSet<_>>();
+        if !blockers.is_empty() {
+            return blockers;
+        }
+
+        for key in &candidates {
+            self.agent_manager.stop_daemon_by_key(key).await;
+        }
+
+        // A connection may have started while idle runtimes were stopping.
+        self.active_agent_connection_driver_keys().await.into_iter().filter(|key| candidates.contains(key)).collect()
     }
 
     pub async fn connection_identifier_quote(
@@ -3848,6 +3865,79 @@ mod tests {
         (AppState::new(storage), dir)
     }
 
+    fn agent_pool_stub() -> PoolKind {
+        PoolKind::Agent(std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::db::agent_driver::AgentDriverClient::test_stub(),
+        )))
+    }
+
+    #[tokio::test]
+    async fn agent_update_blockers_only_include_open_connections() {
+        let (state, dir) = test_app_state().await;
+        let mut config = mysql_config(None);
+        config.id = "dameng-conn".to_string();
+        config.db_type = DatabaseType::Dameng;
+        state.configs.write().await.insert(config.id.clone(), config);
+        state
+            .agent_manager
+            .daemons
+            .lock()
+            .await
+            .insert("oracle".to_string(), crate::db::agent_driver::AgentDriverClient::test_stub());
+        state.connections.write().await.insert("dameng-conn".to_string(), agent_pool_stub());
+
+        assert_eq!(
+            state.active_agent_connection_driver_keys().await,
+            std::collections::HashSet::from(["dameng".to_string()])
+        );
+
+        state.connections.write().await.remove("dameng-conn");
+        assert!(state.active_agent_connection_driver_keys().await.is_empty());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn preparing_agent_update_stops_idle_runtime() {
+        let (state, dir) = test_app_state().await;
+        state
+            .agent_manager
+            .daemons
+            .lock()
+            .await
+            .insert("dameng".to_string(), crate::db::agent_driver::AgentDriverClient::test_stub());
+
+        let blockers = state.prepare_agent_driver_updates(&["dameng".to_string()]).await;
+
+        assert!(blockers.is_empty());
+        assert!(state.agent_manager.active_daemon_keys().await.is_empty());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn preparing_agent_update_keeps_runtime_when_connection_is_open() {
+        let (state, dir) = test_app_state().await;
+        let mut config = mysql_config(None);
+        config.id = "dameng-conn".to_string();
+        config.db_type = DatabaseType::Dameng;
+        state.configs.write().await.insert(config.id.clone(), config);
+        state.connections.write().await.insert("dameng-conn".to_string(), agent_pool_stub());
+        state
+            .agent_manager
+            .daemons
+            .lock()
+            .await
+            .insert("dameng".to_string(), crate::db::agent_driver::AgentDriverClient::test_stub());
+
+        let blockers = state.prepare_agent_driver_updates(&["dameng".to_string()]).await;
+
+        assert_eq!(blockers, std::collections::HashSet::from(["dameng".to_string()]));
+        assert_eq!(state.agent_manager.active_daemon_keys().await, vec!["dameng".to_string()]);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     fn touch_executable(path: &std::path::Path) {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).unwrap();
@@ -4195,7 +4285,7 @@ mod tests {
 
         assert_eq!(
             connection_url_for_endpoint(&config, &config.host, config.port),
-            "postgres://gaussdb:secret@127.0.0.1:3306/postgres"
+            "postgres://gaussdb:secret@127.0.0.1:3306/postgres?sslmode=disable"
         );
     }
 

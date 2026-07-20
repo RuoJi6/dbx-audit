@@ -153,7 +153,7 @@ export function runSidebarDataOpenImmediately(optionsOrRunner: SidebarDataOpenOp
 }
 
 export function cancelPendingSidebarDataOpen() {
-  for (const request of [...requests.values()]) cancelRequest(request);
+  for (const request of Array.from(requests.values())) cancelRequest(request);
   latestSupersedingRequestId = 0;
 }
 
