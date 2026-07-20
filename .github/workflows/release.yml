@@ -253,6 +253,15 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
+          if ! gh release view "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --json assets \
+            --jq '.assets[].name' \
+            | grep -qx 'latest.json'; then
+            echo "No latest.json asset found; skipping updater metadata augmentation for unsigned release."
+            exit 0
+          fi
+
           mkdir -p "$RUNNER_TEMP/latest-json"
           gh release download "${GITHUB_REF_NAME}" \
             --repo "${GITHUB_REPOSITORY}" \
