@@ -165,7 +165,7 @@ jobs:
           $portableRoot = "portable"
           $portableDir = Join-Path $portableRoot "DBX_${version}_${arch}"
           $zipName = "DBX_${version}_${arch}-portable.zip"
-          $exePath = "target/${{ matrix.target }}/release/dbx.exe"
+          $exePath = "target/${{ matrix.target }}/release/dbx-audit.exe"
 
           if (!(Test-Path $exePath)) {
             Write-Error "Missing Windows executable: $exePath"
