@@ -509,6 +509,14 @@ const ORACLE_SQL_TYPES = [
   "XMLTYPE",
 ];
 
+const ORACLE_SYSTEM_VALUE_NAMES = ["SYSDATE", "SYSTIMESTAMP", "CURRENT_DATE", "CURRENT_TIMESTAMP", "LOCALTIMESTAMP", "SESSIONTIMEZONE", "DBTIMEZONE", "USER", "UID"] as const;
+
+const ORACLE_SYSTEM_VALUE_NAME_SET = new Set<string>(ORACLE_SYSTEM_VALUE_NAMES);
+
+export function isOracleSystemValueName(name: string, databaseType?: DatabaseType): boolean {
+  return isOracleLikeDatabase(databaseType) && ORACLE_SYSTEM_VALUE_NAME_SET.has(name.toUpperCase());
+}
+
 const NON_ORACLE_COMPLETION_WORDS = new Set(["BIGSERIAL", "BOOLEAN", "ELSEIF", "LIMIT", "LOCALTIME", "SERIAL", "STRING", "TEXT", "TIME", "USE"]);
 
 const ORACLE_SQL_KEYWORDS = Array.from(
@@ -954,9 +962,11 @@ const POSTGRES_FUNCTION_SIGNATURES = new Map<string, string[]>([
 ]);
 
 const MYSQL_FUNCTION_SIGNATURES = new Map<string, string[]>([
+  ["CONVERT", ["expression", "type"]],
   ["DATE_FORMAT", ["date", "format"]],
   ["FROM_UNIXTIME", ["unix_timestamp"]],
   ["UNIX_TIMESTAMP", []],
+  ["SYSDATE", []],
   ["JSON_EXTRACT", ["json", "path"]],
   ["JSON_UNQUOTE", ["json"]],
   ["GROUP_CONCAT", ["expression"]],
@@ -975,6 +985,7 @@ const SQLITE_FUNCTION_SIGNATURES = new Map<string, string[]>([
 const CLOUDFLARE_D1_FUNCTION_SIGNATURES = new Map(Array.from(SQLITE_FUNCTION_SIGNATURES.entries()).filter(([name]) => name !== "NOW"));
 
 const SQLSERVER_FUNCTION_SIGNATURES = new Map<string, string[]>([
+  ["CONVERT", ["type", "expression"]],
   ["TRY_CAST", ["expression AS type"]],
   ["TRY_CONVERT", ["type", "expression"]],
   ["JSON_VALUE", ["expression", "path"]],
@@ -1169,6 +1180,9 @@ export interface SqlCompletionObject {
   type: "procedure" | "function" | "trigger" | "package";
   parentSchema?: string;
   parentName?: string;
+  dataType?: string;
+  signature?: string;
+  comment?: string | null;
   applyName?: string;
   boost?: number;
 }
@@ -1336,10 +1350,18 @@ class SqlCompletionProvider {
     }
 
     const preferReferencedColumns = hasMatchingReferencedColumnPrefix(context, this.input.columnsByTable);
-    if (!pendingJoinKeyword && !preferReferencedColumns && !context.exclusiveTableSuggestions && !context.exclusiveColumnSuggestions && !context.exclusiveRoutineSuggestions) {
+    if (!pendingJoinKeyword && !context.exclusiveTableSuggestions && !context.exclusiveColumnSuggestions && !context.exclusiveRoutineSuggestions) {
       const snippets = this.databaseType === "manticoresearch" ? [...(this.input.snippets ?? DEFAULT_SQL_SNIPPETS), ...MANTICORESEARCH_SQL_SNIPPETS] : (this.input.snippets ?? DEFAULT_SQL_SNIPPETS);
-      this.items.push(...buildSnippetItems(context.prefix, snippets, this.input.keywordCase));
-      this.items.push(...buildFunctionSnippetItems(context.prefix, getFunctionDescriptions(this.t), this.databaseType));
+      if (!preferReferencedColumns) {
+        this.items.push(...buildSnippetItems(context.prefix, snippets, this.input.keywordCase));
+      }
+      if (!preferReferencedColumns || context.suggestRoutines) {
+        const functionItems = buildFunctionSnippetItems(context.prefix, getFunctionDescriptions(this.t), this.databaseType);
+        this.items.push(...(preferReferencedColumns ? functionItems.filter((item) => item.label.toLowerCase().startsWith(context.prefix.toLowerCase())) : functionItems));
+        if (isOracleLikeDatabase(this.databaseType)) {
+          this.items.push(...buildOracleSystemValueItems(context.prefix, this.input.keywordCase));
+        }
+      }
     }
 
     if (this.databaseType === "manticoresearch" && context.exclusiveRoutineSuggestions) {
@@ -1371,6 +1393,8 @@ class SqlCompletionProvider {
     if (context.suggestKeywords && !context.exclusiveRoutineSuggestions && !pendingJoinKeyword) {
       this.items.push(...buildJoinModifierKeywordItems(context.prefix, this.input.keywordCase));
       this.items.push(...buildKeywordItems(context.prefix, context, this.databaseType, this.input.keywordCase));
+    } else if (shouldOfferKeywordPrefixContinuations(context, pendingJoinKeyword)) {
+      this.items.push(...buildKeywordPrefixContinuationItems(context.prefix, context, this.databaseType, this.input.keywordCase));
     }
 
     if (!context.exclusiveTableSuggestions && context.suggestColumns) {
@@ -1619,7 +1643,7 @@ export function getSqlCompletionResultValidFor(sql: string, cursor: number): Reg
   return undefined;
 }
 
-export function getSqlFunctionSignatureHelp(sql: string, cursor: number): SqlFunctionSignatureHelp | null {
+export function getSqlFunctionSignatureHelp(sql: string, cursor: number, databaseType?: DatabaseType): SqlFunctionSignatureHelp | null {
   const beforeCursor = sql.slice(0, cursor);
   const openParenIndex = findActiveFunctionOpenParen(beforeCursor);
   if (openParenIndex == null) return null;
@@ -1628,7 +1652,7 @@ export function getSqlFunctionSignatureHelp(sql: string, cursor: number): SqlFun
   const name = /([A-Za-z_][\w$]*)$/.exec(beforeParen)?.[1]?.toUpperCase();
   if (!name) return null;
 
-  const parameters = SQL_FUNCTION_SIGNATURES.get(name);
+  const parameters = (databaseType ? DATABASE_FUNCTION_SIGNATURES[databaseType]?.get(name) : undefined) ?? SQL_FUNCTION_SIGNATURES.get(name);
   if (!parameters) return null;
 
   const activeParameter = countTopLevelCommas(beforeCursor.slice(openParenIndex + 1));
@@ -1816,10 +1840,9 @@ export function getSqlCompletionContext(sql: string, cursor: number): SqlComplet
   const inJoinConditionContext = isInJoinConditionContext(beforeCursor);
   const prioritizeSelectAliases = isInOrderOrGroupByContext(beforeCursor);
   const inCallRoutineContext = isCallRoutineContext(beforeCursor);
-  const inPotentialPackageMemberContext = !!qualifier && !exclusiveTableSuggestions && !insertInfo && !oracleTableFunctionContext;
+  const inPotentialPackageMemberContext = !!qualifier && !exclusiveTableSuggestions && !insertInfo && !updateInfo?.inSetClause && !oracleTableFunctionContext;
   const suggestColumns = !!qualifier || !!updateInfo?.inSetClause || !!insertInfo || (inColumnContext && referencedTables.length > 0);
-  const preferColumnsOverGlobalRoutines = suggestColumns && referencedTables.length > 0 && !qualifier;
-  const suggestRoutines = inCallRoutineContext || oracleTableFunctionContext || inPotentialPackageMemberContext || (!preferColumnsOverGlobalRoutines && !exclusiveTableSuggestions && !exclusiveColumnSuggestions && !insertInfo && prefix.length >= 2);
+  const suggestRoutines = inCallRoutineContext || oracleTableFunctionContext || inPotentialPackageMemberContext || (!exclusiveTableSuggestions && !exclusiveColumnSuggestions && !insertInfo && !updateInfo?.inSetClause && prefix.length >= 2);
 
   const statementKind = detectStatementKind(beforeCursor || fullStatement);
   const preferredKeywords = qualifier ? [] : preferredKeywordsForCompletion(beforeCursor, beforeToken, selectListColumnContext, exclusiveTableSuggestions, updateInfo, deleteInfo);
@@ -1901,12 +1924,12 @@ function detectCompletionContextKind(options: {
   if (options.updateInfo?.inSetClause) return "column";
   if (options.inCallRoutineContext) return "exec";
   if (options.qualifier && options.exclusiveColumnSuggestions) return "alias_column";
+  if (options.suggestColumns) return options.qualifier ? "alias_column" : "column";
   if (options.oracleTableFunctionContext || options.suggestRoutines) return "routine";
   if (options.exclusiveTableSuggestions || options.afterTableTrigger) {
     if (options.statementKind === "insert" && options.lastWord === "into") return "insert_target";
     return options.lastWord === "join" ? "join" : "table";
   }
-  if (options.suggestColumns) return options.qualifier ? "alias_column" : "column";
   return "keyword";
 }
 
@@ -2188,7 +2211,7 @@ function detectInsertColumnListContext(beforeCursor: string): { table: string; s
 
 function detectUpdateCompletionContext(beforeCursor: string): { target: { table: string; schema?: string }; afterTarget: boolean; inSetClause: boolean; afterSetAssignments: boolean } | null {
   const cleaned = beforeCursor.replace(/'[^']*'/g, "''").replace(/"[^"]*"/g, '""');
-  const match = /^\s*update\s+((?:"[^"]+"|`[^`]+`|[A-Za-z_][\w$]*)(?:\.(?:"[^"]+"|`[^`]+`|[A-Za-z_][\w$]*))?)(?:\s+(?:as\s+)?([A-Za-z_][\w$]*))?/i.exec(cleaned);
+  const match = /^\s*update\s+((?:"[^"]+"|`[^`]+`|[A-Za-z_][\w$]*)(?:\.(?:"[^"]+"|`[^`]+`|[A-Za-z_][\w$]*))?)(?:\s+(?:as\s+)?((?!set\b|where\b)[A-Za-z_][\w$]*))?/i.exec(cleaned);
   if (!match) return null;
   const [first, second] = splitQualifiedName(match[1] ?? "");
   if (!first) return null;
@@ -2754,7 +2777,7 @@ function unquoteIdentifier(value: string): string {
   return value;
 }
 
-function quoteSqlIdentifier(identifier: string, dialect?: "mysql" | "postgres" | "sqlserver"): string {
+export function quoteSqlIdentifier(identifier: string, dialect?: "mysql" | "postgres" | "sqlserver"): string {
   if (dialect !== "postgres" || !requiresPostgresIdentifierQuote(identifier)) return identifier;
   return `"${identifier.replaceAll('"', '""')}"`;
 }
@@ -2973,9 +2996,10 @@ function buildSchemaItems(prefix: string, schemas: string[], dialect?: "mysql" |
 function buildObjectItems(context: SqlCompletionContext, objects: SqlCompletionObject[], dialect?: "mysql" | "postgres" | "sqlserver", databaseType?: DatabaseType, currentSchema?: string): SqlCompletionItem[] {
   if (completionQualifierIsReferencedTable(context)) return [];
   const onlyProcedures = context.contextKind === "exec";
+  const onlyFunctions = context.suggestColumns && context.referencedTables.length > 0 && !context.qualifier;
   const prioritizeOracleFunctions = databaseType === "oracle" && context.statementKind === "select";
   return objects
-    .filter((object) => (!onlyProcedures || object.type === "procedure") && objectMatchesCompletionContext(object, context))
+    .filter((object) => (!onlyProcedures || object.type === "procedure") && (!onlyFunctions || (object.type === "function" && object.name.toLowerCase().startsWith(context.prefix.toLowerCase()))) && objectMatchesCompletionContext(object, context))
     .map((object) => {
       const qualifiedByContext = objectIsQualifiedByContext(object, context);
       const objectInCurrentSchema = !!currentSchema && !!object.schema && normalizeIdentifierPart(object.schema) === normalizeIdentifierPart(currentSchema);
@@ -2983,13 +3007,17 @@ function buildObjectItems(context: SqlCompletionContext, objects: SqlCompletionO
         qualifiedByContext || (context.qualifier && object.schema?.toLowerCase() === context.qualifier.toLowerCase())
           ? quoteSqlIdentifier(object.name, dialect)
           : (object.applyName ?? (object.schema && !objectInCurrentSchema ? `${quoteSqlIdentifier(object.schema, dialect)}.${quoteSqlIdentifier(object.name, dialect)}` : quoteSqlIdentifier(object.name, dialect)));
-      const detail = object.type === "trigger" && object.parentName ? `trigger on ${object.parentName}` : object.parentName ? `${object.type} in ${object.parentName}` : object.schema ? `${object.type} in ${object.schema}` : object.type;
+      const locationDetail = object.type === "trigger" && object.parentName ? `trigger on ${object.parentName}` : object.parentName ? `${object.type} in ${object.parentName}` : object.schema ? `${object.type} in ${object.schema}` : object.type;
+      const detail = object.dataType ? `${locationDetail}  [${object.dataType}]` : locationDetail;
+      const schemaBoost = onlyFunctions ? Math.min(object.boost ?? 0, 1000) : (object.boost ?? 0);
+      const typeBoost = routineTypeBoost(object.type, prioritizeOracleFunctions && !onlyFunctions);
       return {
         label: object.name,
         type: "function" as const,
         detail,
+        info: buildRoutineInfo(object),
         apply: object.type === "trigger" || object.type === "package" ? applyName : `${applyName}()`,
-        boost: computeBoost(object.name, context.prefix) + routineTypeBoost(object.type, prioritizeOracleFunctions) + (object.boost ?? 0),
+        boost: computeBoost(object.name, context.prefix) + typeBoost + schemaBoost,
         dedupeKey: object.applyName || (databaseType === "oracle" && object.schema) ? applyName : undefined,
         // Preserve exact routine matches before the capped candidate list is truncated.
         exactMatch: !!context.prefix && object.name.toLowerCase() === context.prefix.toLowerCase(),
@@ -2997,6 +3025,12 @@ function buildObjectItems(context: SqlCompletionContext, objects: SqlCompletionO
     })
     .sort(compareCompletionItems)
     .slice(0, MAX_TABLE_COMPLETION_ITEMS);
+}
+
+function buildRoutineInfo(object: SqlCompletionObject): string | undefined {
+  const qualifiedName = object.parentName ? [object.parentSchema ?? object.schema, object.parentName, object.name].filter(Boolean).join(".") : [object.schema, object.name].filter(Boolean).join(".");
+  const parts = [qualifiedName || object.name, object.signature?.trim(), object.comment?.trim()].filter((part): part is string => !!part);
+  return parts.length > 1 ? parts.join("\n") : undefined;
 }
 
 function routineTypeBoost(type: SqlCompletionObject["type"], prioritizeFunctions: boolean): number {
@@ -3371,8 +3405,7 @@ function buildAliasCandidates(tableName: string): string[] {
 
   if (parts.length > 1) {
     const initials = parts.map((part) => part[0]).join("");
-    if (initials.length >= 2) candidates.push(initials.slice(0, 2));
-    if (initials.length >= 3) candidates.push(initials.slice(0, 3));
+    if (initials.length >= 2) candidates.push(initials);
     candidates.push(parts[0].slice(0, 2), parts[0].slice(0, 3));
   } else {
     const name = parts[0] ?? tableName.toLowerCase().replace(/[^a-z0-9]/g, "");
@@ -4004,6 +4037,19 @@ function buildFunctionSnippetItems(prefix: string, functionDescriptions: Map<str
   return items;
 }
 
+function buildOracleSystemValueItems(prefix: string, keywordCase?: SqlKeywordCase): SqlCompletionItem[] {
+  return ORACLE_SYSTEM_VALUE_NAMES.filter((name) => matchesPrefix(name, prefix)).map((name) => {
+    const label = applySqlKeywordCase(name, keywordCase);
+    return {
+      label,
+      type: "function" as const,
+      detail: "Oracle system value",
+      apply: label,
+      boost: computeBoost(name, prefix) + 300,
+    };
+  });
+}
+
 function mongoCompletionItemToSqlCompletionItem(item: MongoCompletionItem): SqlCompletionItem {
   return {
     label: item.label,
@@ -4101,6 +4147,18 @@ function buildKeywordItems(prefix: string, context: SqlCompletionContext, databa
         boost: base + freqBoost,
       };
     });
+}
+
+function shouldOfferKeywordPrefixContinuations(context: SqlCompletionContext, pendingJoinKeyword: boolean): boolean {
+  return !!context.prefix && !pendingJoinKeyword && !context.qualifier && !context.exclusiveTableSuggestions && !context.exclusiveColumnSuggestions;
+}
+
+function buildKeywordPrefixContinuationItems(prefix: string, context: SqlCompletionContext, databaseType?: DatabaseType, keywordCase?: SqlKeywordCase): SqlCompletionItem[] {
+  const normalizedPrefix = prefix.toLowerCase();
+  return buildKeywordItems(prefix, context, databaseType, keywordCase).filter((item) => {
+    const normalizedLabel = item.label.toLowerCase();
+    return normalizedLabel.length > normalizedPrefix.length && normalizedLabel.startsWith(normalizedPrefix);
+  });
 }
 
 function matchesPrefix(candidate: string, prefix: string): boolean {

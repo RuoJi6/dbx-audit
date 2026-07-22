@@ -21,7 +21,7 @@ import { CONNECTION_ATTEMPT_CANCELLED_MESSAGE, useConnectionStore } from "@/stor
 import { useTunnelProfileStore } from "@/stores/tunnelProfileStore";
 import { detachTunnelProfileLayer, tunnelProfileReferenceLayer, tunnelProfileSummary } from "@/lib/connection/tunnelProfiles";
 import { applySshConfigHostAliasPrefill as prefillSshConfigHostAlias } from "@/lib/connection/sshConfigHosts";
-import { connectionEditDraftSyncAction } from "./connectionEditDraftSync";
+import { canPersistConnectionTestResult, connectionEditDraftSyncAction } from "./connectionEditDraftSync";
 import { REDIS_SCAN_PAGE_SIZE_DEFAULT, REDIS_SCAN_PAGE_SIZE_MIN, REDIS_SCAN_PAGE_SIZE_MAX, REDIS_SCAN_PAGE_SIZE_OPTIONS } from "@/lib/redis/redisKeyPattern";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useToast } from "@/composables/useToast";
@@ -44,9 +44,10 @@ import { prestoSqlBuiltinDriverPaths } from "@/lib/database/prestoSqlBuiltinDriv
 import { JDBCX_DEFAULT_URL, JDBCX_DRIVER_PROFILE, JDBCX_JDBC_DRIVER_CLASS, ensureJdbcxRuntimeDrivers, isJdbcxRuntimeBundle, isJdbcxRuntimePath, jdbcxHighPrivilegeExtensionsEnabled, setJdbcxHighPrivilegeExtensionsEnabled } from "@/lib/database/jdbcxBuiltinDriver";
 import { SQLITE_DATABASE_FILE_EXTENSIONS } from "@/lib/database/databaseFileDetection";
 import { connectionAttemptOriginalErrorMessage, connectionAttemptTimeoutMessage, connectionAttemptTimeoutMs } from "@/lib/connection/connectionAttemptTimeout";
-import { appendConnectionErrorHints } from "@/lib/connection/connectionErrorHints";
+import { appendConnectionErrorHints, isJdbcMissingRuntimeDependencyError } from "@/lib/connection/connectionErrorHints";
 import { postgresTlsModeForForm } from "@/lib/connection/postgresTlsMode";
 import { normalizeKafkaBootstrapServers } from "@/lib/connection/kafkaBootstrapServers";
+import { normalizeRocketmqNamesrvAddr } from "@/lib/connection/rocketmqNamesrv";
 import { detectMqUiAuthKind, isMqAuthKindAllowedForSystem, type MqUiAuthKind } from "@/lib/connection/mqAuth";
 import { driverInstallProgressPercent, type DriverInstallProgress } from "@/lib/connection/driverInstallProgressUi";
 import { isSqlServerLegacyCompatibilityMode, requiresSqlServerLegacyCompatibilityComponent, setSqlServerLegacyCompatibilityMode, SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY } from "@/lib/connection/sqlServerLegacyCompatibility";
@@ -88,6 +89,7 @@ import { oceanbaseModeConnectionPatch, oceanbaseSubModeFromConfig } from "@/lib/
 import { translateBackendError } from "@/i18n/backend-errors";
 import { applyHiveKerberosSubmitConfig, hiveKerberosFormConfig, type HiveKerberosAuthMode } from "@/lib/database/hiveKerberosOptions";
 import { hasCloudflareD1Credentials, isCloudflareD1Connection, normalizeCloudflareD1Connection } from "@/lib/connection/cloudflareD1";
+import { buildElasticsearchExternalConfig, elasticsearchConnectionModeFromConfig, elasticsearchKibanaBasePathFromConfig, type ElasticsearchConnectionMode } from "@/lib/connection/elasticsearchKibanaProxy";
 
 type DbOption = { value: string; label: string };
 type DbCategory = { key: string; title: string; options: DbOption[] };
@@ -251,6 +253,31 @@ const defaultForm = (): ConnectionForm => ({
   visible_databases: undefined,
 });
 
+const elasticsearchConnectionMode = ref<ElasticsearchConnectionMode>("direct");
+const elasticsearchKibanaBasePath = ref("");
+const elasticsearchConnectionPorts = ref<Record<ElasticsearchConnectionMode, number>>({
+  direct: 9200,
+  kibana: 5601,
+});
+
+function resetElasticsearchProxyFields(externalConfig?: unknown) {
+  const mode = elasticsearchConnectionModeFromConfig(externalConfig);
+  elasticsearchConnectionMode.value = mode;
+  elasticsearchKibanaBasePath.value = elasticsearchKibanaBasePathFromConfig(externalConfig);
+  elasticsearchConnectionPorts.value = {
+    direct: mode === "direct" ? form.value.port : 9200,
+    kibana: mode === "kibana" ? form.value.port : 5601,
+  };
+}
+
+function switchElasticsearchConnectionMode(mode: ElasticsearchConnectionMode) {
+  if (mode === elasticsearchConnectionMode.value) return;
+  elasticsearchConnectionPorts.value[elasticsearchConnectionMode.value] = form.value.port;
+  form.value.port = elasticsearchConnectionPorts.value[mode];
+  elasticsearchConnectionMode.value = mode;
+  resetTestState();
+}
+
 function defaultSshTunnel(): SshTunnelConfig {
   return {
     id: uuid(),
@@ -412,6 +439,7 @@ function sshLayersForConfig(config: LegacyConnectionConfig): SshTunnelConfig[] {
 }
 
 const form = ref(defaultForm());
+const showJdbcDependencyDriverManagerAction = computed(() => form.value.db_type === "jdbc" && isJdbcMissingRuntimeDependencyError(connectionErrorDetail.value));
 
 function externalConfigRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? { ...(value as Record<string, unknown>) } : {};
@@ -485,6 +513,8 @@ const configTab = ref<ConfigTab>("connection");
 const MQ_KAFKA_SECURITY_PROTOCOL_AUTO = "__auto";
 const mqAdminUrl = ref("http://127.0.0.1:8080");
 const mqSystemKind = ref<MqSystemKind>("pulsar");
+const mqRocketmqNamesrvAddr = ref("127.0.0.1:9876");
+const mqRocketmqClusterName = ref("");
 const mqKafkaBootstrapServers = ref("127.0.0.1:9092");
 const mqKafkaSecurityProtocol = ref(MQ_KAFKA_SECURITY_PROTOCOL_AUTO);
 const mqKafkaSaslMechanism = ref("PLAIN");
@@ -507,10 +537,29 @@ const mqTlsSkipVerify = ref(false);
 const mqPinnedVersion = ref(pinnedVersionToSelection(undefined));
 const mqTokenSigningMode = ref<MqTokenSigningMode>("none");
 const mqTokenSigningKey = ref("");
-const mqSystemOptions = computed(() => [
-  { value: "pulsar" as const, label: t("connection.mqSystemPulsar") },
-  { value: "kafka" as const, label: t("connection.mqSystemKafka") },
-]);
+const MQ_DRIVER_LABELS: Record<MqSystemKind, string> = {
+  pulsar: "Apache Pulsar",
+  kafka: "Apache Kafka",
+  rocketmq: "Apache RocketMQ",
+};
+
+function mqSystemKindFromProfile(profile: string): MqSystemKind {
+  if (profile === "kafka") return "kafka";
+  if (profile === "rocketmq") return "rocketmq";
+  return "pulsar";
+}
+
+function syncMqSystemKindFromSelectedType() {
+  if (form.value.db_type !== "mq") return;
+  mqSystemKind.value = mqSystemKindFromProfile(selectedType.value);
+}
+
+function resolveMqSystemKind(config?: Partial<MqAdminConfig>): MqSystemKind {
+  if (config?.systemKind === "kafka" || config?.systemKind === "rocketmq" || config?.systemKind === "pulsar") {
+    return config.systemKind;
+  }
+  return mqSystemKindFromProfile(selectedType.value);
+}
 const mqKafkaSecurityProtocolOptions = computed(() => [
   { value: MQ_KAFKA_SECURITY_PROTOCOL_AUTO, label: t("connection.mqSecurityAuto") },
   { value: "PLAINTEXT", label: "PLAINTEXT" },
@@ -751,6 +800,7 @@ const driverProfiles: Record<
   zookeeper: { type: "zookeeper", port: 2181, user: "", label: "Apache ZooKeeper", icon: "zookeeper" },
   mq: { type: "mq", port: 8080, user: "", label: "Apache Pulsar", icon: "pulsar", host: "127.0.0.1" },
   kafka: { type: "mq", port: 9092, user: "", label: "Apache Kafka", icon: "kafka", host: "127.0.0.1" },
+  rocketmq: { type: "mq", port: 9876, user: "", label: "Apache RocketMQ", icon: "rocketmq", host: "127.0.0.1" },
   nacos: { type: "nacos", port: 8848, user: "nacos", label: "Nacos", icon: "nacos", host: "127.0.0.1" },
   iris: { type: "iris", port: 1972, user: "_SYSTEM", label: "IRIS", icon: "iris" },
   influxdb: { type: "influxdb", port: 8086, user: "", label: "InfluxDB", icon: "InfluxDB" },
@@ -778,8 +828,12 @@ function profileForConfig(config: ConnectionConfig) {
     if (config.driver_profile === "oceanbase-oracle") return "oceanbase";
     return config.driver_profile;
   }
-  if (config.db_type === "mq" && (config.external_config as MqAdminConfig | undefined)?.systemKind === "kafka") return "kafka";
-  if (config.db_type === "mq") return "mq";
+  if (config.db_type === "mq") {
+    const kind = (config.external_config as MqAdminConfig | undefined)?.systemKind;
+    if (kind === "kafka") return "kafka";
+    if (kind === "rocketmq") return "rocketmq";
+    return "mq";
+  }
   if (config.db_type === "dameng") return "dm";
   if (config.db_type === "oceanbase-oracle") return "oceanbase";
   return config.db_type;
@@ -821,13 +875,15 @@ function parseJaasStringProperty(value: string, key: string): string {
 }
 
 function resetMqFields(config?: Partial<MqAdminConfig>) {
-  const systemKind = config?.systemKind === "kafka" ? "kafka" : "pulsar";
+  const systemKind = resolveMqSystemKind(config);
   const extra = mqExtraRecord(config);
   const properties = mqExtraProperties(extra);
   const jaasConfig = mqExtraPropertyString(extra, "sasl.jaas.config");
   mqSystemKind.value = systemKind;
-  mqAdminUrl.value = config?.adminUrl?.trim() || (systemKind === "kafka" ? "" : "http://127.0.0.1:8080");
+  mqAdminUrl.value = config?.adminUrl?.trim() || (systemKind === "kafka" || systemKind === "rocketmq" ? "" : "http://127.0.0.1:8080");
   mqKafkaBootstrapServers.value = mqExtraString(extra, "bootstrapServers") || "127.0.0.1:9092";
+  mqRocketmqNamesrvAddr.value = mqExtraString(extra, "namesrvAddr") || mqExtraString(extra, "namesrv_addr") || "127.0.0.1:9876";
+  mqRocketmqClusterName.value = mqExtraString(extra, "clusterName") || mqExtraString(extra, "cluster_name");
   mqKafkaSecurityProtocol.value = mqExtraString(extra, "securityProtocol") || MQ_KAFKA_SECURITY_PROTOCOL_AUTO;
   mqKafkaSaslMechanism.value = mqExtraString(extra, "saslMechanism") || "PLAIN";
   mqKafkaKerberosPrincipal.value = parseJaasStringProperty(jaasConfig, "principal");
@@ -859,13 +915,23 @@ function resetMqFields(config?: Partial<MqAdminConfig>) {
 }
 
 function defaultMqFieldsForProfile(profile: string): Partial<MqAdminConfig> | undefined {
-  if (profile !== "kafka") return undefined;
-  return {
-    systemKind: "kafka",
-    adminUrl: "",
-    auth: { kind: "none" },
-    extra: { bootstrapServers: "127.0.0.1:9092" },
-  };
+  if (profile === "kafka") {
+    return {
+      systemKind: "kafka",
+      adminUrl: "",
+      auth: { kind: "none" },
+      extra: { bootstrapServers: "127.0.0.1:9092" },
+    };
+  }
+  if (profile === "rocketmq") {
+    return {
+      systemKind: "rocketmq",
+      adminUrl: "",
+      auth: { kind: "none" },
+      extra: { namesrvAddr: "127.0.0.1:9876" },
+    };
+  }
+  return undefined;
 }
 
 function hydrateMqFields(value: unknown) {
@@ -876,9 +942,18 @@ function hydrateMqFields(value: unknown) {
   resetMqFields(value as Partial<MqAdminConfig>);
 }
 
+watch(selectedType, () => {
+  syncMqSystemKindFromSelectedType();
+});
+
 watch(mqSystemKind, (kind) => {
   if (kind === "kafka") {
     if (!mqKafkaBootstrapServers.value.trim()) mqKafkaBootstrapServers.value = "127.0.0.1:9092";
+    if (!isMqAuthKindAllowedForSystem(kind, mqAuthKind.value)) mqAuthKind.value = "none";
+    return;
+  }
+  if (kind === "rocketmq") {
+    if (!mqRocketmqNamesrvAddr.value.trim()) mqRocketmqNamesrvAddr.value = "127.0.0.1:9876";
     if (!isMqAuthKindAllowedForSystem(kind, mqAuthKind.value)) mqAuthKind.value = "none";
     return;
   }
@@ -1024,6 +1099,23 @@ function buildMqAdminConfig(): MqAdminConfig {
     if (Object.keys(properties).length) extra.properties = properties;
     return {
       systemKind: mqSystemKind.value,
+      adminUrl: "",
+      auth: buildMqAuth(),
+      tlsSkipVerify: mqTlsSkipVerify.value || undefined,
+      extra,
+    };
+  }
+
+  if (systemKind === "rocketmq") {
+    const namesrvAddr = normalizeRocketmqNamesrvAddr(mqRocketmqNamesrvAddr.value);
+    const extra: Record<string, unknown> = { namesrvAddr };
+    if (mqRocketmqClusterName.value.trim()) extra.clusterName = mqRocketmqClusterName.value.trim();
+    if (mqAuthKind.value === "basic") {
+      extra.accessKey = mqBasicUsername.value.trim();
+      extra.secretKey = mqBasicPassword.value;
+    }
+    return {
+      systemKind: "rocketmq",
       adminUrl: "",
       auth: buildMqAuth(),
       tlsSkipVerify: mqTlsSkipVerify.value || undefined,
@@ -1299,12 +1391,35 @@ function applySuccessfulConnectionTest(result: ConnectionTestResult, config: Con
   testedGeneratedName.value = config.name;
 }
 
-async function persistSuccessfulConnectionTest(result: ConnectionTestResult, config: ConnectionConfig, sourceName: string) {
+async function persistSuccessfulConnectionTest(result: ConnectionTestResult, config: ConnectionConfig, sourceName: string, runId: number) {
   if (!editingId.value || !result.databaseInfo || !savedConnectionConfigFingerprint.value) return;
   const fingerprint = connectionConfigFingerprint(config, sourceName);
-  if (fingerprint !== savedConnectionConfigFingerprint.value) return;
+  let currentDraftFingerprint: string;
   try {
-    await store.updateConnectionDatabaseInfo(editingId.value, result.databaseInfo);
+    const currentDraft = connectionConfigForSubmit(editingId.value, form.value.name);
+    currentDraftFingerprint = connectionConfigFingerprint(currentDraft, form.value.name);
+  } catch {
+    return;
+  }
+  // An in-flight test must not publish its saved snapshot after the user edits,
+  // switches, or closes the draft that initiated it.
+  if (
+    !canPersistConnectionTestResult({
+      testConfigId: config.id,
+      activeDraftId: editingId.value,
+      testRunId: runId,
+      activeTestRunId: testRunId,
+      submittedFingerprint: fingerprint,
+      savedFingerprint: savedConnectionConfigFingerprint.value,
+      currentDraftFingerprint,
+    })
+  ) {
+    return;
+  }
+  const persistedDraftId = editingId.value;
+  try {
+    await store.updateConnectionDatabaseInfo(persistedDraftId, result.databaseInfo);
+    if (runId !== testRunId || editingId.value !== persistedDraftId) return;
     savedDatabaseInfo.value = { ...result.databaseInfo };
     savedDatabaseInfoFingerprint.value = fingerprint;
   } catch {
@@ -1340,6 +1455,20 @@ async function testConnectionWithTimeout(config: ConnectionConfig, runId: number
   } finally {
     if (timer) clearTimeout(timer);
   }
+}
+
+function applyMqRocketmqNamesrv(config: LegacyConnectionConfig, namesrvAddr: string) {
+  const first = normalizeRocketmqNamesrvAddr(namesrvAddr).split(";")[0];
+  if (!first) throw new Error(t("connection.rocketmqNamesrvAddrRequired"));
+  let parsed: URL;
+  try {
+    parsed = new URL(`rocketmq://${first}`);
+  } catch {
+    throw new Error(t("connection.rocketmqNamesrvAddrInvalid"));
+  }
+  config.host = parsed.hostname;
+  config.port = Number(parsed.port) || 9876;
+  config.ssl = false;
 }
 
 function applyMqAdminUrl(config: LegacyConnectionConfig, adminUrl: string) {
@@ -1458,12 +1587,16 @@ function applyProfile(val: string, preserveConnectionFields = false) {
   const profile = driverProfiles[val];
   if (!profile) return;
 
+  const previousDatabaseType = form.value.db_type;
   selectedType.value = val;
   form.value.db_type = profile.type;
   form.value.driver_profile = val;
   form.value.driver_label = isCustomCompatibleProfile() ? customDriverName.value.trim() || profile.label : profile.label;
   if (profile.type !== "sqlserver") {
     form.value.external_config = undefined;
+  }
+  if (profile.type !== "elasticsearch" || previousDatabaseType !== "elasticsearch") {
+    resetElasticsearchProxyFields();
   }
 
   if (!preserveConnectionFields) {
@@ -1508,6 +1641,7 @@ function applyProfile(val: string, preserveConnectionFields = false) {
     }
     if (profile.type === "mq") {
       resetMqFields(defaultMqFieldsForProfile(val));
+      syncMqSystemKindFromSelectedType();
       form.value.database = undefined;
       form.value.connection_string = undefined;
     }
@@ -1629,6 +1763,7 @@ watch(
       } else {
         resetInfluxDbFields();
       }
+      resetElasticsearchProxyFields(config.db_type === "elasticsearch" ? config.external_config : undefined);
       resetHiveKerberosFields(config.db_type === "hive" ? config : undefined);
       h2ConnectionMode.value = h2ConnectionModeForConfig(config);
       customColorInput.value = config.color || "";
@@ -1665,6 +1800,7 @@ watch(
       resetMqFields();
       resetNacosFields();
       resetInfluxDbFields();
+      resetElasticsearchProxyFields();
       resetHiveKerberosFields();
       oceanbaseSubMode.value = "mysql";
       h2ConnectionMode.value = "file";
@@ -1852,6 +1988,7 @@ const iconTypeMap: Record<string, string> = {
   zookeeper: "zookeeper",
   mq: "mq",
   kafka: "kafka",
+  rocketmq: "rocketmq",
   nacos: "nacos",
   dm: "dm",
   h2: "h2",
@@ -1946,6 +2083,7 @@ const dbOptions: DbOption[] = [
   { value: "zookeeper", label: "Apache ZooKeeper" },
   { value: "mq", label: "Apache Pulsar" },
   { value: "kafka", label: "Apache Kafka" },
+  { value: "rocketmq", label: "Apache RocketMQ" },
   { value: "nacos", label: "Nacos" },
   { value: "influxdb", label: "InfluxDB" },
   { value: "iris", label: "IRIS" },
@@ -2276,7 +2414,9 @@ const connectionLabelTopClass = `${connectionLabelClass} mt-2`;
 const connectionLabelSmallPaddedClass = `${connectionLabelClass} pt-2 text-xs`;
 const hasRequiredConnectionTarget = computed(() => {
   if (form.value.db_type === "mq") {
-    return mqSystemKind.value === "kafka" ? !!mqKafkaBootstrapServers.value.trim() : !!mqAdminUrl.value.trim();
+    if (mqSystemKind.value === "kafka") return !!mqKafkaBootstrapServers.value.trim();
+    if (mqSystemKind.value === "rocketmq") return !!mqRocketmqNamesrvAddr.value.trim();
+    return !!mqAdminUrl.value.trim();
   }
   if (form.value.db_type === "zookeeper") return !!(form.value.host || form.value.connection_string || connectionUrlInput.value.trim());
   if (form.value.db_type === "nacos") return !!nacosServerAddr.value.trim();
@@ -2358,7 +2498,7 @@ async function testConnection() {
       successfulConfig = connectionConfigForSubmit(config.id, config.name);
     }
     applySuccessfulConnectionTest(result, successfulConfig, submittedSourceName);
-    void persistSuccessfulConnectionTest(result, successfulConfig, submittedSourceName);
+    void persistSuccessfulConnectionTest(result, successfulConfig, submittedSourceName, runId);
     clearEditedConnectionErrorAfterSuccessfulTest();
   } catch (e: any) {
     if (runId !== testRunId) return;
@@ -2372,7 +2512,7 @@ async function testConnection() {
     }
     if (fallback) {
       applySuccessfulConnectionTest(fallback.result, fallback.config, submittedSourceName);
-      void persistSuccessfulConnectionTest(fallback.result, fallback.config, submittedSourceName);
+      void persistSuccessfulConnectionTest(fallback.result, fallback.config, submittedSourceName, runId);
       clearEditedConnectionErrorAfterSuccessfulTest();
     } else {
       clearTestedConnectionInfo();
@@ -2601,14 +2741,17 @@ function connectionConfigForSubmit(id: string, generatedName = ""): ConnectionCo
   if (!config.is_production) config.is_production = undefined;
   config.production_databases = [...new Set((config.production_databases || []).map((database) => database.trim()).filter(Boolean))];
   if (!config.production_databases.length) config.production_databases = undefined;
-  if (config.db_type === "mq") {
+  if (form.value.db_type === "mq") {
     const mqConfig = buildMqAdminConfig();
     config.external_config = mqConfig;
-    config.driver_profile = mqConfig.systemKind === "kafka" ? "kafka" : "pulsar";
-    config.driver_label = mqConfig.systemKind === "kafka" ? "Apache Kafka" : "Apache Pulsar";
+    config.driver_profile = mqConfig.systemKind;
+    config.driver_label = MQ_DRIVER_LABELS[mqConfig.systemKind];
     if (mqConfig.systemKind === "kafka") {
       const extra = mqExtraRecord(mqConfig);
       applyMqKafkaBootstrapServers(config, mqExtraString(extra, "bootstrapServers"), mqExtraString(extra, "securityProtocol"));
+    } else if (mqConfig.systemKind === "rocketmq") {
+      const extra = mqExtraRecord(mqConfig);
+      applyMqRocketmqNamesrv(config, mqExtraString(extra, "namesrvAddr") || mqExtraString(extra, "namesrv_addr"));
     } else {
       applyMqAdminUrl(config, mqConfig.adminUrl);
     }
@@ -2634,6 +2777,8 @@ function connectionConfigForSubmit(id: string, generatedName = ""): ConnectionCo
       config.password = config.password.trim();
       config.database = config.database?.trim() || undefined;
     }
+  } else if (config.db_type === "elasticsearch") {
+    config.external_config = buildElasticsearchExternalConfig(elasticsearchConnectionMode.value, elasticsearchKibanaBasePath.value);
   } else if (config.db_type === "sqlserver") {
     config.external_config = sqlServerPortExplicitFromConfig(config) ? { portExplicit: true } : undefined;
   } else {
@@ -3331,6 +3476,11 @@ async function copyConnectionErrorDetail() {
   } catch (e: any) {
     toast(t("grid.copyFailed", { message: e?.message || String(e) }), 5000);
   }
+}
+
+function openJdbcDriverManagerFromError() {
+  showConnectionErrorDialog.value = false;
+  emit("openDriverStore", { target: "tab", tab: "jdbc" });
 }
 
 function resetForm() {
@@ -4461,19 +4611,6 @@ function openExternalUrl(url: string) {
 
                 <!-- Message Queue: admin URL and auth -->
                 <template v-else-if="form.db_type === 'mq'">
-                  <div class="grid grid-cols-4 items-center gap-4">
-                    <Label :class="connectionLabelClass">{{ t("connection.mqSystem") }}</Label>
-                    <Select v-model="mqSystemKind">
-                      <SelectTrigger class="col-span-3 h-9">
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem v-for="option in mqSystemOptions" :key="option.value" :value="option.value">
-                          {{ option.label }}
-                        </SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </div>
                   <template v-if="mqSystemKind === 'kafka'">
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelClass">{{ t("connection.mqBootstrapServers") }}</Label>
@@ -4493,6 +4630,16 @@ function openExternalUrl(url: string) {
                       </Select>
                     </div>
                   </template>
+                  <template v-else-if="mqSystemKind === 'rocketmq'">
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label :class="connectionLabelClass">{{ t("connection.rocketmqNamesrvAddr") }}</Label>
+                      <Input v-model="mqRocketmqNamesrvAddr" class="col-span-3" :placeholder="t('connection.rocketmqNamesrvAddrPlaceholder')" />
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label :class="connectionLabelClass">{{ t("connection.rocketmqClusterName") }}</Label>
+                      <Input v-model="mqRocketmqClusterName" class="col-span-3" :placeholder="t('connection.rocketmqClusterNamePlaceholder')" />
+                    </div>
+                  </template>
                   <template v-else>
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelClass">{{ t("connection.mqAdminUrl") }}</Label>
@@ -4503,11 +4650,11 @@ function openExternalUrl(url: string) {
                     <Label :class="connectionLabelClass">{{ t("connection.mqAuth") }}</Label>
                     <div class="col-span-3 flex flex-wrap gap-2">
                       <Button size="sm" :variant="mqAuthKind === 'none' ? 'default' : 'outline'" @click="mqAuthKind = 'none'">{{ t("connection.mqAuthNone") }}</Button>
-                      <Button v-if="mqSystemKind !== 'kafka'" size="sm" :variant="mqAuthKind === 'token' ? 'default' : 'outline'" @click="mqAuthKind = 'token'">{{ t("connection.mqAuthToken") }}</Button>
-                      <Button size="sm" :variant="mqAuthKind === 'basic' ? 'default' : 'outline'" @click="mqAuthKind = 'basic'">{{ t("connection.mqAuthBasic") }}</Button>
+                      <Button v-if="mqSystemKind === 'pulsar'" size="sm" :variant="mqAuthKind === 'token' ? 'default' : 'outline'" @click="mqAuthKind = 'token'">{{ t("connection.mqAuthToken") }}</Button>
+                      <Button size="sm" :variant="mqAuthKind === 'basic' ? 'default' : 'outline'" @click="mqAuthKind = 'basic'">{{ mqSystemKind === "rocketmq" ? t("connection.rocketmqAclAuth") : t("connection.mqAuthBasic") }}</Button>
                       <Button v-if="mqSystemKind === 'kafka'" size="sm" :variant="mqAuthKind === 'kerberos' ? 'default' : 'outline'" @click="mqAuthKind = 'kerberos'">{{ t("connection.mqAuthKerberos") }}</Button>
-                      <Button v-if="mqSystemKind !== 'kafka'" size="sm" :variant="mqAuthKind === 'apiKey' ? 'default' : 'outline'" @click="mqAuthKind = 'apiKey'">{{ t("connection.mqAuthApiKey") }}</Button>
-                      <Button v-if="mqSystemKind !== 'kafka'" size="sm" :variant="mqAuthKind === 'oauth2' ? 'default' : 'outline'" @click="mqAuthKind = 'oauth2'">{{ t("connection.mqAuthOauth2") }}</Button>
+                      <Button v-if="mqSystemKind === 'pulsar'" size="sm" :variant="mqAuthKind === 'apiKey' ? 'default' : 'outline'" @click="mqAuthKind = 'apiKey'">{{ t("connection.mqAuthApiKey") }}</Button>
+                      <Button v-if="mqSystemKind === 'pulsar'" size="sm" :variant="mqAuthKind === 'oauth2' ? 'default' : 'outline'" @click="mqAuthKind = 'oauth2'">{{ t("connection.mqAuthOauth2") }}</Button>
                     </div>
                   </div>
                   <template v-if="mqAuthKind === 'token'">
@@ -4518,11 +4665,11 @@ function openExternalUrl(url: string) {
                   </template>
                   <template v-else-if="mqAuthKind === 'basic'">
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label :class="connectionLabelClass">{{ t("connection.user") }}</Label>
+                      <Label :class="connectionLabelClass">{{ mqSystemKind === "rocketmq" ? t("connection.rocketmqAccessKey") : t("connection.user") }}</Label>
                       <Input v-model="mqBasicUsername" class="col-span-3" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label :class="connectionLabelClass">{{ t("connection.password") }}</Label>
+                      <Label :class="connectionLabelClass">{{ mqSystemKind === "rocketmq" ? t("connection.rocketmqSecretKey") : t("connection.password") }}</Label>
                       <PasswordInput v-model="mqBasicPassword" class="col-span-3" />
                     </div>
                     <div v-if="mqSystemKind === 'kafka'" class="grid grid-cols-4 items-center gap-4">
@@ -4623,7 +4770,7 @@ function openExternalUrl(url: string) {
                       <span class="text-xs text-muted-foreground">{{ t("connection.mqTlsSkipVerify") }}</span>
                     </label>
                   </div>
-                  <div v-if="mqSystemKind !== 'kafka'" class="grid grid-cols-4 items-center gap-4">
+                  <div v-if="mqSystemKind === 'pulsar'" class="grid grid-cols-4 items-center gap-4">
                     <Label :class="connectionLabelClass">{{ t("connection.mqPinnedVersion") }}</Label>
                     <Select v-model="mqPinnedVersion">
                       <SelectTrigger class="col-span-3 h-9">
@@ -4639,7 +4786,7 @@ function openExternalUrl(url: string) {
                       </SelectContent>
                     </Select>
                   </div>
-                  <div v-if="mqSystemKind !== 'kafka'" class="grid grid-cols-4 items-center gap-4">
+                  <div v-if="mqSystemKind === 'pulsar'" class="grid grid-cols-4 items-center gap-4">
                     <Label :class="connectionLabelClass">{{ t("connection.mqTokenSigning") }}</Label>
                     <Select v-model="mqTokenSigningMode">
                       <SelectTrigger class="col-span-3 h-9">
@@ -5063,10 +5210,39 @@ function openExternalUrl(url: string) {
 
                 <!-- MySQL / PostgreSQL: host, port, user, password, database -->
                 <template v-else>
+                  <div v-if="form.db_type === 'elasticsearch'" class="grid grid-cols-4 items-center gap-4">
+                    <Label :class="connectionLabelSmallClass">{{ t("connection.mode") }}</Label>
+                    <div class="col-span-3 grid h-8 grid-cols-2 overflow-hidden rounded-md border border-input bg-muted/30 p-0.5">
+                      <button
+                        type="button"
+                        class="h-7 rounded-sm px-3 text-sm transition-colors"
+                        :class="elasticsearchConnectionMode === 'direct' ? 'bg-background text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'"
+                        :aria-pressed="elasticsearchConnectionMode === 'direct'"
+                        @click="switchElasticsearchConnectionMode('direct')"
+                      >
+                        {{ t("connection.elasticsearchDirectMode") }}
+                      </button>
+                      <button
+                        type="button"
+                        class="h-7 rounded-sm px-3 text-sm transition-colors"
+                        :class="elasticsearchConnectionMode === 'kibana' ? 'bg-background text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'"
+                        :aria-pressed="elasticsearchConnectionMode === 'kibana'"
+                        @click="switchElasticsearchConnectionMode('kibana')"
+                      >
+                        {{ t("connection.elasticsearchKibanaProxyMode") }}
+                      </button>
+                    </div>
+                  </div>
+
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label :class="connectionLabelClass">{{ t("connection.host") }}</Label>
+                    <Label :class="connectionLabelClass">{{ form.db_type === "elasticsearch" && elasticsearchConnectionMode === "kibana" ? t("connection.elasticsearchKibanaHost") : t("connection.host") }}</Label>
                     <Input v-model="form.host" class="col-span-2" />
                     <Input v-model.number="form.port" type="number" class="col-span-1" @input="markSqlServerPortExplicit" />
+                  </div>
+
+                  <div v-if="form.db_type === 'elasticsearch' && elasticsearchConnectionMode === 'kibana'" class="grid grid-cols-4 items-center gap-4">
+                    <Label :class="connectionLabelSmallClass">{{ t("connection.elasticsearchKibanaBasePath") }}</Label>
+                    <Input v-model="elasticsearchKibanaBasePath" class="col-span-3" placeholder="/kibana/s/default" @input="resetTestState" />
                   </div>
 
                   <div v-if="form.driver_profile === 'gbase8s'" class="grid grid-cols-4 items-center gap-4">
@@ -6021,6 +6197,10 @@ function openExternalUrl(url: string) {
       </div>
 
       <DialogFooter class="gap-2">
+        <Button v-if="showJdbcDependencyDriverManagerAction" variant="outline" @click="openJdbcDriverManagerFromError">
+          <FolderOpen class="mr-1.5 h-3.5 w-3.5" />
+          {{ t("toolbar.driverManager") }}
+        </Button>
         <Button variant="outline" @click="copyConnectionErrorDetail">
           <Copy class="mr-1.5 h-3.5 w-3.5" />
           复制错误

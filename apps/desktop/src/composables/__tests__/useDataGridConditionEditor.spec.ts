@@ -11,8 +11,8 @@ vi.stubGlobal("localStorage", {
   clear: () => storage.clear(),
 });
 
-function keyboardEvent(key: string) {
-  return { key, shiftKey: false, preventDefault: vi.fn() } as unknown as KeyboardEvent;
+function keyboardEvent(key: string, extras: Partial<KeyboardEvent> = {}) {
+  return { key, shiftKey: false, preventDefault: vi.fn(), ...extras } as unknown as KeyboardEvent;
 }
 
 describe("useDataGridConditionEditor", () => {
@@ -68,6 +68,39 @@ describe("useDataGridConditionEditor", () => {
     editor.dismiss();
     editor.openHistory();
     expect(editor.suggestions.value).toEqual([{ value: "customer_id = 1", kind: "history" }]);
+  });
+
+  it.each(["where", "orderBy"] as const)("displays raw PostgreSQL column names but inserts their quoted %s text", async (kind) => {
+    const value = ref("");
+    const editor = useDataGridConditionEditor({
+      kind,
+      value,
+      columns: [{ name: "OrderId", insertText: '"OrderId"', comment: "Mixed-case identifier" }],
+      historyScope: {},
+    });
+
+    value.value = kind === "where" ? "status = Order" : "created_at DESC, Order";
+    await nextTick();
+    await vi.waitFor(() => expect(editor.suggestions.value).toEqual([{ value: "OrderId", insertText: '"OrderId"', kind: "column", comment: "Mixed-case identifier" }]));
+
+    expect(editor.accept()).toBe(true);
+    expect(value.value).toBe(kind === "where" ? 'status = "OrderId"' : 'created_at DESC, "OrderId"');
+  });
+
+  it("restores quoted history verbatim instead of quoting it again", () => {
+    const scope = { connectionId: "connection", database: "db", tableName: "orders" };
+    rememberDataGridConditionHistory("orderBy", scope, '"OrderId" DESC');
+    const value = ref("");
+    const editor = useDataGridConditionEditor({
+      kind: "orderBy",
+      value,
+      columns: [{ name: "OrderId", insertText: '"OrderId"' }],
+      historyScope: scope,
+    });
+
+    editor.openHistory();
+    expect(editor.accept(0)).toBe(true);
+    expect(value.value).toBe('"OrderId" DESC');
   });
 
   it.each(["where", "orderBy"] as const)("normalizes %s comments from different metadata providers", async (kind) => {
@@ -191,5 +224,22 @@ describe("useDataGridConditionEditor", () => {
     const escape = keyboardEvent("Escape");
     expect(editor.handleKeydown(escape)).toBe("dismiss");
     expect(editor.dropdownOpen.value).toBe(false);
+  });
+
+  it("ignores shortcut keys while an IME composition is active", async () => {
+    const value = ref("");
+    const editor = useDataGridConditionEditor({ kind: "where", value, columns: ["name"], historyScope: {} });
+    value.value = "na";
+    await nextTick();
+    await vi.waitFor(() => expect(editor.suggestions.value).toHaveLength(1));
+
+    const composingEnter = keyboardEvent("Enter", { isComposing: true });
+    expect(editor.handleKeydown(composingEnter)).toBeUndefined();
+    expect(composingEnter.preventDefault).not.toHaveBeenCalled();
+    expect(value.value).toBe("na");
+
+    const processEnter = keyboardEvent("Process");
+    expect(editor.handleKeydown(processEnter)).toBeUndefined();
+    expect(processEnter.preventDefault).not.toHaveBeenCalled();
   });
 });

@@ -10,6 +10,7 @@ import {
   mongoDistinctToQueryResult,
   mongoDocumentsToQueryResult,
   mongoIndexesToQueryResult,
+  normalizeRustMongoCommand,
   parseMongoAggregateCommand,
   parseMongoCollectionStatsCommand,
   parseMongoCommand,
@@ -37,6 +38,21 @@ test("parseMongoFindCommand parses db collection find with an empty JSON filter"
     limit: 100,
     sort: undefined,
   });
+});
+
+test("normalizeRustMongoCommand preserves the desktop command contract", () => {
+  assert.deepEqual(
+    normalizeRustMongoCommand({ kind: "countDocuments", collection: "users", filter: "{}", accurate: false }),
+    { kind: "countDocuments", collection: "users", filter: "{}", mode: "legacy" },
+  );
+  assert.deepEqual(
+    normalizeRustMongoCommand({ kind: "dropIndexes", collection: "users", indexes: '"email_1"', single: true }),
+    { kind: "dropIndex", collection: "users", index: '"email_1"' },
+  );
+  assert.deepEqual(
+    normalizeRustMongoCommand({ kind: "findOne", collection: "users", filter: "{}", projection: null, options: null }),
+    { kind: "findOne", collection: "users", filter: "{}" },
+  );
 });
 
 test("parseMongoFindCommand parses getCollection find with chained sort skip and limit", () => {
@@ -222,6 +238,55 @@ test("evaluateMongoWriteSafety blocks empty-filter find-and-modify unless danger
   assert.equal(evaluateMongoWriteSafety(command, { allowWrites: true, allowDangerous: true }).allowed, true);
 });
 
+test("evaluateMongoWriteSafety fails closed for opaque or effectively unbounded filters", () => {
+  for (const source of [
+    'db.users.deleteMany({"$nor":[{"$expr":false}]})',
+    'db.users.deleteMany({"$or":[{"id":{"$exists":true}},{"id":{"$exists":false}}]})',
+    'db.users.deleteMany({"$or":[{"id":{"$exists":true}},{"id":{"$not":{"$exists":true}}}]})',
+    'db.users.deleteMany({"$or":[{"id":{"$eq":1}},{"id":{"$ne":1}}]})',
+    'db.users.deleteMany({"$or":[{"$and":[{"id":{"$eq":1}}]},{"id":{"$ne":1}}]})',
+    'db.users.deleteMany({"$or":[{"$and":[{"id":{"$eq":1}},{}]},{"id":{"$ne":1}}]})',
+    'db.users.deleteMany({"$or":[{"$and":[{"id":{"$eq":1}},{"x":{"$exists":true}}]},{"id":{"$ne":1}},{"x":{"$exists":false}}]})',
+    'db.users.deleteMany({"$or":[{"id":1},{"id":{"$ne":1}}]})',
+    'db.users.deleteMany({"$or":[{"id":{"$gt":1}},{"id":{"$lte":1}}]})',
+    'db.users.deleteMany({"$or":[{"id":{"$gte":1}},{"id":{"$lt":1}}]})',
+    'db.users.deleteMany({"$or":[{"id":{"$in":[1,2]}},{"id":{"$nin":[2,1]}}]})',
+    'db.users.deleteMany({"_id":{"$exists":true}})',
+    'db.users.deleteMany({"id":{"$nin":[]}})',
+    'db.users.deleteMany({"id":{"$elemMatch":{"value":1}}})',
+    'db.users.deleteMany({"_id":{"$oid":"not-an-object-id"}})',
+    'db.users.deleteMany({"sequence":{"$numberLong":"9223372036854775808"}})',
+    'db.users.deleteMany({"created_at":{"$date":"2026-02-30T00:00:00Z"}})',
+    'db.users.deleteMany({"name":{"$regex":".*"}})',
+    'db.users.deleteMany({"$or":[{"_id":{"$oid":"507f1f77bcf86cd799439011"}},{"_id":{"$ne":{"$oid":"507f1f77bcf86cd799439011"}}}]})',
+    'db.users.updateMany({"$where":"true"},{"$set":{"active":false}})',
+    'db.users.deleteMany({"$or":[]})',
+    'db.users.deleteMany({"$opaque":[{"id":1}]})',
+  ]) {
+    const command = parseMongoWriteCommand(source);
+    assert.ok(command, source);
+    assert.equal(evaluateMongoWriteSafety(command, { allowWrites: true, allowDangerous: false }).allowed, false, source);
+    assert.equal(evaluateMongoWriteSafety(command, { allowWrites: true, allowDangerous: true }).allowed, true, source);
+  }
+
+  for (const source of [
+    'db.users.deleteMany({"tenant_id":1})',
+    'db.users.updateMany({"created_at":{"$gte":"2026-01-01"}},{"$set":{"active":false}})',
+    'db.users.deleteMany({"$or":[{"tenant_id":1},{"tenant_id":2}]})',
+    'db.users.deleteMany({"id":{"$ne":1}})',
+    'db.users.deleteMany({"id":{"$in":[1,2]}})',
+    'db.users.deleteMany({"id":{"$exists":true}})',
+    'db.users.updateOne({_id:ObjectId("507f1f77bcf86cd799439011")},{"$set":{"active":true}})',
+    'db.users.deleteMany({"sequence":NumberLong("9223372036854775807")})',
+    'db.users.deleteMany({"created_at":ISODate("2026-01-01T00:00:00.000Z")})',
+    'db.users.deleteMany({"tenant_id":1,"id":{"$nin":[]}})',
+  ]) {
+    const command = parseMongoWriteCommand(source);
+    assert.ok(command, source);
+    assert.equal(evaluateMongoWriteSafety(command, { allowWrites: true, allowDangerous: false }).allowed, true, source);
+  }
+});
+
 test("parseMongoVersionCommand parses db.version", () => {
   assert.deepEqual(parseMongoVersionCommand("db.version();"), { kind: "version" });
   assert.equal(parseMongoVersionCommand("db.jobs.version()"), null);
@@ -286,6 +351,33 @@ test("parseMongoWriteCommand accepts unquoted insert and update commands", () =>
     update: '{"$set": {"stock": 3}}',
     many: false,
   });
+});
+
+test("parseMongoWriteCommand accepts legacy insert commands", () => {
+  assert.deepEqual(
+    parseMongoWriteCommand(`db.getCollection("accounting_reconciliations").insert({
+      "accountId": 999,
+      "status": "done"
+    });`),
+    {
+      kind: "insert",
+      collection: "accounting_reconciliations",
+      docsJson: '{\n      "accountId": 999,\n      "status": "done"\n    }',
+    },
+  );
+  assert.deepEqual(parseMongoWriteCommand("db.products.insert([{name: 'first'}, {name: 'second'}])"), {
+    kind: "insert",
+    collection: "products",
+    docsJson: '[{"name": "first"}, {"name": "second"}]',
+  });
+  assert.deepEqual(parseMongoWriteCommand("db.products.insertMany([{name: 'first'}, {name: 'second'}])"), {
+    kind: "insert",
+    collection: "products",
+    docsJson: '[{"name": "first"}, {"name": "second"}]',
+  });
+  assert.equal(parseMongoWriteCommand("db.products.insert({name: 'demo'}, {writeConcern: {w: 1}})"), null);
+  assert.equal(parseMongoWriteCommand("db.products.insert()"), null);
+  assert.equal(parseMongoWriteCommand("db.products.insert('demo')"), null);
 });
 
 test("parseMongoWriteCommand accepts updateMany arrayFilters options", () => {
@@ -379,18 +471,19 @@ test("parseMongoWriteCommand rejects invalid dropIndex/dropIndexes variants", ()
 test("evaluateMongoWriteSafety blocks collection drop unless dangerous writes are enabled", () => {
   const dropCollection = parseMongoWriteCommand("db.users.drop()");
   assert.ok(dropCollection);
-  assert.match(evaluateMongoWriteSafety(dropCollection, { allowWrites: true }).reason || "", /DBX_MCP_ALLOW_DANGEROUS_SQL=1/);
+  assert.match(evaluateMongoWriteSafety(dropCollection, { allowWrites: true }).reason || "", /high-risk operations.*DBX MCP settings/i);
   assert.equal(evaluateMongoWriteSafety(dropCollection, { allowWrites: true, allowDangerous: true }).allowed, true);
 });
 
-test("evaluateMongoWriteSafety blocks dangerous dropIndexes shapes unless enabled", () => {
+test("evaluateMongoWriteSafety requires high-risk permission for schema changes", () => {
   const dropAll = parseMongoWriteCommand("db.users.dropIndexes()");
   assert.ok(dropAll);
-  assert.match(evaluateMongoWriteSafety(dropAll, { allowWrites: true }).reason || "", /DBX_MCP_ALLOW_DANGEROUS_SQL=1/);
+  assert.match(evaluateMongoWriteSafety(dropAll, { allowWrites: true }).reason || "", /high-risk operations.*DBX MCP settings/i);
 
   const dropOne = parseMongoWriteCommand('db.users.dropIndexes("users_email_unique")');
   assert.ok(dropOne);
-  assert.equal(evaluateMongoWriteSafety(dropOne, { allowWrites: true }).allowed, true);
+  assert.equal(evaluateMongoWriteSafety(dropOne, { allowWrites: true }).allowed, false);
+  assert.equal(evaluateMongoWriteSafety(dropOne, { allowWrites: true, allowDangerous: true }).allowed, true);
 });
 
 test("parseMongoCountDocumentsCommand parses db collection countDocuments", () => {
@@ -697,16 +790,16 @@ test("splitMongoCommandRanges preserve document offsets for newline-separated co
   );
 });
 
-test("evaluateMongoAggregateSafety blocks write stages unless MCP write flags allow them", () => {
+test("evaluateMongoAggregateSafety follows the DBX-managed MCP permission level", () => {
   const out = parseMongoAggregateCommand('db.products.aggregate([{"$out":"products_copy"}])');
   assert.ok(out);
   assert.equal(mongoAggregateWriteStage(out.pipeline), "$out");
-  assert.match(evaluateMongoAggregateSafety(out, {}).reason || "", /DBX_MCP_ALLOW_WRITES=1/);
+  assert.match(evaluateMongoAggregateSafety(out, {}).reason || "", /DBX MCP read-only policy/i);
 
   const merge = parseMongoAggregateCommand('db.products.aggregate([{"$merge":{"into":"products_copy"}}])');
   assert.ok(merge);
   assert.equal(mongoAggregateWriteStage(merge.pipeline), "$merge");
-  assert.match(evaluateMongoAggregateSafety(merge, { allowWrites: true }).reason || "", /DBX_MCP_ALLOW_DANGEROUS_SQL=1/);
+  assert.match(evaluateMongoAggregateSafety(merge, { allowWrites: true }).reason || "", /high-risk operations.*DBX MCP settings/i);
   assert.equal(evaluateMongoAggregateSafety(merge, { allowWrites: true, allowDangerous: true }).allowed, true);
 });
 

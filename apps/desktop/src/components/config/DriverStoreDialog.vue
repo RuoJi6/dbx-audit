@@ -21,6 +21,7 @@ import { formatRuntimeBytes, formatRuntimeCpu, formatRuntimeUptime, runtimeHealt
 import { addDriverInstallQueue, driverInstallProgressPercent, isDriverInstallProgressTarget, removeDriverInstallQueue, takeNextDriverInstallQueue, type DriverInstallProgress } from "@/lib/connection/driverInstallProgressUi";
 import { PRESTOSQL_DRIVER_DB_TYPE, prestoSqlBuiltinDriverRow, prestoSqlMavenBundle } from "@/lib/database/prestoSqlBuiltinDriver";
 import type { DriverStoreFocus } from "@/lib/connection/agentDriverInstallHint";
+import { isOfflineDriverPackage, webDriverImportAccept } from "@/lib/driverStore/driverImportSelection";
 
 const { t } = useI18n();
 const { toast } = useToast();
@@ -332,7 +333,7 @@ async function forceRefresh() {
 }
 
 function setUpdateDownloadSource(value: unknown) {
-  if (value !== "official" && value !== "cnb" && value !== "atomgit") return;
+  if (value !== "official" && value !== "cnb") return;
   if (value === settingsStore.editorSettings.updateDownloadSource) return;
   settingsStore.updateEditorSettings({ updateDownloadSource: value });
   void forceRefresh().catch(() => undefined);
@@ -550,19 +551,38 @@ async function importOfflineZip() {
   }
 }
 
-async function importDriverJar(dbType: string) {
+async function importDriverFile(driver: AgentDriverInfo) {
+  const dbType = driver.db_type;
   if (isPrestoSqlBuiltinDriver(dbType)) {
     await importJdbcDrivers();
     return;
   }
+  const blockers = await api.checkAgentUpdateBlockers([dbType]);
+  if (blockers.length > 0) {
+    toast(t("driverStore.driverUpdateBlocked", { labels: blockers.map((blocker) => blocker.label).join(", ") }));
+    return;
+  }
   const label = driverLabel(dbType);
-  if (isWeb) {
-    const file = await chooseWebFile(".jar");
-    if (!file) return;
-    try {
-      await api.importAgentJar(dbType, file);
+  const requiresJavaRuntime = driverRequiresJavaRuntime(driver);
+  const isWindows = navigator.userAgent.toLowerCase().includes("windows");
+  const installSelectedFile = async (selected: string | File) => {
+    if (isOfflineDriverPackage(selected)) {
+      const count = await api.importAgentsFromZip(selected);
+      await refreshAgents();
+      toast(t("driverStore.offlineImportSuccess", { count }));
+    } else {
+      await api.importAgentDriver(dbType, selected);
       await refreshAgents();
       toast(t("driverStore.driverImportSuccess", { label }));
+    }
+  };
+  if (isWeb) {
+    // Native release assets have no extension on macOS/Linux, so do not apply
+    // a browser accept filter that would make the correct file unselectable.
+    const file = await chooseWebFile(webDriverImportAccept(requiresJavaRuntime, isWindows));
+    if (!file) return;
+    try {
+      await installSelectedFile(file);
     } catch (e: any) {
       toast(t("driverStore.driverImportFailed", { label, error: e }));
     }
@@ -572,13 +592,11 @@ async function importDriverJar(dbType: string) {
   const selected = await open({
     title: t("driverStore.chooseDriverJar"),
     multiple: false,
-    filters: [{ name: "JAR", extensions: ["jar"] }],
+    filters: requiresJavaRuntime ? [{ name: "Driver package or JAR", extensions: ["zip", "jar"] }] : isWindows ? [{ name: "Driver package or executable", extensions: ["zip", "exe"] }] : undefined,
   });
   if (typeof selected !== "string") return;
   try {
-    await api.importAgentJar(dbType, selected);
-    await refreshAgents();
-    toast(t("driverStore.driverImportSuccess", { label }));
+    await installSelectedFile(selected);
   } catch (e: any) {
     toast(t("driverStore.driverImportFailed", { label, error: e }));
   }
@@ -1161,7 +1179,6 @@ watch(driverStoreTab, (tab) => {
                   <SelectContent>
                     <SelectItem value="official">{{ t("settings.updateDownloadSourceOfficial") }}</SelectItem>
                     <SelectItem value="cnb">{{ t("settings.updateDownloadSourceCnb") }}</SelectItem>
-                    <SelectItem value="atomgit">{{ t("settings.updateDownloadSourceAtomgit") }}</SelectItem>
                   </SelectContent>
                 </Select>
               </div>
@@ -1294,7 +1311,7 @@ watch(driverStoreTab, (tab) => {
                     class="h-7 w-7 rounded-[6px] text-xs text-muted-foreground"
                     :title="t('driverStore.importLocalJar')"
                     :disabled="upgradingAll || installing !== null"
-                    @click="importDriverJar(driver.db_type)"
+                    @click="importDriverFile(driver)"
                   >
                     <FileUp class="h-3.5 w-3.5" />
                   </Button>
@@ -1360,7 +1377,7 @@ watch(driverStoreTab, (tab) => {
                     class="h-7 w-7 rounded-[6px] text-xs text-muted-foreground"
                     :title="t('driverStore.importLocalJar')"
                     :disabled="upgradingAll || installing !== null"
-                    @click="importDriverJar(driver.db_type)"
+                    @click="importDriverFile(driver)"
                   >
                     <FileUp class="h-3.5 w-3.5" />
                   </Button>

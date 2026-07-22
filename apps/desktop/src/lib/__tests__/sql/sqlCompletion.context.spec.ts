@@ -114,6 +114,30 @@ describe("sqlCompletion table targets", () => {
 });
 
 describe("sqlCompletion table aliases", () => {
+  it("uses initials from all words for generated aliases", () => {
+    const sql = "SELECT * FROM mat";
+    const items = buildSqlCompletionItems(sql, sql.length, {
+      tables: [{ name: "materials_order_item", type: "table" }],
+      columnsByTable: new Map(),
+      autoAliasTables: true,
+    });
+
+    const table = items.find((item) => item.label === "materials_order_item" && item.type === "table");
+    expect(table?.apply).toBe("materials_order_item AS moi");
+  });
+
+  it("uses every word initial for longer multi-word names", () => {
+    const sql = "SELECT * FROM sup";
+    const items = buildSqlCompletionItems(sql, sql.length, {
+      tables: [{ name: "super_long_customer_order_history_archive_snapshot_daily_replica", type: "table" }],
+      columnsByTable: new Map(),
+      autoAliasTables: true,
+    });
+
+    const table = items.find((item) => item.label === "super_long_customer_order_history_archive_snapshot_daily_replica" && item.type === "table");
+    expect(table?.apply).toBe("super_long_customer_order_history_archive_snapshot_daily_replica AS slcohasdr");
+  });
+
   it("applies generated aliases to table completions when enabled", () => {
     const sql = "SELECT * FROM ord";
     const items = buildSqlCompletionItems(sql, sql.length, {
@@ -285,7 +309,7 @@ describe("sqlCompletion scoped context classification", () => {
     expect(context.prefix).toBe("userc");
     expect(context.referencedTables).toEqual(expect.arrayContaining([expect.objectContaining({ name: "A1User" })]));
     expect(context.suggestColumns).toBe(true);
-    expect(context.suggestRoutines).toBe(false);
+    expect(context.suggestRoutines).toBe(true);
   });
 
   it("auto-opens column completion after WHERE whitespace before LIMIT", () => {

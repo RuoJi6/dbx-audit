@@ -64,6 +64,9 @@ import type { ColumnInfo, DatabaseType, TreeNode, TreeNodeType } from "@/types/d
 import * as api from "@/lib/backend/api";
 import { resolveDefaultDatabase } from "@/lib/database/defaultDatabase";
 import { canTreeNodePin, canTreeNodeShowExpander } from "@/lib/sidebar/sidebarTreeItemLayout";
+import { objectTypesForGroupNode } from "@/lib/table/tableTree";
+import { loadSidebarObjectGroup } from "@/lib/sidebar/sidebarObjectGroupRouting";
+import { mysqlObjectTemplateForGroup } from "@/lib/sidebar/mysqlObjectTemplates";
 import { buildTableDeleteTemplate, buildTableInsertTemplate, buildTableSelectTemplate, buildTableUpdateTemplate } from "@/lib/table/tableSqlTemplates";
 import { driverStoreFocusForInstallError } from "@/lib/connection/agentDriverInstallHint";
 import {
@@ -86,8 +89,10 @@ import {
 import { copyNameForTreeNode, isDocumentBrowserTreeNode, objectSourceKindForTreeNode, shouldRunTreeNodeRowAction, treeNodeRowAction, treeNodeRowDoubleClickAction } from "@/lib/sidebar/treeNodeClick";
 import { dataTabOpenModeFromTreeClick, type DataTabOpenMode } from "@/lib/sidebar/dataTabOpenPolicy";
 import { isCopySidebarSelectionShortcut, isEditSidebarConnectionShortcut, isPasteSidebarSelectionShortcut } from "@/lib/editor/keyboardShortcuts";
-import { canRefreshDataTableFromSingleActivationDoubleClick, dataTableDoubleClickAction } from "@/lib/tabs/dataTabActivation";
-import { buildCreateDatabaseSql, buildDuckDbAttachDatabaseSql, duckDbAttachedDatabaseNameFromPath, supportsCreateDatabaseCharset, uniqueDuckDbAttachedDatabaseName } from "@/lib/database/createDatabaseSql";
+import { dataTableDoubleClickAction } from "@/lib/tabs/dataTabActivation";
+import { attachedDatabaseNameFromPath, buildCreateDatabaseSql, buildDuckDbAttachDatabaseSql, buildSqliteAttachDatabaseSql, supportsCreateDatabaseCharset, uniqueAttachedDatabaseName } from "@/lib/database/createDatabaseSql";
+import { appendCreateDatabaseErrorHint } from "@/lib/database/createDatabaseErrorHints";
+import { SQLITE_DATABASE_FILE_EXTENSIONS } from "@/lib/database/databaseFileDetection";
 import {
   buildCreateSchemaSql,
   buildDropDatabaseSql,
@@ -364,6 +369,14 @@ const {
 const {
   canDropMongoDatabase,
   canDropMongoCollection,
+  canRenameMongoCollection,
+  prepareRenameMongoCollectionDialog,
+  confirmRenameMongoCollection,
+  showRenameMongoCollectionDialog,
+  renameMongoCollectionName,
+  renameMongoCollectionError,
+  renameMongoCollectionPreview,
+  renameMongoCollectionLoading,
   mongoIndexNameForNode,
   canDropMongoIndexNode,
   canDropMongoIndex,
@@ -379,6 +392,7 @@ const {
   dropAllMongoIndexes,
   flushRedisDb,
   confirmFlushRedisDb,
+  confirmDropMongoDatabase,
   confirmDropMongoCollection,
   confirmDropMongoIndex,
   confirmDropAllMongoIndexes,
@@ -493,7 +507,10 @@ async function toggle() {
     return;
   }
 
-  const databaseObjectGroup = node.type === "group-tables" || node.type === "group-views" || node.type === "group-materialized-views" || node.type === "group-procedures" || node.type === "group-functions" || node.type === "group-sequences" || node.type === "group-packages";
+  // Keep the click path aligned with every object-group definition. In
+  // particular, schema-level trigger/type groups have no tableName, so they
+  // must use the generic object loader rather than the table-trigger loader.
+  const databaseObjectGroup = !!objectTypesForGroupNode(node.type);
   if (databaseObjectGroup && connectionStore.isTreeNodeChildrenLoaded(node.id)) {
     node.isExpanded = !node.isExpanded;
     if (wasExpanded && !connectionStore.sidebarSearchQuery) connectionStore.releaseCollapsedTreeNodeChildren(node.id);
@@ -509,6 +526,11 @@ async function toggle() {
   }
 
   try {
+    if (await loadSidebarObjectGroup(node, connectionStore)) {
+      emit("node-toggled", node, wasExpanded);
+      return;
+    }
+
     if (node.type === "connection" && node.connectionId) {
       const config = connectionStore.getConfig(node.connectionId);
       if (config?.db_type === "redis") {
@@ -619,10 +641,6 @@ async function toggle() {
       await connectionStore.loadIndexes(node.connectionId, node.database, node.tableName, node.schema, node.id, node.catalog);
     } else if (node.type === "group-fkeys" && node.connectionId && hasTreeNodeDatabaseContext(node) && node.tableName) {
       await connectionStore.loadForeignKeys(node.connectionId, node.database, node.tableName, node.schema, node.id, node.catalog);
-    } else if (node.type === "group-triggers" && node.connectionId && hasTreeNodeDatabaseContext(node) && node.tableName) {
-      await connectionStore.loadTriggers(node.connectionId, node.database, node.tableName, node.schema, node.id, node.catalog);
-    } else if (databaseObjectGroup) {
-      await connectionStore.loadObjectGroupChildren(node);
     }
     emit("node-toggled", node, wasExpanded);
   } catch (e: any) {
@@ -653,9 +671,6 @@ function runRowClickAction(clickDetail: number) {
   const action = treeNodeRowAction(node.type, canExpand.value, settingsStore.editorSettings.sidebarActivation);
   if (!shouldRunTreeNodeRowAction(action, clickDetail)) return;
   if (action === "open-data") {
-    if (node.type === "table") {
-      singleActivationDoubleClickRefreshAllowed = canRefreshDataTableFromSingleActivationDoubleClick(findExistingSameTableDataTab());
-    }
     scheduleOpenData(node);
   } else if (isDocumentBrowserTreeNode(node.type)) {
     openMongoTreeData(node);
@@ -665,8 +680,6 @@ function runRowClickAction(clickDetail: number) {
     toggle();
   }
 }
-
-let singleActivationDoubleClickRefreshAllowed = false;
 
 function refreshActiveKvBrowserAfterOpen(mode: "etcd" | "zookeeper", connectionId: string) {
   void nextTick(() => {
@@ -831,6 +844,10 @@ function requestRenameSelectedNode(): boolean {
     connectionStore.startEditing(editTarget.connectionId);
     return true;
   }
+  if (canRenameMongoCollection.value) {
+    openRenameMongoCollectionDialog();
+    return true;
+  }
   if (canRenameObject.value) {
     openRenameObjectDialog();
     return true;
@@ -840,6 +857,12 @@ function requestRenameSelectedNode(): boolean {
     return true;
   }
   return false;
+}
+
+function openRenameMongoCollectionDialog() {
+  claimTreeItemDialogOwnership();
+  routeTreeItemDialogController();
+  prepareRenameMongoCollectionDialog();
 }
 
 function requestEditSelectedConnection(): boolean {
@@ -891,8 +914,8 @@ function onDoubleClick(event: MouseEvent) {
     if (!activeNode.value.isExpanded) void toggle();
   } else if (action === "open-data") {
     openDataImmediately(activeNode.value);
-  } else if (action === "refresh-data") {
-    void refreshData();
+  } else if (action === "activate-data") {
+    activateDataTableFromDoubleClick();
   } else if (action === "open-source") {
     openObjectSourceDialog(false);
   } else if (action === "open-saved-sql") {
@@ -904,24 +927,21 @@ function onDoubleClick(event: MouseEvent) {
   }
 }
 
-async function refreshData() {
+function activateDataTableFromDoubleClick() {
   const node = activeNode.value;
   if (node.type !== "table" || !hasNodeDatabaseContext(node)) return;
-  const singleActivationRefreshAllowed = singleActivationDoubleClickRefreshAllowed;
-  singleActivationDoubleClickRefreshAllowed = false;
   const activation = settingsStore.editorSettings.sidebarActivation;
-  if (activation === "single" && !singleActivationRefreshAllowed) return;
   const existingSameTableTab = findExistingSameTableDataTab();
-  const action = dataTableDoubleClickAction(existingSameTableTab, activation, singleActivationRefreshAllowed);
+  const action = dataTableDoubleClickAction(existingSameTableTab, activation);
   if (action === "none") return;
   if (action === "open") {
     openDataImmediately(node);
     return;
   }
   if (!existingSameTableTab) return;
+  // Reopening an available table follows DBeaver's editor reuse model: only
+  // activate the existing tab so filters, result rows, and in-flight work stay intact.
   queryStore.switchTab(existingSameTableTab.id);
-  if (action === "activate") return;
-  await queryStore.refreshDataTab(existingSameTableTab.id);
 }
 
 function findExistingSameTableDataTab() {
@@ -1997,7 +2017,12 @@ const canEditNacosNamespace = computed(() => {
 
 const isDuckDbConnection = computed(() => {
   const config = activeNode.value.connectionId ? connectionStore.getConfig(activeNode.value.connectionId) : undefined;
-  return activeNode.value.type === "connection" && connectionNamespaceCreationTarget(config) === "attach";
+  return activeNode.value.type === "connection" && config?.db_type === "duckdb" && connectionNamespaceCreationTarget(config) === "attach";
+});
+
+const isSqliteAttachConnection = computed(() => {
+  const config = activeNode.value.connectionId ? connectionStore.getConfig(activeNode.value.connectionId) : undefined;
+  return activeNode.value.type === "connection" && config?.db_type === "sqlite" && connectionNamespaceCreationTarget(config) === "attach";
 });
 
 const isConnectionSchemaCreation = computed(() => {
@@ -2279,6 +2304,10 @@ async function openCreateDatabase() {
     await createDuckDbAttachedDatabaseFile();
     return;
   }
+  if (isSqliteAttachConnection.value) {
+    await attachSqliteDatabaseFile();
+    return;
+  }
   openCreateDatabaseDialog();
 }
 
@@ -2368,6 +2397,7 @@ function openConnectionNamespaceCreation() {
 
 function connectionNamespaceCreationLabel() {
   if (isDuckDbConnection.value) return t("contextMenu.createDuckDbFile");
+  if (isSqliteAttachConnection.value) return t("contextMenu.attachSqliteDatabase");
   if (isConnectionSchemaCreation.value) return t("contextMenu.createSchema");
   return t("contextMenu.createDatabase");
 }
@@ -2441,12 +2471,13 @@ async function createDuckDbAttachedDatabaseFile() {
     const path = ensureDuckDbFileExtension(selectedPath);
     await connectionStore.ensureConnected(node.connectionId);
     const existingDatabases = await api.listDatabases(node.connectionId);
-    const name = uniqueDuckDbAttachedDatabaseName(
-      duckDbAttachedDatabaseNameFromPath(path),
+    const name = uniqueAttachedDatabaseName(
+      attachedDatabaseNameFromPath(path, "duckdb_database"),
       existingDatabases.map((database) => database.name),
     );
     const sql = await buildDuckDbAttachDatabaseSql(path, name);
-    await executeTreeNodeSqlWithProductionGuard(node, sql, { database: "" });
+    const executionResult = await executeTreeNodeSqlWithProductionGuard(node, sql, { database: "" });
+    if (executionResult === undefined) return;
 
     const config = connectionStore.getConfig(node.connectionId);
     if (config) {
@@ -2459,6 +2490,51 @@ async function createDuckDbAttachedDatabaseFile() {
     await connectionStore.loadDatabases(node.connectionId, { force: true });
     connectionStore.selectedTreeNodeId = `${node.connectionId}:${name}`;
     toast(t("contextMenu.createDuckDbFileSuccess", { name }), 3000);
+  } catch (e: any) {
+    toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), 5000);
+  }
+}
+
+async function attachSqliteDatabaseFile() {
+  const node = activeNode.value;
+  if (!node.connectionId) return;
+  if (!isTauriRuntime()) {
+    toast(t("contextMenu.attachSqliteDatabaseDesktopOnly"), 4000);
+    return;
+  }
+
+  try {
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const selected = await open({
+      title: t("contextMenu.attachSqliteDatabase"),
+      multiple: false,
+      filters: [{ name: "SQLite", extensions: SQLITE_DATABASE_FILE_EXTENSIONS }],
+    });
+    const path = Array.isArray(selected) ? selected[0] : selected;
+    if (!path || typeof path !== "string") return;
+
+    await connectionStore.ensureConnected(node.connectionId);
+    const existingDatabases = await api.listDatabases(node.connectionId);
+    const name = uniqueAttachedDatabaseName(
+      attachedDatabaseNameFromPath(path, "sqlite_database"),
+      existingDatabases.map((database) => database.name),
+      ["main", "temp"],
+    );
+    const sql = await buildSqliteAttachDatabaseSql(path, name);
+    const executionResult = await executeTreeNodeSqlWithProductionGuard(node, sql, { database: "" });
+    if (executionResult === undefined) return;
+
+    const config = connectionStore.getConfig(node.connectionId);
+    if (config) {
+      await connectionStore.updateConnection({
+        ...config,
+        attached_databases: [...(config.attached_databases ?? []), { name, path }],
+      });
+    }
+    await connectionStore.ensureVisibleDatabase(node.connectionId, name);
+    await connectionStore.loadDatabases(node.connectionId, { force: true });
+    connectionStore.selectedTreeNodeId = `${node.connectionId}:${name}`;
+    toast(t("contextMenu.attachSqliteDatabaseSuccess", { name }), 3000);
   } catch (e: any) {
     toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), 5000);
   }
@@ -2508,24 +2584,30 @@ async function applyCreateDatabaseAuthorizationPlan() {
   if (!node.connectionId || !plan || createDatabaseAuthorizationApplying.value) return;
   createDatabaseAuthorizationApplying.value = true;
   try {
+    const config = connectionStore.getConfig(node.connectionId);
     const results = await executeWithProductionSqlGuard({
-      connection: connectionStore.getConfig(node.connectionId),
+      connection: config,
       database: "",
       sql: createDatabasePreviewSql.value,
       source: t("production.sourceSidebar"),
       execute: () => executeAuthorizationPlan(plan, (step) => api.executeMulti(node.connectionId!, step.database, step.sql, undefined, undefined, { maxRows: 1000, continueOnError: true })),
     });
     if (!results) return;
-    createDatabaseAuthorizationResults.value = results;
-    const created = results.some((result) => result.step.id === "create-database" && result.status === "success");
-    const status = authorizationPlanStatus(results);
+    const displayResults = results.map((result) => ({
+      ...result,
+      message: result.message && result.step.operation === "createDatabase" ? appendCreateDatabaseErrorHint(config?.db_type, result.message, t) : result.message,
+    }));
+    createDatabaseAuthorizationResults.value = displayResults;
+    const created = displayResults.some((result) => result.step.id === "create-database" && result.status === "success");
+    const status = authorizationPlanStatus(displayResults);
     if (created) {
       await connectionStore.ensureVisibleDatabase(node.connectionId, name);
       await connectionStore.loadDatabases(node.connectionId, { force: true });
     }
     toast(t(status === "success" ? "contextMenu.createDatabaseSuccess" : status === "partial" ? "contextMenu.createDatabasePartial" : "contextMenu.createDatabaseFailed", { name }), status === "success" ? 3000 : 5000);
   } catch (error: any) {
-    toast(t("contextMenu.tableOperationFailed", { message: error?.message || String(error) }), 5000);
+    const message = appendCreateDatabaseErrorHint(connectionStore.getConfig(node.connectionId)?.db_type, error?.message || String(error), t);
+    toast(t("contextMenu.tableOperationFailed", { message }), 8000);
   } finally {
     createDatabaseAuthorizationApplying.value = false;
   }
@@ -2567,26 +2649,26 @@ function dropDatabase() {
 
 async function confirmDropDatabase() {
   const node = sidebarDangerTarget.value ?? activeNode.value;
-  if (!node.connectionId || dropDatabaseLoading.value) return;
+  if (node.type === "mongo-db") {
+    await confirmDropMongoDatabase();
+    return;
+  }
+
+  const connectionId = node.connectionId;
+  if (!connectionId || dropDatabaseLoading.value) return;
   dropDatabaseLoading.value = true;
   try {
-    await connectionStore.ensureConnected(node.connectionId);
-    if (node.type === "mongo-db" && node.database) {
-      await api.mongoDropDatabase(node.connectionId, node.database);
-      toast(t("contextMenu.dropDatabaseSuccess", { name: node.label }), 3000);
-      await connectionStore.loadMongoDatabases(node.connectionId);
-      showDropDatabaseConfirm.value = false;
-      return;
-    }
+    await connectionStore.ensureConnected(connectionId);
     const sql =
       dropDatabasePreviewSql.value ||
       (await buildDropDatabaseSql({
         databaseType: databaseTypeForNode(node),
         name: node.label,
       }));
-    await executeTreeNodeSqlWithProductionGuard(node, sql, { database: "" });
+    const executed = await executeTreeNodeSqlWithProductionGuard(node, sql, { database: "" });
+    if (!executed) return;
     toast(t("contextMenu.dropDatabaseSuccess", { name: node.label }), 3000);
-    await connectionStore.loadDatabases(node.connectionId, { force: true });
+    await connectionStore.loadDatabases(connectionId, { force: true });
     showDropDatabaseConfirm.value = false;
   } catch (e: any) {
     toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), 5000);
@@ -2800,6 +2882,16 @@ function createView() {
     name: viewName,
     objectType: "VIEW",
   });
+}
+
+function createMysqlObjectTemplate() {
+  const node = activeNode.value;
+  if (!node.connectionId || !node.database) return;
+  const template = mysqlObjectTemplateForGroup(connectionStore.getConfig(node.connectionId), node);
+  if (!template) return;
+  connectionStore.activeConnectionId = node.connectionId;
+  const tabId = queryStore.createTab(node.connectionId, node.database, t(template.titleKey), "query", node.schema);
+  queryStore.updateSql(tabId, template.sql);
 }
 
 const canExpand = computed(() =>
@@ -3235,6 +3327,12 @@ function databaseSpecificDialogCapabilities() {
     editNacosNamespaceDesc,
     editNacosNamespaceLoading,
     confirmEditNacosNamespace,
+    showRenameMongoCollectionDialog,
+    renameMongoCollectionName,
+    renameMongoCollectionError,
+    renameMongoCollectionPreview,
+    renameMongoCollectionLoading,
+    confirmRenameMongoCollection,
     showCreateSchemaDialog,
     createSchemaName,
     confirmCreateSchema,
@@ -3711,6 +3809,14 @@ function buildSpecialSidebarMenu(context: SidebarMenuFactoryContext): boolean {
     items.push({ label: "", separator: true });
     items.push({ label: t("contextMenu.viewData"), action: toggle, icon: TableProperties });
     items.push({ label: t("contextMenu.newQuery"), action: newQuery, icon: TerminalSquare });
+    if (canRenameMongoCollection.value) {
+      items.push({
+        label: t("contextMenu.renameObject"),
+        action: openRenameMongoCollectionDialog,
+        icon: Pencil,
+        shortcut: shortcutRename,
+      });
+    }
     if (canDropAllMongoIndexes.value || canDropMongoCollection.value) {
       items.push({ label: "", separator: true });
       if (canDropAllMongoIndexes.value) {
@@ -3961,7 +4067,8 @@ function buildObjectGroupSidebarMenu(context: SidebarMenuFactoryContext): boolea
   const { node, items } = context;
   // 9. Group Labels (group-columns, group-tables, etc.)
   if (isGroupLabel(node)) {
-    const hasGroupCreateAction = (node.type === "group-tables" && canCreateTable.value) || (node.type === "group-views" && !!node.connectionId && !!node.database);
+    const mysqlObjectTemplate = node.connectionId ? mysqlObjectTemplateForGroup(connectionStore.getConfig(node.connectionId), node) : null;
+    const hasGroupCreateAction = (node.type === "group-tables" && canCreateTable.value) || (node.type === "group-views" && !!node.connectionId && !!node.database) || !!mysqlObjectTemplate;
     const canLoadAllObjectGroup = node.type === "group-tables" || node.type === "group-views" || node.type === "group-materialized-views";
     if (node.type === "group-tables" && canCreateTable.value) {
       items.push({ label: t("contextMenu.createTable"), action: createTable, icon: Plus });
@@ -3974,6 +4081,9 @@ function buildObjectGroupSidebarMenu(context: SidebarMenuFactoryContext): boolea
     }
     if (node.type === "group-views" && node.connectionId && node.database) {
       items.push({ label: t("contextMenu.createView"), action: createView, icon: Plus });
+    }
+    if (mysqlObjectTemplate) {
+      items.push({ label: t(mysqlObjectTemplate.titleKey), action: createMysqlObjectTemplate, icon: Plus });
     }
     if (hasGroupCreateAction) {
       items.push({ label: "", separator: true });

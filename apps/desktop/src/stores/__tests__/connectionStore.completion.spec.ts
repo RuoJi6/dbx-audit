@@ -37,6 +37,18 @@ function oracleConnection(): ConnectionConfig {
   } as ConnectionConfig;
 }
 
+function sqlServerConnection(): ConnectionConfig {
+  return {
+    ...postgresConnection(),
+    id: "sqlserver-1",
+    name: "SQL Server",
+    db_type: "sqlserver",
+    port: 1433,
+    username: "sa",
+    database: "app",
+  } as ConnectionConfig;
+}
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((res) => {
@@ -220,6 +232,95 @@ describe("connectionStore completion assistant", () => {
     ]);
   });
 
+  it("lets Oracle resolve CURRENT_SCHEMA for unqualified column completion", async () => {
+    const completionAssistantSearch = vi.fn().mockResolvedValue({
+      candidates: [],
+      incomplete: false,
+      fallback_used: false,
+    });
+    const getColumns = vi.fn().mockResolvedValue([{ name: "REPORT_ID", data_type: "NUMBER", is_nullable: false, column_default: null, is_primary_key: true, extra: null, comment: null }]);
+
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    vi.doMock("@/lib/backend/api", () => ({
+      checkConnectionHealth: vi.fn().mockResolvedValue(undefined),
+      completionAssistantSearch,
+      getColumns,
+    }));
+
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const store = useConnectionStore();
+    store.connections = [oracleConnection()];
+    store.connectedIds.add("oracle-1");
+
+    const columns = await store.listCompletionColumns("oracle-1", "ORCL", "ORDERS", undefined, { clientSessionId: "tab-a", version: 0 });
+
+    expect(completionAssistantSearch).not.toHaveBeenCalled();
+    expect(getColumns).toHaveBeenCalledWith("oracle-1", "ORCL", "", "ORDERS", undefined, "tab-a");
+    expect(columns).toEqual([expect.objectContaining({ name: "REPORT_ID", table: "ORDERS", schema: undefined, dataType: "NUMBER" })]);
+    expect(store.lookupLocalCompletionColumns("oracle-1", "ORCL", "ORDERS")).toEqual([]);
+  });
+
+  it("isolates Oracle CURRENT_SCHEMA column caches by tab and context version", async () => {
+    const completionAssistantSearch = vi.fn();
+    const getColumns = vi
+      .fn()
+      .mockResolvedValueOnce([{ name: "APP_ID", data_type: "NUMBER", is_nullable: false }])
+      .mockResolvedValueOnce([{ name: "REPORT_ID", data_type: "NUMBER", is_nullable: false }])
+      .mockResolvedValueOnce([{ name: "SYSTEM_ID", data_type: "NUMBER", is_nullable: false }]);
+
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    vi.doMock("@/lib/backend/api", () => ({
+      checkConnectionHealth: vi.fn().mockResolvedValue(undefined),
+      completionAssistantSearch,
+      getColumns,
+    }));
+
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const store = useConnectionStore();
+    store.connections = [oracleConnection()];
+    store.connectedIds.add("oracle-1");
+
+    const app = await store.listCompletionColumns("oracle-1", "ORCL", "SHARED_TABLE", undefined, { clientSessionId: "tab-a", version: 0 });
+    const cachedApp = await store.listCompletionColumns("oracle-1", "ORCL", "SHARED_TABLE", undefined, { clientSessionId: "tab-a", version: 0 });
+    const reporting = await store.listCompletionColumns("oracle-1", "ORCL", "SHARED_TABLE", undefined, { clientSessionId: "tab-a", version: 1 });
+    const independentTab = await store.listCompletionColumns("oracle-1", "ORCL", "SHARED_TABLE", undefined, { clientSessionId: "tab-b", version: 0 });
+
+    expect(app.map((column) => column.name)).toEqual(["APP_ID"]);
+    expect(cachedApp.map((column) => column.name)).toEqual(["APP_ID"]);
+    expect(reporting.map((column) => column.name)).toEqual(["REPORT_ID"]);
+    expect(independentTab.map((column) => column.name)).toEqual(["SYSTEM_ID"]);
+    expect(getColumns).toHaveBeenCalledTimes(3);
+    expect(getColumns.mock.calls.map((call) => call[5])).toEqual(["tab-a", "tab-a", "tab-b"]);
+    expect(completionAssistantSearch).not.toHaveBeenCalled();
+  });
+
+  it("keeps explicit Oracle schema completion on the shared assistant path", async () => {
+    const completionAssistantSearch = vi.fn().mockResolvedValue({
+      candidates: [{ name: "EXPLICIT_ID", kind: "column", schema: "REPORTING", parent_schema: "REPORTING", parent_name: "SHARED_TABLE", data_type: "NUMBER" }],
+      incomplete: false,
+      fallback_used: false,
+    });
+    const getColumns = vi.fn();
+
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    vi.doMock("@/lib/backend/api", () => ({
+      checkConnectionHealth: vi.fn().mockResolvedValue(undefined),
+      completionAssistantSearch,
+      getColumns,
+    }));
+
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const store = useConnectionStore();
+    store.connections = [oracleConnection()];
+    store.connectedIds.add("oracle-1");
+
+    const columns = await store.listCompletionColumns("oracle-1", "ORCL", "SHARED_TABLE", "REPORTING", { clientSessionId: "tab-a", version: 2 });
+
+    expect(completionAssistantSearch).toHaveBeenCalledWith(expect.objectContaining({ schema: "REPORTING", parent_schema: "REPORTING", parent_name: "SHARED_TABLE" }));
+    expect(getColumns).not.toHaveBeenCalled();
+    expect(columns).toEqual([expect.objectContaining({ name: "EXPLICIT_ID", schema: "REPORTING" })]);
+  });
+
   it("maps Oracle package members without scanning every schema", async () => {
     const completionAssistantSearch = vi.fn().mockResolvedValue({
       candidates: [{ name: "CALCULATE_BONUS", kind: "function", schema: "HR", parent_schema: "HR", parent_name: "PAYROLL", data_type: "FUNCTION" }],
@@ -242,7 +343,90 @@ describe("connectionStore completion assistant", () => {
     const objects = await store.listCompletionObjects("oracle-1", "ORCL", "CALC", 20, "HR", "PAYROLL", false, "APP");
 
     expect(completionAssistantSearch).toHaveBeenCalledWith(expect.objectContaining({ object_kinds: ["routine"], mask: "CALC", schema: "APP", parent_schema: "HR", parent_name: "PAYROLL", global_search: false }));
-    expect(objects).toEqual([expect.objectContaining({ name: "CALCULATE_BONUS", schema: "HR", type: "function", parentSchema: "HR", parentName: "PAYROLL", applyName: "HR.CALCULATE_BONUS", boost: 0 })]);
+    expect(objects).toEqual([expect.objectContaining({ name: "CALCULATE_BONUS", schema: "HR", type: "function", parentSchema: "HR", parentName: "PAYROLL", dataType: undefined, applyName: "HR.CALCULATE_BONUS", boost: 0 })]);
+  });
+
+  it("loads PostgreSQL routines by prefix and preserves return metadata", async () => {
+    const completionAssistantSearch = vi.fn().mockResolvedValue({
+      candidates: [{ name: "st_area", kind: "function", schema: "public", data_type: "double precision", comment: "Returns an area" }],
+      incomplete: false,
+      fallback_used: false,
+    });
+
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    vi.doMock("@/lib/backend/api", () => ({
+      checkConnectionHealth: vi.fn().mockResolvedValue(undefined),
+      completionAssistantSearch,
+      listCompletionObjects: vi.fn().mockResolvedValue([]),
+    }));
+
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const store = useConnectionStore();
+    store.connections = [postgresConnection()];
+    store.connectedIds.add("pg-1");
+
+    const objects = await store.listCompletionObjects("pg-1", "app", "st_", 20, "public", undefined, false, "public", ["function"]);
+
+    expect(completionAssistantSearch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        object_kinds: ["function"],
+        mask: "st_",
+        schema: "public",
+        parent_schema: "public",
+        match_mode: "prefix",
+      }),
+    );
+    expect(objects).toEqual([
+      expect.objectContaining({
+        name: "st_area",
+        schema: "public",
+        type: "function",
+        dataType: "double precision",
+        comment: "Returns an area",
+        applyName: "st_area",
+        boost: 1000,
+      }),
+    ]);
+  });
+
+  it("searches default SQL Server schemas without treating the username as a schema", async () => {
+    const completionAssistantSearch = vi.fn().mockResolvedValue({
+      candidates: [{ name: "st_area", kind: "function", schema: "dbo", data_type: "float" }],
+      incomplete: false,
+      fallback_used: false,
+    });
+
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    vi.doMock("@/lib/backend/api", () => ({
+      checkConnectionHealth: vi.fn().mockResolvedValue(undefined),
+      completionAssistantSearch,
+      listCompletionObjects: vi.fn().mockResolvedValue([]),
+    }));
+
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const store = useConnectionStore();
+    store.connections = [sqlServerConnection()];
+    store.connectedIds.add("sqlserver-1");
+
+    const objects = await store.listCompletionObjects("sqlserver-1", "app", "st_", 20);
+
+    expect(completionAssistantSearch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        schema: null,
+        parent_schema: null,
+        mask: "st_",
+      }),
+    );
+    expect(objects).toEqual([
+      expect.objectContaining({
+        name: "st_area",
+        schema: "dbo",
+        type: "function",
+        dataType: "float",
+        applyName: "dbo.st_area",
+        boost: 1000,
+      }),
+    ]);
   });
 
   it("limits concurrent completion column metadata requests per connection database", async () => {
