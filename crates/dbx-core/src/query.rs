@@ -13,7 +13,10 @@ use sqlparser::parser::Parser;
 use std::collections::HashSet;
 use std::future::Future;
 use std::ops::ControlFlow;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use std::time::Duration;
 #[cfg(feature = "duckdb-bundled")]
 use tokio::task::JoinHandle;
@@ -1022,6 +1025,84 @@ fn timeout_error_for(timeout_duration: Duration) -> String {
 
 pub fn canceled_error() -> String {
     QUERY_CANCELED.to_string()
+}
+
+pub(crate) struct StreamProgressClock {
+    started_at: tokio::time::Instant,
+    last_progress_ms: AtomicU64,
+}
+
+impl StreamProgressClock {
+    pub(crate) fn new() -> Self {
+        Self { started_at: tokio::time::Instant::now(), last_progress_ms: AtomicU64::new(0) }
+    }
+
+    pub(crate) fn mark(&self) {
+        self.last_progress_ms.store(self.started_at.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+
+    fn elapsed_since_progress(&self) -> Duration {
+        let last_progress_ms = self.last_progress_ms.load(Ordering::Relaxed);
+        let elapsed_ms = self.started_at.elapsed().as_millis() as u64;
+        Duration::from_millis(elapsed_ms.saturating_sub(last_progress_ms))
+    }
+}
+
+pub(crate) async fn await_stream_with_progress_timeout<F, T>(
+    stream_future: F,
+    timeout: Option<Duration>,
+    progress_clock: Arc<StreamProgressClock>,
+    cancel_token: Option<&CancellationToken>,
+    timeout_message: String,
+) -> Result<T, String>
+where
+    F: Future<Output = Result<T, String>>,
+{
+    let Some(timeout) = timeout else {
+        return match cancel_token {
+            Some(token) => {
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => Err(canceled_error()),
+                    result = stream_future => result,
+                }
+            }
+            None => stream_future.await,
+        };
+    };
+
+    tokio::pin!(stream_future);
+    loop {
+        // Query timeout is an inactivity budget, not a cap on total stream duration.
+        let remaining = timeout.saturating_sub(progress_clock.elapsed_since_progress());
+        if remaining.is_zero() {
+            return Err(timeout_message.clone());
+        }
+        let sleep = tokio::time::sleep(remaining);
+        tokio::pin!(sleep);
+
+        match cancel_token {
+            Some(token) => {
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => return Err(canceled_error()),
+                    result = &mut stream_future => return result,
+                    _ = &mut sleep => {},
+                }
+            }
+            None => {
+                tokio::select! {
+                    biased;
+                    result = &mut stream_future => return result,
+                    _ = &mut sleep => {},
+                }
+            }
+        }
+
+        if progress_clock.elapsed_since_progress() >= timeout {
+            return Err(timeout_message);
+        }
+    }
 }
 
 #[cfg(feature = "duckdb-bundled")]
@@ -2918,12 +2999,24 @@ fn postgres_transaction_begin_sql(consistent_snapshot: bool) -> &'static str {
     }
 }
 
-fn mysql_transaction_begin_sql(consistent_snapshot: bool) -> &'static str {
+fn mysql_transaction_begin_sql_candidates(consistent_snapshot: bool) -> &'static [&'static str] {
     if consistent_snapshot {
-        "START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY"
+        &[
+            "START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY",
+            "START TRANSACTION WITH CONSISTENT SNAPSHOT",
+            "START TRANSACTION",
+        ]
     } else {
-        "START TRANSACTION"
+        &["START TRANSACTION"]
     }
+}
+
+fn mysql_transaction_isolation_sql(consistent_snapshot: bool) -> Option<&'static str> {
+    consistent_snapshot.then_some("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+}
+
+fn mysql_error_is_syntax_error(error: &mysql_async::Error) -> bool {
+    matches!(error, mysql_async::Error::Server(server_error) if server_error.code == 1064)
 }
 
 async fn begin_transaction_session(
@@ -2968,8 +3061,25 @@ async fn begin_transaction_session(
         }
         TxnPoolHandle::Mysql(mysql_pool) => {
             let mut conn = mysql_pool.get_conn().await.map_err(|e| format!("Failed to get MySQL connection: {e}"))?;
-            let begin_sql = mysql_transaction_begin_sql(consistent_snapshot);
-            conn.query_drop(begin_sql).await.map_err(|e| format!("START TRANSACTION failed: {e}"))?;
+            if let Some(isolation_sql) = mysql_transaction_isolation_sql(consistent_snapshot) {
+                conn.query_drop(isolation_sql).await.map_err(|e| format!("SET TRANSACTION failed: {e}"))?;
+            }
+            let mut syntax_errors = Vec::new();
+            for begin_sql in mysql_transaction_begin_sql_candidates(consistent_snapshot) {
+                match conn.query_drop(*begin_sql).await {
+                    Ok(()) => {
+                        syntax_errors.clear();
+                        break;
+                    }
+                    Err(error) if mysql_error_is_syntax_error(&error) => {
+                        syntax_errors.push(format!("{begin_sql}: {error}"));
+                    }
+                    Err(error) => return Err(format!("START TRANSACTION failed: {error}")),
+                }
+            }
+            if !syntax_errors.is_empty() {
+                return Err(format!("START TRANSACTION failed for all compatible forms: {}", syntax_errors.join("; ")));
+            }
             TxnConnection::Mysql(conn)
         }
     };
@@ -4956,8 +5066,35 @@ mod tests {
     }
 
     #[test]
-    fn database_backup_transactions_request_consistent_read_only_snapshots() {
+    fn database_backup_transactions_request_consistent_snapshots() {
         assert_eq!(postgres_transaction_begin_sql(true), "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY");
-        assert_eq!(mysql_transaction_begin_sql(true), "START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY");
+        assert_eq!(mysql_transaction_isolation_sql(true), Some("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"));
+        assert_eq!(
+            mysql_transaction_begin_sql_candidates(true),
+            [
+                "START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY",
+                "START TRANSACTION WITH CONSISTENT SNAPSHOT",
+                "START TRANSACTION",
+            ]
+        );
+        assert_eq!(mysql_transaction_isolation_sql(false), None);
+        assert_eq!(mysql_transaction_begin_sql_candidates(false), ["START TRANSACTION"]);
+    }
+
+    #[test]
+    fn mysql_backup_transaction_only_falls_back_for_syntax_errors() {
+        let syntax_error = mysql_async::Error::Server(mysql_async::ServerError {
+            code: 1064,
+            message: "unsupported transaction characteristic".to_string(),
+            state: "42000".to_string(),
+        });
+        let permission_error = mysql_async::Error::Server(mysql_async::ServerError {
+            code: 1044,
+            message: "access denied".to_string(),
+            state: "42000".to_string(),
+        });
+
+        assert!(mysql_error_is_syntax_error(&syntax_error));
+        assert!(!mysql_error_is_syntax_error(&permission_error));
     }
 }

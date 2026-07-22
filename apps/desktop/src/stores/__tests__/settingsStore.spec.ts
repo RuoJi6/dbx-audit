@@ -1,15 +1,28 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { normalizeDesktopSettings, normalizeEditorSettings } from "@/stores/settingsStore";
+import { enforceRightSidebarPanelExclusivity, EXECUTE_MODE_CURRENT_DEFAULT_VERSION, normalizeDesktopSettings, normalizeEditorSettings, normalizeMcpGlobalPolicy, transitionRightSidebarPanels, type RightSidebarPanelState } from "@/stores/settingsStore";
 import { createPinia, setActivePinia } from "pinia";
 import type { AiConfigItem } from "@/types/ai";
 
 describe("normalizeEditorSettings", () => {
+  it("defaults SQL execution to the current statement and migrates legacy execute-all settings", () => {
+    expect(normalizeEditorSettings({}).executeMode).toBe("current");
+    expect(normalizeEditorSettings({ executeMode: "all" }).executeMode).toBe("current");
+    expect(normalizeEditorSettings({ executeMode: "all", executeModeDefaultVersion: EXECUTE_MODE_CURRENT_DEFAULT_VERSION }).executeMode).toBe("all");
+  });
+
   it("enables automatic table aliases by default", () => {
     expect(normalizeEditorSettings({}).autoAliasTables).toBe(true);
   });
 
   it("preserves disabled automatic table aliases", () => {
     expect(normalizeEditorSettings({ autoAliasTables: false }).autoAliasTables).toBe(false);
+  });
+
+  it("defaults sidebar connection sorting to manual order and preserves valid alphabetical modes", () => {
+    expect(normalizeEditorSettings({}).sidebarConnectionSortMode).toBe("manual");
+    expect(normalizeEditorSettings({ sidebarConnectionSortMode: "asc" }).sidebarConnectionSortMode).toBe("asc");
+    expect(normalizeEditorSettings({ sidebarConnectionSortMode: "desc" }).sidebarConnectionSortMode).toBe("desc");
+    expect(normalizeEditorSettings({ sidebarConnectionSortMode: "invalid" as any }).sidebarConnectionSortMode).toBe("manual");
   });
 
   it("shows the current statement frame by default", () => {
@@ -69,9 +82,9 @@ describe("normalizeEditorSettings", () => {
     expect(normalizeEditorSettings({ restoreOpenTabsOnLaunch: true } as any).openTabsRestoreMode).toBe("all");
   });
 
-  it("preserves mirror update download sources and rejects invalid values", () => {
+  it("preserves CNB, migrates AtomGit to CNB, and rejects invalid values", () => {
     expect(normalizeEditorSettings({ updateDownloadSource: "cnb" }).updateDownloadSource).toBe("cnb");
-    expect(normalizeEditorSettings({ updateDownloadSource: "atomgit" }).updateDownloadSource).toBe("atomgit");
+    expect(normalizeEditorSettings({ updateDownloadSource: "atomgit" as any }).updateDownloadSource).toBe("cnb");
     expect(normalizeEditorSettings({ updateDownloadSource: "mirror" as any }).updateDownloadSource).toBe("official");
   });
 
@@ -111,6 +124,41 @@ describe("normalizeEditorSettings", () => {
     expect(settings.toolbarItems.sqlFileTree).toBe(false);
     expect(settings.toolbarItems.history).toBe(false);
     expect(settings.toolbarItems.sqlLibrary).toBe(true);
+    expect(settings.toolbarItems.exclusiveRightSidebarPanels).toBe(true);
+  });
+
+  it("preserves disabled right sidebar panel exclusivity", () => {
+    expect(
+      normalizeEditorSettings({
+        toolbarItems: {
+          exclusiveRightSidebarPanels: false,
+        } as any,
+      }).toolbarItems.exclusiveRightSidebarPanels,
+    ).toBe(false);
+  });
+});
+
+describe("right sidebar panel transitions", () => {
+  const state = (overrides: Partial<RightSidebarPanelState> = {}): RightSidebarPanelState => ({
+    ai: false,
+    history: false,
+    sqlLibrary: false,
+    sqlFile: false,
+    ...overrides,
+  });
+
+  it("allows multiple panels when exclusivity is disabled", () => {
+    expect(transitionRightSidebarPanels(state({ ai: true }), "history", true, false)).toEqual(state({ ai: true, history: true }));
+  });
+
+  it("switches panels and allows the active panel to toggle closed", () => {
+    const switched = transitionRightSidebarPanels(state({ ai: true }), "sqlLibrary", true, true);
+    expect(switched).toEqual(state({ sqlLibrary: true }));
+    expect(transitionRightSidebarPanels(switched, "sqlLibrary", false, true)).toEqual(state());
+  });
+
+  it("collapses synchronized multi-panel state to the preferred open panel", () => {
+    expect(enforceRightSidebarPanelExclusivity(state({ ai: true, history: true, sqlFile: true }), "history")).toEqual(state({ history: true }));
   });
 });
 
@@ -126,6 +174,37 @@ describe("normalizeDesktopSettings", () => {
     expect(normalizeDesktopSettings({ duckdb_worker_max_processes: 0 }).duckdb_worker_max_processes).toBe(1);
     expect(normalizeDesktopSettings({ duckdb_worker_max_processes: 32 }).duckdb_worker_max_processes).toBe(16);
     expect(normalizeDesktopSettings({ duckdb_worker_max_processes: 3.6 }).duckdb_worker_max_processes).toBe(4);
+  });
+});
+
+describe("normalizeMcpGlobalPolicy", () => {
+  it("defaults to all connections with writes allowed", () => {
+    expect(normalizeMcpGlobalPolicy(undefined)).toEqual({
+      readOnly: false,
+      allowDangerousSql: false,
+      allowedConnectionIds: null,
+      configured: false,
+    });
+  });
+
+  it("normalizes and deduplicates an explicit connection allowlist", () => {
+    expect(
+      normalizeMcpGlobalPolicy({
+        readOnly: true,
+        allowDangerousSql: true,
+        allowedConnectionIds: [" connection-1 ", "connection-1", "", "connection-2"],
+        configured: true,
+      }),
+    ).toEqual({
+      readOnly: true,
+      allowDangerousSql: true,
+      allowedConnectionIds: ["connection-1", "connection-2"],
+      configured: true,
+    });
+  });
+
+  it("preserves an empty allowlist as deny all", () => {
+    expect(normalizeMcpGlobalPolicy({ allowedConnectionIds: [] }).allowedConnectionIds).toEqual([]);
   });
 });
 
@@ -179,6 +258,65 @@ function makeTestConfig(overrides: Partial<AiConfigItem> & { id: string }): AiCo
     ...overrides,
   } as AiConfigItem;
 }
+
+describe("settingsStore MCP policy persistence", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    setActivePinia(createPinia());
+  });
+
+  it("rolls an optimistic policy update back when persistence fails", async () => {
+    let rejectSave!: (reason?: unknown) => void;
+    const saveMcpGlobalPolicy = vi.fn(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectSave = reject;
+        }),
+    );
+    vi.doMock("@/lib/backend/api", () => ({ saveMcpGlobalPolicy }));
+
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const store = useSettingsStore();
+    const previous = {
+      readOnly: true,
+      allowDangerousSql: false,
+      allowedConnectionIds: ["connection-1"],
+      configured: true,
+    };
+    store.mcpGlobalPolicy = previous;
+
+    const update = store.updateMcpGlobalPolicy({ readOnly: false, allowedConnectionIds: [] });
+    expect(store.mcpGlobalPolicy).toEqual({
+      readOnly: false,
+      allowDangerousSql: false,
+      allowedConnectionIds: [],
+      configured: true,
+    });
+
+    rejectSave(new Error("save failed"));
+    await expect(update).rejects.toThrow("save failed");
+    expect(store.mcpGlobalPolicy).toEqual(previous);
+  });
+});
+
+describe("settingsStore sidebar connection sort persistence", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    setActivePinia(createPinia());
+  });
+
+  it("persists the selected alphabetical sort mode", async () => {
+    const saveEditorSettings = vi.fn().mockResolvedValue(undefined);
+    vi.doMock("@/lib/backend/api", () => ({ saveEditorSettings }));
+
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const store = useSettingsStore();
+    store.updateEditorSettings({ sidebarConnectionSortMode: "desc" });
+
+    expect(store.editorSettings.sidebarConnectionSortMode).toBe("desc");
+    expect(saveEditorSettings).toHaveBeenCalledWith(expect.objectContaining({ sidebarConnectionSortMode: "desc" }));
+  });
+});
 
 // --- activeModel lifecycle tests ---
 

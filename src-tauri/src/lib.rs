@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use tauri::menu::Menu;
 #[cfg(target_os = "macos")]
 use tauri::menu::{AboutMetadata, MenuItem, PredefinedMenuItem, Submenu};
+use tauri::webview::PageLoadEvent;
 use tauri::RunEvent;
 use tauri::{
     menu::MenuBuilder,
@@ -35,11 +36,12 @@ const APP_MENU_COPY_SUPPORT_INFO_ID: &str = "app-menu-copy-support-info";
 
 pub struct CloseBehaviorState {
     confirmed_exit: AtomicBool,
+    frontend_ready: AtomicBool,
 }
 
 impl CloseBehaviorState {
     fn new() -> Self {
-        Self { confirmed_exit: AtomicBool::new(false) }
+        Self { confirmed_exit: AtomicBool::new(false), frontend_ready: AtomicBool::new(false) }
     }
 
     pub(crate) fn allow_next_exit(&self) {
@@ -48,6 +50,14 @@ impl CloseBehaviorState {
 
     fn take_confirmed_exit(&self) -> bool {
         self.confirmed_exit.swap(false, Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_frontend_ready(&self, ready: bool) {
+        self.frontend_ready.store(ready, Ordering::Release);
+    }
+
+    fn is_frontend_ready(&self) -> bool {
+        self.frontend_ready.load(Ordering::Acquire)
     }
 }
 #[cfg(target_os = "macos")]
@@ -101,6 +111,10 @@ fn should_show_main_window_after_setup() -> bool {
 
 fn should_confirm_app_exit_request(target_os: &str, exit_code: Option<i32>, confirmed_exit: bool) -> bool {
     should_hide_window_on_close(target_os) && exit_code != Some(tauri::RESTART_EXIT_CODE) && !confirmed_exit
+}
+
+fn should_fallback_to_native_quit(target: &str, frontend_ready: bool) -> bool {
+    target == "quit" && !frontend_ready
 }
 
 fn native_window_decorations_override(target_os: &str) -> Option<bool> {
@@ -334,9 +348,7 @@ fn linux_appimage_system_gtk_immodules_cache(
     let Some(gtk_im_module_file) = gtk_im_module_file else {
         return Some(system_cache_path);
     };
-    let Some(appdir) = appdir else {
-        return None;
-    };
+    let appdir = appdir?;
 
     if std::path::Path::new(gtk_im_module_file).starts_with(std::path::Path::new(appdir)) {
         Some(system_cache_path)
@@ -438,6 +450,16 @@ pub(crate) fn hide_main_window_for_close<R: tauri::Runtime>(app: &tauri::AppHand
 }
 
 pub(crate) fn request_app_close<R: tauri::Runtime>(app: &tauri::AppHandle<R>, target: &str) {
+    let frontend_ready = app.try_state::<CloseBehaviorState>().is_some_and(|state| state.is_frontend_ready());
+    if should_fallback_to_native_quit(target, frontend_ready) {
+        // A missing WebView2 runtime can prevent the frontend listener from ever
+        // loading. Only the explicit tray Quit fallback bypasses the prompt.
+        if let Some(state) = app.try_state::<CloseBehaviorState>() {
+            state.allow_next_exit();
+        }
+        app.exit(0);
+        return;
+    }
     show_main_window(app);
     let _ = app.emit(APP_CLOSE_REQUESTED_EVENT, target);
 }
@@ -526,7 +548,7 @@ fn apply_macos_app_icon_theme(app: &tauri::AppHandle, icon_theme: DesktopIconThe
 fn apply_desktop_icon_theme(app: &tauri::AppHandle, icon_theme: DesktopIconTheme) -> tauri::Result<()> {
     #[cfg(target_os = "macos")]
     {
-        return apply_macos_app_icon_theme(app, icon_theme);
+        apply_macos_app_icon_theme(app, icon_theme)
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -591,9 +613,9 @@ mod tests {
     use super::{
         linux_appimage_system_gtk_immodules_cache, linux_appimage_wayland_backend_override,
         linux_nvidia_driver_from_state, linux_selected_drm_render_device, linux_webkit_rendering_workarounds,
-        native_window_decorations_override, should_confirm_app_exit_request, should_hide_window_on_close,
-        should_setup_desktop_tray, should_show_main_window_after_setup, uses_application_level_icon,
-        LinuxDrmRenderDevice, LinuxNvidiaDriver,
+        native_window_decorations_override, should_confirm_app_exit_request, should_fallback_to_native_quit,
+        should_hide_window_on_close, should_setup_desktop_tray, should_show_main_window_after_setup,
+        uses_application_level_icon, LinuxDrmRenderDevice, LinuxNvidiaDriver,
     };
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
@@ -665,6 +687,13 @@ mod tests {
         assert!(!should_confirm_app_exit_request("windows", Some(0), true));
         assert!(!should_confirm_app_exit_request("windows", Some(tauri::RESTART_EXIT_CODE), false));
         assert!(!should_confirm_app_exit_request("linux", Some(0), false));
+    }
+
+    #[test]
+    fn only_quit_uses_native_fallback_before_frontend_ready() {
+        assert!(should_fallback_to_native_quit("quit", false));
+        assert!(!should_fallback_to_native_quit("quit", true));
+        assert!(!should_fallback_to_native_quit("settings", false));
     }
 
     #[test]
@@ -900,6 +929,14 @@ pub fn run() {
     });
 
     builder
+        .manage(CloseBehaviorState::new())
+        .on_page_load(|webview, payload| {
+            if payload.event() == PageLoadEvent::Started {
+                if let Some(state) = webview.app_handle().try_state::<CloseBehaviorState>() {
+                    state.set_frontend_ready(false);
+                }
+            }
+        })
         .setup(move |app| {
             let setup_start = Instant::now();
             eprintln!("[STARTUP] plugins registered in {:?}", startup_begin.elapsed());
@@ -970,7 +1007,7 @@ pub fn run() {
             app.manage(commands::external_sql::ExternalSqlOpenState::default());
             app.manage(commands::external_db::ExternalDbOpenState::default());
             app.manage(commands::deep_link::DeepLinkOpenState::default());
-            app.manage(CloseBehaviorState::new());
+            app.manage(commands::update::PendingUpdateState::default());
             #[cfg(target_os = "macos")]
             macos_app_delegate::install_dock_quit_handler(app.handle());
             let startup_links = commands::deep_link::connection_deep_links_from_args(std::env::args().skip(1));
@@ -1010,11 +1047,11 @@ pub fn run() {
                 let app = window.app_handle();
                 if app.try_state::<CloseBehaviorState>().is_none() {
                     api.prevent_close();
-                    hide_main_window_for_close(&app, window);
+                    hide_main_window_for_close(app, window);
                     return;
                 }
                 api.prevent_close();
-                request_app_close(&app, "settings");
+                request_app_close(app, "settings");
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -1039,6 +1076,7 @@ pub fn run() {
             commands::app_settings::load_desktop_settings,
             commands::app_settings::save_desktop_settings,
             commands::app_settings::complete_app_close,
+            commands::app_settings::mark_frontend_ready,
             commands::app_settings::request_app_close_from_window_controls,
             commands::window_controls::set_macos_traffic_light_position,
             commands::app_settings::set_driver_store_dir,
@@ -1047,6 +1085,8 @@ pub fn run() {
             commands::app_settings::get_driver_store_path,
             commands::app_settings::load_pinned_tree_node_ids,
             commands::app_settings::save_pinned_tree_node_ids,
+            commands::app_settings::load_mcp_global_policy,
+            commands::app_settings::save_mcp_global_policy,
             commands::app_settings::load_editor_settings,
             commands::app_settings::save_editor_settings,
             commands::app_settings::load_open_tabs_state,
@@ -1126,6 +1166,7 @@ pub fn run() {
             commands::schema::list_schema_infos,
             commands::schema::list_data_types,
             commands::schema::get_columns,
+            commands::schema::get_sqlserver_column_metadata,
             commands::schema::list_indexes,
             commands::schema::list_foreign_keys,
             commands::schema::list_triggers,
@@ -1174,6 +1215,7 @@ pub fn run() {
             commands::query::build_create_database_sql,
             #[cfg(feature = "duckdb-bundled")]
             commands::query::build_duckdb_attach_database_sql,
+            commands::query::build_sqlite_attach_database_sql,
             commands::query::build_drop_object_sql,
             commands::query::build_drop_table_sql,
             commands::query::build_drop_table_child_object_sql,
@@ -1297,6 +1339,7 @@ pub fn run() {
             commands::mongo_cmd::mongo_create_database,
             commands::mongo_cmd::mongo_drop_database,
             commands::mongo_cmd::mongo_drop_collection,
+            commands::mongo_cmd::mongo_rename_collection,
             commands::document_cmd::document_list_databases,
             commands::document_cmd::document_list_collections,
             commands::document_cmd::document_find_documents,
@@ -1308,6 +1351,7 @@ pub fn run() {
             commands::document_cmd::document_upload_gridfs_file,
             commands::document_cmd::document_delete_gridfs_file,
             commands::mongo_cmd::mongo_find_documents,
+            commands::mongo_cmd::mongo_parse_shell_command,
             commands::mongo_cmd::mongo_find_one,
             commands::mongo_cmd::mongo_count_documents,
             commands::mongo_cmd::mongo_server_version,
@@ -1373,6 +1417,10 @@ pub fn run() {
             #[cfg(feature = "mq-admin")]
             commands::mq_cmd::mq_clear_backlog,
             #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_get_consumer_group_config,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_alter_consumer_group_config,
+            #[cfg(feature = "mq-admin")]
             commands::mq_cmd::mq_peek_messages,
             #[cfg(feature = "mq-admin")]
             commands::mq_cmd::mq_expire_messages,
@@ -1409,6 +1457,20 @@ pub fn run() {
             #[cfg(feature = "mq-admin")]
             commands::mq_cmd::mq_get_cluster_info,
             #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_get_topic_route,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_alter_topic_config,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_skip_topic_accumulation,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_view_message,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_query_messages_by_key,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_query_messages_by_topic,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_query_message_trace,
+            #[cfg(feature = "mq-admin")]
             commands::mq_cmd::mq_raw_request,
             #[cfg(feature = "mq-admin")]
             commands::mq_cmd::mq_send_message,
@@ -1421,7 +1483,8 @@ pub fn run() {
             commands::update::check_for_updates,
             commands::update::fetch_changelog,
             commands::update::get_system_proxy_url,
-            commands::update::download_and_install_update,
+            commands::update::download_update,
+            commands::update::install_downloaded_update,
             commands::transfer::start_transfer,
             commands::transfer::preview_transfer_ownership,
             commands::transfer::cancel_transfer,
@@ -1457,6 +1520,7 @@ pub fn run() {
             commands::agents::reinstall_jre,
             commands::agents::invalidate_agent_registry_cache,
             commands::agents::import_agents_from_zip,
+            commands::agents::import_agent_driver_cmd,
             commands::agents::import_agent_jar_cmd,
             commands::system_fonts::list_system_fonts,
             commands::ssh_config::list_ssh_config_hosts,

@@ -618,6 +618,23 @@ test("undo and redo restore pending cell edits before save", () => {
   assert.deepEqual(editor.rowDataWithChanges(result.value.rows[0], 0), [1, "Ada Lovelace"]);
 });
 
+test("typing NULL preserves the literal string value", async () => {
+  setActivePinia(createPinia());
+  installBrowserTestGlobals();
+
+  const result = computed(() => ({
+    columns: ["id", "name"],
+    rows: [[1, "Ada"] as CellValue[]],
+  }));
+  const editor = createPeopleGridEditor(result);
+
+  editor.applyCellValue(0, 1, "NULL");
+
+  assert.equal(editor.dirtyRows.value.get(0)?.get(1), "NULL");
+  assert.deepEqual(editor.rowDataWithChanges(result.value.rows[0], 0), [1, "NULL"]);
+  assert.deepEqual(await editor.previewChanges(), [`UPDATE "people" SET "name" = 'NULL' WHERE "id" = 1;`]);
+});
+
 test("setting a cell to NULL records pending SQL and supports undo and redo", async () => {
   setActivePinia(createPinia());
   installBrowserTestGlobals();
@@ -971,6 +988,34 @@ test("keeps appended empty-table rows when parent refreshes an equivalent rows a
   assert.equal(editor.newRows.value.length, 0);
 });
 
+test("keeps dirty new and deleted state when infinite scrolling appends rows", async () => {
+  setActivePinia(createPinia());
+  installBrowserTestGlobals();
+
+  const firstRow = [1, "Ada"] as CellValue[];
+  const secondRow = [2, "Grace"] as CellValue[];
+  const result = ref<{ columns: string[]; rows: CellValue[][]; appended_from_row_count?: number }>({ columns: ["id", "name"], rows: [firstRow, secondRow] });
+  const editor = createPeopleGridEditor(computed(() => result.value));
+
+  editor.applyCellValue(0, 1, "Ada Lovelace");
+  editor.deletedRows.value = new Set([1]);
+  editor.addRow();
+  await nextTick();
+
+  result.value = { columns: ["id", "name"], rows: [firstRow, secondRow, [3, "Linus"] as CellValue[]], appended_from_row_count: 2 };
+  await nextTick();
+
+  assert.equal(editor.dirtyRows.value.get(0)?.get(1), "Ada Lovelace");
+  assert.deepEqual([...editor.deletedRows.value], [1]);
+  assert.equal(editor.newRows.value.length, 1);
+
+  result.value = { columns: ["id", "name"], rows: [[1, "Ada"] as CellValue[], [2, "Grace"] as CellValue[]] };
+  await nextTick();
+  assert.equal(editor.dirtyRows.value.size, 0, "explicit result replacement still clears stale source indexes");
+  assert.equal(editor.deletedRows.value.size, 0);
+  assert.equal(editor.newRows.value.length, 0);
+});
+
 test("saving manually typed JSON from a MySQL grid normalizes smart quotes", async () => {
   setActivePinia(createPinia());
   installBrowserTestGlobals();
@@ -1167,6 +1212,11 @@ test("single-statement table data save uses auto-commit and records a failed his
   assert.equal(historyEntry.rollback_sql, undefined);
   assert.equal(historyEntry.affected_rows, undefined);
   assert.equal(historyEntry.sql, `UPDATE "pp_questions" SET "title" = 'New title' WHERE "id" = 1;`);
+  const details = JSON.parse(String(historyEntry.details_json));
+  assert.equal(details.statement_count, 1);
+  assert.equal(details.rollback_statement_count, 0);
+  assert.equal("statements" in details, false);
+  assert.equal("rollback_statements" in details, false);
 });
 
 test("multi-statement table data save remains transactional", async () => {

@@ -35,6 +35,65 @@ function semanticCompletion(markedSql: string, input: Partial<SqlCompletionProvi
 }
 
 describe("semantic SQL completion candidates", () => {
+  it.each([
+    ["MySQL ORDER BY", "SELECT * FROM t LIMIT 100 or|", "mysql", "mysql", "ORDER BY"],
+    ["PostgreSQL ON CONFLICT", "INSERT INTO t VALUES (1) on|", "postgres", "postgres", "ON CONFLICT"],
+    ["Oracle EXECUTE IMMEDIATE", "exec|", "oracle", undefined, "EXECUTE IMMEDIATE"],
+  ] as const)("keeps the longer %s keyword available before the current token is committed", (_label, sql, databaseType, dialect, expectedKeyword) => {
+    const { context, items } = semanticCompletion(sql, {}, { databaseType, dialect });
+
+    expect(context.suggestKeywords).toBe(false);
+    expect(items).toEqual(expect.arrayContaining([expect.objectContaining({ label: expectedKeyword, type: "keyword" })]));
+  });
+
+  it("does not offer keyword continuations for qualified column prefixes", () => {
+    const columnsByTable = new Map<string, SqlCompletionColumn[]>([["t", [{ name: "order_number", table: "t" }]]]);
+    const { context, items } = semanticCompletion("SELECT * FROM t WHERE t.or|", { columnsByTable }, { databaseType: "mysql", dialect: "mysql" });
+
+    expect(context.qualifier).toBe("t");
+    expect(items.some((item) => item.label === "ORDER BY")).toBe(false);
+  });
+
+  it("stops offering ORDER BY as a prefix continuation after OR is committed with whitespace", () => {
+    const columnsByTable = new Map<string, SqlCompletionColumn[]>([["t", [{ name: "id", table: "t" }]]]);
+    const { context, items } = semanticCompletion("SELECT * FROM t WHERE id = 1 OR |", { columnsByTable }, { databaseType: "mysql", dialect: "mysql" });
+
+    expect(context.prefix).toBe("");
+    expect(items.some((item) => item.label === "ORDER BY")).toBe(false);
+    expect(items.some((item) => item.label === "id" && item.type === "column")).toBe(true);
+  });
+
+  it("keeps matching functions available in column expressions", () => {
+    const columnsByTable = new Map<string, SqlCompletionColumn[]>([
+      [
+        "routes",
+        [
+          { name: "start_sid", table: "routes" },
+          { name: "start_dept", table: "routes" },
+        ],
+      ],
+    ]);
+
+    const { context, items } = semanticCompletion(
+      "SELECT * FROM routes WHERE st_|",
+      {
+        columnsByTable,
+        objects: [
+          { name: "st_area", type: "function", dataType: "double precision" },
+          { name: "st_refresh", type: "procedure" },
+        ],
+      },
+      { databaseType: "postgres", dialect: "postgres" },
+    );
+
+    expect(context.contextKind).toBe("column");
+    expect(context.suggestColumns).toBe(true);
+    expect(context.suggestRoutines).toBe(true);
+    expect(context.exclusiveRoutineSuggestions).toBe(false);
+    expect(items.some((item) => item.label === "st_area" && item.type === "function")).toBe(true);
+    expect(items.some((item) => item.label === "st_refresh")).toBe(false);
+  });
+
   it("keeps alias-qualified column completion scoped to one row source", () => {
     const columnsByTable = new Map<string, SqlCompletionColumn[]>([
       ["users", ["id", "name", "email"].map((name) => ({ name, table: "users" }))],

@@ -6,6 +6,7 @@ use std::sync::RwLock;
 
 use crate::connection::task_client_session_id;
 use crate::models::connection::DatabaseType;
+use crate::mysql_ddl_normalize::DdlNormalizeOptions;
 use crate::object_source_sql::build_export_object_source_sql;
 use crate::sql_dialect::{qualified_table_name, quote_table_identifier, uses_single_row_insert_statements};
 use crate::transfer::{
@@ -13,6 +14,7 @@ use crate::transfer::{
     selected_columns_include_identity_extras, wrap_dameng_identity_insert_sql,
     wrap_dameng_identity_insert_sql_for_table,
 };
+use crate::types::ObjectSourceKind;
 
 static EXPORT_CANCELLED: std::sync::LazyLock<RwLock<HashSet<String>>> =
     std::sync::LazyLock::new(|| RwLock::new(HashSet::new()));
@@ -31,11 +33,18 @@ pub struct DatabaseExportRequest {
     pub file_path: String,
     #[serde(default)]
     pub selected_tables: Vec<String>,
+    #[serde(default)]
+    pub excluded_tables: Vec<String>,
     pub include_structure: bool,
     pub include_data: bool,
     pub include_objects: bool,
     #[serde(default)]
     pub drop_table_if_exists: bool,
+    /// Drop the table-level `AUTO_INCREMENT=N` clause from exported MySQL DDL,
+    /// so the script can initialize a fresh database without pinning a sequence
+    /// position. No-op for non-MySQL databases. Defaults to `false` (preserve).
+    #[serde(default)]
+    pub omit_auto_increment: bool,
     #[serde(default)]
     pub fail_on_error: bool,
     #[serde(default)]
@@ -89,6 +98,18 @@ struct PostgresExportSequence {
     last_value: Option<String>,
     owner_table: Option<String>,
     owner_column: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PostgresExportExtension {
+    name: String,
+    schema: String,
+}
+
+#[derive(Debug, Default)]
+struct PostgresExtensionMembers {
+    relation_names: HashSet<String>,
+    function_keys: HashSet<(String, String)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -168,6 +189,10 @@ pub struct BuildDatabaseSqlExportOptions {
     pub database: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema: Option<String>,
+    /// Drop the table-level `AUTO_INCREMENT=N` clause from exported MySQL DDL.
+    /// Defaults to `false` (preserve). See `DatabaseExportRequest::omit_auto_increment`.
+    #[serde(default)]
+    pub omit_auto_increment: bool,
 }
 
 pub fn format_export_sql_literal(value: &Value) -> String {
@@ -278,11 +303,30 @@ fn quote_export_sql_string(text: &str) -> String {
 }
 
 fn quote_export_sql_string_for_database(text: &str, database_type: Option<DatabaseType>) -> String {
-    if is_mysql_compatible_export_literal_target(database_type) {
-        quote_mysql_compatible_export_sql_string(text)
-    } else {
-        quote_export_sql_string(text)
+    match database_type {
+        Some(DatabaseType::Dameng) => quote_dameng_export_sql_string(text),
+        database_type if is_mysql_compatible_export_literal_target(database_type) => {
+            quote_mysql_compatible_export_sql_string(text)
+        }
+        _ => quote_export_sql_string(text),
     }
+}
+
+fn quote_dameng_export_sql_string(text: &str) -> String {
+    if !text.contains('\0') {
+        return quote_export_sql_string(text);
+    }
+
+    let mut parts = Vec::new();
+    for (index, segment) in text.split('\0').enumerate() {
+        if index > 0 {
+            parts.push("CHR(0)".to_string());
+        }
+        if !segment.is_empty() {
+            parts.push(quote_export_sql_string(segment));
+        }
+    }
+    parts.join(" || ")
 }
 
 fn quote_mysql_compatible_export_sql_string(text: &str) -> String {
@@ -768,9 +812,13 @@ pub fn build_database_sql_export(options: BuildDatabaseSqlExportOptions) -> Resu
 
     for table in options.tables {
         if let Some(ddl) = table.ddl.as_ref().map(|ddl| ddl.trim()).filter(|ddl| !ddl.is_empty()) {
-            let ddl = normalize_export_table_ddl(ddl, table.database_type);
+            let ddl = format_export_table_ddl(
+                ddl,
+                table.database_type,
+                DdlNormalizeOptions { omit_auto_increment: options.omit_auto_increment },
+            );
             lines.push(format!("-- Structure for {}", table.display_name));
-            lines.push(format!("{};", ddl.trim_end_matches(';')));
+            lines.push(ddl);
             lines.push(String::new());
         }
 
@@ -818,15 +866,22 @@ fn export_qualified_table_name(
     Ok(qualified_table_name(database_type, schema, table_name))
 }
 
-fn normalize_export_table_ddl(ddl: &str, database_type: Option<DatabaseType>) -> String {
+fn normalize_export_table_ddl(
+    ddl: &str,
+    database_type: Option<DatabaseType>,
+    opts: crate::mysql_ddl_normalize::DdlNormalizeOptions,
+) -> String {
     if database_type != Some(DatabaseType::Mysql) {
         return ddl.to_string();
     }
 
-    static LEGACY_MYSQL_ROW_FORMAT_RE: std::sync::LazyLock<regex::Regex> =
-        std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\bROW_FORMAT\s*=\s*(COMPACT|REDUNDANT)\b").unwrap());
+    crate::mysql_ddl_normalize::normalize_mysql_export_ddl(ddl, opts)
+}
 
-    LEGACY_MYSQL_ROW_FORMAT_RE.replace_all(ddl, "ROW_FORMAT=DYNAMIC").into_owned()
+fn format_export_table_ddl(ddl: &str, database_type: Option<DatabaseType>, opts: DdlNormalizeOptions) -> String {
+    let ddl = normalize_export_table_ddl(ddl, database_type, opts);
+    let ddl = ddl.trim().trim_end_matches(';').trim_end();
+    format!("{ddl};")
 }
 
 fn postgres_sequence_qualified_name(schema: &str, sequence_name: &str) -> String {
@@ -886,11 +941,49 @@ fn generate_postgres_sequence_setval_sql(sequence: &PostgresExportSequence, sche
     }
 }
 
+fn generate_postgres_extension_ddl(extension: &PostgresExportExtension) -> String {
+    // Match pg_dump: omit VERSION so the target installation selects its
+    // default compatible version, while preserving the source schema.
+    format!(
+        "CREATE EXTENSION IF NOT EXISTS {} WITH SCHEMA {};",
+        quote_identifier(&extension.name, &DatabaseType::Postgres),
+        quote_identifier(&extension.schema, &DatabaseType::Postgres)
+    )
+}
+
+async fn list_postgres_extension_members(
+    state: &crate::connection::AppState,
+    pool_key: &str,
+    schema: &str,
+) -> Result<PostgresExtensionMembers, String> {
+    let pool = {
+        let connections = state.connections.read().await;
+        match connections.get(pool_key) {
+            Some(crate::connection::PoolKind::Postgres(pool)) => pool.clone(),
+            _ => return Ok(PostgresExtensionMembers::default()),
+        }
+    };
+    let mut members = PostgresExtensionMembers::default();
+    for (kind, name, signature) in crate::db::postgres::list_extension_member_objects(&pool, schema).await? {
+        if kind == "RELATION" {
+            members.relation_names.insert(name);
+        } else if kind == "FUNCTION" {
+            members.function_keys.insert((name, signature));
+        }
+    }
+    Ok(members)
+}
+
+fn is_postgres_extension_member_routine(object: &crate::types::ObjectInfo, members: &PostgresExtensionMembers) -> bool {
+    members.function_keys.contains(&(object.name.clone(), object.signature.clone().unwrap_or_default()))
+}
+
 async fn list_postgres_export_sequences(
     state: &crate::connection::AppState,
     pool_key: &str,
     schema: &str,
     selected_tables: &[String],
+    excluded_tables: &[String],
     include_objects: bool,
     fail_on_error: bool,
 ) -> Result<Vec<PostgresExportSequence>, String> {
@@ -932,6 +1025,7 @@ async fn list_postgres_export_sequences(
         .map_err(|e| e.to_string())?;
 
     let selected: HashSet<&str> = selected_tables.iter().map(String::as_str).collect();
+    let excluded: HashSet<&str> = excluded_tables.iter().map(String::as_str).collect();
     let mut sequences = rows
         .iter()
         .map(|row| PostgresExportSequence {
@@ -948,8 +1042,9 @@ async fn list_postgres_export_sequences(
             owner_column: row.get::<_, Option<String>>(9),
         })
         .filter(|sequence| {
-            selected.is_empty()
-                || sequence.owner_table.as_deref().map(|owner_table| selected.contains(owner_table)).unwrap_or(false)
+            sequence.owner_table.as_deref().is_none_or(|owner_table| !excluded.contains(owner_table))
+                && (selected.is_empty()
+                    || sequence.owner_table.as_deref().is_some_and(|owner_table| selected.contains(owner_table)))
         })
         .filter(|sequence| sequence.owner_table.is_some() || (include_objects && selected.is_empty()))
         .collect::<Vec<_>>();
@@ -1057,6 +1152,18 @@ pub async fn begin_database_backup_snapshot_core(
     Ok(DatabaseBackupSnapshot { session_id, schemas })
 }
 
+/// 只有确认底层支持并发请求的多连接池才允许并发预取导出元数据。
+/// SqlServer（Arc<Mutex> 串行客户端）、Agent/ExternalDriver（插件请求超时覆盖
+/// 排队时间且超时会终止 sidecar）、SQLite/DuckDB 等单连接类型都必须回退串行。
+fn concurrent_metadata_prefetch_allowed(pool_kind: Option<&crate::connection::PoolKind>) -> bool {
+    matches!(
+        pool_kind,
+        Some(crate::connection::PoolKind::Postgres(_))
+            | Some(crate::connection::PoolKind::Mysql(..))
+            | Some(crate::connection::PoolKind::ClickHouse(_))
+    )
+}
+
 fn record_export_error(file: &mut std::fs::File, fail_on_error: bool, message: String) -> Result<(), String> {
     if fail_on_error {
         Err(message)
@@ -1127,8 +1234,6 @@ pub async fn export_database_sql_core(
         None,
     )
     .await?;
-    let all_tables = filter_selected_table_infos(all_tables, &request.selected_tables);
-
     // 4. Create file
     let mut file = std::fs::File::create(&request.file_path).map_err(|e| format!("Failed to write file: {e}"))?;
 
@@ -1145,6 +1250,41 @@ pub async fn export_database_sql_core(
     }
 
     // 7. Separate tables and views
+    let postgres_extension_members =
+        if matches!(db_type, DatabaseType::Postgres) && (request.include_structure || request.include_objects) {
+            match list_postgres_extension_members(state, &pool_key, &request.schema).await {
+                Ok(members) => members,
+                Err(e) => {
+                    record_export_error(&mut file, request.fail_on_error, format!("reading extension members: {e}"))?;
+                    PostgresExtensionMembers::default()
+                }
+            }
+        } else {
+            PostgresExtensionMembers::default()
+        };
+    let postgres_extensions = if request.include_structure && matches!(db_type, DatabaseType::Postgres) {
+        match crate::schema::list_extensions_core(state, &request.connection_id, &request.database, &request.schema)
+            .await
+        {
+            Ok(extensions) => extensions
+                .into_iter()
+                .map(|extension| PostgresExportExtension {
+                    name: extension.name,
+                    schema: extension.schema.unwrap_or_else(|| request.schema.clone()),
+                })
+                .collect(),
+            Err(e) => {
+                record_export_error(&mut file, request.fail_on_error, format!("exporting extensions: {e}"))?;
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    let all_tables = filter_export_table_infos(all_tables, &request.selected_tables, &request.excluded_tables)
+        .into_iter()
+        .filter(|table| !postgres_extension_members.relation_names.contains(&table.name))
+        .collect::<Vec<_>>();
     let mut tables: Vec<_> = all_tables.iter().filter(|t| !t.table_type.contains("VIEW")).collect();
     let views: Vec<_> = all_tables.iter().filter(|t| t.table_type.contains("VIEW")).collect();
     let postgres_sequences = if request.include_structure && matches!(db_type, DatabaseType::Postgres) {
@@ -1153,6 +1293,7 @@ pub async fn export_database_sql_core(
             &pool_key,
             &request.schema,
             &request.selected_tables,
+            &request.excluded_tables,
             request.include_objects,
             request.fail_on_error,
         )
@@ -1193,11 +1334,11 @@ pub async fn export_database_sql_core(
     }
 
     // 8. Calculate total objects
-    let mut total_objects = tables.len() + views.len() + postgres_sequences.len();
+    let mut total_objects = tables.len() + views.len() + postgres_sequences.len() + postgres_extensions.len();
 
     // We'll add procedures/functions count later if include_objects
-    let mut procedures: Vec<String> = Vec::new();
-    let mut functions: Vec<String> = Vec::new();
+    let mut procedures: Vec<crate::types::ObjectInfo> = Vec::new();
+    let mut functions: Vec<crate::types::ObjectInfo> = Vec::new();
 
     if request.include_objects && request.selected_tables.is_empty() {
         match crate::schema::list_objects_core(
@@ -1215,10 +1356,13 @@ pub async fn export_database_sql_core(
             Ok(objects) => {
                 for obj in &objects {
                     let ot = obj.object_type.to_uppercase();
+                    if is_postgres_extension_member_routine(obj, &postgres_extension_members) {
+                        continue;
+                    }
                     if ot.contains("PROCEDURE") {
-                        procedures.push(obj.name.clone());
+                        procedures.push(obj.clone());
                     } else if ot.contains("FUNCTION") {
-                        functions.push(obj.name.clone());
+                        functions.push(obj.clone());
                     }
                 }
             }
@@ -1232,6 +1376,25 @@ pub async fn export_database_sql_core(
 
     // Export tables
     let batch_size = if request.batch_size == 0 { 1000 } else { request.batch_size };
+
+    for extension in &postgres_extensions {
+        if is_export_cancelled(&request.export_id).await {
+            return Err("Export cancelled".to_string());
+        }
+        on_progress(ExportProgress {
+            export_id: request.export_id.clone(),
+            current_object: extension.name.clone(),
+            object_index,
+            total_objects,
+            rows_exported: 0,
+            total_rows: None,
+            status: ExportStatus::Running,
+            error: None,
+        });
+        writeln!(file, "{}\n", generate_postgres_extension_ddl(extension))
+            .map_err(|e| format!("Failed to write file: {e}"))?;
+        object_index += 1;
+    }
 
     for sequence in postgres_sequences.iter().filter(|sequence| sequence.owner_table.is_none()) {
         if is_export_cancelled(&request.export_id).await {
@@ -1254,7 +1417,89 @@ pub async fn export_database_sql_core(
         object_index += 1;
     }
 
-    for table_info in &tables {
+    // 预取各表的 DDL 与列元数据：逐表串行往返在多表数据库上是整库导出耗时的
+    // 主要来源（每表 1-2 次网络往返 × 表数）。有界并发预取后，下方写出循环仍按
+    // 原顺序消费，文件内容与逐表查询完全一致。
+    struct PrefetchedTableMetadata {
+        ddl: Option<Result<String, String>>,
+        columns: Option<Result<Vec<crate::db::ColumnInfo>, String>>,
+    }
+    const EXPORT_METADATA_PREFETCH_CONCURRENCY: usize = 8;
+    let mut prefetched_table_metadata: Vec<Option<PrefetchedTableMetadata>> = Vec::new();
+    prefetched_table_metadata.resize_with(tables.len(), || None);
+    // 防护门按「实际连接池种类」放行，而非数据库类型的能力标记：只有确认底层
+    // 支持并发请求的多连接池（Postgres/MySQL/ClickHouse）才启用并发预取。反例：
+    // 原生 SQL Server 是 Arc<Mutex<..>> 串行客户端；Agent/外部 JDBC（含 SQL Server
+    // legacy profile、PrestoSQL 等路由结果）的插件请求超时覆盖排队时间且超时会
+    // 终止 sidecar；SQLite/DuckDB 等为单连接。被挡住的场景预取 Vec 保持全 None，
+    // 写出循环内的 None 回退路径即原有的逐表串行直查行为。
+    let concurrent_prefetch_is_safe =
+        match state.get_or_create_pool(&request.connection_id, Some(&request.database)).await {
+            Ok(metadata_pool_key) => {
+                concurrent_metadata_prefetch_allowed(state.connections.read().await.get(&metadata_pool_key))
+            }
+            // 建池失败时不预取，让写出循环的直查路径按原有方式报告错误
+            Err(_) => false,
+        };
+    if concurrent_prefetch_is_safe
+        && (request.include_structure || request.include_data)
+        && !tables.is_empty()
+        && !is_export_cancelled(&request.export_id).await
+    {
+        use futures::StreamExt;
+        let prefetch_targets: Vec<(usize, String)> =
+            tables.iter().enumerate().map(|(index, table_info)| (index, table_info.name.clone())).collect();
+        let mut prefetch_stream =
+            futures::stream::iter(prefetch_targets.into_iter().map(|(index, table_name)| async move {
+                if is_export_cancelled_now(&request.export_id) {
+                    return (index, PrefetchedTableMetadata { ddl: None, columns: None });
+                }
+                let ddl = if request.include_structure {
+                    Some(
+                        crate::schema::get_table_ddl_core(
+                            state,
+                            &request.connection_id,
+                            &request.database,
+                            &request.schema,
+                            &table_name,
+                            None,
+                        )
+                        .await,
+                    )
+                } else {
+                    None
+                };
+                if is_export_cancelled_now(&request.export_id) {
+                    return (index, PrefetchedTableMetadata { ddl, columns: None });
+                }
+                let columns = if request.include_data {
+                    Some(
+                        crate::schema::get_columns_core(
+                            state,
+                            &request.connection_id,
+                            &request.database,
+                            &request.schema,
+                            &table_name,
+                        )
+                        .await,
+                    )
+                } else {
+                    None
+                };
+                (index, PrefetchedTableMetadata { ddl, columns })
+            }))
+            .buffer_unordered(EXPORT_METADATA_PREFETCH_CONCURRENCY);
+        while let Some((index, metadata)) = prefetch_stream.next().await {
+            prefetched_table_metadata[index] = Some(metadata);
+            // 取消后不再调度新的预取任务（已在途的任务随 stream 释放而中止），
+            // 写出循环入口的取消检查负责最终收尾
+            if is_export_cancelled_now(&request.export_id) {
+                break;
+            }
+        }
+    }
+
+    for (table_index, table_info) in tables.iter().enumerate() {
         // Check cancellation
         if is_export_cancelled(&request.export_id).await {
             on_progress(ExportProgress {
@@ -1309,19 +1554,32 @@ pub async fn export_database_sql_core(
                     .map_err(|e| format!("Failed to write file: {e}"))?;
                 object_index += 1;
             }
-            match crate::schema::get_table_ddl_core(
-                state,
-                &request.connection_id,
-                &request.database,
-                &request.schema,
-                table_name,
-                None,
-            )
-            .await
+            let ddl_result = match prefetched_table_metadata
+                .get_mut(table_index)
+                .and_then(|m| m.as_mut())
+                .and_then(|m| m.ddl.take())
             {
+                Some(result) => result,
+                None => {
+                    crate::schema::get_table_ddl_core(
+                        state,
+                        &request.connection_id,
+                        &request.database,
+                        &request.schema,
+                        table_name,
+                        None,
+                    )
+                    .await
+                }
+            };
+            match ddl_result {
                 Ok(ddl) => {
-                    let ddl = normalize_export_table_ddl(&ddl, Some(db_type));
-                    writeln!(file, "{};\n", ddl).map_err(|e| format!("Failed to write file: {e}"))?;
+                    let ddl = format_export_table_ddl(
+                        &ddl,
+                        Some(db_type),
+                        DdlNormalizeOptions { omit_auto_increment: request.omit_auto_increment },
+                    );
+                    writeln!(file, "{ddl}\n").map_err(|e| format!("Failed to write file: {e}"))?;
                 }
                 Err(e) => {
                     record_export_error(
@@ -1336,15 +1594,24 @@ pub async fn export_database_sql_core(
         // Export data
         if request.include_data {
             // Get columns
-            let columns = match crate::schema::get_columns_core(
-                state,
-                &request.connection_id,
-                &request.database,
-                &request.schema,
-                table_name,
-            )
-            .await
+            let columns_result = match prefetched_table_metadata
+                .get_mut(table_index)
+                .and_then(|m| m.as_mut())
+                .and_then(|m| m.columns.take())
             {
+                Some(result) => result,
+                None => {
+                    crate::schema::get_columns_core(
+                        state,
+                        &request.connection_id,
+                        &request.database,
+                        &request.schema,
+                        table_name,
+                    )
+                    .await
+                }
+            };
+            let columns = match columns_result {
                 Ok(cols) => cols,
                 Err(e) => {
                     record_export_error(
@@ -1536,8 +1803,13 @@ pub async fn export_database_sql_core(
             .await
             {
                 Ok(obj_source) => {
-                    let source =
-                        build_export_object_source_sql(db_type, crate::db::ObjectSourceKind::View, &obj_source.source);
+                    let source = build_database_export_object_source_sql(
+                        db_type,
+                        &ObjectSourceKind::View,
+                        view_name,
+                        &obj_source.source,
+                        request.drop_table_if_exists,
+                    );
                     if !source.is_empty() {
                         writeln!(file, "{source}\n").map_err(|e| format!("Failed to write file: {e}"))?;
                     }
@@ -1551,10 +1823,12 @@ pub async fn export_database_sql_core(
         }
 
         // Export procedures
-        for proc_name in &procedures {
+        for procedure in &procedures {
             if is_export_cancelled(&request.export_id).await {
                 return Err("Export cancelled".to_string());
             }
+
+            let proc_name = &procedure.name;
 
             on_progress(ExportProgress {
                 export_id: request.export_id.clone(),
@@ -1574,15 +1848,17 @@ pub async fn export_database_sql_core(
                 &request.schema,
                 proc_name,
                 crate::db::ObjectSourceKind::Procedure,
-                None,
+                procedure.signature.as_deref(),
             )
             .await
             {
                 Ok(obj_source) => {
-                    let source = build_export_object_source_sql(
+                    let source = build_database_export_object_source_sql(
                         db_type,
-                        crate::db::ObjectSourceKind::Procedure,
+                        &ObjectSourceKind::Procedure,
+                        proc_name,
                         &obj_source.source,
+                        request.drop_table_if_exists,
                     );
                     if !source.is_empty() {
                         writeln!(file, "{source}\n").map_err(|e| format!("Failed to write file: {e}"))?;
@@ -1601,10 +1877,12 @@ pub async fn export_database_sql_core(
         }
 
         // Export functions
-        for func_name in &functions {
+        for function in &functions {
             if is_export_cancelled(&request.export_id).await {
                 return Err("Export cancelled".to_string());
             }
+
+            let func_name = &function.name;
 
             on_progress(ExportProgress {
                 export_id: request.export_id.clone(),
@@ -1624,15 +1902,17 @@ pub async fn export_database_sql_core(
                 &request.schema,
                 func_name,
                 crate::db::ObjectSourceKind::Function,
-                None,
+                function.signature.as_deref(),
             )
             .await
             {
                 Ok(obj_source) => {
-                    let source = build_export_object_source_sql(
+                    let source = build_database_export_object_source_sql(
                         db_type,
-                        crate::db::ObjectSourceKind::Function,
+                        &ObjectSourceKind::Function,
+                        func_name,
                         &obj_source.source,
+                        request.drop_table_if_exists,
                     );
                     if !source.is_empty() {
                         writeln!(file, "{source}\n").map_err(|e| format!("Failed to write file: {e}"))?;
@@ -1671,32 +1951,60 @@ pub async fn export_database_sql_core(
     Ok(())
 }
 
-fn filter_selected_table_infos(
+fn filter_export_table_infos(
     tables: Vec<crate::types::TableInfo>,
     selected_tables: &[String],
+    excluded_tables: &[String],
 ) -> Vec<crate::types::TableInfo> {
-    if selected_tables.is_empty() {
-        return tables;
-    }
     let selected: HashSet<&str> = selected_tables.iter().map(String::as_str).collect();
-    tables.into_iter().filter(|table| selected.contains(table.name.as_str())).collect()
+    let excluded: HashSet<&str> = excluded_tables.iter().map(String::as_str).collect();
+    tables
+        .into_iter()
+        .filter(|table| selected.is_empty() || selected.contains(table.name.as_str()))
+        .filter(|table| !excluded.contains(table.name.as_str()))
+        .collect()
 }
 
 fn drop_table_if_exists_sql(table_name: &str, schema: &str, db_type: &DatabaseType) -> String {
     format!("DROP TABLE IF EXISTS {};", crate::transfer::qualified_table(table_name, schema, db_type))
 }
 
+fn build_database_export_object_source_sql(
+    database_type: DatabaseType,
+    object_type: &ObjectSourceKind,
+    object_name: &str,
+    source: &str,
+    drop_if_exists: bool,
+) -> String {
+    let source = build_export_object_source_sql(database_type, object_type.clone(), source);
+    if source.is_empty() || !drop_if_exists || database_type != DatabaseType::Mysql {
+        return source;
+    }
+
+    let object_type = match object_type {
+        ObjectSourceKind::View => "VIEW",
+        ObjectSourceKind::Procedure => "PROCEDURE",
+        ObjectSourceKind::Function => "FUNCTION",
+        _ => return source,
+    };
+    let object_name = quote_identifier(object_name, &DatabaseType::Mysql);
+    format!("DROP {object_type} IF EXISTS {object_name};\n{source}")
+}
+
 #[cfg(test)]
 mod tests {
+    use super::concurrent_metadata_prefetch_allowed;
     use super::{
-        build_database_sql_export, build_export_insert_statements, drop_table_if_exists_sql,
-        filter_selected_table_infos, format_export_sql_literal, generate_postgres_sequence_create_ddl,
-        generate_postgres_sequence_owner_ddl, generate_postgres_sequence_setval_sql, normalize_export_table_ddl,
-        record_export_error, BuildDatabaseSqlExportOptions, BuildExportInsertStatementsOptions, ExportedTableSql,
-        PostgresExportSequence, DATABASE_EXPORT_INSERT_BATCH_SIZE, DATABASE_EXPORT_ROW_LIMIT,
+        build_database_export_object_source_sql, build_database_sql_export, build_export_insert_statements,
+        drop_table_if_exists_sql, filter_export_table_infos, format_export_sql_literal, format_export_table_ddl,
+        generate_postgres_extension_ddl, generate_postgres_sequence_create_ddl, generate_postgres_sequence_owner_ddl,
+        generate_postgres_sequence_setval_sql, is_postgres_extension_member_routine, normalize_export_table_ddl,
+        record_export_error, BuildDatabaseSqlExportOptions, BuildExportInsertStatementsOptions, DdlNormalizeOptions,
+        ExportedTableSql, PostgresExportExtension, PostgresExportSequence, PostgresExtensionMembers,
+        DATABASE_EXPORT_INSERT_BATCH_SIZE, DATABASE_EXPORT_ROW_LIMIT,
     };
     use crate::models::connection::DatabaseType;
-    use crate::types::TableInfo;
+    use crate::types::{ObjectInfo, ObjectSourceKind, TableInfo};
     use serde_json::{json, Value};
 
     fn table(name: &str, table_type: &str) -> TableInfo {
@@ -1709,11 +2017,68 @@ mod tests {
         }
     }
 
+    fn routine(name: &str, signature: &str) -> ObjectInfo {
+        ObjectInfo {
+            name: name.to_string(),
+            object_type: "FUNCTION".to_string(),
+            schema: Some("public".to_string()),
+            valid: None,
+            signature: Some(signature.to_string()),
+            comment: None,
+            created_at: None,
+            updated_at: None,
+            parent_schema: None,
+            parent_name: None,
+        }
+    }
+
+    #[test]
+    fn postgres_extension_ddl_uses_target_default_version_and_source_schema() {
+        let extension = PostgresExportExtension { name: "pg_trgm".to_string(), schema: "addons".to_string() };
+
+        let ddl = generate_postgres_extension_ddl(&extension);
+
+        assert_eq!(ddl, "CREATE EXTENSION IF NOT EXISTS \"pg_trgm\" WITH SCHEMA \"addons\";");
+        assert!(!ddl.contains("VERSION"));
+    }
+
+    #[test]
+    fn postgres_extension_member_filter_keeps_user_overload_with_same_name() {
+        let mut members = PostgresExtensionMembers::default();
+        members.function_keys.insert(("similarity".to_string(), "text, text".to_string()));
+
+        assert!(is_postgres_extension_member_routine(&routine("similarity", "text, text"), &members));
+        assert!(!is_postgres_extension_member_routine(&routine("similarity", "integer, integer"), &members));
+        assert!(!is_postgres_extension_member_routine(&routine("user_similarity", "text, text"), &members));
+    }
+
+    #[test]
+    fn concurrent_prefetch_only_allowed_for_multi_connection_pools() {
+        use crate::connection::PoolKind;
+        use std::sync::Arc;
+
+        // ChClient::new 只构造 HTTP 客户端，不发起连接
+        let clickhouse = PoolKind::ClickHouse(crate::db::clickhouse_driver::ChClient::new(
+            "http://127.0.0.1:1",
+            None,
+            None,
+            std::time::Duration::from_secs(1),
+        ));
+        assert!(concurrent_metadata_prefetch_allowed(Some(&clickhouse)));
+
+        // Agent（JDBC sidecar）请求超时覆盖排队时间，必须回退串行
+        let agent =
+            PoolKind::Agent(Arc::new(tokio::sync::Mutex::new(crate::db::agent_driver::AgentDriverClient::test_stub())));
+        assert!(!concurrent_metadata_prefetch_allowed(Some(&agent)));
+
+        assert!(!concurrent_metadata_prefetch_allowed(None));
+    }
+
     #[test]
     fn filters_export_tables_by_selected_names() {
         let tables = vec![table("users", "TABLE"), table("orders", "TABLE"), table("active_users", "VIEW")];
 
-        let filtered = filter_selected_table_infos(tables, &["active_users".to_string(), "users".to_string()]);
+        let filtered = filter_export_table_infos(tables, &["active_users".to_string(), "users".to_string()], &[]);
 
         assert_eq!(filtered.iter().map(|table| table.name.as_str()).collect::<Vec<_>>(), vec!["users", "active_users"]);
     }
@@ -1722,9 +2087,28 @@ mod tests {
     fn keeps_all_export_tables_when_selection_is_empty() {
         let tables = vec![table("users", "TABLE"), table("orders", "TABLE")];
 
-        let filtered = filter_selected_table_infos(tables.clone(), &[]);
+        let filtered = filter_export_table_infos(tables.clone(), &[], &[]);
 
         assert_eq!(filtered.iter().map(|table| table.name.as_str()).collect::<Vec<_>>(), vec!["users", "orders"]);
+    }
+
+    #[test]
+    fn excludes_export_tables_by_name() {
+        let tables = vec![table("users", "TABLE"), table("audit_log", "TABLE"), table("active_users", "VIEW")];
+
+        let filtered = filter_export_table_infos(tables, &[], &["audit_log".to_string(), "active_users".to_string()]);
+
+        assert_eq!(filtered.iter().map(|table| table.name.as_str()).collect::<Vec<_>>(), vec!["users"]);
+    }
+
+    #[test]
+    fn exclusions_take_precedence_over_selected_tables() {
+        let tables = vec![table("users", "TABLE"), table("orders", "TABLE")];
+
+        let filtered =
+            filter_export_table_infos(tables, &["users".to_string(), "orders".to_string()], &["orders".to_string()]);
+
+        assert_eq!(filtered.iter().map(|table| table.name.as_str()).collect::<Vec<_>>(), vec!["users"]);
     }
 
     #[test]
@@ -1739,6 +2123,67 @@ mod tests {
         let sql = drop_table_if_exists_sql("users", "", &DatabaseType::Postgres);
 
         assert_eq!(sql, "DROP TABLE IF EXISTS \"users\";");
+    }
+
+    #[test]
+    fn mysql_export_adds_drop_if_exists_for_views_and_escapes_names() {
+        let sql = build_database_export_object_source_sql(
+            DatabaseType::Mysql,
+            &ObjectSourceKind::View,
+            "active`rows",
+            "CREATE VIEW `active``rows` AS SELECT 1",
+            true,
+        );
+
+        assert_eq!(sql, "DROP VIEW IF EXISTS `active``rows`;\nCREATE VIEW `active``rows` AS SELECT 1;");
+    }
+
+    #[test]
+    fn mysql_export_adds_drop_if_exists_before_delimited_routines() {
+        let procedure = build_database_export_object_source_sql(
+            DatabaseType::Mysql,
+            &ObjectSourceKind::Procedure,
+            "refresh_cache",
+            "CREATE PROCEDURE `refresh_cache`() BEGIN SELECT 1; END",
+            true,
+        );
+        let function = build_database_export_object_source_sql(
+            DatabaseType::Mysql,
+            &ObjectSourceKind::Function,
+            "active_count",
+            "CREATE FUNCTION `active_count`() RETURNS INT RETURN 1",
+            true,
+        );
+
+        assert_eq!(
+            procedure,
+            "DROP PROCEDURE IF EXISTS `refresh_cache`;\nDELIMITER //\nCREATE PROCEDURE `refresh_cache`() BEGIN SELECT 1; END//\nDELIMITER ;"
+        );
+        assert_eq!(
+            function,
+            "DROP FUNCTION IF EXISTS `active_count`;\nDELIMITER //\nCREATE FUNCTION `active_count`() RETURNS INT RETURN 1//\nDELIMITER ;"
+        );
+    }
+
+    #[test]
+    fn object_drop_option_does_not_change_disabled_or_non_mysql_exports() {
+        let mysql_without_drop = build_database_export_object_source_sql(
+            DatabaseType::Mysql,
+            &ObjectSourceKind::View,
+            "active_rows",
+            "CREATE VIEW `active_rows` AS SELECT 1",
+            false,
+        );
+        let postgres_with_drop = build_database_export_object_source_sql(
+            DatabaseType::Postgres,
+            &ObjectSourceKind::View,
+            "active_rows",
+            "CREATE VIEW active_rows AS SELECT 1",
+            true,
+        );
+
+        assert_eq!(mysql_without_drop, "CREATE VIEW `active_rows` AS SELECT 1;");
+        assert_eq!(postgres_with_drop, "CREATE VIEW active_rows AS SELECT 1;");
     }
 
     #[test]
@@ -2034,6 +2479,47 @@ mod tests {
     }
 
     #[test]
+    fn dameng_strings_export_nul_as_chr_expression() {
+        let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
+            database_type: Some(DatabaseType::Dameng),
+            schema: Some("DBX_TEST".to_string()),
+            table_name: Some("NUL_VALUES".to_string()),
+            qualified_table_name: None,
+            columns: vec![
+                "PLAIN".to_string(),
+                "TRAILING".to_string(),
+                "LEADING".to_string(),
+                "MIDDLE".to_string(),
+                "CONSECUTIVE".to_string(),
+                "ONLY_NUL".to_string(),
+            ],
+            column_types: vec![Some("VARCHAR".to_string()); 6],
+            column_extras: Vec::new(),
+            rows: vec![vec![
+                json!("plain"),
+                json!("eHall\0"),
+                json!("\0leading"),
+                json!("left\0right"),
+                json!("left\0\0right"),
+                json!("\0"),
+            ]],
+            batch_size: Some(10),
+        })
+        .unwrap();
+
+        assert_eq!(
+            statements,
+            vec![concat!(
+                "INSERT INTO \"DBX_TEST\".\"NUL_VALUES\" ",
+                "(\"PLAIN\", \"TRAILING\", \"LEADING\", \"MIDDLE\", \"CONSECUTIVE\", \"ONLY_NUL\") ",
+                "VALUES ('plain', 'eHall' || CHR(0), CHR(0) || 'leading', 'left' || CHR(0) || 'right', ",
+                "'left' || CHR(0) || CHR(0) || 'right', CHR(0));"
+            )]
+        );
+        assert!(!statements[0].contains('\0'));
+    }
+
+    #[test]
     fn mysql_export_uses_typed_literals_for_numeric_and_blob_columns() {
         let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
             database_type: Some(DatabaseType::Mysql),
@@ -2205,6 +2691,7 @@ mod tests {
             connection_id: None,
             database: None,
             schema: None,
+            omit_auto_increment: false,
         })
         .unwrap();
 
@@ -2229,10 +2716,65 @@ mod tests {
     }
 
     #[test]
+    fn table_ddl_export_has_one_statement_terminator() {
+        let ddl = "CREATE TABLE `users` (`id` int);;\n";
+
+        assert_eq!(
+            format_export_table_ddl(ddl, Some(DatabaseType::Mysql), DdlNormalizeOptions::default()),
+            "CREATE TABLE `users` (`id` int);"
+        );
+        assert_eq!(
+            format_export_table_ddl(
+                "CREATE TABLE users (id int)",
+                Some(DatabaseType::Postgres),
+                DdlNormalizeOptions::default(),
+            ),
+            "CREATE TABLE users (id int);"
+        );
+    }
+
+    #[test]
+    fn omitted_auto_increment_preserves_mysql_line_comment_boundaries() {
+        let options = DdlNormalizeOptions { omit_auto_increment: true };
+
+        assert_eq!(
+            format_export_table_ddl(
+                "CREATE TABLE `users` (`id` int) ENGINE=InnoDB -- keep this comment\nAUTO_INCREMENT=5 DEFAULT CHARSET=utf8mb4",
+                Some(DatabaseType::Mysql),
+                options,
+            ),
+            "CREATE TABLE `users` (`id` int) ENGINE=InnoDB -- keep this comment\n DEFAULT CHARSET=utf8mb4;"
+        );
+        assert_eq!(
+            format_export_table_ddl(
+                "CREATE TABLE `users` (`id` int) ENGINE=InnoDB # keep this comment\r\nAUTO_INCREMENT=5 DEFAULT CHARSET=utf8mb4",
+                Some(DatabaseType::Mysql),
+                options,
+            ),
+            "CREATE TABLE `users` (`id` int) ENGINE=InnoDB # keep this comment\r\n DEFAULT CHARSET=utf8mb4;"
+        );
+    }
+
+    #[test]
+    fn omitted_auto_increment_consumes_only_horizontal_separator_whitespace() {
+        let options = DdlNormalizeOptions { omit_auto_increment: true };
+
+        for separator in [" ", "\t"] {
+            let ddl = format!(
+                "CREATE TABLE `users` (`id` int) ENGINE=InnoDB{separator}AUTO_INCREMENT=5 DEFAULT CHARSET=utf8mb4"
+            );
+            assert_eq!(
+                format_export_table_ddl(&ddl, Some(DatabaseType::Mysql), options),
+                "CREATE TABLE `users` (`id` int) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;"
+            );
+        }
+    }
+
+    #[test]
     fn normalizes_legacy_mysql_row_format_for_export_compatibility() {
         let ddl = "CREATE TABLE `wide_table` (\n  `payload` varchar(4096) DEFAULT NULL\n) ENGINE=InnoDB DEFAULT CHARSET=utf8 ROW_FORMAT=COMPACT";
 
-        let normalized = normalize_export_table_ddl(ddl, Some(DatabaseType::Mysql));
+        let normalized = normalize_export_table_ddl(ddl, Some(DatabaseType::Mysql), DdlNormalizeOptions::default());
 
         assert_eq!(
             normalized,
@@ -2244,7 +2786,7 @@ mod tests {
     fn normalizes_lowercase_redundant_mysql_row_format_for_export_compatibility() {
         let ddl = "CREATE TABLE `wide_table` (`payload` varchar(4096)) engine=InnoDB row_format = redundant";
 
-        let normalized = normalize_export_table_ddl(ddl, Some(DatabaseType::Mysql));
+        let normalized = normalize_export_table_ddl(ddl, Some(DatabaseType::Mysql), DdlNormalizeOptions::default());
 
         assert_eq!(normalized, "CREATE TABLE `wide_table` (`payload` varchar(4096)) engine=InnoDB ROW_FORMAT=DYNAMIC");
     }
@@ -2254,8 +2796,14 @@ mod tests {
         let mysql_ddl = "CREATE TABLE `ok` (`payload` text) ENGINE=InnoDB ROW_FORMAT=COMPRESSED";
         let postgres_ddl = "CREATE TABLE users (payload text) ROW_FORMAT=COMPACT";
 
-        assert_eq!(normalize_export_table_ddl(mysql_ddl, Some(DatabaseType::Mysql)), mysql_ddl);
-        assert_eq!(normalize_export_table_ddl(postgres_ddl, Some(DatabaseType::Postgres)), postgres_ddl);
+        assert_eq!(
+            normalize_export_table_ddl(mysql_ddl, Some(DatabaseType::Mysql), DdlNormalizeOptions::default()),
+            mysql_ddl
+        );
+        assert_eq!(
+            normalize_export_table_ddl(postgres_ddl, Some(DatabaseType::Postgres), DdlNormalizeOptions::default()),
+            postgres_ddl
+        );
     }
 
     fn postgres_sequence(name: &str) -> PostgresExportSequence {

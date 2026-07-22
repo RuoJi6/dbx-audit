@@ -13,7 +13,7 @@ use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::models::connection::{ConnectionConfig, DatabaseConnectionInfo, DatabaseType};
-use crate::sql::starts_with_executable_sql_keyword;
+use crate::sql::{starts_with_executable_sql_keyword, starts_with_executable_sql_keyword_for_database};
 use crate::types::{
     ColumnInfo, CompletionAssistantCandidate, CompletionAssistantCandidateKind, CompletionAssistantMatchMode,
     CompletionAssistantObjectKind, CompletionAssistantRequest, CompletionAssistantResponse, DatabaseInfo,
@@ -73,21 +73,27 @@ where
     row.get_opt::<T, I>(index).and_then(|result| result.ok())
 }
 
+/// 字节转 String：合法 UTF-8（绝大多数场景）时直接复用入参缓冲零拷贝，
+/// 仅在非法序列时退化为 lossy 替换。from_utf8_lossy(&b).to_string() 即使
+/// 对合法输入也会多一次分配+拷贝。
+fn bytes_to_string_lossy(bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes).unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned())
+}
+
 fn get_str(row: &mysql_async::Row, idx: usize) -> String {
     row_get::<String, _>(row, idx)
-        .or_else(|| row_get::<Vec<u8>, _>(row, idx).map(|b| String::from_utf8_lossy(&b).to_string()))
+        .or_else(|| row_get::<Vec<u8>, _>(row, idx).map(bytes_to_string_lossy))
         .unwrap_or_default()
 }
 
 fn get_str_by_name(row: &mysql_async::Row, name: &str) -> String {
     row_get::<String, _>(row, name)
-        .or_else(|| row_get::<Vec<u8>, _>(row, name).map(|b| String::from_utf8_lossy(&b).to_string()))
+        .or_else(|| row_get::<Vec<u8>, _>(row, name).map(bytes_to_string_lossy))
         .unwrap_or_default()
 }
 
 fn get_opt_str(row: &mysql_async::Row, name: &str) -> Option<String> {
-    row_get::<String, _>(row, name)
-        .or_else(|| row_get::<Vec<u8>, _>(row, name).map(|b| String::from_utf8_lossy(&b).to_string()))
+    row_get::<String, _>(row, name).or_else(|| row_get::<Vec<u8>, _>(row, name).map(bytes_to_string_lossy))
 }
 
 /// First non-empty string value among the named columns (e.g. Doris `CatalogName`
@@ -279,7 +285,7 @@ fn mysql_bytes_to_json(bytes: Vec<u8>, column: &mysql_async::Column) -> serde_js
             .map(serde_json::Value::String)
             .unwrap_or_else(|| super::binary_value_to_json(&bytes));
     }
-    serde_json::Value::String(String::from_utf8_lossy(&bytes).to_string())
+    serde_json::Value::String(bytes_to_string_lossy(bytes))
 }
 
 /// Map a MySQL column to a user-facing type name for the result-grid header.
@@ -2064,6 +2070,66 @@ pub async fn list_tables_show(pool: &MySqlPool, database: &str) -> Result<Vec<Ta
     list_tables_show_with_status(pool, database).await.map(|(tables, _)| tables)
 }
 
+fn starrocks_materialized_views_sql(database: &str) -> String {
+    format!(
+        "SELECT TABLE_NAME FROM information_schema.materialized_views WHERE TABLE_SCHEMA = {}",
+        quote_value(database)
+    )
+}
+
+async fn list_starrocks_materialized_view_names(pool: &MySqlPool, database: &str) -> Result<HashSet<String>, String> {
+    let sql = starrocks_materialized_views_sql(database);
+    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
+    let result = conn.query_iter(&sql).await.map_err(|e| e.to_string())?;
+    let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
+    Ok(rows
+        .iter()
+        .filter_map(|row| {
+            let name = get_str_by_name(row, "TABLE_NAME").trim().to_string();
+            (!name.is_empty()).then_some(name)
+        })
+        .collect())
+}
+
+fn classify_starrocks_materialized_views(
+    tables: &mut [TableInfo],
+    materialized_view_names: Result<HashSet<String>, String>,
+    database: &str,
+) {
+    let materialized_view_names = match materialized_view_names {
+        Ok(names) => names,
+        Err(err) => {
+            // Older StarRocks versions and restricted accounts may not expose this
+            // information_schema view; keep the base SHOW TABLES result usable.
+            log::warn!("Skipping materialized view classification for StarRocks database `{database}`: {err}");
+            return;
+        }
+    };
+
+    for table in tables {
+        if table.table_type.eq_ignore_ascii_case("VIEW") && materialized_view_names.contains(&table.name) {
+            table.table_type = "MATERIALIZED_VIEW".to_string();
+        }
+    }
+}
+
+async fn list_starrocks_tables_with_status(
+    pool: &MySqlPool,
+    database: &str,
+) -> Result<(Vec<TableInfo>, HashMap<String, TableStatusMeta>), String> {
+    let (tables, materialized_view_names) = tokio::join!(
+        list_tables_show_with_status(pool, database),
+        list_starrocks_materialized_view_names(pool, database)
+    );
+    let (mut tables, status) = tables?;
+    classify_starrocks_materialized_views(&mut tables, materialized_view_names, database);
+    Ok((tables, status))
+}
+
+pub async fn list_starrocks_tables(pool: &MySqlPool, database: &str) -> Result<Vec<TableInfo>, String> {
+    list_starrocks_tables_with_status(pool, database).await.map(|(tables, _)| tables)
+}
+
 fn requested_object_type(object_types: Option<&[String]>, object_type: &str) -> bool {
     object_types.is_none_or(|types| {
         types.is_empty() || types.iter().any(|candidate| candidate.eq_ignore_ascii_case(object_type))
@@ -2276,13 +2342,49 @@ pub async fn list_table_objects_show(pool: &MySqlPool, database: &str) -> Result
     let (tables, routines) =
         tokio::join!(list_tables_show_with_status(pool, database), list_routine_objects(pool, database));
     let (tables, status) = tables?;
-    let mut objects: Vec<ObjectInfo> = tables
+    let mut objects = table_infos_to_objects(tables, &status, database);
+
+    match routines {
+        Ok(routines) => objects.extend(routines),
+        Err(err) => log::warn!("Skipping routines for database `{}` in object browser: {}", database, err),
+    }
+
+    Ok(objects)
+}
+
+pub async fn list_starrocks_table_objects(pool: &MySqlPool, database: &str) -> Result<Vec<ObjectInfo>, String> {
+    let (tables, routines) =
+        tokio::join!(list_starrocks_tables_with_status(pool, database), list_routine_objects(pool, database));
+    let (tables, status) = tables?;
+    let mut objects = table_infos_to_objects(tables, &status, database);
+
+    match routines {
+        Ok(routines) => objects.extend(routines),
+        Err(err) => log::warn!("Skipping routines for database `{}` in object browser: {}", database, err),
+    }
+
+    Ok(objects)
+}
+
+fn table_infos_to_objects(
+    tables: Vec<TableInfo>,
+    status: &HashMap<String, TableStatusMeta>,
+    database: &str,
+) -> Vec<ObjectInfo> {
+    tables
         .into_iter()
         .map(|table| {
             let meta = status.get(&table.name);
             ObjectInfo {
                 name: table.name,
-                object_type: if table.table_type.eq_ignore_ascii_case("VIEW") { "VIEW" } else { "TABLE" }.to_string(),
+                object_type: if table.table_type.eq_ignore_ascii_case("MATERIALIZED_VIEW") {
+                    "MATERIALIZED_VIEW"
+                } else if table.table_type.eq_ignore_ascii_case("VIEW") {
+                    "VIEW"
+                } else {
+                    "TABLE"
+                }
+                .to_string(),
                 schema: Some(database.to_string()),
                 valid: None,
                 signature: None,
@@ -2293,14 +2395,7 @@ pub async fn list_table_objects_show(pool: &MySqlPool, database: &str) -> Result
                 parent_name: table.parent_name,
             }
         })
-        .collect();
-
-    match routines {
-        Ok(routines) => objects.extend(routines),
-        Err(err) => log::warn!("Skipping routines for database `{}` in object browser: {}", database, err),
-    }
-
-    Ok(objects)
+        .collect()
 }
 
 async fn list_routine_objects(pool: &MySqlPool, database: &str) -> Result<Vec<ObjectInfo>, String> {
@@ -3198,8 +3293,11 @@ fn prefers_text_protocol_query(sql: &str, dialect: MySqlQueryDialect) -> bool {
 }
 
 fn is_result_set_query(sql: &str, dialect: MySqlQueryDialect) -> bool {
-    starts_with_executable_sql_keyword(sql, &["SELECT", "SHOW", "DESCRIBE", "EXPLAIN", "WITH", "CALL"])
-        || dialect.supports_admin_show_results && is_admin_show_query(sql)
+    starts_with_executable_sql_keyword_for_database(
+        sql,
+        &["SELECT", "SHOW", "DESCRIBE", "EXPLAIN", "WITH", "CALL"],
+        DatabaseType::Mysql,
+    ) || dialect.supports_admin_show_results && is_admin_show_query(sql)
 }
 
 fn requires_text_protocol_query(sql: &str, dialect: MySqlQueryDialect) -> bool {
@@ -3207,12 +3305,11 @@ fn requires_text_protocol_query(sql: &str, dialect: MySqlQueryDialect) -> bool {
         return true;
     }
 
-    if !starts_with_executable_sql_keyword(sql, &["SHOW"]) {
+    if !starts_with_executable_sql_keyword_for_database(sql, &["SHOW"], DatabaseType::Mysql) {
         return false;
     }
 
-    let tokens =
-        sql.trim().trim_end_matches(';').split_whitespace().map(|token| token.to_ascii_lowercase()).collect::<Vec<_>>();
+    let tokens = leading_sql_word_tokens(sql, 3);
     if tokens.len() >= 2 && tokens[0] == "show" && tokens[1] == "grants" {
         return true;
     }
@@ -3362,11 +3459,7 @@ pub async fn show_create_table_ddl(pool: &MySqlPool, database: &str, table: &str
     let row = rows.first().ok_or("DDL not found")?;
     row.get_opt::<String, usize>(1)
         .and_then(|result| result.ok())
-        .or_else(|| {
-            row.get_opt::<Vec<u8>, usize>(1)
-                .and_then(|result| result.ok())
-                .map(|b| String::from_utf8_lossy(&b).to_string())
-        })
+        .or_else(|| row.get_opt::<Vec<u8>, usize>(1).and_then(|result| result.ok()).map(bytes_to_string_lossy))
         .ok_or_else(|| "Failed to read DDL".to_string())
 }
 
@@ -3549,11 +3642,7 @@ pub async fn show_create_table_ddl_from(
     let row = rows.first().ok_or("DDL not found")?;
     row.get_opt::<String, usize>(1)
         .and_then(|result| result.ok())
-        .or_else(|| {
-            row.get_opt::<Vec<u8>, usize>(1)
-                .and_then(|result| result.ok())
-                .map(|b| String::from_utf8_lossy(&b).to_string())
-        })
+        .or_else(|| row.get_opt::<Vec<u8>, usize>(1).and_then(|result| result.ok()).map(bytes_to_string_lossy))
         .ok_or_else(|| "Failed to read DDL".to_string())
 }
 
@@ -3909,6 +3998,15 @@ mod tests {
     use mysql_async::consts::ColumnFlags;
 
     #[test]
+    fn bytes_to_string_reuses_valid_utf8_and_falls_back_lossy() {
+        assert_eq!(super::bytes_to_string_lossy("héllo 世界".as_bytes().to_vec()), "héllo 世界");
+        assert_eq!(super::bytes_to_string_lossy(vec![]), "");
+        // 非法 UTF-8 序列退化为替换字符，与 from_utf8_lossy 语义一致
+        let invalid = vec![0x66, 0x6f, 0xff, 0x6f];
+        assert_eq!(super::bytes_to_string_lossy(invalid.clone()), String::from_utf8_lossy(&invalid));
+    }
+
+    #[test]
     fn mysql_column_type_names_map_to_friendly_names() {
         use mysql_async::consts::ColumnType::*;
         let utf8 = 45u16;
@@ -3985,6 +4083,16 @@ mod tests {
     fn mysql_with_queries_are_treated_as_result_sets() {
         let sql = "WITH RECURSIVE org_tree AS (SELECT 1 AS id) SELECT id FROM org_tree";
         assert!(is_result_set_query(sql, MySqlQueryDialect::default()));
+    }
+
+    #[test]
+    fn mysql_hash_comments_before_queries_preserve_result_sets_per_issue_3830() {
+        let dialect = MySqlQueryDialect::default();
+
+        assert!(is_result_set_query("# 注释\nSELECT NOW()", dialect));
+        assert!(prefers_text_protocol_query("# 注释\nSELECT NOW()", dialect));
+        assert!(requires_text_protocol_query("# inspect sessions\nSHOW PROCESSLIST", dialect));
+        assert!(!is_result_set_query("# update row\nUPDATE users SET name = 'Ada' WHERE id = 1", dialect));
     }
 
     #[test]
@@ -4169,6 +4277,101 @@ mod tests {
         let filtered = filter_list_tables_fallback(rows, Some("ood"), None, None, Some(&["TABLE".to_string()]));
 
         assert_eq!(filtered.iter().map(|table| table.name.as_str()).collect::<Vec<_>>(), vec!["t_0001"]);
+    }
+
+    #[test]
+    fn starrocks_materialized_views_are_classified_without_duplicating_tables() {
+        let mut tables = vec![
+            TableInfo {
+                name: "orders".to_string(),
+                table_type: "BASE TABLE".to_string(),
+                comment: None,
+                parent_schema: None,
+                parent_name: None,
+            },
+            TableInfo {
+                name: "orders_view".to_string(),
+                table_type: "VIEW".to_string(),
+                comment: None,
+                parent_schema: None,
+                parent_name: None,
+            },
+            TableInfo {
+                name: "orders_mv".to_string(),
+                table_type: "VIEW".to_string(),
+                comment: None,
+                parent_schema: None,
+                parent_name: None,
+            },
+        ];
+        let materialized_views = HashSet::from(["orders_mv".to_string(), "orders_mv".to_string()]);
+
+        classify_starrocks_materialized_views(&mut tables, Ok(materialized_views), "analytics");
+
+        assert_eq!(tables.len(), 3);
+        assert_eq!(
+            tables.iter().map(|table| (table.name.as_str(), table.table_type.as_str())).collect::<Vec<_>>(),
+            vec![("orders", "BASE TABLE"), ("orders_view", "VIEW"), ("orders_mv", "MATERIALIZED_VIEW")]
+        );
+    }
+
+    #[test]
+    fn starrocks_materialized_view_lookup_failure_keeps_base_types() {
+        let mut tables = vec![TableInfo {
+            name: "orders_mv".to_string(),
+            table_type: "VIEW".to_string(),
+            comment: None,
+            parent_schema: None,
+            parent_name: None,
+        }];
+
+        classify_starrocks_materialized_views(&mut tables, Err("permission denied".to_string()), "analytics");
+
+        assert_eq!(tables[0].table_type, "VIEW");
+    }
+
+    #[test]
+    fn starrocks_materialized_view_query_is_scoped_to_database() {
+        let sql = starrocks_materialized_views_sql("tenant's analytics");
+
+        assert_eq!(
+            sql,
+            "SELECT TABLE_NAME FROM information_schema.materialized_views WHERE TABLE_SCHEMA = 'tenant\\'s analytics'"
+        );
+    }
+
+    #[test]
+    fn starrocks_object_conversion_preserves_table_view_and_materialized_view_types() {
+        let tables = vec![
+            TableInfo {
+                name: "orders".to_string(),
+                table_type: "BASE TABLE".to_string(),
+                comment: None,
+                parent_schema: None,
+                parent_name: None,
+            },
+            TableInfo {
+                name: "orders_view".to_string(),
+                table_type: "VIEW".to_string(),
+                comment: None,
+                parent_schema: None,
+                parent_name: None,
+            },
+            TableInfo {
+                name: "orders_mv".to_string(),
+                table_type: "MATERIALIZED_VIEW".to_string(),
+                comment: None,
+                parent_schema: None,
+                parent_name: None,
+            },
+        ];
+
+        let objects = table_infos_to_objects(tables, &HashMap::new(), "analytics");
+
+        assert_eq!(
+            objects.iter().map(|object| (object.name.as_str(), object.object_type.as_str())).collect::<Vec<_>>(),
+            vec![("orders", "TABLE"), ("orders_view", "VIEW"), ("orders_mv", "MATERIALIZED_VIEW")]
+        );
     }
 
     #[test]
@@ -4528,7 +4731,6 @@ UNIQUE KEY(`tenant_id`, `name``part`)
     #[test]
     fn mysql_tcp_keepalive_uses_milliseconds_not_seconds() {
         assert_eq!(MYSQL_TCP_KEEPALIVE_MS, 30_000);
-        assert!(MYSQL_TCP_KEEPALIVE_MS >= 1_000);
     }
 
     #[test]

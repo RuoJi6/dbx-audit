@@ -1,4 +1,5 @@
 import { computed, getCurrentScope, nextTick, onScopeDispose, ref, toValue, watch, type MaybeRefOrGetter } from "vue";
+import { dataGridSearchMatchKey } from "@/lib/dataGrid/canvasDataGridRenderer";
 
 export type DataGridSearchMatch = {
   kind: "cell" | "column";
@@ -10,7 +11,9 @@ export type UseDataGridSearchOptions<Row> = {
   columns: MaybeRefOrGetter<readonly string[]>;
   suggestionColumns?: MaybeRefOrGetter<readonly string[]>;
   rows: MaybeRefOrGetter<readonly Row[]>;
-  getCellText: (row: Row, columnIndex: number) => string;
+  /** 必须返回小写文本（查询词已小写）。调用方可据此缓存小写副本，
+   * 避免每次按键对全部单元格重新分配 toLowerCase 字符串。 */
+  getCellSearchText: (row: Row, columnIndex: number) => string;
   debounceMs?: number;
   onNavigate?: (match: DataGridSearchMatch) => void;
 };
@@ -38,12 +41,13 @@ export function useDataGridSearch<Row>(options: UseDataGridSearchOptions<Row>) {
     });
     toValue(options.rows).forEach((row, displayRow) => {
       columns.forEach((_, col) => {
-        if (options.getCellText(row, col).toLowerCase().includes(query)) result.push({ kind: "cell", displayRow, col });
+        if (options.getCellSearchText(row, col).includes(query)) result.push({ kind: "cell", displayRow, col });
       });
     });
     return result;
   });
-  const matchSet = computed(() => new Set(matches.value.map((match) => `${match.kind}:${match.displayRow}:${match.col}`)));
+  // 数值 key（列头匹配 displayRow=-1），避免每匹配一次字符串拼接
+  const matchSet = computed(() => new Set(matches.value.map((match) => dataGridSearchMatchKey(match.displayRow, match.col))));
   const currentMatch = computed(() => matches.value[currentMatchIndex.value] ?? null);
 
   function clearTimer() {
@@ -87,8 +91,11 @@ export function useDataGridSearch<Row>(options: UseDataGridSearchOptions<Row>) {
   }
 
   function navigateMatch(delta: number) {
-    if (!matches.value.length) return;
-    currentMatchIndex.value = (currentMatchIndex.value + delta + matches.value.length) % matches.value.length;
+    const matchCount = matches.value.length;
+    if (!matchCount) return;
+    // Results may change between input and navigation; recover from a stale index in the requested direction.
+    const currentIndex = currentMatchIndex.value >= 0 && currentMatchIndex.value < matchCount ? currentMatchIndex.value : delta < 0 ? 0 : -1;
+    currentMatchIndex.value = (((currentIndex + delta) % matchCount) + matchCount) % matchCount;
     const match = currentMatch.value;
     if (match) options.onNavigate?.(match);
   }

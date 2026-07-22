@@ -1,10 +1,11 @@
 import { strict as assert } from "node:assert";
 import { afterEach, test } from "vitest";
 import { createPinia, disposePinia, getActivePinia, setActivePinia } from "pinia";
-import { isReactive } from "vue";
+import { isReactive, toRaw } from "vue";
 import { decodeQueryResultArchive } from "../../apps/desktop/src/lib/query/queryResultArchive.ts";
 import { analyzeEditableQueryEditability } from "../../apps/desktop/src/lib/sql/sqlAnalysis.ts";
 import { resultSqlForGrid } from "../../apps/desktop/src/lib/tabs/tabPresentation.ts";
+import { parseMongoCommand } from "../../apps/desktop/src/lib/mongo/mongoShellCommand.ts";
 import { useConnectionStore } from "../../apps/desktop/src/stores/connectionStore.ts";
 import { useQueryStore } from "../../apps/desktop/src/stores/queryStore.ts";
 import { useSettingsStore } from "../../apps/desktop/src/stores/settingsStore.ts";
@@ -90,6 +91,21 @@ function withConnectionHealthMock(handler: typeof fetch): typeof fetch {
   return async (input, init) => {
     if (String(input) === "/api/connection/check-health") {
       return new Response("null", { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    if (String(input) === "/api/mongo/parse-shell-command") {
+      const source = JSON.parse(String(init?.body ?? "{}")).source as string;
+      const parsed = parseMongoCommand(source)?.command;
+      if (!parsed) return new Response("invalid MongoDB command", { status: 400 });
+      let command: Record<string, unknown> = parsed as unknown as Record<string, unknown>;
+      if (parsed.kind === "countDocuments") {
+        const { mode, ...rest } = parsed;
+        command = { ...rest, kind: "countDocuments", accurate: mode === "accurate" };
+      } else if (parsed.kind === "dropIndex") {
+        command = { kind: "dropIndexes", collection: parsed.collection, indexes: parsed.index, single: true };
+      } else if (parsed.kind === "dropIndexes") {
+        command = { ...parsed, single: false };
+      }
+      return new Response(JSON.stringify(command), { status: 200, headers: { "Content-Type": "application/json" } });
     }
     return handler(input, init);
   };
@@ -2568,7 +2584,118 @@ test("data tab execution preserves pagination offset metadata", async () => {
   }
 });
 
-test("data tab default pagination is independent from query result page size", async () => {
+test("append pagination preserves existing rows and respects the memory cap", async () => {
+  const restoreStorage = installMemoryStorage();
+  setActivePinia(createPinia());
+  const connectionStore = useConnectionStore();
+  const store = useQueryStore();
+  const originalFetch = globalThis.fetch;
+
+  connectionStore.addEphemeralConnection(conn("conn-append"));
+  const tabId = store.createTab("conn-append", "db", "users", "data", "public");
+  const tab = store.tabs.find((item) => item.id === tabId);
+  assert.ok(tab);
+  const firstRow = [1] as (string | number | boolean | null)[];
+  tab.result = { columns: ["id"], rows: [firstRow], affected_rows: 0, execution_time_ms: 3 };
+
+  globalThis.fetch = withConnectionHealthMock(async (input) => {
+    if (String(input) === "/api/query/execute-multi") {
+      return Response.json([{ columns: ["id"], rows: [[2], [3]], affected_rows: 0, execution_time_ms: 4, has_more: true }]);
+    }
+    return new Response("unexpected request", { status: 500 });
+  });
+
+  try {
+    await store.executeTabSql(tabId, 'SELECT * FROM "users" LIMIT 2 OFFSET 1;', {
+      pagination: { limit: 2, offset: 1 },
+      appendResult: { maxRows: 2 },
+      preserveResultDuringExecution: true,
+      preserveTotalRowCountDuringExecution: true,
+    });
+
+    assert.deepEqual(tab.result?.rows, [[1], [2]]);
+    assert.equal(toRaw(tab.result?.rows[0]), firstRow);
+    assert.equal(tab.result?.execution_time_ms, 7);
+    assert.equal(tab.result?.has_more, false);
+    assert.equal(tab.resultPageOffset, 0, "later refreshes must restart from the logical result origin");
+    assert.equal(tab.resultPageLimit, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreStorage();
+  }
+});
+
+test("failed append pagination preserves the visible result", async () => {
+  const restoreStorage = installMemoryStorage();
+  setActivePinia(createPinia());
+  const connectionStore = useConnectionStore();
+  const store = useQueryStore();
+  const originalFetch = globalThis.fetch;
+
+  connectionStore.addEphemeralConnection(conn("conn-append-error"));
+  const tabId = store.createTab("conn-append-error", "db", "users", "data", "public");
+  const tab = store.tabs.find((item) => item.id === tabId);
+  assert.ok(tab);
+  const originalResult: QueryResult = { columns: ["id"], rows: [[1]], affected_rows: 0, execution_time_ms: 3 };
+  tab.result = originalResult;
+
+  globalThis.fetch = withConnectionHealthMock(async (input) => {
+    if (String(input) === "/api/query/execute-multi") return new Response("segment failed", { status: 500 });
+    return new Response("unexpected request", { status: 500 });
+  });
+
+  try {
+    await store.executeTabSql(tabId, 'SELECT * FROM "users" LIMIT 2 OFFSET 1;', {
+      pagination: { limit: 2, offset: 1 },
+      appendResult: { maxRows: 10 },
+      preserveResultDuringExecution: true,
+      preserveTotalRowCountDuringExecution: true,
+    });
+
+    assert.equal(toRaw(tab.result), originalResult);
+    assert.deepEqual(tab.result?.rows, [[1]]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreStorage();
+  }
+});
+
+test("stale append offsets do not duplicate already loaded rows", async () => {
+  const restoreStorage = installMemoryStorage();
+  setActivePinia(createPinia());
+  const connectionStore = useConnectionStore();
+  const store = useQueryStore();
+  const originalFetch = globalThis.fetch;
+
+  connectionStore.addEphemeralConnection(conn("conn-append-stale"));
+  const tabId = store.createTab("conn-append-stale", "db", "users", "data", "public");
+  const tab = store.tabs.find((item) => item.id === tabId);
+  assert.ok(tab);
+  const originalResult: QueryResult = { columns: ["id"], rows: [[1], [2]], affected_rows: 0, execution_time_ms: 3 };
+  tab.result = originalResult;
+
+  globalThis.fetch = withConnectionHealthMock(async (input) => {
+    if (String(input) === "/api/query/execute-multi") return Response.json([{ columns: ["id"], rows: [[2]], affected_rows: 0, execution_time_ms: 1 }]);
+    return new Response("unexpected request", { status: 500 });
+  });
+
+  try {
+    await store.executeTabSql(tabId, 'SELECT * FROM "users" LIMIT 1 OFFSET 1;', {
+      pagination: { limit: 1, offset: 1 },
+      appendResult: { maxRows: 10 },
+      preserveResultDuringExecution: true,
+      preserveTotalRowCountDuringExecution: true,
+    });
+
+    assert.equal(toRaw(tab.result), originalResult);
+    assert.deepEqual(tab.result?.rows, [[1], [2]]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreStorage();
+  }
+});
+
+test("data tab default pagination uses the dedicated table-open page size", async () => {
   const restoreStorage = installMemoryStorage();
   setActivePinia(createPinia());
   const connectionStore = useConnectionStore();
@@ -2578,7 +2705,7 @@ test("data tab default pagination is independent from query result page size", a
   let executeBody: any;
   let preparedPagination = false;
 
-  settingsStore.updateEditorSettings({ pageSize: 1000 });
+  settingsStore.updateEditorSettings({ pageSize: 1000, tableOpenPageSize: 500 });
   connectionStore.addEphemeralConnection(conn("conn-1"));
   const tabId = store.createTab("conn-1", "db", "users", "data", "public");
   const tab = store.tabs.find((item) => item.id === tabId);
@@ -2601,12 +2728,12 @@ test("data tab default pagination is independent from query result page size", a
   });
 
   try {
-    await store.executeTabSql(tabId, 'SELECT * FROM "users" LIMIT 100;');
+    await store.executeTabSql(tabId, 'SELECT * FROM "users" LIMIT 500;');
 
     assert.equal(preparedPagination, false);
-    assert.equal(executeBody.maxRows, 100);
-    assert.equal(executeBody.fetchSize, 100);
-    assert.equal(tab.resultPageLimit, 100);
+    assert.equal(executeBody.maxRows, 500);
+    assert.equal(executeBody.fetchSize, 500);
+    assert.equal(tab.resultPageLimit, 500);
     assert.equal(tab.resultPageOffset, 0);
   } finally {
     globalThis.fetch = originalFetch;
@@ -3495,7 +3622,7 @@ test("mongo multi-command execution reconnects before running commands", async (
   });
   connectionStore.connectedIds.delete("mongo-1");
 
-  globalThis.fetch = async (input, init) => {
+  globalThis.fetch = withConnectionHealthMock(async (input, init) => {
     const url = String(input);
     if (url === "/api/connection/connect") {
       requests.push(url);
@@ -3514,7 +3641,7 @@ test("mongo multi-command execution reconnects before running commands", async (
       });
     }
     return new Response("unexpected request", { status: 500 });
-  };
+  });
 
   try {
     const tabId = store.createTab("mongo-1", "accounting", "Query", "query", "");
@@ -3592,10 +3719,10 @@ test("mongo use-only execution updates the tab without reconnecting", async () =
   });
   connectionStore.connectedIds.delete("mongo-1");
 
-  globalThis.fetch = async (input) => {
+  globalThis.fetch = withConnectionHealthMock(async (input) => {
     requests.push(String(input));
     return new Response("unexpected request", { status: 500 });
-  };
+  });
 
   try {
     const tabId = store.createTab("mongo-1", "accounting", "Query", "query", "");
