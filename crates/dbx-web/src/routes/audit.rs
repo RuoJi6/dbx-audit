@@ -87,7 +87,7 @@ pub async fn start_scan(
 ) -> Result<Json<String>, AppError> {
     let request = body.request;
     if request.connection_id.trim().is_empty() {
-        return Err(AppError("请选择连接".to_string()));
+        return Err(AppError::bad_request("请选择连接"));
     }
 
     let job_id = Uuid::new_v4().to_string();
@@ -168,21 +168,21 @@ pub async fn export_report(
         .await
         .get(&body.job_id)
         .cloned()
-        .ok_or_else(|| AppError(format!("未找到审计任务：{}", body.job_id)))?;
+        .ok_or_else(|| AppError::not_found(format!("未找到审计任务：{}", body.job_id)))?;
 
     let path_buf = PathBuf::from(body.path.trim());
     if path_buf.as_os_str().is_empty() {
-        return Err(AppError("请填写导出路径".to_string()));
+        return Err(AppError::bad_request("请填写导出路径"));
     }
 
     match body.format {
         AuditExportFormat::Json => {
-            let json = audit_job_to_json(&job).map_err(AppError)?;
-            std::fs::write(&path_buf, json).map_err(|err| AppError(err.to_string()))?;
+            let json = audit_job_to_json(&job).map_err(AppError::from)?;
+            std::fs::write(&path_buf, json).map_err(|err| AppError::internal(err.to_string()))?;
         }
         AuditExportFormat::Xlsx => {
-            let workbook = audit_job_to_xlsx(&job).map_err(AppError)?;
-            std::fs::write(&path_buf, workbook).map_err(|err| AppError(err.to_string()))?;
+            let workbook = audit_job_to_xlsx(&job).map_err(AppError::from)?;
+            std::fs::write(&path_buf, workbook).map_err(|err| AppError::internal(err.to_string()))?;
         }
     }
 
@@ -198,16 +198,16 @@ pub async fn export_report_snapshot(
 ) -> Result<Json<AuditExportResult>, AppError> {
     let path_buf = PathBuf::from(body.path.trim());
     if path_buf.as_os_str().is_empty() {
-        return Err(AppError("请填写导出路径".to_string()));
+        return Err(AppError::bad_request("请填写导出路径"));
     }
     match body.format {
         AuditExportFormat::Json => {
-            let json = audit_job_to_json(&body.job).map_err(AppError)?;
-            std::fs::write(&path_buf, json).map_err(|err| AppError(err.to_string()))?;
+            let json = audit_job_to_json(&body.job).map_err(AppError::from)?;
+            std::fs::write(&path_buf, json).map_err(|err| AppError::internal(err.to_string()))?;
         }
         AuditExportFormat::Xlsx => {
-            let workbook = audit_job_to_xlsx(&body.job).map_err(AppError)?;
-            std::fs::write(&path_buf, workbook).map_err(|err| AppError(err.to_string()))?;
+            let workbook = audit_job_to_xlsx(&body.job).map_err(AppError::from)?;
+            std::fs::write(&path_buf, workbook).map_err(|err| AppError::internal(err.to_string()))?;
         }
     }
     Ok(Json(AuditExportResult {
@@ -219,7 +219,7 @@ pub async fn export_report_snapshot(
 
 pub async fn parse_fscan(Json(body): Json<ParseFscanRequest>) -> Result<Json<ParsedFscanTargets>, AppError> {
     let input = if std::path::Path::new(&body.text_or_file).is_file() {
-        std::fs::read_to_string(&body.text_or_file).map_err(|err| AppError(err.to_string()))?
+        std::fs::read_to_string(&body.text_or_file).map_err(|err| AppError::internal(err.to_string()))?
     } else {
         body.text_or_file
     };
@@ -227,14 +227,14 @@ pub async fn parse_fscan(Json(body): Json<ParseFscanRequest>) -> Result<Json<Par
 }
 
 pub async fn load_task_store(State(state): State<Arc<WebState>>) -> Result<Json<Option<serde_json::Value>>, AppError> {
-    Ok(Json(state.app.storage.load_audit_task_store().await.map_err(AppError)?))
+    Ok(Json(state.app.storage.load_audit_task_store().await.map_err(AppError::from)?))
 }
 
 pub async fn save_task_store(
     State(state): State<Arc<WebState>>,
     Json(body): Json<SaveTaskStoreRequest>,
 ) -> Result<Json<bool>, AppError> {
-    state.app.storage.save_audit_task_store(&body.store).await.map_err(AppError)?;
+    state.app.storage.save_audit_task_store(&body.store).await.map_err(AppError::from)?;
     Ok(Json(true))
 }
 
