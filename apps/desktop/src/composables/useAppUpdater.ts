@@ -19,7 +19,7 @@ export function shouldOpenUpdateDialog(options: { silent?: boolean }) {
 }
 
 export function canDownloadAndInstallUpdate(info: api.UpdateInfo | null, isDesktop: boolean) {
-  return isDesktop && info?.update_available === true && info.portable_mode !== true;
+  return isDesktop && info?.update_available === true;
 }
 
 export function normalizeUpdateDownloadSource(value: unknown): SettingsUpdateDownloadSource {
@@ -82,7 +82,7 @@ export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
     checkingUpdates.value = true;
     updateCheckMessage.value = "";
     try {
-      const info = await api.checkForUpdates(currentLocale());
+      const info = await api.checkForUpdates(currentLocale(), normalizeUpdateDownloadSource(settingsStore.editorSettings.updateDownloadSource));
       updateInfo.value = info;
       if (info.update_available) {
         if (shouldOpenUpdateDialog({ silent: options.silent })) {
@@ -169,9 +169,11 @@ export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
   async function installPendingUpdate() {
     isInstallingUpdate.value = true;
     try {
+      const portableMode = updateInfo.value?.portable_mode === true;
       await api.installDownloadedUpdate();
       updateDownloaded.value = false;
-      updateReady.value = true;
+      // The portable helper exits and relaunches DBX after the invoke response is delivered.
+      updateReady.value = !portableMode;
     } finally {
       isInstallingUpdate.value = false;
     }

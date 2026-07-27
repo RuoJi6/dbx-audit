@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { createPinia, setActivePinia } from "pinia";
 import { DEFAULT_SQL_FORMATTER_SETTINGS } from "../../apps/desktop/src/lib/sql/sqlFormatterConfig.ts";
 import { DEFAULT_TABLE_COLUMN_TEMPLATE_FIELDS } from "../../apps/desktop/src/lib/table/tableColumnTemplates.ts";
-import { DEFAULT_UI_FONT_FAMILY, SYSTEM_UI_FONT_FAMILY } from "../../apps/desktop/src/lib/app/appFonts.ts";
+import { DEFAULT_DATA_GRID_FONT_FAMILY, DEFAULT_UI_FONT_FAMILY, SYSTEM_UI_FONT_FAMILY } from "../../apps/desktop/src/lib/app/appFonts.ts";
 import { tableOpenPageLimit } from "../../apps/desktop/src/lib/table/tableOpenPageLimit.ts";
 import { AI_PROVIDER_PRESETS, DEFAULT_EDITOR_SETTINGS, EXECUTE_MODE_CURRENT_DEFAULT_VERSION, normalizeAiConfig, normalizeEditorSettings, useSettingsStore } from "../../apps/desktop/src/stores/settingsStore.ts";
 
@@ -163,6 +163,15 @@ test("keeps saved UI font family", () => {
   const uiFontFamily = `"Aptos", system-ui, sans-serif`;
   assert.equal(normalizeEditorSettings({ uiFontFamily } as any).uiFontFamily, uiFontFamily);
   assert.equal(normalizeEditorSettings({ uiFontFamily: SYSTEM_UI_FONT_FAMILY } as any).uiFontFamily, SYSTEM_UI_FONT_FAMILY);
+});
+
+test("defaults result grid font family without changing saved custom fonts", () => {
+  const tableFontFamily = `"IBM Plex Mono", monospace`;
+
+  assert.equal(DEFAULT_EDITOR_SETTINGS.tableFontFamily, DEFAULT_DATA_GRID_FONT_FAMILY);
+  assert.equal(normalizeEditorSettings({}).tableFontFamily, DEFAULT_DATA_GRID_FONT_FAMILY);
+  assert.equal(normalizeEditorSettings({ tableFontFamily: "" as any }).tableFontFamily, DEFAULT_DATA_GRID_FONT_FAMILY);
+  assert.equal(normalizeEditorSettings({ tableFontFamily }).tableFontFamily, tableFontFamily);
 });
 
 test("defaults dangerous SQL confirmation to enabled", () => {
@@ -345,10 +354,12 @@ test("normalizes table column template fields", () => {
 });
 
 test("normalizes grid drawer widths", () => {
+  assert.equal(DEFAULT_EDITOR_SETTINGS.tableInfoActiveTab, "ddl");
   assert.equal(DEFAULT_EDITOR_SETTINGS.tableInfoDrawerWidth, 320);
   assert.equal(DEFAULT_EDITOR_SETTINGS.cellDetailDrawerWidth, 380);
   assert.equal(DEFAULT_EDITOR_SETTINGS.cellDetailPanelLayout, "bottom");
   assert.equal(DEFAULT_EDITOR_SETTINGS.cellDetailJsonFormatted, false);
+  assert.equal(normalizeEditorSettings({}).tableInfoActiveTab, "ddl");
   assert.equal(normalizeEditorSettings({}).tableInfoDrawerWidth, 320);
   assert.equal(normalizeEditorSettings({}).cellDetailDrawerWidth, 380);
   assert.equal(normalizeEditorSettings({}).cellDetailPanelLayout, "bottom");
@@ -356,6 +367,8 @@ test("normalizes grid drawer widths", () => {
   assert.equal(normalizeEditorSettings({ tableInfoDrawerWidth: 200 } as any).tableInfoDrawerWidth, 240);
   assert.equal(normalizeEditorSettings({ cellDetailDrawerWidth: 200 } as any).cellDetailDrawerWidth, 260);
   assert.equal(normalizeEditorSettings({ tableInfoDrawerWidth: 1000 } as any).tableInfoDrawerWidth, 900);
+  assert.equal(normalizeEditorSettings({ tableInfoActiveTab: "columns" } as any).tableInfoActiveTab, "columns");
+  assert.equal(normalizeEditorSettings({ tableInfoActiveTab: "invalid" } as any).tableInfoActiveTab, "ddl");
   assert.equal(normalizeEditorSettings({ cellDetailDrawerWidth: 456.7 } as any).cellDetailDrawerWidth, 457);
   assert.equal(normalizeEditorSettings({ cellDetailPanelLayout: "right" } as any).cellDetailPanelLayout, "right");
   assert.equal(normalizeEditorSettings({ cellDetailPanelLayout: "invalid" } as any).cellDetailPanelLayout, "bottom");
@@ -519,6 +532,12 @@ test("normalizeEditorSettings clamps UI scale into the supported range", () => {
 
 test("normalizeEditorSettings keeps valid UI scales with two-decimal precision", () => {
   assert.equal(normalizeEditorSettings({ uiScale: 1.125 }).uiScale, 1.13);
+});
+
+test("shows persisted UI scales that are not available as presets", () => {
+  const source = readFileSync("apps/desktop/src/components/editor/EditorSettingsDialog.vue", "utf8");
+
+  assert.match(source, /<SelectValue>\{\{ Math\.round\(editUiScale \* 100\) \}\}%<\/SelectValue>/);
 });
 
 test("defaults SQL formatter settings", () => {

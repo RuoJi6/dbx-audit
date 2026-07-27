@@ -6,6 +6,7 @@ import type { TopicRef, TopicInfo, SubscriptionInfo, ResetPosition, SkipCount, P
 import { mqListSubscriptions, mqCreateSubscription, mqDeleteSubscription, mqResetCursor, mqSkipMessages, mqClearBacklog, mqPeekMessages, mqExpireMessages } from "@/lib/backend/api";
 import RocketMqConsumerGroupDialogs, { type RocketMqConsumerGroupDialogKind } from "./rocketmq/RocketMqConsumerGroupDialogs.vue";
 import MqTypeFilterBar from "./shared/MqTypeFilterBar.vue";
+import DangerConfirmDialog from "@/components/editor/DangerConfirmDialog.vue";
 import { DEFAULT_ROCKETMQ_CONSUMER_GROUP_TYPE_FILTERS, matchesRocketMqConsumerGroupTypeFilters, resolveRocketMqConsumerGroupMessageModel, resolveRocketMqConsumerGroupType, ROCKETMQ_CONSUMER_GROUP_TYPES, type RocketMqConsumerGroupType } from "@/lib/mq/rocketmqConsumerGroupTypes";
 
 interface Props {
@@ -43,6 +44,12 @@ const selectedSub = ref<SubscriptionInfo>();
 const peekedMessages = ref<PeekedMessage[]>([]);
 const peekLoading = ref(false);
 const peekCount = ref(5);
+const deleteTarget = ref<SubscriptionInfo>();
+const showDeleteDialog = ref(false);
+const deleting = ref(false);
+const clearBacklogTarget = ref<SubscriptionInfo>();
+const showClearBacklogDialog = ref(false);
+const clearingBacklog = ref(false);
 
 const formData = ref({
   subName: "",
@@ -122,7 +129,7 @@ function getListTopicRef(): TopicRef | null {
   if (!props.topic) return null;
   return {
     tenant: props.tenant,
-    namespace: props.namespace,
+    namespace: props.topic.namespace || props.namespace,
     topic: props.topic.shortName,
     persistent: props.topic.persistent,
     partitioned: props.topic.partitioned,
@@ -133,7 +140,7 @@ function getPulsarTopicRef(): TopicRef | null {
   if (!props.tenant || !props.namespace || !props.topic) return null;
   return {
     tenant: props.tenant,
-    namespace: props.namespace,
+    namespace: props.topic.namespace || props.namespace,
     topic: props.topic.shortName,
     persistent: props.topic.persistent,
     partitioned: props.topic.partitioned,
@@ -246,20 +253,27 @@ async function handleCreate() {
   }
 }
 
-async function handleDelete(sub: SubscriptionInfo) {
+function handleDelete(sub: SubscriptionInfo) {
   if (!guardWritable()) return;
-  if (!confirm(t("mqSubscriptions.confirmDelete", { name: sub.name }))) return;
+  deleteTarget.value = sub;
+  showDeleteDialog.value = true;
+}
+
+async function confirmDelete() {
+  const sub = deleteTarget.value;
+  if (!sub) return;
   const topicRef = getListTopicRef();
   if (!topicRef) return;
-  loading.value = true;
+  deleting.value = true;
   error.value = undefined;
   try {
     await mqDeleteSubscription(props.connectionId, topicRef, sub.name, false);
+    showDeleteDialog.value = false;
     await loadSubscriptions();
   } catch (e: unknown) {
     error.value = formatError(e);
   } finally {
-    loading.value = false;
+    deleting.value = false;
   }
 }
 
@@ -304,20 +318,27 @@ async function handleSkipMessages() {
   }
 }
 
-async function handleClearBacklog(sub: SubscriptionInfo) {
+function handleClearBacklog(sub: SubscriptionInfo) {
   if (!guardWritable()) return;
-  if (!confirm(t("mqSubscriptions.confirmClearBacklog", { name: sub.name }))) return;
+  clearBacklogTarget.value = sub;
+  showClearBacklogDialog.value = true;
+}
+
+async function confirmClearBacklog() {
+  const sub = clearBacklogTarget.value;
+  if (!sub) return;
   const topicRef = getPulsarTopicRef();
   if (!topicRef) return;
-  loading.value = true;
+  clearingBacklog.value = true;
   error.value = undefined;
   try {
     await mqClearBacklog(props.connectionId, topicRef, sub.name);
+    showClearBacklogDialog.value = false;
     await loadSubscriptions();
   } catch (e: unknown) {
     error.value = formatError(e);
   } finally {
-    loading.value = false;
+    clearingBacklog.value = false;
   }
 }
 
@@ -628,6 +649,19 @@ watch(
         </div>
       </div>
     </div>
+    <!-- Delete Confirm Dialog -->
+    <DangerConfirmDialog v-model:open="showDeleteDialog" :title="t('mqSubscriptions.delete')" :message="t('mqSubscriptions.confirmDelete', { name: deleteTarget?.name ?? '' })" :confirm-label="t('mqSubscriptions.delete')" :loading="deleting" :close-on-confirm="false" @confirm="confirmDelete" />
+
+    <!-- Clear Backlog Confirm Dialog -->
+    <DangerConfirmDialog
+      v-model:open="showClearBacklogDialog"
+      :title="t('mqSubscriptions.clearBacklog')"
+      :message="t('mqSubscriptions.confirmClearBacklog', { name: clearBacklogTarget?.name ?? '' })"
+      :confirm-label="t('mqSubscriptions.clearBacklog')"
+      :loading="clearingBacklog"
+      :close-on-confirm="false"
+      @confirm="confirmClearBacklog"
+    />
   </div>
 </template>
 
@@ -666,7 +700,7 @@ watch(
   min-width: 180px;
   padding: 6px 10px;
   border: 1px solid var(--color-border);
-  border-radius: 6px;
+  border-radius: var(--dbx-radius-fixed-6);
   background: var(--color-background);
   color: var(--color-text);
   font-size: 13px;
@@ -687,7 +721,7 @@ watch(
 .btn-secondary {
   padding: 6px 12px;
   border: 1px solid var(--color-border);
-  border-radius: 6px;
+  border-radius: var(--dbx-radius-fixed-6);
   background: var(--color-background);
   color: var(--color-text);
   cursor: pointer;
@@ -757,7 +791,7 @@ watch(
   min-width: 220px;
   padding: 6px 10px;
   border: 1px solid var(--color-border);
-  border-radius: 4px;
+  border-radius: var(--dbx-radius-fixed-4);
   font-size: 13px;
   background: var(--color-background);
 }
@@ -830,7 +864,7 @@ td {
 .badge {
   display: inline-block;
   padding: 2px 8px;
-  border-radius: 4px;
+  border-radius: var(--dbx-radius-fixed-4);
   font-size: 11px;
   font-weight: 500;
   background: var(--color-background-secondary);
@@ -854,7 +888,7 @@ td {
 .btn-danger {
   padding: 6px 12px;
   border: 1px solid var(--color-border);
-  border-radius: 4px;
+  border-radius: var(--dbx-radius-fixed-4);
   background: var(--color-background);
   color: var(--color-text);
   cursor: pointer;
@@ -909,7 +943,7 @@ button:disabled {
 
 .dialog {
   background: var(--color-background);
-  border-radius: 8px;
+  border-radius: var(--dbx-radius-fixed-6);
   width: 90%;
   max-width: 500px;
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
@@ -965,7 +999,7 @@ button:disabled {
   width: 100%;
   padding: 8px 12px;
   border: 1px solid var(--color-border);
-  border-radius: 4px;
+  border-radius: var(--dbx-radius-fixed-4);
   font-size: 14px;
   box-sizing: border-box;
   background: var(--color-background);
@@ -989,7 +1023,7 @@ button:disabled {
   gap: 8px;
   cursor: pointer;
   padding: 8px;
-  border-radius: 4px;
+  border-radius: var(--dbx-radius-fixed-4);
   transition: background 0.2s;
 }
 
@@ -1012,7 +1046,7 @@ button:disabled {
   padding: 8px 12px;
   background: var(--color-error-bg);
   color: var(--color-error);
-  border-radius: 4px;
+  border-radius: var(--dbx-radius-fixed-4);
   font-size: 13px;
 }
 
@@ -1033,7 +1067,7 @@ button:disabled {
   width: 96px;
   padding: 6px 8px;
   border: 1px solid var(--color-border);
-  border-radius: 4px;
+  border-radius: var(--dbx-radius-fixed-4);
   background: var(--color-background);
   color: var(--color-text);
 }
@@ -1045,7 +1079,7 @@ button:disabled {
 
 .peek-message {
   border: 1px solid var(--color-border);
-  border-radius: 6px;
+  border-radius: var(--dbx-radius-fixed-6);
   background: var(--color-background-secondary);
   overflow: hidden;
 }

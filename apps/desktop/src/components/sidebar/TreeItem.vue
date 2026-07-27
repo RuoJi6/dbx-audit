@@ -44,8 +44,9 @@ import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import LightTooltip from "@/components/ui/LightTooltip.vue";
 import type { ColumnInfo, ConnectionConfig, DatabaseType, TreeNode, TreeNodeType } from "@/types/database";
-import { canTreeNodeShowExpander, trailingCommentAvailableWidth, trailingCommentGapPx, treeItemPaddingLeft, treeLabelWidthClass, usesFullWidthTreeLabel } from "@/lib/sidebar/sidebarTreeItemLayout";
+import { canTreeNodeShowExpander, sidebarTreeNodeComment, trailingCommentAvailableWidth, trailingCommentGapPx, treeItemPaddingLeft, treeLabelWidthClass, usesFullWidthTreeLabel } from "@/lib/sidebar/sidebarTreeItemLayout";
 import { clearActiveTableReferencePayload, createTableReferencePayload, createTableReferenceDropEvent, setActiveTableReferencePayload, type QueryEditorTableReferencePayload } from "@/lib/editor/queryEditorTableDrop";
+import { formatSidebarObjectStorage } from "@/lib/sidebar/sidebarDatabaseStorage";
 import { dataTabOpenModeFromTreeClick } from "@/lib/sidebar/dataTabOpenPolicy";
 import { effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
 import { hexToRgba } from "@/lib/common/color";
@@ -150,6 +151,7 @@ const props = defineProps<{
   dragDisabled?: boolean;
   pendingRename?: boolean;
   highlighted?: boolean;
+  commentLabelWidth?: number;
 }>();
 
 const emit = defineEmits<{
@@ -549,13 +551,13 @@ const isNodeDefaultDatabase = computed(
 );
 
 const trailingComment = computed(() => {
-  if (settingsStore.editorSettings.sidebarHideTableComments) return null;
-  if (activeNode.value.type === "column" && activeNode.value.meta && "comment" in activeNode.value.meta) return (activeNode.value.meta as any).comment || null;
-  if ((activeNode.value.type === "schema" || activeNode.value.type === "table" || activeNode.value.type === "view" || activeNode.value.type === "mongo-collection" || activeNode.value.type === "vector-collection" || activeNode.value.type === "elasticsearch-index") && activeNode.value.comment) {
-    return activeNode.value.comment;
-  }
-  return null;
+  if (!settingsStore.editorSettings.sidebarObjectInfoMode.startsWith("comment-")) return null;
+  return sidebarTreeNodeComment(activeNode.value);
 });
+
+function isRightAlignedComment(): boolean {
+  return settingsStore.editorSettings.sidebarObjectInfoMode === "comment-right" && !!trailingComment.value;
+}
 
 function cancelTrailingCommentMeasure() {
   if (!trailingCommentMeasureFrame) return;
@@ -566,14 +568,10 @@ function cancelTrailingCommentMeasure() {
 function measureTrailingCommentLayout() {
   const container = trailingCommentLayoutRef.value;
   const leading = trailingCommentLeadingRef.value;
-  if (!trailingComment.value || !container || !leading) {
+  if (!isRightAlignedComment() || !container || !leading) {
     trailingCommentMaxWidth.value = 0;
     return;
   }
-
-  // The leading group keeps the complete table name ahead of the comment.
-  // Only the width remaining after that name and the fixed gap may be used
-  // by the comment; once it reaches zero, the comment is hidden.
   trailingCommentMaxWidth.value = trailingCommentAvailableWidth(container.clientWidth, leading.scrollWidth);
 }
 
@@ -593,7 +591,9 @@ function refreshTrailingCommentMeasurement() {
   trailingCommentResizeObserver?.disconnect();
   trailingCommentResizeObserver = null;
 
-  if (!trailingComment.value || !trailingCommentLayoutRef.value || !trailingCommentLeadingRef.value) {
+  const container = trailingCommentLayoutRef.value;
+  const leading = trailingCommentLeadingRef.value;
+  if (!isRightAlignedComment() || !container || !leading) {
     trailingCommentMaxWidth.value = 0;
     return;
   }
@@ -601,19 +601,29 @@ function refreshTrailingCommentMeasurement() {
   scheduleTrailingCommentMeasure();
   if (typeof ResizeObserver !== "undefined") {
     trailingCommentResizeObserver = new ResizeObserver(scheduleTrailingCommentMeasure);
-    trailingCommentResizeObserver.observe(trailingCommentLayoutRef.value);
+    trailingCommentResizeObserver.observe(container);
+    trailingCommentResizeObserver.observe(leading);
   }
 }
 
-// Keep comment rows constrained to the sidebar. When space is tight, the
-// comment truncates before the table name instead of creating a large gap.
-const usesFullWidthLabel = computed(() => usesFullWidthTreeLabel(activeNode.value.type, settingsStore.editorSettings.sidebarAllowHorizontalScroll, !!trailingComment.value));
+function formattedObjectStorage(): string {
+  if (settingsStore.editorSettings.sidebarObjectInfoMode !== "size" || (activeNode.value.type !== "database" && activeNode.value.type !== "table" && activeNode.value.type !== "materialized_view")) return "";
+  return formatSidebarObjectStorage(activeNode.value.sizeBytes);
+}
+
+const alignedCommentLabelWidth = computed(() => (settingsStore.editorSettings.sidebarObjectInfoMode === "comment-aligned" ? props.commentLabelWidth : undefined));
+
+function hasTrailingMetadata(): boolean {
+  return !!trailingComment.value || !!formattedObjectStorage();
+}
+
+const usesFullWidthLabel = computed(() => usesFullWidthTreeLabel(activeNode.value.type, settingsStore.editorSettings.sidebarAllowHorizontalScroll, hasTrailingMetadata()));
 
 const rowWidthClass = computed(() => (usesFullWidthLabel.value ? "w-max min-w-full" : "w-full min-w-0"));
 
-const labelWidthClass = computed(() => treeLabelWidthClass({ fullWidth: usesFullWidthLabel.value, hasTrailingComment: !!trailingComment.value }));
+const labelWidthClass = computed(() => treeLabelWidthClass({ fullWidth: usesFullWidthLabel.value, hasTrailingComment: hasTrailingMetadata() }));
 
-watch(() => [trailingComment.value, visibleLabel(activeNode.value), trailingCommentLayoutRef.value, trailingCommentLeadingRef.value], refreshTrailingCommentMeasurement, { flush: "post", immediate: true });
+watch(() => [isRightAlignedComment(), visibleLabel(activeNode.value), trailingComment.value, trailingCommentLayoutRef.value, trailingCommentLeadingRef.value], refreshTrailingCommentMeasurement, { flush: "post", immediate: true });
 
 const paddingLeft = computed(() => treeItemPaddingLeft(props.depth));
 
@@ -1058,8 +1068,12 @@ function onKeydown(event: KeyboardEvent) {
         <DatabaseIcon v-if="node.type === 'connection'" :db-type="connectionIconType(node.connectionId)" class="h-3.5 w-3.5 shrink-0" />
         <Loader2 v-else-if="node.type === 'load-more' && node.isLoading" class="w-3.5 h-3.5 shrink-0 animate-spin text-primary" />
         <component v-else :is="getIconInfo(node)?.icon || Database" class="w-3.5 h-3.5 shrink-0" :class="databaseOpenVisual.iconClass" />
-        <div ref="trailingCommentLayoutRef" :class="trailingComment ? 'flex flex-1 min-w-0 items-center' : 'contents'">
-          <div ref="trailingCommentLeadingRef" :class="trailingComment ? 'flex max-w-full min-w-0 shrink-0 items-center gap-2' : 'contents'">
+        <div ref="trailingCommentLayoutRef" :class="hasTrailingMetadata() ? 'flex flex-1 min-w-0 items-center' : 'contents'">
+          <div
+            ref="trailingCommentLeadingRef"
+            :class="trailingComment ? 'flex max-w-full min-w-0 shrink-0 items-center gap-2' : formattedObjectStorage() ? 'flex min-w-0 flex-1 items-center gap-2' : 'contents'"
+            :style="alignedCommentLabelWidth ? { width: `${alignedCommentLabelWidth}px` } : undefined"
+          >
             <input
               v-if="isRenamingGroup"
               ref="renameInputRef"
@@ -1084,10 +1098,11 @@ function onKeydown(event: KeyboardEvent) {
               {{ t("editor.defaultDatabase") }}
             </Badge>
           </div>
-          <span v-if="trailingComment && trailingCommentMaxWidth > 0" class="min-w-0 flex-1" aria-hidden="true" />
+          <span v-if="trailingComment && !isRightAlignedComment()" class="sidebar-object-comment ml-2 min-w-0 flex-1 truncate text-left" :class="{ 'sidebar-object-comment--windows': useWindowsSidebarCommentFont }">{{ trailingComment }}</span>
+          <span v-if="isRightAlignedComment() && trailingCommentMaxWidth > 0" class="min-w-0 flex-1" aria-hidden="true" />
           <span
-            v-if="trailingComment && trailingCommentMaxWidth > 0"
-            class="sidebar-object-comment min-w-0 shrink-0 truncate text-left"
+            v-if="isRightAlignedComment() && trailingCommentMaxWidth > 0"
+            class="sidebar-object-comment sidebar-object-comment--right min-w-0 shrink-0 truncate text-left"
             :class="{ 'sidebar-object-comment--windows': useWindowsSidebarCommentFont }"
             :style="{ marginLeft: `${trailingCommentGapPx}px`, maxWidth: `${trailingCommentMaxWidth}px` }"
             >{{ trailingComment }}</span
@@ -1098,6 +1113,7 @@ function onKeydown(event: KeyboardEvent) {
         <Badge v-if="isConnectionReadonly" variant="secondary" class="h-4 px-1.5 text-[10px] gap-0.5"><Lock class="w-2.5 h-2.5" />{{ t("connection.readOnlyBadge") }}</Badge>
         <ConnectionErrorIndicator v-if="node.type === 'connection'" :connection-id="node.connectionId" trigger-class="h-4 w-4" />
         <Pin v-if="isPinned" class="w-3 h-3 shrink-0 text-primary fill-current" aria-hidden="true" />
+        <span v-if="formattedObjectStorage()" class="ml-auto shrink-0 text-right text-xs tabular-nums text-muted-foreground">{{ formattedObjectStorage() }}</span>
         <button
           v-if="isConnecting"
           type="button"
@@ -1142,21 +1158,22 @@ function onKeydown(event: KeyboardEvent) {
 <style>
 .sidebar-object-comment {
   color: var(--muted-foreground);
-  font-size: 10px;
+  font-size: 12px;
   line-height: 1rem;
   opacity: 0.6;
-  /* Use the comment's natural width whenever the row has room for it. */
-  width: max-content;
-  max-width: 100%;
-  /* Preserve table names when a narrow row needs to truncate its comment. */
-  flex-shrink: 999;
   /* Sidebar rows repaint on hover; avoid heavier font shaping and fallback here. */
   text-rendering: auto;
 }
 
+.sidebar-object-comment--right {
+  width: max-content;
+  max-width: 100%;
+  flex-shrink: 999;
+}
+
 .sidebar-object-comment--windows {
   font-family: "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", system-ui, sans-serif;
-  font-size: 12px;
+  font-size: 14px;
   font-weight: 500;
   opacity: 1;
 }

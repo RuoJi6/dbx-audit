@@ -140,7 +140,7 @@ export interface ConnectionConfig {
   client_cert_path?: string;
   client_key_path?: string;
   sysdba?: boolean;
-  oracle_connection_type?: "service_name" | "sid";
+  oracle_connection_type?: "service_name" | "sid" | "tns";
   connection_string?: string;
   jdbc_driver_class?: string;
   jdbc_driver_paths?: string[];
@@ -349,6 +349,11 @@ export interface JdbcPluginStatus {
 
 export interface DatabaseInfo {
   name: string;
+}
+
+export interface DatabaseStorageInfo {
+  name: string;
+  size_bytes: number | null;
 }
 
 export interface SchemaInfo {
@@ -589,6 +594,7 @@ export interface SqlTextSpan {
 
 export interface SqlTableReference {
   name: string;
+  database?: string | null;
   schema?: string | null;
   alias?: string | null;
   span: SqlTextSpan;
@@ -713,6 +719,7 @@ export interface TreeNode {
   tableType?: string;
   comment?: string | null;
   valid?: boolean | null;
+  sizeBytes?: number | null;
   objectCount?: number;
   loadedKeyCount?: number;
   totalKeyCount?: number;
@@ -747,6 +754,7 @@ export interface TableStructureEditorDraft {
   indexes: import("@/lib/table/tableStructureEditorSql").EditableStructureIndex[];
   foreignKeys: import("@/lib/table/tableStructureEditorSql").EditableStructureForeignKey[];
   triggers: import("@/lib/table/tableStructureEditorSql").EditableStructureTrigger[];
+  triggersLoaded?: boolean;
   scrollPositions?: Partial<Record<TableInfoTab, TableStructureEditorViewport>>;
   initialized: boolean;
 }

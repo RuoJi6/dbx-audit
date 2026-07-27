@@ -133,6 +133,7 @@ export const syncSavedSqlDirectory = forward("syncSavedSqlDirectory");
 
 // Schema
 export const listDatabases = forward("listDatabases");
+export const listDatabaseStorage = forward("listDatabaseStorage");
 export const listDorisCatalogs = forward("listDorisCatalogs");
 export const listDorisCatalogDatabases = forward("listDorisCatalogDatabases");
 export const listSqlServerLinkedServers = forward("listSqlServerLinkedServers");
@@ -254,6 +255,8 @@ export const loadDesktopSettings = forward("loadDesktopSettings");
 export const saveDesktopSettings = forward("saveDesktopSettings");
 export const loadMcpGlobalPolicy = forward("loadMcpGlobalPolicy");
 export const saveMcpGlobalPolicy = forward("saveMcpGlobalPolicy");
+export const loadMaxAgentTurns = forward("loadMaxAgentTurns");
+export const saveMaxAgentTurns = forward("saveMaxAgentTurns");
 export const completeAppClose = forward("completeAppClose");
 export const requestAppClose = forward("requestAppClose");
 export const setDriverStoreDir = forward("setDriverStoreDir");
@@ -296,6 +299,13 @@ export const auditParseFscan = forward("auditParseFscan");
 export const auditLoadTaskStore = forward("auditLoadTaskStore");
 export const auditSaveTaskStore = forward("auditSaveTaskStore");
 
+// Prompt Templates
+export const loadPromptTemplates = forward("loadPromptTemplates");
+export const savePromptTemplate = forward("savePromptTemplate");
+export const deletePromptTemplate = forward("deletePromptTemplate");
+export const getAiGlobalCustomInstructions = forward("getAiGlobalCustomInstructions");
+export const setAiGlobalCustomInstructions = forward("setAiGlobalCustomInstructions");
+
 // System
 export const listSystemFonts = forward("listSystemFonts");
 export const listSshConfigHosts = forward("listSshConfigHosts");
@@ -325,6 +335,8 @@ export const nacosDeleteConfig = forward("nacosDeleteConfig");
 export const nacosListConfigHistory = forward("nacosListConfigHistory");
 export const nacosGetConfigHistory = forward("nacosGetConfigHistory");
 export const nacosRollbackConfig = forward("nacosRollbackConfig");
+export const nacosGetRNacosConsoleCaptcha = forward("nacosGetRNacosConsoleCaptcha");
+export const nacosLoginRNacosConsole = forward("nacosLoginRNacosConsole");
 export const nacosListServices = forward("nacosListServices");
 export const nacosListInstances = forward("nacosListInstances");
 export const nacosUpdateInstance = forward("nacosUpdateInstance");
@@ -340,6 +352,7 @@ export const sortTablesByFkDependency = forward("sortTablesByFkDependency");
 export const previewTableImportFile = forward("previewTableImportFile");
 export const importTableFile = forward("importTableFile");
 export const cancelTableImport = forward("cancelTableImport");
+export const releaseTableImportSource = forward("releaseTableImportSource");
 
 // Database Export
 export const beginDatabaseBackupSnapshot = forward("beginDatabaseBackupSnapshot");
@@ -415,6 +428,15 @@ export const mqDeleteTopic = forward("mqDeleteTopic");
 export const mqUpdatePartitions = forward("mqUpdatePartitions");
 export const mqGetTopicStats = forward("mqGetTopicStats");
 export const mqGetTopicInternalStats = forward("mqGetTopicInternalStats");
+export const mqListExchanges = forward("mqListExchanges");
+export const mqCreateExchange = forward("mqCreateExchange");
+export const mqDeleteExchange = forward("mqDeleteExchange");
+export const mqListBindings = forward("mqListBindings");
+export const mqBind = forward("mqBind");
+export const mqUnbind = forward("mqUnbind");
+export const mqListClientConnections = forward("mqListClientConnections");
+export const mqListClientChannels = forward("mqListClientChannels");
+export const mqCloseClientConnection = forward("mqCloseClientConnection");
 export const mqListSubscriptions = forward("mqListSubscriptions");
 export const mqCreateSubscription = forward("mqCreateSubscription");
 export const mqDeleteSubscription = forward("mqDeleteSubscription");
@@ -450,6 +472,17 @@ export const mqQueryMessagesByTopic = forward("mqQueryMessagesByTopic");
 export const mqQueryMessageTrace = forward("mqQueryMessageTrace");
 export const mqRawRequest = forward("mqRawRequest");
 export const mqSendMessage = forward("mqSendMessage");
+export const mqListUsers = forward("mqListUsers");
+export const mqCreateUser = forward("mqCreateUser");
+export const mqDeleteUser = forward("mqDeleteUser");
+export const mqListUserPermissions = forward("mqListUserPermissions");
+export const mqGrantUserPermission = forward("mqGrantUserPermission");
+export const mqRevokeUserPermission = forward("mqRevokeUserPermission");
+export const mqListPolicies = forward("mqListPolicies");
+export const mqSetPolicy = forward("mqSetPolicy");
+export const mqDeletePolicy = forward("mqDeletePolicy");
+export const mqGetOverview = forward("mqGetOverview");
+export const mqListNodes = forward("mqListNodes");
 
 // MongoDB
 export const documentListDatabases = forward("documentListDatabases");
@@ -469,6 +502,7 @@ export const mongoDropDatabase = forward("mongoDropDatabase");
 export const mongoDropCollection = forward("mongoDropCollection");
 export const mongoRenameCollection = forward("mongoRenameCollection");
 export const documentFindDocuments = forward("documentFindDocuments");
+export const elasticsearchCountDocuments = forward("elasticsearchCountDocuments");
 export const mongoFindDocuments = forward("mongoFindDocuments");
 export const mongoParseShellCommand = forward("mongoParseShellCommand");
 export const mongoFindOne = forward("mongoFindOne");
@@ -499,6 +533,8 @@ export const vectorListCollections = forward("vectorListCollections");
 // History
 export const saveHistory = forward("saveHistory");
 export const loadHistory = forward("loadHistory");
+export const searchHistory = forward("searchHistory");
+export const loadHistoryConnectionOptions = forward("loadHistoryConnectionOptions");
 export const loadRedisHistory = forward("loadRedisHistory");
 export const clearHistory = forward("clearHistory");
 export const clearRedisHistory = forward("clearRedisHistory");
@@ -534,6 +570,7 @@ export type {
   AiModelInfo,
   AiChatMessage,
   AiConversation,
+  PromptTemplate,
   AgentDriverInfo,
   DriverStoreUsage,
   DriverStoreUsageItem,
@@ -586,8 +623,15 @@ export type {
   KvPutOptions,
   KvPutResponse,
   KvDeleteResponse,
+  DocumentQueryResult,
   MongoDocumentResult,
   HistoryEntry,
+  HistoryConnectionFilter,
+  HistoryDatabaseFilter,
+  HistoryCursor,
+  HistorySearchRequest,
+  HistorySearchResult,
+  HistoryConnectionOption,
   SqlFileStatus,
   SqlFileRequest,
   SqlFilePreview,
@@ -607,6 +651,7 @@ export type {
   TableImportParseOptions,
   TableImportPreviewRequest,
   TableImportPreview,
+  TableImportPreparedSource,
   TableImportRequest,
   TableImportSummary,
   TableImportProgress,

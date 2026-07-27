@@ -10,11 +10,11 @@ import type { ConnectionListSortMode } from "@/lib/sidebar/connectionListSort";
 import { DEFAULT_SQL_FORMATTER_SETTINGS, normalizeSqlFormatterSettings, type SqlFormatterSettings } from "@/lib/sql/sqlFormatterConfig";
 import { normalizeSqlVariableSyntaxOverrides, type SqlVariableSyntaxOverrides } from "@/lib/sql/sqlVariableSyntax";
 import type { SidebarActivation } from "@/lib/sidebar/treeNodeClick";
-import type { SqlSnippet } from "@/types/database";
+import type { SqlSnippet, TableInfoTab } from "@/types/database";
 import { DEFAULT_SQL_SNIPPETS } from "@/lib/sql/sqlCompletion";
 import { setDebugLoggingEnabled } from "@/lib/backend/debugLog";
 import { DEFAULT_TABLE_COLUMN_TEMPLATE_FIELDS, normalizeTableColumnTemplateFields } from "@/lib/table/tableColumnTemplates";
-import { DEFAULT_UI_FONT_FAMILY } from "@/lib/app/appFonts";
+import { DEFAULT_DATA_GRID_FONT_FAMILY, DEFAULT_UI_FONT_FAMILY } from "@/lib/app/appFonts";
 import { safeLocalStorageGet, safeLocalStorageRemove } from "@/lib/backend/safeStorage";
 import type { AiProvider, AiApiStyle, AiAuthMethod, AiEffortLevel, AiReasoningLevel, AiConfiguredModel, AiConfig, AiTestConnectionResult, AiConfigItem } from "@/types/ai";
 
@@ -376,6 +376,8 @@ export interface CustomTheme {
 
 export const DEFAULT_CUSTOM_THEMES: CustomTheme[] = [{ id: "default", name: "Custom", colors: { ...DEFAULT_CUSTOM_THEME_COLORS }, ddlColors: { ...DEFAULT_CUSTOM_THEME_DDL_COLORS } }];
 
+export type SidebarObjectInfoMode = "comment-inline" | "comment-aligned" | "comment-right" | "size" | "hidden";
+
 export interface EditorSettings {
   fontFamily: string;
   fontSize: number;
@@ -417,8 +419,10 @@ export interface EditorSettings {
   dataGridSearchMode: DataGridSearchMode;
   dataGridMultiRowTranspose: boolean;
   dataGridHideNullColumns: boolean;
+  tableFontFamily: string;
   tableFontSize: number;
   structureEditorDensity: StructureEditorDensity;
+  tableInfoActiveTab: TableInfoTab;
   tableInfoDrawerWidth: number;
   cellDetailDrawerWidth: number;
   cellDetailPanelLayout: CellDetailPanelLayout;
@@ -437,7 +441,7 @@ export interface EditorSettings {
   prefillNewQueryWithSelect: boolean;
   updateNotificationsEnabled: boolean;
   sidebarHiddenTablePrefixes: string[];
-  sidebarHideTableComments: boolean;
+  sidebarObjectInfoMode: SidebarObjectInfoMode;
   sidebarAllowHorizontalScroll: boolean;
   columnFormatters: Record<string, ColumnFormatterConfig>;
   customColumnFormatters: Record<string, CustomColumnFormatterConfig>;
@@ -534,16 +538,6 @@ export const EDITOR_THEMES: { value: EditorTheme; label: string; dark: boolean }
 
 const EDITOR_THEME_VALUES = new Set<EditorTheme>(EDITOR_THEMES.map((theme) => theme.value));
 
-export const FONT_FAMILIES: { value: string; label: string }[] = [
-  { value: "'Fira Code', 'Cascadia Code', 'Cascadia Mono', 'JetBrains Mono', monospace", label: "Fira Code" },
-  { value: "'JetBrains Mono', 'Fira Code', monospace", label: "JetBrains Mono" },
-  { value: "'Cascadia Code', 'Cascadia Mono', monospace", label: "Cascadia Code" },
-  { value: "'Source Code Pro', monospace", label: "Source Code Pro" },
-  { value: "'SF Mono', 'Menlo', monospace", label: "SF Mono / Menlo" },
-  { value: "'Consolas', 'Courier New', monospace", label: "Consolas" },
-  { value: "monospace", label: "System Monospace" },
-];
-
 export const EXECUTE_MODE_CURRENT_DEFAULT_VERSION = 1;
 
 export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
@@ -587,8 +581,10 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   dataGridSearchMode: "filter",
   dataGridMultiRowTranspose: false,
   dataGridHideNullColumns: false,
+  tableFontFamily: DEFAULT_DATA_GRID_FONT_FAMILY,
   tableFontSize: TABLE_FONT_SIZE_DEFAULT,
   structureEditorDensity: "compact",
+  tableInfoActiveTab: "ddl",
   tableInfoDrawerWidth: 320,
   cellDetailDrawerWidth: 380,
   cellDetailPanelLayout: "bottom",
@@ -607,7 +603,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   prefillNewQueryWithSelect: true,
   updateNotificationsEnabled: true,
   sidebarHiddenTablePrefixes: [],
-  sidebarHideTableComments: false,
+  sidebarObjectInfoMode: "comment-aligned",
   sidebarAllowHorizontalScroll: false,
   columnFormatters: {},
   customColumnFormatters: {},
@@ -719,6 +715,14 @@ function normalizeConnectionListSortMode(value: unknown): ConnectionListSortMode
   return value === "asc" || value === "desc" ? value : "manual";
 }
 
+function normalizeSidebarObjectInfoMode(value: unknown, legacyCommentLayout?: unknown, legacyHideTableComments?: unknown, legacyShowDatabaseSizes?: unknown): SidebarObjectInfoMode {
+  if (value === "comment-inline" || value === "comment-aligned" || value === "comment-right" || value === "size" || value === "hidden") return value;
+  if (legacyCommentLayout === "hidden" || legacyHideTableComments === true) return "hidden";
+  if (legacyShowDatabaseSizes === true) return "size";
+  if (legacyCommentLayout === "aligned") return "comment-aligned";
+  return DEFAULT_EDITOR_SETTINGS.sidebarObjectInfoMode;
+}
+
 function normalizeColumnFormatters(value: unknown): Record<string, ColumnFormatterConfig> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   const formatters: Record<string, ColumnFormatterConfig> = {};
@@ -776,6 +780,12 @@ function normalizeToolbarItems(items: Partial<ToolbarItems> | undefined): Toolba
     // Saved settings from before right-sidebar exclusivity must adopt the new default.
     exclusiveRightSidebarPanels: items.exclusiveRightSidebarPanels !== false,
   };
+}
+
+const TABLE_INFO_TABS = new Set<TableInfoTab>(["ddl", "columns", "indexes", "foreignKeys", "triggers"]);
+
+function normalizeTableInfoTab(value: unknown): TableInfoTab {
+  return typeof value === "string" && TABLE_INFO_TABS.has(value as TableInfoTab) ? (value as TableInfoTab) : DEFAULT_EDITOR_SETTINGS.tableInfoActiveTab;
 }
 
 export function normalizeEditorSettings(settings: Partial<EditorSettings>, existing?: EditorSettings): EditorSettings {
@@ -848,8 +858,10 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     dataGridSearchMode: normalizeDataGridSearchMode(settings.dataGridSearchMode),
     dataGridMultiRowTranspose: settings.dataGridMultiRowTranspose === true,
     dataGridHideNullColumns: settings.dataGridHideNullColumns === true,
+    tableFontFamily: normalizeFontFamily(settings.tableFontFamily, DEFAULT_EDITOR_SETTINGS.tableFontFamily),
     tableFontSize: normalizeTableFontSize(settings.tableFontSize),
     structureEditorDensity: normalizeStructureEditorDensity(settings.structureEditorDensity),
+    tableInfoActiveTab: normalizeTableInfoTab(settings.tableInfoActiveTab),
     tableInfoDrawerWidth: normalizeDrawerWidth(settings.tableInfoDrawerWidth, 240, DEFAULT_EDITOR_SETTINGS.tableInfoDrawerWidth),
     cellDetailDrawerWidth: normalizeDrawerWidth(settings.cellDetailDrawerWidth, 260, DEFAULT_EDITOR_SETTINGS.cellDetailDrawerWidth),
     cellDetailPanelLayout: normalizeCellDetailPanelLayout(settings.cellDetailPanelLayout),
@@ -868,7 +880,12 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     prefillNewQueryWithSelect: typeof settings.prefillNewQueryWithSelect === "boolean" ? settings.prefillNewQueryWithSelect : DEFAULT_EDITOR_SETTINGS.prefillNewQueryWithSelect,
     updateNotificationsEnabled: settings.updateNotificationsEnabled ?? DEFAULT_EDITOR_SETTINGS.updateNotificationsEnabled,
     sidebarHiddenTablePrefixes: normalizeSidebarHiddenTablePrefixes(settings.sidebarHiddenTablePrefixes),
-    sidebarHideTableComments: settings.sidebarHideTableComments ?? DEFAULT_EDITOR_SETTINGS.sidebarHideTableComments,
+    sidebarObjectInfoMode: normalizeSidebarObjectInfoMode(
+      settings.sidebarObjectInfoMode,
+      (settings as Partial<EditorSettings> & { sidebarTableCommentLayout?: string }).sidebarTableCommentLayout,
+      (settings as Partial<EditorSettings> & { sidebarHideTableComments?: boolean }).sidebarHideTableComments,
+      (settings as Partial<EditorSettings> & { sidebarShowDatabaseSizes?: boolean }).sidebarShowDatabaseSizes,
+    ),
     sidebarAllowHorizontalScroll: settings.sidebarAllowHorizontalScroll ?? DEFAULT_EDITOR_SETTINGS.sidebarAllowHorizontalScroll,
     columnFormatters: normalizeColumnFormatters(settings.columnFormatters),
     customColumnFormatters: normalizeCustomColumnFormatters(settings.customColumnFormatters),
@@ -916,8 +933,12 @@ function clearLegacyEditorSettings() {
   safeLocalStorageRemove(EXPORT_BATCH_SIZE_DEFAULT_MIGRATION_KEY);
 }
 
+function editorSettingsSnapshot(settings: EditorSettings): EditorSettings {
+  return JSON.parse(JSON.stringify(settings)) as EditorSettings;
+}
+
 function saveEditorSettings(settings: EditorSettings) {
-  void api.saveEditorSettings(settings).catch(() => {});
+  void api.saveEditorSettings(editorSettingsSnapshot(settings)).catch(() => {});
 }
 
 export interface SettingsNavigationRequest {
@@ -1207,8 +1228,10 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.dataGridSearchMode !== undefined) editorSettings.value.dataGridSearchMode = normalizeDataGridSearchMode(partial.dataGridSearchMode);
     if (partial.dataGridMultiRowTranspose !== undefined) editorSettings.value.dataGridMultiRowTranspose = partial.dataGridMultiRowTranspose === true;
     if (partial.dataGridHideNullColumns !== undefined) editorSettings.value.dataGridHideNullColumns = partial.dataGridHideNullColumns === true;
+    if (partial.tableFontFamily !== undefined) editorSettings.value.tableFontFamily = normalizeFontFamily(partial.tableFontFamily, DEFAULT_EDITOR_SETTINGS.tableFontFamily);
     if (partial.tableFontSize !== undefined) editorSettings.value.tableFontSize = normalizeTableFontSize(partial.tableFontSize);
     if (partial.structureEditorDensity !== undefined) editorSettings.value.structureEditorDensity = normalizeStructureEditorDensity(partial.structureEditorDensity);
+    if (partial.tableInfoActiveTab !== undefined) editorSettings.value.tableInfoActiveTab = normalizeTableInfoTab(partial.tableInfoActiveTab);
     if (partial.tableInfoDrawerWidth !== undefined) editorSettings.value.tableInfoDrawerWidth = normalizeDrawerWidth(partial.tableInfoDrawerWidth, 240, DEFAULT_EDITOR_SETTINGS.tableInfoDrawerWidth);
     if (partial.cellDetailDrawerWidth !== undefined) editorSettings.value.cellDetailDrawerWidth = normalizeDrawerWidth(partial.cellDetailDrawerWidth, 260, DEFAULT_EDITOR_SETTINGS.cellDetailDrawerWidth);
     if (partial.cellDetailPanelLayout !== undefined) editorSettings.value.cellDetailPanelLayout = normalizeCellDetailPanelLayout(partial.cellDetailPanelLayout);
@@ -1227,7 +1250,7 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.prefillNewQueryWithSelect !== undefined) editorSettings.value.prefillNewQueryWithSelect = partial.prefillNewQueryWithSelect;
     if (partial.updateNotificationsEnabled !== undefined) editorSettings.value.updateNotificationsEnabled = partial.updateNotificationsEnabled;
     if (partial.sidebarHiddenTablePrefixes !== undefined) editorSettings.value.sidebarHiddenTablePrefixes = normalizeSidebarHiddenTablePrefixes(partial.sidebarHiddenTablePrefixes);
-    if (partial.sidebarHideTableComments !== undefined) editorSettings.value.sidebarHideTableComments = partial.sidebarHideTableComments;
+    if (partial.sidebarObjectInfoMode !== undefined) editorSettings.value.sidebarObjectInfoMode = normalizeSidebarObjectInfoMode(partial.sidebarObjectInfoMode);
     if (partial.sidebarAllowHorizontalScroll !== undefined) editorSettings.value.sidebarAllowHorizontalScroll = partial.sidebarAllowHorizontalScroll;
     if (partial.columnFormatters !== undefined) editorSettings.value.columnFormatters = partial.columnFormatters;
     if (partial.customColumnFormatters !== undefined) editorSettings.value.customColumnFormatters = partial.customColumnFormatters;
@@ -1247,6 +1270,10 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.sqlVariableSyntaxOverrides !== undefined) editorSettings.value.sqlVariableSyntaxOverrides = normalizeSqlVariableSyntaxOverrides(partial.sqlVariableSyntaxOverrides);
     if (partial.continueOnErrorOnBatch !== undefined) editorSettings.value.continueOnErrorOnBatch = partial.continueOnErrorOnBatch === true;
     saveEditorSettings(editorSettings.value);
+  }
+
+  async function persistEditorSettings(): Promise<void> {
+    await api.saveEditorSettings(editorSettingsSnapshot(editorSettings.value));
   }
 
   function updateColumnFormatter(key: string, formatter: ColumnFormatterConfig | undefined) {
@@ -1306,6 +1333,7 @@ export const useSettingsStore = defineStore("settings", () => {
     mcpGlobalPolicy,
     initEditorSettings,
     updateEditorSettings,
+    persistEditorSettings,
     initDesktopSettings,
     updateDesktopSettings,
     initMcpGlobalPolicy,

@@ -1,6 +1,6 @@
 {
   "name": "dbx-audit",
-  "version": "0.5.63",
+  "version": "0.5.66",
   "private": true,
   "license": "Apache-2.0",
   "type": "module",
@@ -21,6 +21,7 @@
     "release:agents": "node scripts/release.mjs agents",
     "release:app": "node scripts/release.mjs app",
     "release:packages": "node scripts/release.mjs packages",
+    "test:release": "node --test scripts/release.test.mjs",
     "build:knowledge-base": "node scripts/build-knowledge-base.mjs",
     "typecheck": "vue-tsc --noEmit --project apps/desktop/tsconfig.json",
     "build": "vite build --config apps/desktop/vite.config.ts",
@@ -30,6 +31,7 @@
     "test:db-env": "node --test scripts/database-env.test.mjs",
     "bench:redis-key-search": "node scripts/bench/redis-key-search.mjs",
     "bench:mongodb-count": "node scripts/bench/mongodb-count.mjs",
+    "bench:table-import": "cargo run -p dbx-core --no-default-features --example table_import_bench --release --",
     "lint": "oxlint --vue-plugin apps/desktop/src",
     "fmt": "oxfmt \"apps/desktop/src/**/*.{ts,vue}\"",
     "test": "vitest run",

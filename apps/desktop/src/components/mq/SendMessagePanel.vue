@@ -5,6 +5,7 @@ import type { MqSystemKind, PeekedMessage, TopicInfo, TopicRef, SendMessageReque
 import { mqSendMessage, mqListTopics, mqPeekMessages } from "@/lib/backend/api";
 import { formatError } from "@/lib/backend/errorUtils";
 import { parseNonNegativeSafeInteger } from "@/lib/mq/mqPeekFilters";
+import { resolveRabbitMqSendNamespace } from "@/lib/mq/mqConsoleDefaults";
 import RocketMqTopicSelect from "./shared/RocketMqTopicSelect.vue";
 
 interface Props {
@@ -26,6 +27,8 @@ const { t } = useI18n();
 const topicName = ref("");
 const messageKey = ref("");
 const messageTag = ref("");
+const exchangeName = ref("");
+const routingKey = ref("");
 const messageValue = ref("");
 const headersText = ref("");
 const loading = ref(false);
@@ -47,6 +50,7 @@ let successTimer: ReturnType<typeof setTimeout> | undefined;
 
 const readOnlyMessage = computed(() => t("mqMessages.readOnlyCannotSend"));
 const isRocketMqCluster = computed(() => props.mqSystemKind === "rocketmq");
+const isRabbitMqCluster = computed(() => props.mqSystemKind === "rabbitmq");
 
 const topicOptions = computed(() => {
   return availableTopics.value.map((t) => ({
@@ -62,7 +66,9 @@ const selectedTopicRef = computed<TopicRef | null>(() => {
   const selected = availableTopics.value.find((item) => item.shortName === topic);
   return {
     tenant: props.tenant,
-    namespace: props.namespace,
+    // Cross-vhost listings tag each row with its own vhost; row-level
+    // operations (e.g. peek) must target that vhost, not the "*" selection.
+    namespace: selected?.namespace || props.topic?.namespace || props.namespace,
     topic,
     persistent: selected?.persistent ?? true,
     partitioned: selected?.partitioned,
@@ -172,6 +178,23 @@ async function sendMessage() {
       payloadText: messageValue.value,
       headers,
     };
+    // RabbitMQ: publish through a specific exchange only when one is given;
+    // an empty exchange keeps the default-exchange behavior. The vhost is
+    // resolved for every publish: a topic picked from the datalist keeps the
+    // vhost of that row (cross-vhost listings), then the selected topic prop,
+    // then the current selection; in all-vhosts mode without a row topic the
+    // publish falls back to the connection default vhost (no explicit
+    // namespace).
+    const exchange = exchangeName.value.trim();
+    if (isRabbitMqCluster.value) {
+      if (exchange) {
+        req.exchange = exchange;
+        req.routingKey = routingKey.value.trim() || undefined;
+      }
+      const datalistTopic = availableTopics.value.find((item) => item.shortName === topic);
+      const sendNamespace = resolveRabbitMqSendNamespace(datalistTopic, props.namespace, props.topic);
+      if (sendNamespace) req.namespace = sendNamespace;
+    }
     success.value = await mqSendMessage(props.connectionId, req);
     if (canBrowseMessages.value) {
       peekPartition.value = String(success.value.partition);
@@ -249,6 +272,8 @@ function formatJson() {
 function clearForm() {
   topicName.value = "";
   messageKey.value = "";
+  exchangeName.value = "";
+  routingKey.value = "";
   messageValue.value = "";
   headersText.value = "";
   error.value = undefined;
@@ -326,6 +351,18 @@ watch(
         <label>{{ t("mqMessages.messageTag") }}</label>
         <input v-model="messageTag" type="text" :placeholder="t('mqMessages.optional')" :disabled="readOnly" />
       </div>
+
+      <template v-if="isRabbitMqCluster">
+        <div class="form-group">
+          <label>{{ t("mqMessages.exchange") }}</label>
+          <input v-model="exchangeName" type="text" :placeholder="t('mqMessages.exchangePlaceholder')" :disabled="readOnly" />
+          <div class="form-hint">{{ t("mqMessages.exchangeHint") }}</div>
+        </div>
+        <div v-if="exchangeName.trim()" class="form-group">
+          <label>{{ t("mqMessages.routingKey") }}</label>
+          <input v-model="routingKey" type="text" :placeholder="t('mqMessages.optional')" :disabled="readOnly" />
+        </div>
+      </template>
 
       <!-- 消息内容 -->
       <div class="form-group">
@@ -454,7 +491,7 @@ watch(
 
 .readonly-hint {
   padding: 10px 14px;
-  border-radius: 6px;
+  border-radius: var(--dbx-radius-fixed-6);
   background: var(--color-warning-alpha);
   color: var(--color-warning);
   font-size: 13px;
@@ -462,7 +499,7 @@ watch(
 
 .panel-error {
   padding: 10px 14px;
-  border-radius: 6px;
+  border-radius: var(--dbx-radius-fixed-6);
   background: var(--color-error-bg);
   color: var(--color-error);
   font-size: 13px;
@@ -475,7 +512,7 @@ watch(
   padding: 14px 18px;
   border: 1px solid color-mix(in srgb, var(--color-success) 34%, transparent);
   border-left: 4px solid var(--color-success);
-  border-radius: 8px;
+  border-radius: var(--dbx-radius-fixed-6);
   background: color-mix(in srgb, var(--color-success) 13%, var(--color-background));
   color: var(--color-success);
   font-size: 15px;
@@ -535,7 +572,7 @@ watch(
   flex: 1;
   padding: 7px 10px;
   border: 1px solid var(--color-border);
-  border-radius: 6px;
+  border-radius: var(--dbx-radius-fixed-6);
   background: var(--color-background);
   color: var(--color-text);
   font-size: 13px;
@@ -555,7 +592,7 @@ watch(
   width: 32px;
   height: 32px;
   border: 1px solid var(--color-border);
-  border-radius: 6px;
+  border-radius: var(--dbx-radius-fixed-6);
   background: var(--color-background);
   color: var(--color-text-secondary);
   cursor: pointer;
@@ -587,7 +624,7 @@ input[type="text"],
 input[type="number"] {
   padding: 7px 10px;
   border: 1px solid var(--color-border);
-  border-radius: 6px;
+  border-radius: var(--dbx-radius-fixed-6);
   background: var(--color-background);
   color: var(--color-text);
   font-size: 13px;
@@ -606,7 +643,7 @@ input[type="number"]:focus {
   width: 100%;
   padding: 8px 10px;
   border: 1px solid var(--color-border);
-  border-radius: 6px;
+  border-radius: var(--dbx-radius-fixed-6);
   background: var(--color-background);
   color: var(--color-text);
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
@@ -676,7 +713,7 @@ input[type="number"]:focus {
 .btn-sm {
   padding: 7px 16px;
   border: 1px solid var(--color-border);
-  border-radius: 6px;
+  border-radius: var(--dbx-radius-fixed-6);
   background: var(--color-background);
   color: var(--color-text);
   cursor: pointer;
@@ -718,7 +755,7 @@ input[type="number"]:focus {
   margin-top: 4px;
   padding: 14px;
   border: 1px solid var(--color-border);
-  border-radius: 8px;
+  border-radius: var(--dbx-radius-fixed-6);
   background: var(--color-background-secondary);
 }
 
@@ -740,7 +777,7 @@ input[type="number"]:focus {
 .peek-default-hint {
   margin: 0 0 12px;
   padding: 8px 10px;
-  border-radius: 6px;
+  border-radius: var(--dbx-radius-fixed-6);
   background: color-mix(in srgb, var(--color-primary) 8%, transparent);
   color: var(--color-text-secondary);
   font-size: 12px;
@@ -774,7 +811,7 @@ input[type="number"]:focus {
 .message-empty {
   padding: 18px;
   border: 1px dashed var(--color-border);
-  border-radius: 6px;
+  border-radius: var(--dbx-radius-fixed-6);
   color: var(--color-text-tertiary);
   text-align: center;
   font-size: 13px;
@@ -791,7 +828,7 @@ input[type="number"]:focus {
 .message-row {
   padding: 10px 12px;
   border: 1px solid var(--color-border);
-  border-radius: 6px;
+  border-radius: var(--dbx-radius-fixed-6);
   background: var(--color-background);
 }
 
@@ -814,7 +851,7 @@ input[type="number"]:focus {
   padding: 10px;
   max-height: 160px;
   overflow: auto;
-  border-radius: 6px;
+  border-radius: var(--dbx-radius-fixed-6);
   background: var(--color-background-tertiary, var(--color-background-secondary));
   color: var(--color-text);
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
@@ -834,7 +871,7 @@ input[type="number"]:focus {
 .message-headers span {
   padding: 2px 6px;
   border: 1px solid var(--color-border);
-  border-radius: 4px;
+  border-radius: var(--dbx-radius-fixed-4);
   color: var(--color-text-secondary);
   background: var(--color-background-secondary);
   font-size: 12px;

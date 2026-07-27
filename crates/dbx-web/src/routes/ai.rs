@@ -113,12 +113,12 @@ pub async fn save_ai_config(
     Json(body): Json<SaveAiConfigRequest>,
 ) -> Result<Json<()>, AppError> {
     reject_web_unsupported_ai_provider(&body.config)?;
-    state.app.storage.save_ai_config(&body.config).await.map_err(AppError)?;
+    state.app.storage.save_ai_config(&body.config).await.map_err(AppError::from)?;
     Ok(Json(()))
 }
 
 pub async fn load_ai_config(State(state): State<Arc<WebState>>) -> Result<Json<Option<AiConfig>>, AppError> {
-    let config = state.app.storage.load_ai_config().await.map_err(AppError)?;
+    let config = state.app.storage.load_ai_config().await.map_err(AppError::from)?;
     Ok(Json(config))
 }
 
@@ -130,14 +130,14 @@ pub async fn save_ai_provider_config(
     let mut config = body.config;
     config.provider = parsed_provider;
     reject_web_unsupported_ai_provider(&config)?;
-    state.app.storage.save_ai_provider_config(&body.provider, &config).await.map_err(AppError)?;
+    state.app.storage.save_ai_provider_config(&body.provider, &config).await.map_err(AppError::from)?;
     Ok(Json(()))
 }
 
 pub async fn load_ai_provider_configs(
     State(state): State<Arc<WebState>>,
 ) -> Result<Json<HashMap<String, AiConfig>>, AppError> {
-    let configs = state.app.storage.load_ai_provider_configs().await.map_err(AppError)?;
+    let configs = state.app.storage.load_ai_provider_configs().await.map_err(AppError::from)?;
     Ok(Json(configs))
 }
 
@@ -158,12 +158,12 @@ pub async fn save_ai_configs(
     for item in &body.configs {
         reject_web_unsupported_ai_provider(&item.config)?;
     }
-    state.app.storage.save_ai_configs(&body.configs).await.map_err(AppError)?;
+    state.app.storage.save_ai_configs(&body.configs).await.map_err(AppError::from)?;
     Ok(Json(()))
 }
 
 pub async fn load_ai_configs(State(state): State<Arc<WebState>>) -> Result<Json<Vec<AiConfigItem>>, AppError> {
-    let configs = state.app.storage.load_ai_configs().await.map_err(AppError)?;
+    let configs = state.app.storage.load_ai_configs().await.map_err(AppError::from)?;
     Ok(Json(configs))
 }
 
@@ -177,7 +177,7 @@ pub async fn set_default_ai_config(
     State(state): State<Arc<WebState>>,
     Json(body): Json<SetDefaultAiConfigRequest>,
 ) -> Result<Json<()>, AppError> {
-    state.app.storage.set_default_ai_config(&body.config_id).await.map_err(AppError)?;
+    state.app.storage.set_default_ai_config(&body.config_id).await.map_err(AppError::from)?;
     Ok(Json(()))
 }
 
@@ -192,7 +192,7 @@ pub async fn save_ai_config_item(
     Json(body): Json<SaveAiConfigItemRequest>,
 ) -> Result<Json<()>, AppError> {
     reject_web_unsupported_ai_provider(&body.config.config)?;
-    state.app.storage.save_ai_config_item(&body.config).await.map_err(AppError)?;
+    state.app.storage.save_ai_config_item(&body.config).await.map_err(AppError::from)?;
     Ok(Json(()))
 }
 
@@ -200,7 +200,7 @@ pub async fn delete_ai_config(
     State(state): State<Arc<WebState>>,
     Path(config_id): Path<String>,
 ) -> Result<Json<()>, AppError> {
-    state.app.storage.delete_ai_config(&config_id).await.map_err(AppError)?;
+    state.app.storage.delete_ai_config(&config_id).await.map_err(AppError::from)?;
     Ok(Json(()))
 }
 
@@ -212,12 +212,12 @@ pub async fn save_ai_conversation(
     State(state): State<Arc<WebState>>,
     Json(body): Json<SaveAiConversationRequest>,
 ) -> Result<Json<()>, AppError> {
-    state.app.storage.save_ai_conversation(&body.conversation).await.map_err(AppError)?;
+    state.app.storage.save_ai_conversation(&body.conversation).await.map_err(AppError::from)?;
     Ok(Json(()))
 }
 
 pub async fn load_ai_conversations(State(state): State<Arc<WebState>>) -> Result<Json<Vec<AiConversation>>, AppError> {
-    let conversations = state.app.storage.load_ai_conversations().await.map_err(AppError)?;
+    let conversations = state.app.storage.load_ai_conversations().await.map_err(AppError::from)?;
     Ok(Json(conversations))
 }
 
@@ -225,7 +225,7 @@ pub async fn delete_ai_conversation(
     State(state): State<Arc<WebState>>,
     Path(id): Path<String>,
 ) -> Result<Json<()>, AppError> {
-    state.app.storage.delete_ai_conversation(&id).await.map_err(AppError)?;
+    state.app.storage.delete_ai_conversation(&id).await.map_err(AppError::from)?;
     Ok(Json(()))
 }
 
@@ -235,7 +235,7 @@ pub async fn delete_ai_conversation(
 
 pub async fn ai_complete(Json(body): Json<AiCompleteRequest>) -> Result<Json<String>, AppError> {
     reject_web_unsupported_ai_provider(&body.request.config)?;
-    let result = dbx_core::ai::complete(&body.request).await.map_err(AppError)?;
+    let result = dbx_core::ai::complete(&body.request).await.map_err(AppError::from)?;
     Ok(Json(result))
 }
 
@@ -247,13 +247,13 @@ pub async fn ai_test_connection(
     Json(body): Json<AiTestConnectionRequest>,
 ) -> Result<Json<AiTestConnectionResult>, AppError> {
     reject_web_unsupported_ai_provider(&body.config)?;
-    let result = dbx_core::ai::test_connection_core(&body.config).await.map_err(AppError)?;
+    let result = dbx_core::ai::test_connection_core(&body.config).await.map_err(AppError::from)?;
     Ok(Json(result))
 }
 
 pub async fn ai_list_models(Json(body): Json<AiListModelsRequest>) -> Result<Json<Vec<AiModelInfo>>, AppError> {
     reject_web_unsupported_ai_provider(&body.config)?;
-    let result = dbx_core::ai::list_models_core(&body.config).await.map_err(AppError)?;
+    let result = dbx_core::ai::list_models_core(&body.config).await.map_err(AppError::from)?;
     Ok(Json(result))
 }
 
@@ -323,7 +323,7 @@ pub async fn ai_agent_stream(
     let (tx, rx) = tokio::sync::broadcast::channel::<String>(256);
 
     let parsed_db_type: DatabaseType = serde_json::from_str(&format!("\"{}\"", body.db_type))
-        .map_err(|_| AppError(format!("Unknown database type: {}", body.db_type)))?;
+        .map_err(|_| AppError::from(format!("Unknown database type: {}", body.db_type)))?;
     let production_database = state
         .app
         .configs
@@ -332,6 +332,10 @@ pub async fn ai_agent_stream(
         .get(&body.connection_id)
         .is_some_and(|config| dbx_core::production_safety::is_production_database(config, &body.database));
 
+    let max_agent_turns = state.app.storage.load_max_agent_turns().await.unwrap_or_else(|err| {
+        log::warn!("Failed to load max_agent_turns setting, using default: {err}");
+        dbx_core::agent_loop::DEFAULT_MAX_AGENT_TURNS
+    });
     let agent_ctx = AgentLoopContext {
         state: state.app.clone(),
         connection_id: body.connection_id,
@@ -342,6 +346,7 @@ pub async fn ai_agent_stream(
             allow_writes: !production_database && body.allow_write_sql,
             allow_dangerous: !production_database && body.allow_write_sql,
         },
+        max_agent_turns,
     };
 
     let sid = session_id.clone();

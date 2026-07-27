@@ -59,6 +59,7 @@ pub fn agent_connect_params(config: &ConnectionConfig, host: &str, port: u16, da
         "ca_cert_path": config.ca_cert_path,
         "client_cert_path": config.client_cert_path,
         "client_key_path": config.client_key_path,
+        "connect_timeout_secs": config.effective_connect_timeout_secs(),
         "etcd_endpoints": etcd_endpoints,
         "zookeeper_connect_string": zookeeper_connect_string,
         "gbase_server": config.gbase_server,
@@ -259,6 +260,11 @@ pub fn oracle_error_with_driver_hint(config: &ConnectionConfig, err: &str) -> St
 
 pub fn oracle_alternate_connect_configs(config: &ConnectionConfig, err: &str) -> Vec<ConnectionConfig> {
     if config.db_type != DatabaseType::Oracle {
+        return Vec::new();
+    }
+    if config.oracle_connection_type.as_deref() == Some("tns") {
+        // TNS owns its complete address/failover descriptor; host-based retries would
+        // replace the configured alias with unrelated Service Name/SID URLs.
         return Vec::new();
     }
     if config.connection_string.as_deref().is_some_and(|value| !value.trim().is_empty()) {
@@ -735,6 +741,16 @@ mod tests {
     }
 
     #[test]
+    fn agent_params_include_effective_connect_timeout_seconds() {
+        let mut cfg = config(DatabaseType::Mysql, Some("app"));
+        cfg.connect_timeout_secs = 45;
+
+        let params = agent_connect_params(&cfg, "mysql.example.com", 3306, "app");
+
+        assert_eq!(params["connect_timeout_secs"], 45);
+    }
+
+    #[test]
     fn zookeeper_agent_params_fall_back_to_host_port_connect_string() {
         let cfg = config(DatabaseType::ZooKeeper, None);
 
@@ -791,6 +807,20 @@ mod tests {
         cfg.oracle_connection_type = Some("service_name".to_string());
         let service = agent_connect_params(&cfg, "oracle.example.com", 1521, "ORCL");
         assert_eq!(service["connection_string"], "jdbc:oracle:thin:@//oracle.example.com:1521/ORCL");
+    }
+
+    #[test]
+    fn oracle_tns_does_not_retry_with_host_based_descriptors() {
+        let mut cfg = config(DatabaseType::Oracle, Some("DBX_FAILOVER"));
+        cfg.oracle_connection_type = Some("tns".to_string());
+        cfg.connection_string =
+            Some("jdbc:oracle:thin:@DBX_FAILOVER?TNS_ADMIN=%2Fopt%2Foracle%2Fnetwork%2Fadmin".to_string());
+
+        assert!(oracle_alternate_connect_configs(
+            &cfg,
+            "ORA-12514: listener does not currently know of service requested"
+        )
+        .is_empty());
     }
 
     #[test]

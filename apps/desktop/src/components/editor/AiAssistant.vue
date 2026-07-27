@@ -47,15 +47,18 @@ import { useSettingsStore, AI_PROVIDER_PRESETS, normalizeAiConfig } from "@/stor
 import AiProviderLogo from "@/components/icons/AiProviderLogo.vue";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useSavedSqlStore } from "@/stores/savedSqlStore";
+import { usePromptTemplateStore } from "@/stores/promptTemplateStore";
 import { connectionIconType } from "@/lib/connection/connectionPresentation";
 import DatabaseIcon from "@/components/icons/DatabaseIcon.vue";
 import ConnectionGroupBadge from "@/components/connection/ConnectionGroupBadge.vue";
 import { useQueryStore } from "@/stores/queryStore";
 import { useToast } from "@/composables/useToast";
 import { useNavigationTargets } from "@/composables/useNavigationTargets";
-import { buildAiContext, runAgentStream, isVectorDbType, isValidActionForMode, defaultActionForMode, type AiAction, type AiAssistantMode, type AiSqlFileContext } from "@/lib/ai/ai";
+import { buildAiContext, runAgentStream, isVectorDbType, isValidActionForMode, defaultActionForMode, type AiAction, type AiAssistantMode, type AiSqlFileContext, type CustomPromptContext } from "@/lib/ai/ai";
+import { getAiConfigModelIds, isAiConfigModelCandidate } from "@/lib/ai/aiConfigCandidates";
 import { orderAiConfigsForDisplay } from "@/lib/ai/aiConfigOrdering";
 import { normalizeClaudeCodeReasoningLevel } from "@/lib/ai/aiModelEffort";
+import { ACTIVE_TEMPLATES_TOTAL_MAX, promptTemplateCharacterCount } from "@/types/promptTemplate";
 
 import type { AgentEvent } from "@/lib/backend/tauri";
 import { buildAiAgentPlan } from "@/lib/ai/aiAgentPlan";
@@ -85,6 +88,7 @@ const { t } = useI18n();
 const settings = useSettingsStore();
 const connectionStore = useConnectionStore();
 const savedSqlStore = useSavedSqlStore();
+const promptTemplateStore = usePromptTemplateStore();
 const queryStore = useQueryStore();
 const { openTableTarget } = useNavigationTargets({
   showFieldLineageDialog: ref(false),
@@ -132,6 +136,8 @@ const emit = defineEmits<{
   executeSql: [sql: string];
   tempRunSql: [sql: string];
   requestAutoExecuteSql: [sql: string];
+  insertRedisCommand: [command: string];
+  executeRedisCommand: [command: string];
   openExplainPlan: [sql: string];
   close: [];
 }>();
@@ -146,6 +152,67 @@ const currentSessionId = ref("");
 const conversationId = ref("");
 const conversations = ref<AiConversation[]>([]);
 const showConversationList = ref(false);
+const showTemplateSelector = ref(false);
+
+// Prompt template selection (panel-session scope)
+const activeTemplateIds = ref<string[]>([]);
+const activeTemplates = computed(() => promptTemplateStore.templates.filter((t) => activeTemplateIds.value.includes(t.id)));
+
+watch(
+  () => promptTemplateStore.templates,
+  (templates) => {
+    const availableIds = new Set(templates.map((template) => template.id));
+    activeTemplateIds.value = activeTemplateIds.value.filter((id) => availableIds.has(id));
+  },
+);
+
+// Retry store load on selector open if prior init failed (e.g. backend not yet ready at mount)
+watch(showTemplateSelector, (open) => {
+  if (open) void promptTemplateStore.ensureLoaded();
+});
+
+// Reset template selection when the user switches to a different connection or database —
+// a new database context warrants a fresh selection of scenario templates.
+watch(
+  // Return a stable primitive key: a fresh array literal is never Object.is-equal to the
+  // previous one, so a getter returning `[id, database]` fires on every dependency
+  // invalidation (e.g. the 30s backup scheduler replacing connection objects) even when the
+  // id/database values are unchanged — spuriously clearing the selection mid agent-run.
+  () => `${props.connection?.id ?? ""}::${props.tab?.database ?? ""}`,
+  () => {
+    activeTemplateIds.value = [];
+  },
+);
+
+function toggleTemplateId(id: string) {
+  if (activeTemplateIds.value.includes(id)) {
+    activeTemplateIds.value = activeTemplateIds.value.filter((tid) => tid !== id);
+  } else {
+    // Check total content limit
+    const tpl = promptTemplateStore.templates.find((t) => t.id === id);
+    if (tpl) {
+      const currentTotal = activeTemplates.value.reduce((sum, template) => sum + promptTemplateCharacterCount(template.content), 0);
+      if (currentTotal + promptTemplateCharacterCount(tpl.content) > ACTIVE_TEMPLATES_TOTAL_MAX) {
+        toast(t("ai.templateSelectorTooLong", { max: ACTIVE_TEMPLATES_TOTAL_MAX }), 4000);
+        return;
+      }
+    }
+    activeTemplateIds.value = [...activeTemplateIds.value, id];
+  }
+}
+
+function deselectAllTemplates() {
+  activeTemplateIds.value = [];
+}
+
+const templateSelectorLabel = computed(() => {
+  if (!promptTemplateStore.isLoaded) return t("ai.templateSelectorLoading");
+  const count = activeTemplates.value.length;
+  if (count === 0) return t("ai.templateSelectorNone");
+  const name = activeTemplates.value[0].name;
+  if (count === 1) return name;
+  return `${name} +${count - 1}`;
+});
 const promptTextareaRef = ref<HTMLTextAreaElement | null>(null);
 const shouldAutoScroll = ref(true);
 const userPausedAutoScroll = ref(false);
@@ -167,7 +234,9 @@ const MESSAGE_SCROLL_BUTTON_HIDE_THRESHOLD_PX = 48;
 let messageScrollViewport: HTMLElement | null = null;
 let messageTouchStartY: number | null = null;
 let lastMessageScrollTop = 0;
+const STREAM_RENDER_INTERVAL_MS = 33;
 let assistantDeltaFrame: number | null = null;
+let lastAssistantFlushAt = 0;
 let pendingAssistantDelta = "";
 let pendingAssistantReasoning = "";
 let pendingAssistantIndex = -1;
@@ -231,14 +300,7 @@ const modelSearchQuery = ref("");
 
 // Configured providers for quick switching - get from aiConfigs
 const configuredProviders = computed(() => {
-  const providers = orderAiConfigsForDisplay(
-    settings.aiConfigs.filter((c) => {
-      // Check directly if config has required fields
-      const preset = AI_PROVIDER_PRESETS[c.provider];
-      if (c.provider === "codex-cli" || c.provider === "claude-code-cli") return true;
-      return !!c.endpoint?.trim() && !!c.model?.trim() && (!preset.requiresApiKey || !!c.apiKey?.trim());
-    }),
-  );
+  const providers = orderAiConfigsForDisplay(settings.aiConfigs.filter((config) => isAiConfigModelCandidate(config, AI_PROVIDER_PRESETS[config.provider].requiresApiKey)));
   // Apply search filter - hide providers with no matching models
   if (modelSearchQuery.value.trim()) {
     const query = modelSearchQuery.value.trim().toLowerCase();
@@ -268,12 +330,7 @@ const activeFullConfig = computed(() => {
 function getModelsForConfig(configId: string): string[] {
   const config = settings.aiConfigs.find((c) => c.id === configId);
   if (!config) return [];
-  const models = config.models?.map((m) => m.name) || [];
-  // Always include the current model
-  if (config.model && !models.includes(config.model)) {
-    return [config.model, ...models];
-  }
-  return models;
+  return getAiConfigModelIds(config);
 }
 
 function getConfigModelOptionIds(configId: string): string[] {
@@ -390,6 +447,7 @@ const agentActionButtons: AiActionButton[] = [
 ];
 
 const actionButtons = computed<AiActionButton[]>(() => (assistantMode.value === "agent" ? agentActionButtons : askActionButtons));
+const isRedisConnection = computed(() => props.connection?.db_type === "redis");
 
 // Vector DBs hide the action menu and only expose collection tools.
 // Keep their action at `generate` so the task contract doesn't tell the LLM to call execute_query.
@@ -626,6 +684,7 @@ function changeDatabase(value: string) {
 
 function flushAssistantDeltas() {
   assistantDeltaFrame = null;
+  lastAssistantFlushAt = performance.now();
   const msg = messages.value[pendingAssistantIndex];
   if (!msg) return;
   if (pendingAssistantReasoning) {
@@ -641,12 +700,22 @@ function flushAssistantDeltas() {
   scrollToBottom();
 }
 
+function runAssistantDeltaFrame() {
+  // Markdown is rendered live, so keep the refresh rate under the frame rate:
+  // a repaint every STREAM_RENDER_INTERVAL_MS still reads as continuous typing.
+  if (performance.now() - lastAssistantFlushAt < STREAM_RENDER_INTERVAL_MS) {
+    assistantDeltaFrame = requestAnimationFrame(runAssistantDeltaFrame);
+    return;
+  }
+  flushAssistantDeltas();
+}
+
 function scheduleAssistantDeltaFlush(assistantIdx: number) {
   pendingAssistantIndex = assistantIdx;
   if (assistantDeltaFrame !== null) return;
-  // Providers can emit many tiny chunks. Render once per animation frame so
+  // Providers can emit many tiny chunks. Batch them on an animation frame so
   // Markdown parsing, highlighting, and layout do not run for every token.
-  assistantDeltaFrame = requestAnimationFrame(flushAssistantDeltas);
+  assistantDeltaFrame = requestAnimationFrame(runAssistantDeltaFrame);
 }
 
 function appendAssistantDelta(assistantIdx: number, delta: string) {
@@ -1390,6 +1459,21 @@ async function send() {
     toast(t("ai.noConfig"));
     return;
   }
+  // Acquire the send guard before the first async operation so two rapid
+  // submissions cannot both pass the initial isGenerating check and then
+  // resume into concurrent agent runs.
+  isGenerating.value = true;
+  if (!(await promptTemplateStore.ensureLoaded())) {
+    isGenerating.value = false;
+    toast(t("ai.customInstructionsLoadFailed"), 5000);
+    return;
+  }
+  // Snapshot the selected custom prompts at send time so later async context loading
+  // cannot change the instructions for an already-submitted request.
+  const customPromptContext: CustomPromptContext = {
+    globalInstructions: promptTemplateStore.globalInstructions,
+    activeTemplates: [...activeTemplates.value],
+  };
 
   const selectedTableMentions = [...selectedMentions.value];
   const selectedSqlFiles = [...selectedSqlFileMentions.value];
@@ -1414,7 +1498,6 @@ async function send() {
   // Agent confirmation cannot grant autonomous writes while the active database is production.
   const allowWriteSql = requestedMode === "agent" && allowWriteSqlForNextRun && !productionContext.value.active;
   allowWriteSqlForNextRun = false;
-  isGenerating.value = true;
   messages.value.push({ role: "assistant", content: "" });
   const assistantIdx = messages.value.length - 1;
   const sessionId = uuid();
@@ -1472,10 +1555,11 @@ async function send() {
         scrollToBottom();
       },
       sessionId,
+      customPromptContext,
     );
   } catch (e: unknown) {
     const message = e instanceof Error ? e.message : String(e);
-    messages.value[assistantIdx].content = `Error: ${message}`;
+    messages.value[assistantIdx].content = `${t("ai.requestFailed")}\n\n${translateBackendError(t, message)}`;
   } finally {
     if (assistantDeltaFrame !== null) cancelAnimationFrame(assistantDeltaFrame);
     flushAssistantDeltas();
@@ -1531,14 +1615,26 @@ async function cancelStream() {
 }
 
 function applySql(code: string) {
+  if (isRedisConnection.value) {
+    emit("insertRedisCommand", code);
+    return;
+  }
   emit("replaceSql", code);
 }
 
 function executeSql(code: string) {
+  if (isRedisConnection.value) {
+    emit("executeRedisCommand", code);
+    return;
+  }
   emit("executeSql", code);
 }
 
 function tempRunSql(code: string) {
+  if (isRedisConnection.value) {
+    emit("executeRedisCommand", code);
+    return;
+  }
   emit("tempRunSql", code);
 }
 
@@ -1562,6 +1658,7 @@ function clearMessages() {
   conversationId.value = "";
   historyIndex.value = -1;
   draftBeforeHistory.value = "";
+  messageRenderer.value.clear();
 }
 
 async function persistConversation() {
@@ -1592,6 +1689,8 @@ async function setConversationListOpen(open: boolean) {
 
 function selectConversation(conv: AiConversation) {
   conversationId.value = conv.id;
+  // Drop the previous conversation's rendered Markdown instead of keeping it until the LRU evicts it.
+  messageRenderer.value.clear();
   messages.value = conv.messages.map((m) => ({
     role: m.role as "user" | "assistant",
     content: m.content,
@@ -1733,6 +1832,15 @@ const messageRenderer = computed(() => {
   });
 });
 
+/**
+ * Renders Markdown live while the answer streams in. The renderer reuses the
+ * already-finished segments, so a frame only re-parses the growing tail.
+ */
+function renderMessageSegments(msg: ChatMessage) {
+  const streaming = isGenerating.value && msg === messages.value[messages.value.length - 1];
+  return messageRenderer.value.render(msg.content, { streaming });
+}
+
 function onMarkdownClick(event: MouseEvent) {
   handleAiMarkdownLinkClick(event, openExternalUrl);
 }
@@ -1865,7 +1973,7 @@ async function openExternalUrl(url: string) {
             </div>
 
             <div v-else-if="msg.content || msg.reasoning || msg.isThinking" class="flex">
-              <div class="max-w-[95%] min-w-0 rounded-lg bg-muted px-3 py-2 text-xs leading-relaxed">
+              <div class="max-w-[95%] min-w-0 rounded-lg bg-muted px-3 py-2 text-xs leading-relaxed [overflow-wrap:anywhere]">
                 <div v-if="msg.reasoning || msg.isThinking" class="mb-2">
                   <button class="flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground transition-colors" @click="toggleReasoning()">
                     <ChevronRight class="h-3 w-3 transition-transform duration-200" :class="{ 'rotate-90': reasoningExpanded }" />
@@ -1907,8 +2015,7 @@ async function openExternalUrl(url: string) {
                     </div>
                   </div>
                 </div>
-                <div v-if="isGenerating && msg === messages[messages.length - 1]" class="whitespace-pre-wrap break-words leading-relaxed">{{ msg.content }}</div>
-                <template v-else v-for="(seg, j) in messageRenderer.render(msg.content)" :key="j">
+                <template v-for="(seg, j) in renderMessageSegments(msg)" :key="j">
                   <div v-if="seg.type === 'text'" class="ai-markdown whitespace-normal" @click.capture="onMarkdownClick">
                     <div v-html="seg.html" />
                   </div>
@@ -1917,14 +2024,16 @@ async function openExternalUrl(url: string) {
                       <component :is="seg.isSql ? Database : Terminal" class="h-3 w-3 mr-1.5" />
                       <span>{{ seg.lang }}</span>
                       <span class="flex-1" />
+                      <!-- `pending` means the closing fence is still missing, so the code is truncated: never offer to run or apply it. -->
+                      <Loader2 v-if="seg.pending && isGenerating" class="h-3 w-3 animate-spin text-zinc-400" />
                       <div class="flex items-center gap-1.5">
-                        <button v-if="seg.isSql" class="rounded p-0.5 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-700 dark:hover:text-zinc-200" :title="t('ai.tempRunSql')" @click="tempRunSql(seg.content)">
+                        <button v-if="!seg.pending && seg.isSql && !isRedisConnection" class="rounded p-0.5 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-700 dark:hover:text-zinc-200" :title="t('ai.tempRunSql')" @click="tempRunSql(seg.content)">
                           <FlaskConical class="h-3.5 w-3.5" />
                         </button>
-                        <button v-if="seg.isSql" class="rounded p-0.5 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-700 dark:hover:text-zinc-200" :title="t('ai.executeSql')" @click="executeSql(seg.content)">
+                        <button v-if="!seg.pending && (seg.isSql || isRedisConnection)" class="rounded p-0.5 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-700 dark:hover:text-zinc-200" :title="t('ai.executeSql')" @click="executeSql(seg.content)">
                           <Play class="h-3.5 w-3.5" />
                         </button>
-                        <button v-if="seg.isSql" class="rounded p-0.5 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-700 dark:hover:text-zinc-200" :title="t('ai.apply')" @click="applySql(seg.content)">
+                        <button v-if="!seg.pending && (seg.isSql || isRedisConnection)" class="rounded p-0.5 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-700 dark:hover:text-zinc-200" :title="t('ai.apply')" @click="applySql(seg.content)">
                           <Replace class="h-3.5 w-3.5" />
                         </button>
                         <button
@@ -2105,6 +2214,44 @@ async function openExternalUrl(url: string) {
             @keydown="onPromptKeydown"
           />
           <div class="flex min-w-0 flex-nowrap items-center gap-1.5 overflow-hidden">
+            <!-- Template selector -->
+            <Popover v-model:open="showTemplateSelector">
+              <PopoverTrigger as-child>
+                <button type="button" class="flex shrink-0 items-center gap-1 whitespace-nowrap rounded-[6px] border px-2 py-0.5 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground">
+                  <FileCode class="h-3 w-3" />
+                  {{ t("ai.templateSelectorLabel", { label: templateSelectorLabel }) }}
+                  <svg class="h-3 w-3 shrink-0 opacity-60" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6" /></svg>
+                </button>
+              </PopoverTrigger>
+              <PopoverContent align="start" class="w-64 gap-0 p-1.5">
+                <div class="max-h-64 overflow-auto">
+                  <div v-if="!promptTemplateStore.isLoaded" class="px-3 py-4 text-center text-xs text-muted-foreground">
+                    {{ t("ai.templateSelectorLoading") }}
+                  </div>
+                  <div v-else-if="promptTemplateStore.templates.length === 0" class="px-3 py-4 text-center text-xs text-muted-foreground">
+                    {{ t("ai.templateSelectorEmpty") }}
+                  </div>
+                  <template v-else>
+                    <template v-for="tpl in promptTemplateStore.templates" :key="tpl.id">
+                      <button type="button" class="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-xs hover:bg-muted" @click="toggleTemplateId(tpl.id)">
+                        <div class="flex h-4 w-4 shrink-0 items-center justify-center rounded-sm border" :class="activeTemplateIds.includes(tpl.id) ? 'border-primary bg-primary text-primary-foreground' : ''">
+                          <Check v-if="activeTemplateIds.includes(tpl.id)" class="h-3 w-3" />
+                        </div>
+                        <div class="flex-1 truncate text-left">
+                          <div class="font-medium">{{ tpl.name }}</div>
+                          <div class="text-[10px] text-muted-foreground truncate">{{ tpl.content.slice(0, 60) }}</div>
+                        </div>
+                      </button>
+                    </template>
+                  </template>
+                </div>
+                <div v-if="promptTemplateStore.isLoaded && promptTemplateStore.templates.length > 0" class="border-t mt-1 pt-1 px-1">
+                  <button type="button" class="flex w-full items-center gap-2 rounded-sm px-2 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground" @click="deselectAllTemplates">
+                    {{ t("ai.templateSelectorDeselectAll") }}
+                  </button>
+                </div>
+              </PopoverContent>
+            </Popover>
             <LightDropdown
               v-model="assistantMode"
               :items="assistantModeItems"

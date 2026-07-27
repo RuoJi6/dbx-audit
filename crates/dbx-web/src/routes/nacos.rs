@@ -70,6 +70,14 @@ pub(crate) struct ConfigRollbackReq {
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct RNacosConsoleLoginReq {
+    connection_id: String,
+    #[serde(default)]
+    captcha: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct ServiceListReq {
     connection_id: String,
     query: dbx_core::nacos::NacosServiceQuery,
@@ -100,8 +108,9 @@ pub async fn test_connection(
     State(state): State<Arc<WebState>>,
     Json(req): Json<ConnReq>,
 ) -> Result<Json<dbx_core::nacos::NacosConnectionInfo>, AppError> {
-    let result =
-        dbx_core::nacos::service::nacos_test_connection_core(&state.app, &req.connection_id).await.map_err(AppError)?;
+    let result = dbx_core::nacos::service::nacos_test_connection_core(&state.app, &req.connection_id)
+        .await
+        .map_err(AppError::from)?;
     Ok(Json(result))
 }
 
@@ -109,8 +118,9 @@ pub async fn list_namespaces(
     State(state): State<Arc<WebState>>,
     Json(req): Json<ConnReq>,
 ) -> Result<Json<Vec<dbx_core::nacos::NacosNamespaceInfo>>, AppError> {
-    let result =
-        dbx_core::nacos::service::nacos_list_namespaces_core(&state.app, &req.connection_id).await.map_err(AppError)?;
+    let result = dbx_core::nacos::service::nacos_list_namespaces_core(&state.app, &req.connection_id)
+        .await
+        .map_err(AppError::from)?;
     Ok(Json(result))
 }
 
@@ -120,7 +130,7 @@ pub async fn create_namespace(
 ) -> Result<Json<()>, AppError> {
     dbx_core::nacos::service::nacos_create_namespace_core(&state.app, &req.connection_id, req.req)
         .await
-        .map_err(AppError)?;
+        .map_err(AppError::from)?;
     Ok(Json(()))
 }
 
@@ -130,7 +140,7 @@ pub async fn update_namespace(
 ) -> Result<Json<()>, AppError> {
     dbx_core::nacos::service::nacos_update_namespace_core(&state.app, &req.connection_id, req.req)
         .await
-        .map_err(AppError)?;
+        .map_err(AppError::from)?;
     Ok(Json(()))
 }
 
@@ -140,7 +150,7 @@ pub async fn list_configs(
 ) -> Result<Json<dbx_core::nacos::NacosConfigList>, AppError> {
     let result = dbx_core::nacos::service::nacos_list_configs_core(&state.app, &req.connection_id, req.query)
         .await
-        .map_err(AppError)?;
+        .map_err(AppError::from)?;
     Ok(Json(result))
 }
 
@@ -150,7 +160,7 @@ pub async fn get_config(
 ) -> Result<Json<dbx_core::nacos::NacosConfigItem>, AppError> {
     let result = dbx_core::nacos::service::nacos_get_config_core(&state.app, &req.connection_id, req.key)
         .await
-        .map_err(AppError)?;
+        .map_err(AppError::from)?;
     Ok(Json(result))
 }
 
@@ -160,7 +170,7 @@ pub async fn publish_config(
 ) -> Result<Json<()>, AppError> {
     dbx_core::nacos::service::nacos_publish_config_core(&state.app, &req.connection_id, req.req)
         .await
-        .map_err(AppError)?;
+        .map_err(AppError::from)?;
     Ok(Json(()))
 }
 
@@ -170,7 +180,7 @@ pub async fn delete_config(
 ) -> Result<Json<()>, AppError> {
     dbx_core::nacos::service::nacos_delete_config_core(&state.app, &req.connection_id, req.key)
         .await
-        .map_err(AppError)?;
+        .map_err(AppError::from)?;
     Ok(Json(()))
 }
 
@@ -180,7 +190,7 @@ pub async fn list_config_history(
 ) -> Result<Json<dbx_core::nacos::NacosConfigHistoryList>, AppError> {
     let result = dbx_core::nacos::service::nacos_list_config_history_core(&state.app, &req.connection_id, req.query)
         .await
-        .map_err(AppError)?;
+        .map_err(AppError::from)?;
     Ok(Json(result))
 }
 
@@ -190,7 +200,7 @@ pub async fn get_config_history(
 ) -> Result<Json<dbx_core::nacos::NacosConfigItem>, AppError> {
     let result = dbx_core::nacos::service::nacos_get_config_history_core(&state.app, &req.connection_id, req.key)
         .await
-        .map_err(AppError)?;
+        .map_err(AppError::from)?;
     Ok(Json(result))
 }
 
@@ -200,7 +210,27 @@ pub async fn rollback_config(
 ) -> Result<Json<()>, AppError> {
     dbx_core::nacos::service::nacos_rollback_config_core(&state.app, &req.connection_id, req.req)
         .await
-        .map_err(AppError)?;
+        .map_err(AppError::from)?;
+    Ok(Json(()))
+}
+
+pub async fn get_rnacos_console_captcha(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<ConnReq>,
+) -> Result<Json<dbx_core::nacos::NacosRNacosConsoleCaptcha>, AppError> {
+    let result = dbx_core::nacos::service::nacos_get_rnacos_console_captcha_core(&state.app, &req.connection_id)
+        .await
+        .map_err(AppError::from)?;
+    Ok(Json(result))
+}
+
+pub async fn login_rnacos_console(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<RNacosConsoleLoginReq>,
+) -> Result<Json<()>, AppError> {
+    dbx_core::nacos::service::nacos_login_rnacos_console_core(&state.app, &req.connection_id, req.captcha)
+        .await
+        .map_err(AppError::from)?;
     Ok(Json(()))
 }
 
@@ -210,7 +240,7 @@ pub async fn list_services(
 ) -> Result<Json<dbx_core::nacos::NacosServiceList>, AppError> {
     let result = dbx_core::nacos::service::nacos_list_services_core(&state.app, &req.connection_id, req.query)
         .await
-        .map_err(AppError)?;
+        .map_err(AppError::from)?;
     Ok(Json(result))
 }
 
@@ -220,7 +250,7 @@ pub async fn list_instances(
 ) -> Result<Json<Vec<dbx_core::nacos::NacosInstanceInfo>>, AppError> {
     let result = dbx_core::nacos::service::nacos_list_instances_core(&state.app, &req.connection_id, req.query)
         .await
-        .map_err(AppError)?;
+        .map_err(AppError::from)?;
     Ok(Json(result))
 }
 
@@ -230,7 +260,7 @@ pub async fn update_instance(
 ) -> Result<Json<()>, AppError> {
     dbx_core::nacos::service::nacos_update_instance_core(&state.app, &req.connection_id, req.req)
         .await
-        .map_err(AppError)?;
+        .map_err(AppError::from)?;
     Ok(Json(()))
 }
 
@@ -240,6 +270,6 @@ pub async fn raw_request(
 ) -> Result<Json<dbx_core::nacos::NacosRawResponse>, AppError> {
     let result = dbx_core::nacos::service::nacos_raw_request_core(&state.app, &req.connection_id, req.req)
         .await
-        .map_err(AppError)?;
+        .map_err(AppError::from)?;
     Ok(Json(result))
 }
