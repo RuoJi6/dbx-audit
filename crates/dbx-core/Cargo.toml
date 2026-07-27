@@ -83,6 +83,8 @@ quick-xml = "0.37"
 base64 = "0.22"
 jsonwebtoken = "9"
 aes-gcm = "0.10"
+aes = "0.8"
+cbc = "0.1"
 argon2 = "0.5"
 sha2 = "0.10"
 async-trait = "0.1"
@@ -90,3 +92,4 @@ bytes = "1"
 font-kit = "0.14.3"
 zip = { version = "4", default-features = false, features = ["deflate"] }
 sysinfo = { version = "0.32", features = ["system"] }
+tempfile = "3"

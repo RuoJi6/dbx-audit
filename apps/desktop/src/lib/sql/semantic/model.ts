@@ -21,7 +21,7 @@ const TABLE_FUNCTION_NAMES = new Set(["table", "xmltable", "json_table", "the", 
 const JOIN_MODIFIERS = new Set(["left", "right", "inner", "outer", "cross", "full", "natural"]);
 const CLAUSE_BOUNDARIES = new Set(["where", "group", "having", "order", "limit", "offset", "union", "intersect", "except", "on", "set", "values", "returning"]);
 const FROM_CLAUSE_BOUNDARIES = new Set([...CLAUSE_BOUNDARIES, "window", "qualify", "fetch", "for", "connect", "start", "model"].filter((item) => item !== "on"));
-const ALIAS_BLACKLIST = new Set([...CLAUSE_BOUNDARIES, "join", "straight_join", "left", "right", "inner", "outer", "cross", "full", "natural", "as", "select", "from", "with"]);
+const ALIAS_BLACKLIST = new Set([...FROM_CLAUSE_BOUNDARIES, "on", "join", "straight_join", "left", "right", "inner", "outer", "cross", "full", "natural", "as", "select", "from", "with"]);
 const TABLE_TARGET_MODIFIERS = new Set(["lateral", "only"]);
 const TABLE_FUNCTION_INTRODUCERS = new Set(["from", "join", "straight_join", "apply"]);
 const TOP_LEVEL_STATEMENT_WORDS = new Set(["select", "insert", "delete", "merge", "create", "alter", "drop", "truncate", "call", "exec", "execute", "grant", "revoke"]);
@@ -409,6 +409,7 @@ function parseTableSource(state: ParseState, nameIndex: number, introducer: stri
     columns: cte?.columns ? mergeColumnAliases(cte.columns, alias.columns) : undefined,
     columnAliases: alias.columns,
     metadataTarget: {
+      database: qualifierParts.length >= 2 ? qualifierParts[qualifierParts.length - 2] : undefined,
       schema: qualifierParts[qualifierParts.length - 1],
       table: name,
     },
@@ -640,7 +641,11 @@ function buildCursorIntent(tokens: readonly SqlSemanticToken[], cursor: number, 
 
   if (
     trailing.qualifierParts.length > 0 &&
-    (previous === "from" || previous === "join" || TABLE_INTRODUCERS.has(previous) || TABLE_INTRODUCERS.has(wordBeforeReplacement) || (!!targetSource && !targetSource.alias && TABLE_INTRODUCERS.has(wordBeforePosition(tokens, targetSource.sourceSpan.start))))
+    (previous === "from" ||
+      previous === "join" ||
+      TABLE_INTRODUCERS.has(previous) ||
+      TABLE_INTRODUCERS.has(wordBeforeReplacement) ||
+      (!!targetSource && !targetSource.alias && trailing.replacementRange.start <= targetSource.sourceSpan.end + 1 && TABLE_INTRODUCERS.has(wordBeforePosition(tokens, targetSource.sourceSpan.start))))
   ) {
     const role = dialect.qualifierRole(trailing.qualifierParts, "table");
     return { kind: role === "catalog" ? "catalog" : "table", prefix: trailing.prefix, replacementRange: trailing.replacementRange, qualifierParts: trailing.qualifierParts, expectedObjectKinds: ["table", "view"], confidence: "medium" };

@@ -152,6 +152,15 @@ func mysqlSQLModeExists(db *sql.DB) bool {
 	return db.QueryRow("SELECT 1 FROM sys_catalog.sys_settings WHERE LOWER(name) = 'sql_mode'").Scan(&value) == nil
 }
 
+func (s *server) identifierQuote() string {
+	// Kingbase MySQL compatibility mode follows MySQL identifier quoting;
+	// other modes retain the PostgreSQL-compatible double quote.
+	if s.mode.mysqlCompat {
+		return "`"
+	}
+	return `"`
+}
+
 func (s *server) connectionInfo() (map[string]any, error) {
 	db, err := s.requireDB()
 	if err != nil {
@@ -164,7 +173,7 @@ func (s *server) connectionInfo() (map[string]any, error) {
 	}
 	return map[string]any{
 		"database": database, "username": username, "version": version, "schema": schema,
-		"mysql_compat_mode": s.mode.mysqlCompat,
+		"mysql_compat_mode": s.mode.mysqlCompat, "identifierQuote": s.identifierQuote(),
 	}, nil
 }
 
@@ -229,22 +238,16 @@ func (s *server) listTables(schema string, constraints metadataListConstraints) 
 	if !constraintsAllowsTableLike(constraints) {
 		return []tableInfo{}, nil
 	}
-	var query string
-	if s.mode.mysqlCompat {
-		query = "SELECT table_name, table_type, CAST(NULL AS varchar(4000)) FROM information_schema.tables WHERE table_schema = " + quoteLiteral(effective) + " ORDER BY table_name"
-	} else {
-		catalog := "sys_catalog"
-		if s.mode.postgresCatalog {
-			catalog = "pg_catalog"
-		}
-		query = fmt.Sprintf(`SELECT c.relname,
+	catalog := "sys_catalog"
+	if s.mode.postgresCatalog {
+		catalog = "pg_catalog"
+	}
+	query := fmt.Sprintf(`SELECT c.relname,
 CASE c.relkind WHEN 'r' THEN 'TABLE' WHEN 'p' THEN 'TABLE' WHEN 'v' THEN 'VIEW' WHEN 'm' THEN 'MATERIALIZED_VIEW' WHEN 'f' THEN 'FOREIGN_TABLE' ELSE 'TABLE' END,
-d.description
+obj_description(c.oid)
 FROM %s.%s_class c
 JOIN %s.%s_namespace n ON n.oid = c.relnamespace
-LEFT JOIN %s.%s_description d ON d.objoid = c.oid AND d.objsubid = 0
-WHERE n.nspname = %s AND c.relkind IN ('r','p','v','m','f') ORDER BY c.relname`, catalog, catalogPrefix(catalog), catalog, catalogPrefix(catalog), catalog, catalogPrefix(catalog), quoteLiteral(effective))
-	}
+WHERE n.nspname = %s AND c.relkind IN ('r','p','v','m','f') ORDER BY c.relname`, catalog, catalogPrefix(catalog), catalog, catalogPrefix(catalog), quoteLiteral(effective))
 	rows, err := s.metadataQuery(query)
 	if err != nil {
 		return nil, err
@@ -263,6 +266,31 @@ WHERE n.nspname = %s AND c.relkind IN ('r','p','v','m','f') ORDER BY c.relname`,
 		}
 	}
 	return pageTables(result, constraints), rows.Err()
+}
+
+func (s *server) getTableComment(schema, table string) (*string, error) {
+	effective, err := s.effectiveSchema(schema)
+	if err != nil {
+		return nil, err
+	}
+	catalog := "sys_catalog"
+	if s.mode.postgresCatalog {
+		catalog = "pg_catalog"
+	}
+	prefix := catalogPrefix(catalog)
+	query := fmt.Sprintf(`SELECT obj_description(c.oid)
+FROM %s.%s_class c
+JOIN %s.%s_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = %s AND c.relname = %s AND c.relkind IN ('r','p','v','m','f')
+LIMIT 1`, catalog, prefix, catalog, prefix, quoteLiteral(effective), quoteLiteral(table))
+	var comment sql.NullString
+	if err := s.requireDBQueryRow(query, &comment); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return nullStringPtr(comment), nil
 }
 
 func (s *server) listObjects(schema string, constraints metadataListConstraints) ([]objectInfo, error) {
@@ -426,15 +454,15 @@ func (s *server) queryCatalogColumns(
 	catalog, prefix, expression string,
 ) ([]columnInfo, error) {
 	query := fmt.Sprintf(`SELECT a.attname, format_type(a.atttypid, a.atttypmod), NOT a.attnotnull,
-%s(ad.adbin, ad.adrelid), d.description,
-CASE WHEN t.typname = 'numeric' AND a.atttypmod > 0 THEN ((a.atttypmod - 4) >> 16) & 65535 END,
-CASE WHEN t.typname = 'numeric' AND a.atttypmod > 0 THEN (a.atttypmod - 4) & 65535 END,
-CASE WHEN t.typname IN ('varchar','bpchar') AND a.atttypmod > 0 THEN a.atttypmod - 4 END
-FROM %s.%s_attribute a JOIN %s.%s_type t ON t.oid = a.atttypid
-JOIN %s.%s_class c ON c.oid = a.attrelid JOIN %s.%s_namespace n ON n.oid = c.relnamespace
-LEFT JOIN %s.%s_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
-LEFT JOIN %s.%s_description d ON d.objoid = a.attrelid AND d.objsubid = a.attnum
-WHERE n.nspname = %s AND c.relname = %s AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum`, expression, catalog, prefix, catalog, prefix, catalog, prefix, catalog, prefix, catalog, prefix, catalog, prefix, quoteLiteral(schema), quoteLiteral(table))
+	%s(ad.adbin, ad.adrelid), col_description(a.attrelid, a.attnum),
+	CASE WHEN t.typname = 'numeric' AND a.atttypmod > 0 THEN ((a.atttypmod - 4) >> 16) & 65535 END,
+	CASE WHEN t.typname = 'numeric' AND a.atttypmod > 0 THEN (a.atttypmod - 4) & 65535 END,
+	CASE WHEN t.typname IN ('varchar','bpchar') AND a.atttypmod > 0 THEN a.atttypmod - 4 END,
+	a.attidentity
+	FROM %s.%s_attribute a JOIN %s.%s_type t ON t.oid = a.atttypid
+	JOIN %s.%s_class c ON c.oid = a.attrelid JOIN %s.%s_namespace n ON n.oid = c.relnamespace
+	LEFT JOIN %s.%s_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
+WHERE n.nspname = %s AND c.relname = %s AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum`, expression, catalog, prefix, catalog, prefix, catalog, prefix, catalog, prefix, catalog, prefix, quoteLiteral(schema), quoteLiteral(table))
 	rows, err := s.metadataQuery(query)
 	if err != nil {
 		return nil, err
@@ -444,12 +472,12 @@ WHERE n.nspname = %s AND c.relname = %s AND a.attnum > 0 AND NOT a.attisdropped 
 	for rows.Next() {
 		var name, dataType string
 		var nullable bool
-		var defaultValue, comment sql.NullString
+		var defaultValue, comment, identity sql.NullString
 		var precision, scale, length sql.NullInt64
-		if err := rows.Scan(&name, &dataType, &nullable, &defaultValue, &comment, &precision, &scale, &length); err != nil {
+		if err := rows.Scan(&name, &dataType, &nullable, &defaultValue, &comment, &precision, &scale, &length, &identity); err != nil {
 			return nil, err
 		}
-		result = append(result, columnInfo{Name: name, DataType: dataType, IsNullable: nullable, ColumnDefault: nullStringPtr(defaultValue), IsPrimaryKey: primary[strings.ToLower(name)], Comment: nullStringPtr(comment), NumericPrecision: nullIntPtr(precision), NumericScale: nullIntPtr(scale), CharacterMaximumLength: nullIntPtr(length)})
+		result = append(result, columnInfo{Name: name, DataType: dataType, IsNullable: nullable, ColumnDefault: nullStringPtr(defaultValue), IsPrimaryKey: primary[strings.ToLower(name)], Extra: kingbaseIdentityClause(identity.String), Comment: nullStringPtr(comment), NumericPrecision: nullIntPtr(precision), NumericScale: nullIntPtr(scale), CharacterMaximumLength: nullIntPtr(length)})
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -469,8 +497,13 @@ func isUndefinedFunction(err error, functionName string) bool {
 }
 
 func (s *server) informationSchemaColumns(schema, table string, primary map[string]bool) ([]columnInfo, error) {
-	query := `SELECT column_name, data_type, is_nullable, column_default, numeric_precision, numeric_scale, character_maximum_length
-FROM information_schema.columns WHERE table_schema = ` + quoteLiteral(schema) + ` AND table_name = ` + quoteLiteral(table) + ` ORDER BY ordinal_position`
+	query := `SELECT c.column_name, c.data_type, c.is_nullable, c.column_default,
+	col_description(a.attrelid, a.attnum), c.numeric_precision, c.numeric_scale, c.character_maximum_length
+	FROM information_schema.columns c
+	LEFT JOIN sys_catalog.sys_namespace n ON n.nspname = c.table_schema
+	LEFT JOIN sys_catalog.sys_class rel ON rel.relnamespace = n.oid AND rel.relname = c.table_name
+	LEFT JOIN sys_catalog.sys_attribute a ON a.attrelid = rel.oid AND a.attname = c.column_name AND a.attnum > 0 AND NOT a.attisdropped
+	WHERE c.table_schema = ` + quoteLiteral(schema) + ` AND c.table_name = ` + quoteLiteral(table) + ` ORDER BY c.ordinal_position`
 	rows, err := s.metadataQuery(query)
 	if err != nil {
 		return nil, err
@@ -479,15 +512,15 @@ FROM information_schema.columns WHERE table_schema = ` + quoteLiteral(schema) + 
 	result := []columnInfo{}
 	for rows.Next() {
 		var name, dataType, nullable string
-		var defaultValue sql.NullString
+		var defaultValue, comment sql.NullString
 		var precision, scale, length sql.NullInt64
-		if err := rows.Scan(&name, &dataType, &nullable, &defaultValue, &precision, &scale, &length); err != nil {
+		if err := rows.Scan(&name, &dataType, &nullable, &defaultValue, &comment, &precision, &scale, &length); err != nil {
 			return nil, err
 		}
 		if parsed := boundedVarcharLength(dataType); parsed != nil && !length.Valid {
 			length = sql.NullInt64{Int64: int64(*parsed), Valid: true}
 		}
-		result = append(result, columnInfo{Name: name, DataType: dataType, IsNullable: strings.EqualFold(nullable, "YES"), ColumnDefault: nullStringPtr(defaultValue), IsPrimaryKey: primary[strings.ToLower(name)], NumericPrecision: nullIntPtr(precision), NumericScale: nullIntPtr(scale), CharacterMaximumLength: nullIntPtr(length)})
+		result = append(result, columnInfo{Name: name, DataType: dataType, IsNullable: strings.EqualFold(nullable, "YES"), ColumnDefault: nullStringPtr(defaultValue), IsPrimaryKey: primary[strings.ToLower(name)], Comment: nullStringPtr(comment), NumericPrecision: nullIntPtr(precision), NumericScale: nullIntPtr(scale), CharacterMaximumLength: nullIntPtr(length)})
 	}
 	return result, rows.Err()
 }
@@ -642,14 +675,7 @@ func (s *server) getTableDDL(schema, table string) (string, error) {
 	definitions := make([]string, 0, len(columns)+1)
 	primary := []string{}
 	for _, column := range columns {
-		definition := quoteIdentifier(column.Name) + " " + column.DataType
-		if !column.IsNullable {
-			definition += " NOT NULL"
-		}
-		if column.ColumnDefault != nil && *column.ColumnDefault != "" {
-			definition += " DEFAULT " + *column.ColumnDefault
-		}
-		definitions = append(definitions, definition)
+		definitions = append(definitions, columnDDLDefinition(column))
 		if column.IsPrimaryKey {
 			primary = append(primary, quoteIdentifier(column.Name))
 		}
@@ -658,6 +684,35 @@ func (s *server) getTableDDL(schema, table string) (string, error) {
 		definitions = append(definitions, "PRIMARY KEY ("+strings.Join(primary, ", ")+")")
 	}
 	return "CREATE TABLE " + quoteIdentifier(effective) + "." + quoteIdentifier(table) + " (\n  " + strings.Join(definitions, ",\n  ") + "\n);", nil
+}
+
+func columnDDLDefinition(column columnInfo) string {
+	definition := quoteIdentifier(column.Name) + " " + column.DataType
+	if column.Extra != nil && *column.Extra != "" {
+		// Identity clauses belong immediately after the data type in both
+		// PostgreSQL-compatible and SQL Server-compatible Kingbase modes.
+		definition += " " + *column.Extra
+	}
+	if !column.IsNullable {
+		definition += " NOT NULL"
+	}
+	if column.ColumnDefault != nil && *column.ColumnDefault != "" {
+		definition += " DEFAULT " + *column.ColumnDefault
+	}
+	return definition
+}
+
+func kingbaseIdentityClause(code string) *string {
+	var clause string
+	switch strings.ToLower(strings.TrimSpace(code)) {
+	case "a":
+		clause = "GENERATED ALWAYS AS IDENTITY"
+	case "d":
+		clause = "GENERATED BY DEFAULT AS IDENTITY"
+	default:
+		return nil
+	}
+	return &clause
 }
 
 func (s *server) getExplainInfo(sqlText string) (string, error) {

@@ -6,6 +6,7 @@ import type {
   ConnectionTestResult,
   DatabaseConnectionInfo,
   DatabaseInfo,
+  DatabaseStorageInfo,
   SchemaInfo,
   LinkedServerInfo,
   CatalogInfo,
@@ -643,6 +644,14 @@ export async function saveMcpGlobalPolicy(policy: Omit<McpGlobalPolicy, "configu
   return invoke("save_mcp_global_policy", { policy });
 }
 
+export async function loadMaxAgentTurns(): Promise<number> {
+  return invoke("load_max_agent_turns");
+}
+
+export async function saveMaxAgentTurns(maxAgentTurns: number): Promise<void> {
+  return invoke("save_max_agent_turns", { maxAgentTurns });
+}
+
 export interface OpenTabsStatePayload {
   tabs: unknown[];
   activeTabId: string | null;
@@ -857,6 +866,36 @@ export async function deleteAiConversation(id: string): Promise<void> {
   return invoke("delete_ai_conversation", { id });
 }
 
+// --- Prompt Templates ---
+
+export interface PromptTemplate {
+  id: string;
+  name: string;
+  content: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export async function loadPromptTemplates(): Promise<PromptTemplate[]> {
+  return invoke("load_prompt_templates");
+}
+
+export async function savePromptTemplate(id: string, name: string, content: string): Promise<PromptTemplate> {
+  return invoke("save_prompt_template", { id, name, content });
+}
+
+export async function deletePromptTemplate(id: string): Promise<void> {
+  return invoke("delete_prompt_template", { id });
+}
+
+export async function getAiGlobalCustomInstructions(): Promise<string> {
+  return invoke("get_ai_global_custom_instructions");
+}
+
+export async function setAiGlobalCustomInstructions(content: string): Promise<void> {
+  return invoke("set_ai_global_custom_instructions", { content });
+}
+
 export async function testConnection(config: ConnectionConfig): Promise<string> {
   return invoke("test_connection", { config });
 }
@@ -907,6 +946,10 @@ export async function closeDatabaseConnection(connectionId: string, database: st
 
 export async function listDatabases(connectionId: string): Promise<DatabaseInfo[]> {
   return invoke("list_databases", { connectionId });
+}
+
+export async function listDatabaseStorage(connectionId: string, databases: string[]): Promise<DatabaseStorageInfo[]> {
+  return invoke("list_database_storage", { connectionId, databases });
 }
 
 export async function listDorisCatalogs(connectionId: string): Promise<CatalogInfo[]> {
@@ -969,8 +1012,8 @@ export async function completionAssistantSearch(request: CompletionAssistantRequ
   return invoke("completion_assistant_search", { request });
 }
 
-export async function getObjectSource(connectionId: string, database: string, schema: string, name: string, objectType: ObjectSourceKind, signature?: string): Promise<ObjectSource> {
-  return invoke("get_object_source", { connectionId, database, schema, name, objectType, signature });
+export async function getObjectSource(connectionId: string, database: string, schema: string, name: string, objectType: ObjectSourceKind, signature?: string, relationName?: string): Promise<ObjectSource> {
+  return invoke("get_object_source", { connectionId, database, schema, name, objectType, signature, relationName });
 }
 
 export async function listSchemas(connectionId: string, database: string, applyVisibleFilter = false): Promise<string[]> {
@@ -1351,7 +1394,7 @@ export async function listOwners(connectionId: string, database: string, schema:
   return invoke("list_owners", { connectionId, database, schema });
 }
 
-export async function listExtensions(connectionId: string, database: string, schema: string): Promise<ExtensionInfo[]> {
+export async function listExtensions(connectionId: string, database: string, schema?: string): Promise<ExtensionInfo[]> {
   return invoke("list_extensions", { connectionId, database, schema });
 }
 
@@ -1629,6 +1672,7 @@ export interface McpServerStatus {
   latest_version: string | null;
   update_available: boolean;
   bin_path: string | null;
+  native_bin_path: string | null;
   script_path: string | null;
   install_command: string;
   update_command: string;
@@ -1643,8 +1687,8 @@ export async function installMcpServer(): Promise<string> {
   return invoke("install_mcp_server");
 }
 
-export async function checkForUpdates(locale?: string): Promise<UpdateInfo> {
-  return invoke("check_for_updates", { locale });
+export async function checkForUpdates(locale?: string, source?: UpdateDownloadSource): Promise<UpdateInfo> {
+  return invoke("check_for_updates", { locale, source });
 }
 
 export async function fetchChangelog(lang?: string): Promise<import("@/lib/app/changelog").ChangelogData> {
@@ -1985,13 +2029,17 @@ export async function zookeeperDelete(connectionId: string, key: string): Promis
   return invoke("zookeeper_delete", { connectionId, key });
 }
 
-// --- MongoDB ---
-export interface MongoDocumentResult {
+// --- Document stores ---
+export interface DocumentQueryResult {
   documents: any[];
   raw_documents?: string[];
   extended_documents?: any[];
   total: number;
+  total_is_exact?: boolean;
 }
+
+// Kept for callers that are specifically using MongoDB APIs.
+export type MongoDocumentResult = DocumentQueryResult;
 
 export interface MongoCollectionStatsResult {
   count: unknown;
@@ -2078,8 +2126,12 @@ export async function mongoParseShellCommand(source: string): Promise<MongoComma
   return normalizeRustMongoCommand(raw);
 }
 
-export async function documentFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, projection?: string, sort?: string, executionId?: string): Promise<MongoDocumentResult> {
+export async function documentFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, projection?: string, sort?: string, executionId?: string): Promise<DocumentQueryResult> {
   return invoke("document_find_documents", { connectionId, database, collection, skip, limit, filter, projection, sort, executionId });
+}
+
+export async function elasticsearchCountDocuments(connectionId: string, index: string, filter?: string, executionId?: string): Promise<number> {
+  return invoke("elasticsearch_count_documents", { connectionId, index, filter, executionId });
 }
 
 export async function mongoCountDocuments(connectionId: string, database: string, collection: string, filter?: string, mode?: "accurate" | "legacy", executionId?: string): Promise<number> {
@@ -2230,12 +2282,56 @@ export interface HistoryEntry {
   details_json?: string | null;
 }
 
+export interface HistoryConnectionFilter {
+  connection_id: string;
+  connection_name: string;
+}
+
+export interface HistoryDatabaseFilter extends HistoryConnectionFilter {
+  database: string;
+}
+
+export interface HistoryCursor {
+  executed_at: string;
+  id: string;
+}
+
+export interface HistorySearchRequest {
+  search_text: string;
+  connections: HistoryConnectionFilter[];
+  databases: HistoryDatabaseFilter[];
+  activity_kind?: string;
+  success?: boolean;
+  started_at?: string;
+  ended_at?: string;
+  cursor?: HistoryCursor;
+  limit: number;
+}
+
+export interface HistorySearchResult {
+  entries: HistoryEntry[];
+  next_cursor?: HistoryCursor | null;
+  total: number;
+}
+
+export interface HistoryConnectionOption extends HistoryConnectionFilter {
+  databases: string[];
+}
+
 export async function saveHistory(entry: HistoryEntry): Promise<void> {
   return invoke("save_history", { entry });
 }
 
 export async function loadHistory(limit: number, offset: number, activityKind?: string): Promise<HistoryEntry[]> {
   return invoke("load_history", { limit, offset, activityKind: activityKind ?? null });
+}
+
+export async function searchHistory(request: HistorySearchRequest): Promise<HistorySearchResult> {
+  return invoke("search_history", { request });
+}
+
+export async function loadHistoryConnectionOptions(): Promise<HistoryConnectionOption[]> {
+  return invoke("load_history_connection_options");
 }
 
 export async function loadRedisHistory(limit = 100, offset = 0): Promise<HistoryEntry[]> {
@@ -2392,6 +2488,7 @@ export async function sortTablesByFkDependency(options: SortTablesByFkOptions): 
 // --- Table File Import ---
 export type TableImportMode = "append" | "truncate";
 export type TableImportStatus = "running" | "done" | "error" | "cancelled";
+export type TableImportPhase = "preparing" | "detectingEncoding" | "reading" | "writing" | "finalizing" | "done";
 export type TableImportSourceFormat = "csv" | "tsv" | "delimited" | "json" | "excel";
 export type TableImportJsonShape = "auto" | "objects" | "arrays";
 export type TableImportTextEncoding = "auto" | "utf8" | "gbk" | "utf16Le" | "utf16Be";
@@ -2433,8 +2530,19 @@ export interface TableImportPreview {
   columns: string[];
   rows: unknown[][];
   totalRows: number;
+  totalRowsExact?: boolean;
+  sourceFingerprint: string;
   effectiveEncoding?: TableImportTextEncoding | null;
   sheets?: string[];
+}
+
+export interface TableImportPreparedSource {
+  fingerprint: string;
+  columns: string[];
+  rows: unknown[][];
+  totalRows: number;
+  totalRowsExact?: boolean;
+  effectiveEncoding?: TableImportTextEncoding | null;
 }
 
 export interface TableImportRequest {
@@ -2452,19 +2560,27 @@ export interface TableImportRequest {
   createTable?: boolean;
   batchSize: number;
   dateTimeFormat?: string;
+  preparedSource?: TableImportPreparedSource | null;
+  retainSource?: boolean;
 }
 
 export interface TableImportSummary {
   importId: string;
   rowsImported: number;
   totalRows: number;
+  elapsedMs: number;
 }
 
 export interface TableImportProgress {
   importId: string;
   status: TableImportStatus;
+  phase?: TableImportPhase;
   rowsImported: number;
   totalRows: number;
+  totalRowsExact?: boolean;
+  bytesRead?: number;
+  totalBytes?: number;
+  elapsedMs: number;
   error?: string | null;
 }
 
@@ -2486,7 +2602,9 @@ export async function importTableFile(request: TableImportRequest, onProgress: (
     }
   });
   try {
-    return await invoke("import_table_file", { request });
+    const summary = await invoke<TableImportSummary>("import_table_file", { request });
+    unlisten();
+    return summary;
   } catch (e) {
     unlisten();
     throw e;
@@ -2495,6 +2613,10 @@ export async function importTableFile(request: TableImportRequest, onProgress: (
 
 export async function cancelTableImport(importId: string): Promise<boolean> {
   return invoke("cancel_table_import", { importId });
+}
+
+export async function releaseTableImportSource(_sourceRef: string): Promise<boolean> {
+  return false;
 }
 
 // --- Database Export ---
@@ -2581,6 +2703,7 @@ export interface QueryResultExportRequest {
   schema?: string;
   sql: string;
   queryBaseSql: string;
+  setupSql?: string[];
   databaseType: DatabaseType;
   useAgentCursor: boolean;
   filePath: string;

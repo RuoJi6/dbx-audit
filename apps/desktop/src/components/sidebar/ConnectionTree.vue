@@ -1,13 +1,13 @@
 <script setup lang="ts">
-import { ref, computed, nextTick, watch, provide, onMounted, onUnmounted, type Component, type ComponentPublicInstance, type CSSProperties } from "vue";
+import { ref, shallowRef, computed, nextTick, watch, provide, onMounted, onUnmounted, type Component, type ComponentPublicInstance, type CSSProperties } from "vue";
 import { useI18n } from "vue-i18n";
-import { Search, X, ListFilter, ListOrdered, ArrowDownAZ, ArrowUpZA, Crosshair, Server, Database, FolderTree, Table2, Eye, RotateCcw } from "@lucide/vue";
+import { Search, X, ListFilter, ListOrdered, ArrowDownAZ, ArrowUpZA, CircleDot, Crosshair, Server, Database, FolderTree, Table2, Eye, RotateCcw } from "@lucide/vue";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useQueryStore } from "@/stores/queryStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useToast } from "@/composables/useToast";
 import type { ObjectSourceKind, TreeNode, TreeNodeType } from "@/types/database";
-import { filterSidebarSearchRootsByConnectionState, filterSidebarTree } from "@/lib/sidebar/sidebarSearchTree";
+import { filterSidebarSearchRootsByConnectionState, filterSidebarTree, filterSidebarTreeToConnectedConnections, resolveSidebarFilterGuards } from "@/lib/sidebar/sidebarSearchTree";
 import { isCancelSearchShortcut, isCopySidebarSelectionShortcut, isEditSidebarConnectionShortcut, isPasteSidebarSelectionShortcut } from "@/lib/editor/keyboardShortcuts";
 import { copyNameForTreeNode, objectSourceKindForTreeNode } from "@/lib/sidebar/treeNodeClick";
 import { copyToClipboard } from "@/lib/common/clipboard";
@@ -38,6 +38,9 @@ import type { SidebarDangerDialogRequest } from "@/lib/sidebar/sidebarDangerDial
 import { resetSidebarTreeDialogState } from "./sidebarTreeDialogState";
 import { SidebarDangerConfirmDialog, SidebarDdlViewDialog, SidebarObjectSourceDialog, SidebarProcedureExecutionDialog, SidebarVisibleDatabasesDialog, SidebarVisibleSchemasDialog } from "./sidebarAsyncDialogs";
 import { sortConnectionListForDisplay } from "@/lib/sidebar/connectionListSort";
+import { sidebarDisplayTableName } from "@/lib/sidebar/sidebarTableNameDisplay";
+import { alignedSidebarCommentLabelWidths, isSidebarCommentAlignableNode, sidebarTreeNodeComment } from "@/lib/sidebar/sidebarTreeItemLayout";
+import { sidebarTableStorageScopes, supportsSidebarTableStorage } from "@/lib/sidebar/sidebarDatabaseStorage";
 
 const { t } = useI18n();
 const store = useConnectionStore();
@@ -46,6 +49,7 @@ const settingsStore = useSettingsStore();
 const { toast } = useToast();
 const searchQuery = ref("");
 const deferredSearchQuery = ref("");
+const showConnectedConnectionsOnly = ref(false);
 const searchInputRef = ref<HTMLInputElement>();
 const rootRef = ref<HTMLElement>();
 const pointerInsideTree = ref(false);
@@ -115,7 +119,7 @@ watch(
 );
 
 function refreshActiveSidebarTableSearches() {
-  if (isFiltering.value) return;
+  if (isTreeSearchFiltering.value) return;
   for (const parentNodeId of Object.keys(store.sidebarTableSearchQueries)) {
     scheduleSidebarTableSearchRefresh(parentNodeId);
   }
@@ -197,7 +201,11 @@ function collectExpandedObjectSearchTargets(node: TreeNode, tasks: Promise<void>
 }
 
 const isSearching = computed(() => !!deferredSearchQuery.value);
-const isFiltering = computed(() => !!searchQuery.value.trim() || hasSearchScopeFilter.value);
+const sidebarFilterGuards = computed(() => resolveSidebarFilterGuards(showConnectedConnectionsOnly.value, searchQuery.value, hasSearchScopeFilter.value));
+// Connected-only filtering changes only root visibility, so descendant-local
+// features stay available while operations requiring the full root list pause.
+const isTreeSearchFiltering = computed(() => sidebarFilterGuards.value.isTreeSearchFiltering);
+const isRootListPartial = computed(() => sidebarFilterGuards.value.isRootListPartial);
 
 const SEARCH_SCOPE_TO_NODE_TYPES: Record<SearchScope, TreeNodeType[]> = {
   connection: ["connection"],
@@ -297,7 +305,7 @@ function clearSearchScopeFilter() {
 
 function scheduleSidebarTableSearchRefresh(parentNodeId: string, options?: { restoreFocus?: boolean }) {
   window.clearTimeout(tableSearchTimers.get(parentNodeId));
-  if (isFiltering.value) return;
+  if (isTreeSearchFiltering.value) return;
   const restoreToken = options?.restoreFocus ? ++tableSearchFocusRestoreTokenSeq : 0;
   if (restoreToken) {
     tableSearchFocusRestoreTokens.clear();
@@ -340,6 +348,9 @@ const displayedTreeNodes = computed(() => sortConnectionListForDisplay(store.tre
 
 const filteredNodes = computed(() => {
   let nodes = displayedTreeNodes.value;
+  if (showConnectedConnectionsOnly.value) {
+    nodes = filterSidebarTreeToConnectedConnections(nodes, store.connectedIds);
+  }
 
   const q = deferredSearchQuery.value;
   nodes = filterSidebarTree(nodes, q, searchCollapsedIds.value, searchableNodeTypes.value);
@@ -352,10 +363,68 @@ const filteredNodes = computed(() => {
 
 const flatNodes = computed<FlatTreeNode[]>(() =>
   insertSidebarTableSearchControls(flattenTree(filteredNodes.value), {
-    enabled: settingsStore.editorSettings.sidebarTableSearchEnabled && !isFiltering.value,
+    enabled: settingsStore.editorSettings.sidebarTableSearchEnabled && !isTreeSearchFiltering.value,
     sidebarObjectDisplay: settingsStore.editorSettings.sidebarObjectDisplay,
     activeQueries: store.sidebarTableSearchQueries,
   }),
+);
+
+const sidebarCommentLabelWidths = shallowRef(new Map<string, number>());
+let sidebarCommentMeasureFrame = 0;
+const sidebarTableNameDisplayTypes = new Set<TreeNodeType>(["table", "view", "materialized_view", "mongo-collection", "vector-collection", "elasticsearch-index"]);
+
+function sidebarCommentLabel(node: TreeNode): string {
+  const label = sidebarTableNameDisplayTypes.has(node.type) ? sidebarDisplayTableName(node.label, settingsStore.editorSettings.sidebarHiddenTablePrefixes) : node.label;
+  return node.valid === false ? `${label} · INVALID` : label;
+}
+
+function measureSidebarCommentLabelWidths() {
+  sidebarCommentMeasureFrame = 0;
+  if (settingsStore.editorSettings.sidebarObjectInfoMode !== "comment-aligned" || typeof document === "undefined" || !rootRef.value) {
+    sidebarCommentLabelWidths.value = new Map();
+    return;
+  }
+
+  const context = document.createElement("canvas").getContext("2d");
+  if (!context) return;
+  const style = window.getComputedStyle(rootRef.value);
+  context.font = style.font || `${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
+  sidebarCommentLabelWidths.value = alignedSidebarCommentLabelWidths(
+    flatNodes.value.map(({ id, depth, node }) => ({
+      id,
+      depth,
+      alignable: isSidebarCommentAlignableNode(node),
+      hasComment: !!sidebarTreeNodeComment(node),
+      labelWidth: context.measureText(sidebarCommentLabel(node)).width,
+    })),
+  );
+}
+
+function scheduleSidebarCommentLabelMeasure() {
+  if (typeof window === "undefined") {
+    measureSidebarCommentLabelWidths();
+    return;
+  }
+  if (sidebarCommentMeasureFrame) window.cancelAnimationFrame(sidebarCommentMeasureFrame);
+  sidebarCommentMeasureFrame = window.requestAnimationFrame(measureSidebarCommentLabelWidths);
+}
+
+watch([flatNodes, () => settingsStore.editorSettings.sidebarObjectInfoMode, () => settingsStore.editorSettings.sidebarHiddenTablePrefixes, () => settingsStore.editorSettings.uiFontFamily, () => settingsStore.editorSettings.uiScale], scheduleSidebarCommentLabelMeasure, {
+  flush: "post",
+  immediate: true,
+});
+
+const visibleSidebarTableStorageScopes = computed(() => {
+  if (settingsStore.editorSettings.sidebarObjectInfoMode !== "size") return [];
+  return sidebarTableStorageScopes(flatNodes.value.map(({ node }) => node)).filter((scope) => supportsSidebarTableStorage(store.getConfig(scope.connectionId)));
+});
+
+watch(
+  visibleSidebarTableStorageScopes,
+  (scopes) => {
+    for (const scope of scopes) void store.loadSidebarTableStorage(scope);
+  },
+  { flush: "post", immediate: true },
 );
 // Build all lookup tables in one linear pass whenever the visible tree changes.
 // Selection, scrolling and sticky headers then avoid repeated full-array scans.
@@ -451,7 +520,7 @@ watch(
 );
 
 const stickyNode = computed<FlatTreeNode | null>(() => {
-  if (!useVirtualTree.value || isFiltering.value) return null;
+  if (!useVirtualTree.value || isTreeSearchFiltering.value) return null;
   const nodes = flatNodes.value;
   const len = nodes.length;
   if (len === 0) return null;
@@ -656,9 +725,10 @@ async function createNewGroup() {
 async function startRenamingCreatedGroup(groupId: string) {
   pendingRenameGroupId.value = groupId;
   store.selectedTreeNodeId = groupId;
-  if (isFiltering.value) {
+  if (isRootListPartial.value) {
     searchQuery.value = "";
     deferredSearchQuery.value = "";
+    showConnectedConnectionsOnly.value = false;
     clearSearchScopeFilter();
   }
 
@@ -693,9 +763,10 @@ async function locateActiveTabInSidebar() {
   await ensureTreeLoadedForTarget(initialTarget);
 
   // Clear any active search filter so the node is visible
-  if (isFiltering.value) {
+  if (isRootListPartial.value) {
     searchQuery.value = "";
     deferredSearchQuery.value = "";
+    showConnectedConnectionsOnly.value = false;
     clearSearchScopeFilter();
   }
 
@@ -1051,7 +1122,7 @@ async function executeSidebarProcedureSql(sql: string) {
 }
 
 async function refreshSidebarActionTarget() {
-  const target = sidebarObjectSourceTarget.value?.node || sidebarDdlTarget.value;
+  const target = sidebarObjectSourceTarget.value?.node || sidebarDdlTarget.value || sidebarInstallExtensionTarget.value;
   if (!target) return;
   const currentTarget = findSidebarActionTarget(store.treeNodes, target);
   if (!currentTarget) return;
@@ -1306,6 +1377,7 @@ onUnmounted(() => {
   sidebarScrollbarResizeObserver?.disconnect();
   window.cancelAnimationFrame(sidebarScrollbarAnimationFrame);
   window.clearTimeout(sidebarScrollingTimer);
+  if (sidebarCommentMeasureFrame) window.cancelAnimationFrame(sidebarCommentMeasureFrame);
 });
 
 defineExpose({ focusSearch, createNewGroup, collapseAllTreeNodes });
@@ -1388,6 +1460,17 @@ defineExpose({ focusSearch, createNewGroup, collapseAllTreeNodes });
           align="end"
           @update:model-value="selectSearchScopeMenuItem"
         />
+        <button
+          type="button"
+          class="shrink-0 h-6 w-6 flex items-center justify-center rounded border hover:bg-accent"
+          :class="showConnectedConnectionsOnly ? 'text-primary bg-primary/10 border-primary/30' : 'border-border text-muted-foreground hover:text-foreground'"
+          :aria-label="t('sidebar.showActiveConnectionsOnly')"
+          :aria-pressed="showConnectedConnectionsOnly"
+          :title="t('sidebar.showActiveConnectionsOnly')"
+          @click="showConnectedConnectionsOnly = !showConnectedConnectionsOnly"
+        >
+          <CircleDot class="h-3.5 w-3.5" />
+        </button>
       </div>
     </div>
     <CustomContextMenu ref="sidebarContextMenuRef" :items="sidebarContextMenuItems" v-slot="contextMenuSlot">
@@ -1410,9 +1493,10 @@ defineExpose({ focusSearch, createNewGroup, collapseAllTreeNodes });
             <TreeItem
               :node="item.node"
               :depth="item.depth"
-              :drag-disabled="isFiltering || isConnectionListAlphabeticallySorted"
+              :drag-disabled="isRootListPartial || isConnectionListAlphabeticallySorted"
               :pending-rename="pendingRenameGroupId === item.node.id"
               :highlighted="highlightedNodeId === item.node.id"
+              :comment-label-width="sidebarCommentLabelWidths.get(item.node.id)"
               @context-menu="(event, node) => openSidebarContextMenu(event, node, contextMenuSlot.onContextMenu)"
               @rename-started="pendingRenameGroupId = null"
               @group-created="startRenamingCreatedGroup"
@@ -1420,7 +1504,7 @@ defineExpose({ focusSearch, createNewGroup, collapseAllTreeNodes });
           </template>
         </RecycleScroller>
         <div v-if="stickyNode" class="sticky-database-header pointer-events-auto absolute inset-x-0 top-0 z-[5] border-b border-border/60" :style="stickyHeaderStyle">
-          <TreeItem :node="stickyNode.node" :depth="stickyNode.depth" :drag-disabled="true" @context-menu="(event, node) => openSidebarContextMenu(event, node, contextMenuSlot.onContextMenu)" />
+          <TreeItem :node="stickyNode.node" :depth="stickyNode.depth" :drag-disabled="true" :comment-label-width="sidebarCommentLabelWidths.get(stickyNode.node.id)" @context-menu="(event, node) => openSidebarContextMenu(event, node, contextMenuSlot.onContextMenu)" />
         </div>
         <div v-if="hasSidebarVerticalOverflow" ref="sidebarScrollbarTrackRef" class="sidebar-tree-scrollbar" :class="{ 'sidebar-tree-scrollbar--scrolling': isScrollingSidebar, 'sidebar-tree-scrollbar--dragging': isDraggingSidebarScrollbar }" @pointerdown="onSidebarScrollbarTrackPointerDown">
           <div class="sidebar-tree-scrollbar__thumb" :style="sidebarScrollbarThumbStyle" @pointerdown.stop="onSidebarScrollbarThumbPointerDown" />
@@ -1433,9 +1517,10 @@ defineExpose({ focusSearch, createNewGroup, collapseAllTreeNodes });
             :key="item.id"
             :node="item.node"
             :depth="item.depth"
-            :drag-disabled="isFiltering || isConnectionListAlphabeticallySorted"
+            :drag-disabled="isRootListPartial || isConnectionListAlphabeticallySorted"
             :pending-rename="pendingRenameGroupId === item.node.id"
             :highlighted="highlightedNodeId === item.id"
+            :comment-label-width="sidebarCommentLabelWidths.get(item.node.id)"
             @context-menu="(event, node) => openSidebarContextMenu(event, node, contextMenuSlot.onContextMenu)"
             @rename-started="pendingRenameGroupId = null"
             @group-created="startRenamingCreatedGroup"
@@ -1467,6 +1552,7 @@ defineExpose({ focusSearch, createNewGroup, collapseAllTreeNodes });
       :database="sidebarObjectSourceTarget.node.database!"
       :schema="sidebarObjectSourceTarget.node.schema"
       :name="sidebarObjectSourceTarget.node.objectName || sidebarObjectSourceTarget.node.label"
+      :relation-name="sidebarObjectSourceTarget.node.tableName"
       :signature="sidebarObjectSourceTarget.node.signature"
       :object-type="sidebarObjectSourceType"
       :database-type="sidebarObjectSourceDatabaseType"
@@ -1521,7 +1607,7 @@ defineExpose({ focusSearch, createNewGroup, collapseAllTreeNodes });
       </template>
     </SidebarDangerConfirmDialog>
     <SidebarTreeItemDialogs v-if="sidebarTreeItemDialogController" :key="sidebarTreeItemDialogController.node?.id" :controller="sidebarTreeItemDialogController" @closed="sidebarTreeItemDialogController = null" />
-    <InstallExtensionDialog v-if="sidebarInstallExtensionTarget" ref="sidebarInstallExtensionDialogRef" :node="sidebarInstallExtensionTarget" @close="refreshSidebarActionTarget" />
+    <InstallExtensionDialog v-if="sidebarInstallExtensionTarget" ref="sidebarInstallExtensionDialogRef" :node="sidebarInstallExtensionTarget" @close="refreshSidebarActionTarget" @changed="refreshSidebarActionTarget" />
     <div v-if="store.treeNodes.length === 0" class="px-3 py-8 text-center text-muted-foreground text-xs">
       {{ t("sidebar.noConnections") }}
     </div>
